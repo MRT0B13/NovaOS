@@ -43,6 +43,9 @@ WORKDIR /app
 # Install bun in runtime to satisfy any bun-shebang scripts
 RUN npm install -g bun
 
+# Ensure writable data dir for eliza (pglite, state)
+RUN mkdir -p /app/.eliza && chown -R node:node /app /home/node
+
 # Copy runtime artifacts only
 COPY --from=builder /app/package.json /app/bun.lock* ./
 COPY --from=builder /app/node_modules ./node_modules
