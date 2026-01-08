@@ -40,6 +40,9 @@ FROM base AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 
+# Install bun in runtime to satisfy any bun-shebang scripts
+RUN npm install -g bun
+
 # Copy runtime artifacts only
 COPY --from=builder /app/package.json /app/bun.lock* ./
 COPY --from=builder /app/node_modules ./node_modules
