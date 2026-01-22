@@ -8,6 +8,8 @@ import { LaunchPackStore } from '../db/launchPackRepository.ts';
 import type { SecretsStore } from './secrets.ts';
 import { getEnv } from '../env.ts';
 import { redactSensitive } from './redact.ts';
+import { getPumpWalletBalance, getFundingWalletBalance, depositToPumpWallet } from './fundingWallet.ts';
+import { schedulePostLaunchMarketing, createMarketingSchedule } from './xScheduler.ts';
 
 interface PumpLauncherOptions {
   maxDevBuy: number;
@@ -216,7 +218,83 @@ export class PumpLauncherService {
     return record;
   }
 
-  private ensureLaunchAllowed(pack: LaunchPack, forceRetry?: boolean) {
+  /**
+   * FAILSAFE: Validate critical launch requirements before proceeding
+   * This ensures all required details are properly configured
+   */
+  private validateLaunchRequirements(pack: LaunchPack, options?: { skipTelegramCheck?: boolean }): void {
+    const missingRequirements: string[] = [];
+    const warnings: string[] = [];
+
+    // === CRITICAL REQUIREMENTS ===
+    // These MUST be present or launch is blocked
+    
+    // 1. Brand details must be complete
+    if (!pack.brand?.name?.trim()) {
+      missingRequirements.push('Token name is missing');
+    }
+    if (!pack.brand?.ticker?.trim()) {
+      missingRequirements.push('Token ticker is missing');
+    }
+    if (pack.brand?.ticker && (pack.brand.ticker.length < 1 || pack.brand.ticker.length > 12)) {
+      missingRequirements.push('Token ticker must be 1-12 characters');
+    }
+
+    // 2. Logo is required for pump.fun
+    if (!pack.assets?.logo_url?.trim()) {
+      missingRequirements.push('Token logo URL is missing');
+    }
+
+    // 3. Description should be present (pump.fun shows it)
+    if (!pack.brand?.description?.trim() && !pack.brand?.tagline?.trim()) {
+      warnings.push('No description or tagline set - will use default');
+    }
+
+    // === TELEGRAM VALIDATION (unless skipped) ===
+    if (!options?.skipTelegramCheck) {
+      const env = getEnv();
+      const tgEnabled = env.TG_ENABLE === 'true';
+      
+      if (tgEnabled) {
+        // If Telegram is enabled, check if setup is complete
+        const hasTelegramLink = Boolean(pack.links?.telegram);
+        const hasTelegramChatId = Boolean(pack.tg?.telegram_chat_id || pack.tg?.chat_id);
+        const telegramVerified = Boolean(pack.tg?.verified);
+
+        if (hasTelegramLink && !hasTelegramChatId && !telegramVerified) {
+          // Has link but not linked/verified - this is a problem
+          missingRequirements.push('Telegram group link provided but not verified - add bot to group first');
+        }
+
+        // Warn if no Telegram at all
+        if (!hasTelegramLink && !hasTelegramChatId) {
+          warnings.push('No Telegram group configured - token will launch without TG community link');
+        }
+      }
+    }
+
+    // === SOCIAL LINKS VALIDATION ===
+    // Warn if no social links at all (affects pump.fun display)
+    if (!pack.links?.telegram && !pack.links?.x && !pack.links?.website) {
+      warnings.push('No social links configured - token will have no links on pump.fun');
+    }
+
+    // Log warnings (non-blocking)
+    if (warnings.length > 0) {
+      logger.warn({ warnings, packId: pack.id }, '[PumpLauncher] Launch warnings');
+    }
+
+    // Throw error if critical requirements missing
+    if (missingRequirements.length > 0) {
+      logger.error({ missingRequirements, packId: pack.id }, '[PumpLauncher] Launch blocked - missing requirements');
+      throw errorWithCode('LAUNCH_REQUIREMENTS_MISSING', 
+        `Cannot launch: ${missingRequirements.join('; ')}`, 
+        { missingRequirements, warnings, packId: pack.id }
+      );
+    }
+  }
+
+  private async ensureLaunchAllowed(pack: LaunchPack, forceRetry?: boolean): Promise<LaunchPack> {
     const env = getEnv();
     const kill = env.launchEnabled;
     if (!kill) {
@@ -230,10 +308,26 @@ export class PumpLauncherService {
       (err as any).code = 'ALREADY_LAUNCHED';
       throw err;
     }
-    if (pack.launch?.requested_at && pack.launch.status !== 'failed') {
-      const err = new Error('Launch in progress');
-      (err as any).code = 'LAUNCH_IN_PROGRESS';
-      throw err;
+    
+    // Check for stale "in progress" launches (older than 5 minutes = likely crashed)
+    if (pack.launch?.requested_at && pack.launch.status !== 'failed' && pack.launch.status !== 'launched') {
+      const requestedAt = new Date(pack.launch.requested_at).getTime();
+      const now = Date.now();
+      const staleLockMs = 5 * 60 * 1000; // 5 minutes
+      
+      if (now - requestedAt < staleLockMs) {
+        const err = new Error('Launch in progress');
+        (err as any).code = 'LAUNCH_IN_PROGRESS';
+        throw err;
+      } else {
+        // Lock is stale - clear it in database and allow retry
+        logger.warn(`[PumpLauncher] Stale launch lock detected (requested ${Math.round((now - requestedAt) / 1000)}s ago), clearing lock...`);
+        const cleared = await this.store.update(pack.id, {
+          launch: { ...pack.launch, requested_at: undefined, status: 'failed', failed_at: pack.launch.requested_at }
+        });
+        logger.info(`[PumpLauncher] ✅ Stale lock cleared, proceeding with retry`);
+        return cleared; // Return updated pack
+      }
     }
 
     if (pack.launch?.status === 'failed' && !forceRetry) {
@@ -247,9 +341,33 @@ export class PumpLauncherService {
         throw err;
       }
     }
+    
+    return pack; // Return pack unchanged if no stale lock
   }
 
-  private enforceCaps(): CapsResult {
+  /**
+   * Count how many launches happened today (UTC)
+   */
+  private async countTodayLaunches(): Promise<number> {
+    const packs = await this.store.list();
+    const todayStart = new Date();
+    todayStart.setUTCHours(0, 0, 0, 0);
+    
+    let count = 0;
+    for (const pack of packs) {
+      if (pack.launch?.status === 'launched' && pack.launch?.launched_at) {
+        const launchDate = new Date(pack.launch.launched_at);
+        if (launchDate >= todayStart) {
+          count++;
+        }
+      }
+    }
+    
+    logger.info('[PumpLauncher] Today\'s launches: ' + count);
+    return count;
+  }
+
+  private async enforceCaps(): Promise<CapsResult> {
     const env = getEnv();
     const maxDevBuy = this.options.maxDevBuy;
     const maxPriorityFee = this.options.maxPriorityFee;
@@ -272,7 +390,23 @@ export class PumpLauncherService {
       };
       throw err;
     }
-    // TODO: implement per-day counting using DB; skipped for MVP.
+    
+    // Check daily launch limit
+    if (maxLaunchesPerDay > 0) {
+      const todayCount = await this.countTodayLaunches();
+      if (todayCount >= maxLaunchesPerDay) {
+        const err = new Error('Daily launch limit reached. Try again tomorrow (UTC).');
+        (err as any).code = 'DAILY_LIMIT_REACHED';
+        (err as any).details = {
+          maxLaunchesPerDay,
+          launchesToday: todayCount,
+        };
+        logger.warn('[PumpLauncher] Daily limit reached: ' + todayCount + '/' + maxLaunchesPerDay);
+        throw err;
+      }
+      logger.info('[PumpLauncher] Daily limit check passed: ' + todayCount + '/' + maxLaunchesPerDay);
+    }
+    
     return { maxDevBuy, maxPriorityFee, maxLaunchesPerDay, requestedDevBuy, requestedPriority };
   }
 
@@ -394,6 +528,7 @@ export class PumpLauncherService {
     });
 
     const resJson = await safeJson(res);
+    console.log('[DEBUG] Pump.fun response:', { status: res.status, body: resJson });
     if (!res.ok) {
       const err = new Error(resJson?.error || `Launch failed (${res.status})`);
       (err as any).code = 'LAUNCH_FAILED';
@@ -402,6 +537,7 @@ export class PumpLauncherService {
 
     const sig = resJson?.signature || resJson?.tx || resJson?.txSignature;
     const returnedMint: string | undefined = resJson?.mint;
+    console.log('[DEBUG] Extracted from response:', { sig, returnedMint, mintPublic });
     if (returnedMint && returnedMint !== mintPublic) {
       throw errorWithCode('MINT_MISMATCH', 'Mint mismatch returned from pump portal', {
         expected: mintPublic,
@@ -418,6 +554,15 @@ export class PumpLauncherService {
     if (mintLen !== 32) {
       throw errorWithCode('MINT_MISMATCH', 'Mint length invalid', { length: mintLen });
     }
+
+    // Build dev_buy info for transparency
+    const devBuyInfo = devBuy > 0 ? {
+      enabled: true,
+      amount_sol: devBuy,
+      tokens_received: undefined, // Will be filled by on-chain query if needed
+      disclosed: true, // Always disclosed for transparency
+    } : undefined;
+
     return {
       ...pack,
       launch: {
@@ -428,36 +573,98 @@ export class PumpLauncherService {
         pump_url: this.buildPumpUrl(sig),
         completed_at: nowIso(),
         launched_at: nowIso(),
-        requested_at: pack.launch?.requested_at,
+        requested_at: pack.launch?.requested_at || nowIso(),
+        dev_buy: devBuyInfo,
         error_code: undefined,
         error_message: undefined,
       },
       ops: {
         ...(pack.ops || {}),
-        audit_log: appendAudit(pack.ops?.audit_log, 'Pump launch complete', 'eliza'),
+        audit_log: appendAudit(pack.ops?.audit_log, `Pump launch complete${devBuy > 0 ? ` (dev buy: ${devBuy} SOL)` : ''}`, 'eliza'),
       },
     } as LaunchPack;
   }
 
-  async launch(id: string, options?: { force?: boolean }): Promise<LaunchPack> {
-    const existing = await this.store.get(id);
+  async launch(id: string, options?: { force?: boolean; skipTelegramCheck?: boolean }): Promise<LaunchPack> {
+    let existing = await this.store.get(id);
     if (!existing) throw new Error('LaunchPack not found');
 
     if (existing.launch?.status === 'launched') {
       return existing;
     }
 
-    this.ensureLaunchAllowed(existing, options?.force);
-    const caps = this.enforceCaps();
+    // === FAILSAFE: Validate all requirements BEFORE proceeding ===
+    // This prevents launching with incomplete/incorrect details
+    logger.info(`[Launch] Running pre-launch validation for pack ${id}...`);
+    this.validateLaunchRequirements(existing, { skipTelegramCheck: options?.skipTelegramCheck || options?.force });
+    logger.info(`[Launch] ✅ Pre-launch validation passed`);
+
+    // Check if launch allowed - may clear stale locks and return updated pack
+    existing = await this.ensureLaunchAllowed(existing, options?.force);
+    const caps = await this.enforceCaps();
     const slippagePercent = this.resolveSlippage();
 
+    // === WALLET BALANCE CHECK ===
+    // Required: devBuy + priorityFee + buffer for tx fees
+    const requiredSol = caps.requestedDevBuy + (caps.requestedPriority / 1_000_000) + 0.05; // +0.05 buffer
+    logger.info(`[Launch] Required SOL for launch: ${requiredSol.toFixed(4)}`);
+
+    let pumpBalance: number;
+    try {
+      pumpBalance = await getPumpWalletBalance();
+      logger.info(`[Launch] Current pump wallet balance: ${pumpBalance.toFixed(4)} SOL`);
+    } catch (err: any) {
+      throw errorWithCode('WALLET_CHECK_FAILED', `Failed to check pump wallet balance: ${err.message}`);
+    }
+
+    if (pumpBalance < requiredSol) {
+      // Try to auto-fund from agent's funding wallet
+      const deficit = requiredSol - pumpBalance + 0.1; // Add extra buffer
+      logger.info(`[Launch] Insufficient funds. Need ${deficit.toFixed(4)} more SOL. Attempting auto-fund...`);
+
+      try {
+        const fundingWallet = await getFundingWalletBalance();
+        logger.info(`[Launch] Funding wallet balance: ${fundingWallet.balance.toFixed(4)} SOL`);
+
+        if (fundingWallet.balance < deficit + 0.01) {
+          throw errorWithCode(
+            'INSUFFICIENT_FUNDS',
+            `Insufficient funds for launch.\n` +
+            `• Pump wallet: ${pumpBalance.toFixed(4)} SOL\n` +
+            `• Funding wallet: ${fundingWallet.balance.toFixed(4)} SOL\n` +
+            `• Required: ${requiredSol.toFixed(4)} SOL\n\n` +
+            `Please fund your agent wallet (${fundingWallet.address}) with at least ${(deficit + 0.01).toFixed(4)} SOL.`
+          );
+        }
+
+        // Auto-deposit to pump wallet
+        logger.info(`[Launch] Auto-depositing ${deficit.toFixed(4)} SOL to pump wallet...`);
+        const depositResult = await depositToPumpWallet(deficit);
+        logger.info(`[Launch] ✅ Auto-funded pump wallet. New balance: ${depositResult.balance.toFixed(4)} SOL`);
+        pumpBalance = depositResult.balance;
+      } catch (err: any) {
+        if (err.code === 'INSUFFICIENT_FUNDS') throw err;
+        throw errorWithCode(
+          'AUTO_FUND_FAILED',
+          `Launch requires ${requiredSol.toFixed(4)} SOL but pump wallet only has ${pumpBalance.toFixed(4)} SOL.\n` +
+          `Auto-funding failed: ${err.message}\n\n` +
+          `Please manually deposit SOL to your pump wallet or funding wallet.`
+        );
+      }
+    }
+
+    logger.info(`[Launch] ✅ Wallet check passed. Proceeding with launch...`);
+
     // atomic claim
-    const claimed = await this.store.claimLaunch(id, { requested_at: nowIso(), status: 'ready' });
+    const requestedAt = nowIso();
+    console.log('[DEBUG] Claiming launch with requested_at:', requestedAt);
+    const claimed = await this.store.claimLaunch(id, { requested_at: requestedAt, status: 'ready' });
     if (!claimed) {
       const err = new Error('Launch in progress');
       (err as any).code = 'LAUNCH_IN_PROGRESS';
       throw err;
     }
+    console.log('[DEBUG] Claimed launch object:', JSON.stringify(claimed.launch, null, 2));
     const withRequested = claimed;
 
     try {
@@ -470,24 +677,75 @@ export class PumpLauncherService {
         wallet,
         slippagePercent
       );
+      
+      // DEBUG: Log the launch object before saving
+      logger.info(`[Launch] DEBUG: launched.launch = ${JSON.stringify(launched.launch)}`);
+      
       const saved = await this.store.update(id, {
         launch: launched.launch,
         ops: launched.ops,
       });
+      
+      // DEBUG: Verify the saved object has correct status
+      logger.info(`[Launch] DEBUG: saved.launch.status = "${saved.launch?.status}", mint = "${saved.launch?.mint}"`);
+      if (saved.launch?.status !== 'launched') {
+        logger.error(`[Launch] BUG DETECTED: Status should be 'launched' but is '${saved.launch?.status}'! Auto-correcting...`);
+        // Auto-correct the status
+        await this.store.update(id, {
+          launch: {
+            ...saved.launch,
+            status: 'launched',
+          },
+        });
+        logger.info(`[Launch] Status auto-corrected to 'launched'`);
+      }
+
+      // === AUTO-SCHEDULE MARKETING TWEETS ===
+      // If X is enabled, schedule post-launch marketing tweets
+      const env = getEnv();
+      if (env.X_ENABLE === 'true') {
+        try {
+          const scheduled = await schedulePostLaunchMarketing(saved, 7); // 7 days of tweets
+          await createMarketingSchedule(saved, 3); // 3 tweets per week ongoing
+          
+          // Save marketing info to database for recovery
+          await this.store.update(id, {
+            ops: {
+              ...(saved.ops || {}),
+              x_marketing_enabled: true,
+              x_marketing_tweets_per_week: 3,
+              x_marketing_total_tweeted: 0,
+              x_marketing_created_at: nowIso(),
+              x_marketing_scheduled_count: scheduled.length,
+            },
+          });
+          
+          logger.info(`[Launch] ✅ Auto-scheduled ${scheduled.length} marketing tweets for $${saved.brand?.ticker}`);
+        } catch (scheduleErr) {
+          // Non-fatal - launch succeeded, just couldn't schedule tweets
+          logger.warn(`[Launch] Could not auto-schedule marketing tweets: ${(scheduleErr as Error).message}`);
+        }
+      }
+
       return saved;
     } catch (error) {
       const err = error as Error & { code?: string };
       const failure: LaunchPackUpdateInput = {
         launch: {
-          ...(withRequested.launch || {}),
           status: 'failed',
           failed_at: nowIso(),
           error_code: err.code || 'LAUNCH_FAILED',
           error_message: err.message,
+          // Don't include ANY old datetime fields - they might be in wrong format
+          // Only keep non-datetime fields from existing launch
+          mint: withRequested.launch?.mint,
+          tx_signature: withRequested.launch?.tx_signature,
+          pump_url: withRequested.launch?.pump_url,
         },
         ops: {
-          ...(withRequested.ops || {}),
-          audit_log: appendAudit(withRequested.ops?.audit_log, `Launch failed: ${err.message}`, 'eliza'),
+          checklist: withRequested.ops?.checklist,
+          // Recreate audit log with only the new entry - avoid old timestamps
+          audit_log: [{ at: nowIso(), message: `Launch failed: ${err.message}`, actor: 'eliza' }],
         },
       };
       const saved = await this.store.update(id, failure);

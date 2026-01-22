@@ -9,11 +9,14 @@ import {
 import { getPglite } from './pglite.ts';
 
 const PUBLISH_COOLDOWN_MS = 10 * 60 * 1000;
+const TREASURY_COOLDOWN_MS = 5 * 60 * 1000; // 5 min cooldown for treasury operations
 
 export interface LaunchPackStore {
   create(input: LaunchPackCreateInput): Promise<LaunchPack>;
   get(id: string): Promise<LaunchPack | null>;
+  list(): Promise<LaunchPack[]>;
   update(id: string, patch: LaunchPackUpdateInput): Promise<LaunchPack>;
+  delete(id: string): Promise<boolean>;
   claimLaunch(
     id: string,
     fields: { requested_at: string; status: string }
@@ -23,6 +26,10 @@ export interface LaunchPackStore {
     fields: { requested_at: string; force?: boolean }
   ): Promise<LaunchPack | null>;
   claimXPublish(
+    id: string,
+    fields: { requested_at: string; force?: boolean }
+  ): Promise<LaunchPack | null>;
+  claimTreasuryWithdraw(
     id: string,
     fields: { requested_at: string; force?: boolean }
   ): Promise<LaunchPack | null>;
@@ -151,13 +158,19 @@ export class LaunchPackRepository implements LaunchPackStore {
 
   async get(id: string): Promise<LaunchPack | null> {
     const result = await this.db.query(
-      `SELECT id, data, created_at, updated_at FROM launch_packs WHERE id = $1 LIMIT 1`,
+      `SELECT id, data, created_at, updated_at, launch_status FROM launch_packs WHERE id = $1 LIMIT 1`,
       [id]
     );
 
     if (!result.rows?.length) return null;
     const row = result.rows[0] as any;
     const stored = (row.data || {}) as LaunchPack;
+    
+    // Use launch_status column as authoritative source for status
+    if (row.launch_status && stored.launch) {
+      stored.launch.status = row.launch_status;
+    }
+    
     return {
       ...stored,
       id: row.id || stored.id || id,
@@ -166,12 +179,45 @@ export class LaunchPackRepository implements LaunchPackStore {
     } as LaunchPack;
   }
 
+  async list(): Promise<LaunchPack[]> {
+    const result = await this.db.query(
+      `SELECT id, data, created_at, updated_at, launch_status FROM launch_packs ORDER BY created_at DESC`
+    );
+
+    if (!result.rows?.length) return [];
+    return result.rows.map((row: any) => {
+      const stored = (row.data || {}) as LaunchPack;
+      
+      // Use launch_status column as authoritative source for status
+      if (row.launch_status && stored.launch) {
+        stored.launch.status = row.launch_status;
+      }
+      
+      return {
+        ...stored,
+        id: row.id || stored.id,
+        created_at: toIso(row.created_at) || stored.created_at,
+        updated_at: toIso(row.updated_at) || stored.updated_at,
+      } as LaunchPack;
+    });
+  }
+
+  async delete(id: string): Promise<boolean> {
+    const result = await this.db.query(
+      `DELETE FROM launch_packs WHERE id = $1`,
+      [id]
+    );
+    return (result.affectedRows ?? 0) > 0;
+  }
+
   async update(id: string, patch: LaunchPackUpdateInput): Promise<LaunchPack> {
     const existing = await this.get(id);
     if (!existing) {
       throw new Error('LaunchPack not found');
     }
 
+    console.log(`[LaunchPackStore] UPDATE ${id} - patch keys: ${Object.keys(patch).join(', ')}`);
+    
     const parsedPatch = LaunchPackValidation.update(patch);
     const merged = deepMerge(existing, parsedPatch) as LaunchPack;
     const timestamp = new Date().toISOString();
@@ -181,6 +227,8 @@ export class LaunchPackRepository implements LaunchPackStore {
     merged.version = currentVersion + 1;
     const launchStatus = merged.launch?.status ?? 'draft';
     const launchRequestedAt = merged.launch?.requested_at ? new Date(merged.launch.requested_at) : null;
+
+    console.log(`[LaunchPackStore] UPDATE ${id} - mascot: ${merged.mascot?.name || 'none'}, version: ${merged.version}`);
 
     await this.db.query(
       `UPDATE launch_packs
@@ -204,7 +252,7 @@ export class LaunchPackRepository implements LaunchPackStore {
        SET launch_status = $3,
            launch_requested_at = $2::timestamptz,
            data = jsonb_set(
-                   jsonb_set(data, '{launch,requested_at}', to_jsonb($2::text), true),
+                   jsonb_set(data, '{launch,requested_at}', $4::jsonb, true),
                    '{launch,status}', to_jsonb($3::text), true
                  ),
            updated_at = NOW()
@@ -212,11 +260,12 @@ export class LaunchPackRepository implements LaunchPackStore {
          AND launch_status <> 'launched'
          AND (launch_requested_at IS NULL OR launch_status = 'failed')
        RETURNING id, data, created_at, updated_at, launch_status, launch_requested_at`,
-      [id, fields.requested_at, fields.status]
+      [id, fields.requested_at, fields.status, JSON.stringify(fields.requested_at)]
     );
 
     if (!result.rows?.length) return null;
     const row = result.rows[0] as any;
+    console.log('[DEBUG] Raw row.data from PGlite:', JSON.stringify(row.data, null, 2));
     const stored = (row.data || {}) as LaunchPack;
     return {
       ...stored,
@@ -230,86 +279,117 @@ export class LaunchPackRepository implements LaunchPackStore {
     id: string,
     fields: { requested_at: string; force?: boolean }
   ): Promise<LaunchPack | null> {
-    const force = Boolean(fields.force);
-    const result = await this.db.query(
-      `UPDATE launch_packs
-         SET data = jsonb_set(
-                        jsonb_set(
-                          jsonb_set(data, '{ops,tg_publish_status}', to_jsonb('in_progress'), true),
-                          '{ops,tg_publish_attempted_at}', to_jsonb($2::text), true
-                        ),
-                        '{ops,tg_publish_error_code}', 'null'::jsonb, true
-                      ),
-             updated_at = NOW()
-       WHERE id = $1
-         AND COALESCE(data->'ops'->>'tg_publish_status', 'idle') <> 'published'
-         AND COALESCE(data->'ops'->>'tg_publish_status', 'idle') <> 'in_progress'
-         AND (
-              COALESCE(data->'ops'->>'tg_publish_status', 'idle') = 'idle'
-              OR (
-                   COALESCE(data->'ops'->>'tg_publish_status', 'idle') = 'failed'
-                   AND (
-                        $3 = TRUE
-                        OR COALESCE((data->'ops'->>'tg_publish_failed_at')::timestamptz, TO_TIMESTAMP(0)) <= NOW() - INTERVAL '10 minutes'
-                      )
-                 )
-             )
-       RETURNING id, data, created_at, updated_at` ,
-      [id, fields.requested_at, force]
-    );
-
-    if (!result.rows?.length) return null;
-    const row = result.rows[0] as any;
-    const stored = (row.data || {}) as LaunchPack;
-    return {
-      ...stored,
-      id: row.id || stored.id || id,
-      created_at: toIso(row.created_at) || stored.created_at,
-      updated_at: toIso(row.updated_at) || stored.updated_at,
-    } as LaunchPack;
+    // Simplified approach: fetch, check, update to avoid PGLite to_jsonb issues
+    const existing = await this.get(id);
+    if (!existing) return null;
+    
+    const currentStatus = existing.ops?.tg_publish_status || 'idle';
+    const failedAt = existing.ops?.tg_publish_failed_at;
+    
+    // Already published or in progress
+    if (currentStatus === 'published' || currentStatus === 'in_progress') {
+      return null;
+    }
+    
+    // Failed but not enough time passed (10 min cooldown) unless forced
+    if (currentStatus === 'failed' && !fields.force && failedAt) {
+      const failedTime = new Date(failedAt).getTime();
+      const now = Date.now();
+      if (now - failedTime < 10 * 60 * 1000) {
+        return null;
+      }
+    }
+    
+    // Update with clean ops object
+    const updatedOps = {
+      ...(existing.ops || {}),
+      tg_publish_status: 'in_progress' as const,
+      tg_publish_attempted_at: fields.requested_at,
+      tg_publish_error_code: null,
+      tg_publish_error_message: null,
+    };
+    
+    const updated = await this.update(id, { ops: updatedOps });
+    return updated;
   }
 
   async claimXPublish(
     id: string,
     fields: { requested_at: string; force?: boolean }
   ): Promise<LaunchPack | null> {
-    const force = Boolean(fields.force);
-    const result = await this.db.query(
-      `UPDATE launch_packs
-         SET data = jsonb_set(
-                        jsonb_set(
-                          jsonb_set(data, '{ops,x_publish_status}', to_jsonb('in_progress'), true),
-                          '{ops,x_publish_attempted_at}', to_jsonb($2::text), true
-                        ),
-                        '{ops,x_publish_error_code}', 'null'::jsonb, true
-                      ),
-             updated_at = NOW()
-       WHERE id = $1
-         AND COALESCE(data->'ops'->>'x_publish_status', 'idle') <> 'published'
-         AND COALESCE(data->'ops'->>'x_publish_status', 'idle') <> 'in_progress'
-         AND (
-              COALESCE(data->'ops'->>'x_publish_status', 'idle') = 'idle'
-              OR (
-                   COALESCE(data->'ops'->>'x_publish_status', 'idle') = 'failed'
-                   AND (
-                        $3 = TRUE
-                        OR COALESCE((data->'ops'->>'x_publish_failed_at')::timestamptz, TO_TIMESTAMP(0)) <= NOW() - INTERVAL '10 minutes'
-                      )
-                 )
-             )
-       RETURNING id, data, created_at, updated_at` ,
-      [id, fields.requested_at, force]
-    );
+    // Simplified approach: fetch, check, update to avoid PGLite to_jsonb issues
+    const existing = await this.get(id);
+    if (!existing) return null;
+    
+    const currentStatus = existing.ops?.x_publish_status || 'idle';
+    const failedAt = existing.ops?.x_publish_failed_at;
+    
+    // Already published or in progress
+    if (currentStatus === 'published' || currentStatus === 'in_progress') {
+      return null;
+    }
+    
+    // Failed but not enough time passed (10 min cooldown) unless forced
+    if (currentStatus === 'failed' && !fields.force && failedAt) {
+      const failedTime = new Date(failedAt).getTime();
+      const now = Date.now();
+      if (now - failedTime < 10 * 60 * 1000) {
+        return null;
+      }
+    }
+    
+    // Update with clean ops object
+    const updatedOps = {
+      ...(existing.ops || {}),
+      x_publish_status: 'in_progress' as const,
+      x_publish_attempted_at: fields.requested_at,
+      x_publish_error_code: null,
+      x_publish_error_message: null,
+    };
+    
+    const updated = await this.update(id, { ops: updatedOps });
+    return updated;
+  }
 
-    if (!result.rows?.length) return null;
-    const row = result.rows[0] as any;
-    const stored = (row.data || {}) as LaunchPack;
-    return {
-      ...stored,
-      id: row.id || stored.id || id,
-      created_at: toIso(row.created_at) || stored.created_at,
-      updated_at: toIso(row.updated_at) || stored.updated_at,
-    } as LaunchPack;
+  async claimTreasuryWithdraw(
+    id: string,
+    fields: { requested_at: string; force?: boolean }
+  ): Promise<LaunchPack | null> {
+    // Similar pattern to claimTelegramPublish: fetch, check, update
+    const existing = await this.get(id);
+    if (!existing) return null;
+    
+    const currentStatus = existing.ops?.treasury?.status || 'idle';
+    const completedAt = existing.ops?.treasury?.completed_at;
+    
+    // Already in progress - cannot claim
+    if (currentStatus === 'in_progress') {
+      return null;
+    }
+    
+    // Recently completed (cooldown) unless forced
+    if (currentStatus === 'success' && !fields.force && completedAt) {
+      const completedTime = new Date(completedAt).getTime();
+      const now = Date.now();
+      if (now - completedTime < TREASURY_COOLDOWN_MS) {
+        return null;
+      }
+    }
+    
+    // Update with claim - set status to in_progress
+    const updatedOps = {
+      ...(existing.ops || {}),
+      treasury: {
+        ...(existing.ops?.treasury || {}),
+        status: 'in_progress' as const,
+        attempted_at: fields.requested_at,
+        error_code: undefined,
+        error_message: undefined,
+      },
+    };
+    
+    const updated = await this.update(id, { ops: updatedOps });
+    return updated;
   }
 
   async findDueTelegramPublishes(nowIso: string, limit: number): Promise<LaunchPack[]> {
@@ -473,6 +553,45 @@ export function createInMemoryLaunchPackStore(): LaunchPackStore {
       store.set(id, updated);
       return updated;
     },
+    async claimTreasuryWithdraw(id, fields) {
+      const existing = store.get(id);
+      if (!existing) return null;
+      
+      const currentStatus = existing.ops?.treasury?.status || 'idle';
+      const completedAt = existing.ops?.treasury?.completed_at;
+      
+      // Already in progress - cannot claim
+      if (currentStatus === 'in_progress') {
+        return null;
+      }
+      
+      // Recently completed (cooldown) unless forced
+      if (currentStatus === 'success' && !fields.force && completedAt) {
+        const completedTime = new Date(completedAt).getTime();
+        const now = Date.now();
+        if (now - completedTime < TREASURY_COOLDOWN_MS) {
+          return null;
+        }
+      }
+      
+      const updated: LaunchPack = {
+        ...existing,
+        ops: {
+          ...(existing.ops || {}),
+          treasury: {
+            ...(existing.ops?.treasury || {}),
+            status: 'in_progress',
+            attempted_at: fields.requested_at,
+            error_code: undefined,
+            error_message: undefined,
+          },
+        },
+        updated_at: new Date().toISOString(),
+      } as LaunchPack;
+      updated.version = (existing.version ?? 1) + 1;
+      store.set(id, updated);
+      return updated;
+    },
     async findDueTelegramPublishes(nowIso, limit) {
       const nowTs = new Date(nowIso).getTime();
       const results: LaunchPack[] = [];
@@ -500,6 +619,14 @@ export function createInMemoryLaunchPackStore(): LaunchPackStore {
         results.push(pack);
       }
       return results;
+    },
+    async list() {
+      return Array.from(store.values()).sort(
+        (a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+      );
+    },
+    async delete(id) {
+      return store.delete(id);
     },
   };
 }

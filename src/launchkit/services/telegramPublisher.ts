@@ -15,6 +15,37 @@ function errorWithCode(code: string, message: string, details?: unknown) {
   return err;
 }
 
+/**
+ * Replace placeholder tokens with actual URLs before posting
+ * Handles: [MINT_ADDRESS], [MINT], [TG_LINK], [TG], [WEBSITE], pump.fun/[MINT_ADDRESS], etc.
+ */
+function resolvePlaceholders(text: string, mint?: string, telegramUrl?: string, websiteUrl?: string): string {
+  let result = text;
+  
+  // Build the actual pump.fun URL
+  const pumpUrl = mint ? `https://pump.fun/coin/${mint}` : '';
+  
+  // Replace various placeholder patterns
+  // Full URLs first
+  result = result.replace(/pump\.fun\/\[MINT_ADDRESS\]/g, pumpUrl ? pumpUrl.replace('https://', '') : '');
+  result = result.replace(/pump\.fun\/\[MINT\]/g, pumpUrl ? pumpUrl.replace('https://', '') : '');
+  
+  // Standalone placeholders
+  result = result.replace(/\[MINT_ADDRESS\]/g, mint || '');
+  result = result.replace(/\[MINT\]/g, mint || '');
+  result = result.replace(/\[TG_LINK\]/g, telegramUrl || '');
+  result = result.replace(/\[TG\]/g, telegramUrl || '');
+  result = result.replace(/\[WEBSITE\]/g, websiteUrl || '');
+  
+  // Clean up empty lines (when placeholder is replaced with empty string)
+  result = result.replace(/\nChart: $/gm, '');
+  result = result.replace(/\nTelegram: $/gm, '');
+  result = result.replace(/\nWebsite: $/gm, '');
+  result = result.replace(/\n\n+/g, '\n\n');
+  
+  return result.trim();
+}
+
 async function tgApi(token: string, method: string, body: Record<string, unknown>) {
   const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: 'POST',
@@ -36,15 +67,19 @@ export class TelegramPublisherService {
     if (env.TG_ENABLE !== 'true') {
       throw errorWithCode('TG_DISABLED', 'Telegram publishing disabled');
     }
-    const missingKeys: string[] = [];
-    if (!env.TG_BOT_TOKEN) missingKeys.push('TG_BOT_TOKEN');
-    if (!env.TG_CHAT_ID) missingKeys.push('TG_CHAT_ID');
-    if (missingKeys.length) {
-      throw errorWithCode('TG_CONFIG_MISSING', 'Telegram configuration missing', { missingKeys });
+    if (!env.TG_BOT_TOKEN) {
+      throw errorWithCode('TG_CONFIG_MISSING', 'TG_BOT_TOKEN not configured');
     }
 
     const pack = await this.store.get(id);
     if (!pack) throw errorWithCode('NOT_FOUND', 'LaunchPack not found');
+    
+    // Get the actual Telegram chat_id (telegram_chat_id is the real one, chat_id is ElizaOS roomId)
+    const chatId = pack.tg?.telegram_chat_id || pack.tg?.chat_id || env.TG_CHAT_ID;
+    if (!chatId) {
+      throw errorWithCode('TG_CHAT_ID_MISSING', 'No chat_id configured for this LaunchPack. Link a Telegram group first.');
+    }
+    
     if (!pack.ops?.checklist?.tg_ready) {
       throw errorWithCode('TG_NOT_READY', 'Telegram checklist not ready');
     }
@@ -60,23 +95,34 @@ export class TelegramPublisherService {
       throw errorWithCode('TG_PUBLISH_IN_PROGRESS', 'Telegram publish already in progress');
     }
 
-    const pins = claim.tg?.pins ?? {};
+    // Get the actual mint and telegram URL for resolving placeholders
+    const mint = claim.launch?.mint;
+    const telegramUrl = claim.tg?.invite_link;
+    const websiteUrl = claim.links?.website;
+
+    const rawPins = claim.tg?.pins ?? {};
+    // Resolve placeholders in pins
+    const pins = {
+      welcome: rawPins.welcome ? resolvePlaceholders(rawPins.welcome, mint, telegramUrl, websiteUrl) : undefined,
+      how_to_buy: rawPins.how_to_buy ? resolvePlaceholders(rawPins.how_to_buy, mint, telegramUrl, websiteUrl) : undefined,
+      memekit: rawPins.memekit ? resolvePlaceholders(rawPins.memekit, mint, telegramUrl, websiteUrl) : undefined,
+    };
     const schedule = claim.tg?.schedule ?? [];
     const messageIds: string[] = [];
 
     const maybeSendAndPin = async (text: string | undefined) => {
       if (!text) return null;
       const message = await tgApi(env.TG_BOT_TOKEN!, 'sendMessage', {
-        chat_id: env.TG_CHAT_ID,
+        chat_id: chatId,
         text,
-        disable_web_page_preview: true,
+        disable_web_page_preview: false, // Enable link previews for pump.fun URLs
       });
       const messageId = message?.message_id;
       if (messageId === undefined || messageId === null) {
         throw errorWithCode('TG_PUBLISH_FAILED', 'Telegram sendMessage missing message_id');
       }
       await tgApi(env.TG_BOT_TOKEN!, 'pinChatMessage', {
-        chat_id: env.TG_CHAT_ID,
+        chat_id: chatId,
         message_id: messageId,
       });
       return messageId as number;
@@ -92,30 +138,34 @@ export class TelegramPublisherService {
 
       const scheduleIntent = schedule.map((item) => ({ ...item, when: new Date(item.when).toISOString() }));
 
+      // Ensure clean serializable objects to avoid PostgreSQL type issues
+      const cleanOps = {
+        checklist: { ...(claim.ops?.checklist || {}), tg_published: true },
+        tg_publish_status: 'published' as const,
+        tg_published_at: nowIso(),
+        tg_message_ids: messageIds.length > 0 ? messageIds : [],
+        tg_schedule_intent: scheduleIntent.length > 0 ? scheduleIntent : [],
+        tg_publish_error_code: null,
+        tg_publish_error_message: null,
+        audit_log: appendAudit(claim.ops?.audit_log, 'Telegram publish complete', 'eliza'),
+      };
+
       const updated = await this.store.update(id, {
-        ops: {
-          ...(claim.ops || {}),
-          checklist: { ...(claim.ops?.checklist || {}), tg_published: true },
-          tg_publish_status: 'published',
-          tg_published_at: nowIso(),
-          tg_message_ids: messageIds,
-          tg_schedule_intent: scheduleIntent,
-          tg_publish_error_code: null,
-          tg_publish_error_message: null,
-          audit_log: appendAudit(claim.ops?.audit_log, 'Telegram publish complete', 'eliza'),
-        },
+        ops: cleanOps,
       });
       return updated;
     } catch (error) {
       const err = error as Error & { code?: string };
+      // Clean error update to avoid serialization issues
+      const errorOps = {
+        checklist: claim.ops?.checklist || {},
+        tg_publish_status: 'failed' as const,
+        tg_publish_failed_at: nowIso(),
+        tg_publish_error_code: String(err.code || 'TG_PUBLISH_FAILED'),
+        tg_publish_error_message: String(err.message || 'Unknown error'),
+      };
       await this.store.update(id, {
-        ops: {
-          ...(claim.ops || {}),
-          tg_publish_status: 'failed',
-          tg_publish_failed_at: nowIso(),
-          tg_publish_error_code: err.code || 'TG_PUBLISH_FAILED',
-          tg_publish_error_message: err.message,
-        },
+        ops: errorOps,
       });
       throw err;
     }

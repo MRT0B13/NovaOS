@@ -68,10 +68,6 @@ async function ensureSchema(pool: Pool) {
 export class PostgresLaunchPackRepository implements LaunchPackStore {
   private constructor(private pool: Pool) {}
 
-  async close() {
-    await this.pool.end();
-  }
-
   static async create(databaseUrl: string): Promise<PostgresLaunchPackRepository> {
     const pool = buildPool(databaseUrl);
     await ensureSchema(pool);
@@ -139,6 +135,14 @@ export class PostgresLaunchPackRepository implements LaunchPackStore {
     return this.rowToPack(result.rows[0]);
   }
 
+  async list(): Promise<LaunchPack[]> {
+    const result = await this.pool.query(
+      `SELECT id, data, created_at, updated_at FROM launch_packs ORDER BY created_at DESC`
+    );
+    if (!result.rows?.length) return [];
+    return result.rows.map(row => this.rowToPack(row));
+  }
+
   async update(id: string, patch: LaunchPackUpdateInput): Promise<LaunchPack> {
     const existing = await this.get(id);
     if (!existing) {
@@ -177,7 +181,7 @@ export class PostgresLaunchPackRepository implements LaunchPackStore {
        SET launch_status = $3,
            launch_requested_at = $2::timestamptz,
            data = jsonb_set(
-                   jsonb_set(data, '{launch,requested_at}', to_jsonb($2::text), true),
+                   jsonb_set(data, '{launch,requested_at}', $4::jsonb, true),
                    '{launch,status}', to_jsonb($3::text), true
                  ),
            updated_at = NOW()
@@ -185,7 +189,7 @@ export class PostgresLaunchPackRepository implements LaunchPackStore {
          AND launch_status <> 'launched'
          AND (launch_requested_at IS NULL OR launch_status = 'failed')
        RETURNING id, data, created_at, updated_at, launch_status, launch_requested_at`,
-      [id, fields.requested_at, fields.status]
+      [id, fields.requested_at, fields.status, JSON.stringify(fields.requested_at)]
     );
 
     if (!result.rows?.length) return null;
@@ -202,7 +206,7 @@ export class PostgresLaunchPackRepository implements LaunchPackStore {
          SET data = jsonb_set(
                         jsonb_set(
                           jsonb_set(data, '{ops,tg_publish_status}', to_jsonb('in_progress'), true),
-                          '{ops,tg_publish_attempted_at}', to_jsonb($2::text), true
+                          '{ops,tg_publish_attempted_at}', to_jsonb($2), true
                         ),
                         '{ops,tg_publish_error_code}', 'null'::jsonb, true
                       ),
@@ -237,7 +241,7 @@ export class PostgresLaunchPackRepository implements LaunchPackStore {
          SET data = jsonb_set(
                         jsonb_set(
                           jsonb_set(data, '{ops,x_publish_status}', to_jsonb('in_progress'), true),
-                          '{ops,x_publish_attempted_at}', to_jsonb($2::text), true
+                          '{ops,x_publish_attempted_at}', to_jsonb($2), true
                         ),
                         '{ops,x_publish_error_code}', 'null'::jsonb, true
                       ),
@@ -252,6 +256,41 @@ export class PostgresLaunchPackRepository implements LaunchPackStore {
                    AND (
                         $3 = TRUE
                         OR COALESCE((data->'ops'->>'x_publish_failed_at')::timestamptz, TO_TIMESTAMP(0)) <= NOW() - INTERVAL '${PUBLISH_COOLDOWN_INTERVAL}'
+                      )
+                 )
+             )
+       RETURNING id, data, created_at, updated_at` ,
+      [id, fields.requested_at, force]
+    );
+    if (!result.rows?.length) return null;
+    return this.rowToPack(result.rows[0]);
+  }
+
+  async claimTreasuryWithdraw(
+    id: string,
+    fields: { requested_at: string; force?: boolean }
+  ): Promise<LaunchPack | null> {
+    const force = Boolean(fields.force);
+    const result = await this.pool.query(
+      `UPDATE launch_packs
+         SET data = jsonb_set(
+                        jsonb_set(
+                          jsonb_set(data, '{ops,treasury_withdraw_status}', to_jsonb('in_progress'), true),
+                          '{ops,treasury_withdraw_requested_at}', to_jsonb($2), true
+                        ),
+                        '{ops,treasury_withdraw_error_code}', 'null'::jsonb, true
+                      ),
+             updated_at = NOW()
+       WHERE id = $1
+         AND COALESCE(data->'ops'->>'treasury_withdraw_status', 'idle') <> 'in_progress'
+         AND COALESCE(data->'ops'->>'treasury_withdraw_status', 'idle') <> 'success'
+         AND (
+              COALESCE(data->'ops'->>'treasury_withdraw_status', 'idle') = 'idle'
+              OR (
+                   COALESCE(data->'ops'->>'treasury_withdraw_status', 'idle') = 'failed'
+                   AND (
+                        $3 = TRUE
+                        OR COALESCE((data->'ops'->>'treasury_withdraw_failed_at')::timestamptz, TO_TIMESTAMP(0)) <= NOW() - INTERVAL '${PUBLISH_COOLDOWN_INTERVAL}'
                       )
                  )
              )
@@ -296,5 +335,13 @@ export class PostgresLaunchPackRepository implements LaunchPackStore {
 
   async close(): Promise<void> {
     await this.pool.end();
+  }
+
+  async delete(id: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `DELETE FROM launch_packs WHERE id = $1 RETURNING id`,
+      [id]
+    );
+    return Boolean(result.rows?.length);
   }
 }

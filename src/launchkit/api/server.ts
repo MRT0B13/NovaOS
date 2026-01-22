@@ -15,7 +15,13 @@ import { PumpLauncherService } from '../services/pumpLauncher.ts';
 import { createSecretsStore } from '../db/storeFactory.ts';
 import { TelegramPublisherService } from '../services/telegramPublisher.ts';
 import { XPublisherService } from '../services/xPublisher.ts';
+import { cacheTelegramUser } from '../services/telegramCommunity.ts';
+import { processUpdate as processBanUpdate } from '../services/telegramBanHandler.ts';
 import { getEnv } from '../env.ts';
+import { checkDatabaseReadiness, logDbReadinessSummary, type DbReadiness } from '../db/railwayReady.ts';
+
+// Cached DB readiness status for /health endpoint
+let cachedDbReadiness: DbReadiness | null = null;
 
 export interface LaunchKitServerOptions {
   port?: number;
@@ -55,7 +61,7 @@ async function readJson<T>(req: http.IncomingMessage): Promise<T> {
 }
 
 function isHealth(pathname: string) {
-  return pathname === '/health';
+  return pathname === '/health' || pathname === '/healthz';
 }
 
 const idSchema = z.string().uuid();
@@ -165,6 +171,9 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
   const env = getEnv();
   const port = options.port ?? Number(process.env.PORT ?? process.env.LAUNCHKIT_PORT ?? env.LAUNCHKIT_PORT ?? 8787);
   const adminToken = (options.adminToken || env.ADMIN_TOKEN || '').trim();
+  console.log(`[LaunchKit] Admin token configured: ${adminToken ? adminToken.substring(0, 10) + '...' : 'NONE'}`);
+  console.log(`[LaunchKit] env.ADMIN_TOKEN: ${env.ADMIN_TOKEN?.substring(0, 10) || 'undefined'}`);
+  console.log(`[LaunchKit] process.env.ADMIN_TOKEN: ${process.env.ADMIN_TOKEN?.substring(0, 10) || 'undefined'}`);
   const store =
     options.store ||
     ((await LaunchPackRepository.create()) as LaunchPackStore);
@@ -186,13 +195,105 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
   const telegramPublisher = options.telegramPublisher || new TelegramPublisherService(store);
   const xPublisher = options.xPublisher || new XPublisherService(store);
 
+  // Check DB readiness on startup
+  if (!cachedDbReadiness) {
+    cachedDbReadiness = await checkDatabaseReadiness(env.DATABASE_URL);
+    logDbReadinessSummary(cachedDbReadiness);
+  }
+
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const { pathname } = url;
 
     if (isHealth(pathname)) {
-      sendJson(res, 200, { ok: true, uptime: process.uptime() });
+      // Return structured health response with DB readiness
+      const health = {
+        ok: true,
+        uptime: process.uptime(),
+        launchkit: true,
+        db: cachedDbReadiness ? {
+          mode: cachedDbReadiness.mode,
+          ready: cachedDbReadiness.ready,
+          vectorEnabled: cachedDbReadiness.vectorEnabled,
+          centralDbReady: cachedDbReadiness.centralDbReady,
+          launchPacksReady: cachedDbReadiness.launchPacksReady,
+        } : { mode: 'unknown', ready: false },
+        env: {
+          LAUNCHKIT_ENABLE: env.launchkitEnabled,
+          TREASURY_ENABLE: env.treasuryEnabled,
+          AUTO_WITHDRAW_ENABLE: env.autoWithdrawEnabled,
+          AUTO_SELL_ENABLE: env.autoSellEnabled,
+        },
+      };
+      sendJson(res, 200, health);
       return;
+    }
+
+    // Telegram webhook interceptor - caches user IDs before ElizaOS processes messages
+    // This endpoint receives Telegram updates and extracts user_id for kick functionality
+    if (pathname === '/telegram-webhook' || pathname.startsWith('/telegram-webhook/')) {
+      try {
+        const update = await readJson<any>(req);
+        
+        // Extract user info from various update types
+        const message = update.message || update.edited_message || update.channel_post;
+        const callbackQuery = update.callback_query;
+        
+        let from: any = null;
+        let chatId: string | null = null;
+        let messageId: number | undefined;
+        
+        if (message?.from) {
+          from = message.from;
+          chatId = String(message.chat?.id);
+          messageId = message.message_id;
+        } else if (callbackQuery?.from) {
+          from = callbackQuery.from;
+          chatId = String(callbackQuery.message?.chat?.id);
+          messageId = callbackQuery.message?.message_id;
+        }
+        
+        if (from && chatId) {
+          cacheTelegramUser(chatId, {
+            id: from.id,
+            username: from.username,
+            firstName: from.first_name,
+            lastName: from.last_name,
+          }, messageId);
+          
+          console.log(`[TG_WEBHOOK] Cached user ${from.id} (@${from.username || from.first_name}) for chat ${chatId}`);
+        }
+        
+        // Process /ban and /kick commands through our handler
+        // This gives us access to reply_to_message.from.id for banning
+        try {
+          await processBanUpdate(update);
+        } catch (banErr) {
+          console.error('[TG_WEBHOOK] Ban handler error:', banErr);
+        }
+        
+        // Forward to ElizaOS webhook if configured
+        const elizaWebhookUrl = process.env.ELIZA_TELEGRAM_WEBHOOK_URL;
+        if (elizaWebhookUrl) {
+          try {
+            await fetch(elizaWebhookUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(update),
+            });
+          } catch (fwdErr) {
+            console.error('[TG_WEBHOOK] Failed to forward to ElizaOS:', fwdErr);
+          }
+        }
+        
+        // Return OK to Telegram
+        sendJson(res, 200, { ok: true });
+        return;
+      } catch (err) {
+        console.error('[TG_WEBHOOK] Error processing update:', err);
+        sendJson(res, 200, { ok: true }); // Always return 200 to Telegram
+        return;
+      }
     }
 
     if (!adminToken || req.headers['x-admin-token'] !== adminToken) {
@@ -244,8 +345,11 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
         return;
       }
       try {
-        const body = await readJson<{ force?: boolean }>(req);
-        const updated = await pumpService.launch(idParam, { force: Boolean(body?.force) });
+        const body = await readJson<{ force?: boolean; skipTelegramCheck?: boolean }>(req);
+        const updated = await pumpService.launch(idParam, { 
+          force: Boolean(body?.force),
+          skipTelegramCheck: Boolean(body?.skipTelegramCheck)
+        });
         sendJson(res, 200, { data: updated });
       } catch (error) {
         const err = error as Error & { code?: string };
@@ -263,7 +367,7 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
           conflict(res, { code, message: err.message });
           return;
         }
-        if (code === 'CAP_EXCEEDED') {
+        if (code === 'CAP_EXCEEDED' || code === 'LAUNCH_REQUIREMENTS_MISSING') {
           badRequest(res, { code, message: err.message, details });
           return;
         }
@@ -393,6 +497,23 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
       return;
     }
 
+    // POST /v1/tweet - Send a direct tweet (for testing)
+    if (pathname === '/v1/tweet' && req.method === 'POST') {
+      try {
+        const body = await readJson<{ text: string }>(req);
+        if (!body?.text) {
+          badRequest(res, { code: 'INVALID_BODY', message: 'text is required' });
+          return;
+        }
+        const result = await xPublisher.tweet(body.text);
+        sendJson(res, 200, { data: result });
+      } catch (error) {
+        const err = error as Error & { code?: string };
+        badRequest(res, { code: err.code || 'TWEET_FAILED', message: err.message });
+      }
+      return;
+    }
+
     if (pathname === '/v1/launchpacks' && req.method === 'POST') {
       try {
         const payload = await readJson<LaunchPackCreateInput>(req);
@@ -407,6 +528,17 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
       return;
     }
 
+    if (pathname === '/v1/launchpacks' && req.method === 'GET') {
+      try {
+        const packs = await store.list();
+        sendJson(res, 200, { data: packs });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to list LaunchPacks';
+        sendJson(res, 500, { error: { code: 'LIST_FAILED', message } });
+      }
+      return;
+    }
+
     const match = pathname.match(/^\/v1\/launchpacks\/([^/]+)$/);
     if (match) {
       const id = match[1];
@@ -417,6 +549,48 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
           return;
         }
         sendJson(res, 200, { data: found });
+        return;
+      }
+
+      if (req.method === 'DELETE') {
+        // Handle "all" to delete all unlaunched
+        if (id === 'all') {
+          try {
+            const packs = await store.list();
+            const notLaunched = packs.filter((p: any) => p.launch?.status !== 'launched');
+            let deleted = 0;
+            for (const pack of notLaunched) {
+              await store.delete(pack.id);
+              deleted++;
+            }
+            sendJson(res, 200, { 
+              data: { deleted, preserved: packs.length - notLaunched.length },
+              message: `Deleted ${deleted} unlaunched LaunchPacks`
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : 'Delete failed';
+            badRequest(res, { code: 'DELETE_FAILED', message });
+          }
+          return;
+        }
+        
+        // Delete single pack
+        try {
+          const found = await store.get(id);
+          if (!found) {
+            notFound(res);
+            return;
+          }
+          if (found.launch?.status === 'launched') {
+            forbidden(res, { code: 'CANNOT_DELETE_LAUNCHED', message: 'Cannot delete launched tokens' });
+            return;
+          }
+          await store.delete(id);
+          sendJson(res, 200, { data: { deleted: true, id } });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Delete failed';
+          badRequest(res, { code: 'DELETE_FAILED', message });
+        }
         return;
       }
 
@@ -439,18 +613,32 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
     notFound(res);
   });
 
+  // Bind to 0.0.0.0 for Railway compatibility (not just localhost)
+  const host = process.env.RAILWAY_ENVIRONMENT ? '0.0.0.0' : '0.0.0.0';
+  
   await new Promise<void>((resolve) => {
-    server.listen(port, () => resolve());
+    server.listen(port, host, () => resolve());
   });
 
   const address = server.address();
   const actualPort = typeof address === 'object' && address ? address.port : port;
-  const baseUrl = `http://localhost:${actualPort}`;
+  
+  // Use Railway public URL if available, otherwise localhost
+  const publicUrl = process.env.RAILWAY_PUBLIC_DOMAIN 
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : `http://localhost:${actualPort}`;
+  const baseUrl = `http://${host === '0.0.0.0' ? 'localhost' : host}:${actualPort}`;
+  
+  console.log(`[LaunchKit] Server listening on ${host}:${actualPort}`);
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) {
+    console.log(`[LaunchKit] Public URL: ${publicUrl}`);
+  }
 
   return {
     server,
     port: actualPort,
     baseUrl,
+    publicUrl,
     close: () =>
       new Promise<void>((resolve, reject) =>
         server.close(async (err) => {

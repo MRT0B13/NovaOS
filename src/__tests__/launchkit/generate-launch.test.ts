@@ -69,6 +69,8 @@ describe('LaunchKit generate + launch endpoints', () => {
     // default LAUNCH_ENABLE false for first test
     process.env.LAUNCH_ENABLE = 'false';
 
+    const mockSecretsStore = { get: async () => null, save: async () => {} } as any;
+
     server = await startLaunchKitServer({
       port: 0,
       adminToken,
@@ -79,7 +81,7 @@ describe('LaunchKit generate + launch endpoints', () => {
         maxDevBuy: 0.1,
         maxPriorityFee: 0.0005,
         maxLaunchesPerDay: 3,
-      }),
+      }, mockSecretsStore),
     });
   });
 
@@ -410,11 +412,12 @@ describe('LaunchKit generate + launch endpoints', () => {
       return baseClaim(id, fields);
     };
     const created = await localStore.create({ ...baseInput, brand: { ...baseInput.brand, ticker: 'RACE' } });
+    const mockSecretsStore = { get: async () => null, save: async () => {} } as any;
     const pump = new PumpLauncherService(localStore, {
       maxDevBuy: 0.1,
       maxPriorityFee: 0.001,
       maxLaunchesPerDay: 3,
-    });
+    }, mockSecretsStore);
 
     (pump as any).ensureLauncherWallet = async () => ({ apiKey: 'k', wallet: 'w' });
     (pump as any).uploadMetadataToPumpIPFS = async () => 'ipfs://meta';

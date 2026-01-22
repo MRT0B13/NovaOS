@@ -49,15 +49,15 @@ your-agent-project/
 
 ```typescript
 // src/character.ts
-import { Character } from '@elizaos/core';
+import { Character } from "@elizaos/core";
 
 export const character: Character = {
   // Basic Identity
-  name: 'AssistantAgent',
-  username: 'assistant',
+  name: "AssistantAgent",
+  username: "assistant",
 
   // Personality & Behavior
-  bio: 'A helpful AI assistant created to provide assistance and engage in meaningful conversations.',
+  bio: "A helpful AI assistant created to provide assistance and engage in meaningful conversations.",
 
   system: `You are a helpful, harmless, and honest AI assistant.
 Core principles:
@@ -69,18 +69,21 @@ Core principles:
   // Conversation Examples (Training Data)
   messageExamples: [
     [
-      { name: 'user', content: { text: 'Hello! How are you today?' } },
+      { name: "user", content: { text: "Hello! How are you today?" } },
       {
-        name: 'AssistantAgent',
+        name: "AssistantAgent",
         content: {
           text: "Hello! I'm doing well, thank you for asking. I'm here and ready to help you with whatever you need. How can I assist you today?",
         },
       },
     ],
     [
-      { name: 'user', content: { text: 'Can you help me understand a complex topic?' } },
       {
-        name: 'AssistantAgent',
+        name: "user",
+        content: { text: "Can you help me understand a complex topic?" },
+      },
+      {
+        name: "AssistantAgent",
         content: {
           text: "Absolutely! I'd be happy to help you understand any topic. Could you tell me which specific topic you'd like to explore? I'll break it down in a clear, easy-to-understand way.",
         },
@@ -91,31 +94,31 @@ Core principles:
   // Communication Style
   style: {
     all: [
-      'Be helpful and friendly',
-      'Use clear and concise language',
-      'Show genuine interest in helping',
-      'Maintain a professional yet approachable tone',
+      "Be helpful and friendly",
+      "Use clear and concise language",
+      "Show genuine interest in helping",
+      "Maintain a professional yet approachable tone",
     ],
     chat: [
-      'Respond naturally and conversationally',
-      'Use appropriate emojis sparingly for warmth',
-      'Ask follow-up questions to better understand needs',
+      "Respond naturally and conversationally",
+      "Use appropriate emojis sparingly for warmth",
+      "Ask follow-up questions to better understand needs",
     ],
     post: [
-      'Be informative and engaging',
-      'Structure information clearly',
-      'Include actionable insights when possible',
+      "Be informative and engaging",
+      "Structure information clearly",
+      "Include actionable insights when possible",
     ],
   },
 
   // Plugin Configuration
   plugins: [
     // REQUIRED: Core functionality
-    '@elizaos/plugin-bootstrap', // Essential actions & handlers
-    '@elizaos/plugin-sql', // Memory & database management
+    "@elizaos/plugin-bootstrap", // Essential actions & handlers
+    "@elizaos/plugin-sql", // Memory & database management
 
     // REQUIRED: Model provider (choose one or more)
-    '@elizaos/plugin-openai', // GPT-4, GPT-3.5, etc.
+    "@elizaos/plugin-openai", // GPT-4, GPT-3.5, etc.
     // "@elizaos/plugin-anthropic", // Claude models
     // "@elizaos/plugin-groq",      // Fast inference
 
@@ -131,9 +134,9 @@ Core principles:
 
   // Agent Settings
   settings: {
-    voice: 'en-US-Neural2-F',
-    model: 'gpt-4o-mini',
-    embeddingModel: 'text-embedding-3-small',
+    voice: "en-US-Neural2-F",
+    model: "gpt-4o-mini",
+    embeddingModel: "text-embedding-3-small",
     secrets: {},
     intiface: false,
     chains: [],
@@ -147,26 +150,26 @@ export default character;
 
 ```typescript
 // characters/variants.ts
-import { Character } from '@elizaos/core';
-import { baseCharacter } from '../src/character';
+import { Character } from "@elizaos/core";
+import { baseCharacter } from "../src/character";
 
 // Production character
 export const productionCharacter: Character = {
   ...baseCharacter,
-  name: 'ProductionAgent',
+  name: "ProductionAgent",
   settings: {
     ...baseCharacter.settings,
-    model: 'gpt-4', // More capable model for production
+    model: "gpt-4", // More capable model for production
   },
 };
 
 // Development character
 export const devCharacter: Character = {
   ...baseCharacter,
-  name: 'DevAgent',
+  name: "DevAgent",
   settings: {
     ...baseCharacter.settings,
-    model: 'gpt-4o-mini', // Faster/cheaper for development
+    model: "gpt-4o-mini", // Faster/cheaper for development
   },
   plugins: [
     ...baseCharacter.plugins,
@@ -177,9 +180,13 @@ export const devCharacter: Character = {
 // Specialized character
 export const cryptoCharacter: Character = {
   ...baseCharacter,
-  name: 'CryptoAgent',
-  bio: 'A cryptocurrency and blockchain expert assistant',
-  plugins: [...baseCharacter.plugins, '@elizaos/plugin-solana', '@elizaos/plugin-evm'],
+  name: "CryptoAgent",
+  bio: "A cryptocurrency and blockchain expert assistant",
+  plugins: [
+    ...baseCharacter.plugins,
+    "@elizaos/plugin-solana",
+    "@elizaos/plugin-evm",
+  ],
 };
 ```
 
@@ -390,11 +397,11 @@ For project-specific functionality beyond available plugins:
 
 ```typescript
 // src/plugin.ts
-import { Plugin, Action, ActionResult, Service } from '@elizaos/core';
+import { Plugin, Action, ActionResult, Service } from "@elizaos/core";
 
 // Custom service for your specific needs
 class CustomService extends Service {
-  static serviceType = 'custom';
+  static serviceType = "custom";
 
   async initialize(runtime: IAgentRuntime): Promise<void> {
     // Initialize your custom integrations
@@ -405,7 +412,7 @@ class CustomService extends Service {
     // Add your custom logic here
     return {
       success: true,
-      message: 'Custom request processed successfully',
+      message: "Custom request processed successfully",
       data: message.content,
     };
   }
@@ -413,41 +420,47 @@ class CustomService extends Service {
 
 // Custom action for specific commands
 const customAction: Action = {
-  name: 'CUSTOM_ACTION',
-  description: 'Handles custom functionality specific to this project',
+  name: "CUSTOM_ACTION",
+  description: "Handles custom functionality specific to this project",
 
   validate: async (runtime, message) => {
-    return message.content.text.includes('custom');
+    return message.content.text.includes("custom");
   },
 
-  handler: async (runtime, message, state, options, callback): Promise<ActionResult> => {
+  handler: async (
+    runtime,
+    message,
+    state,
+    options,
+    callback,
+  ): Promise<ActionResult> => {
     try {
-      const service = runtime.getService<CustomService>('custom');
+      const service = runtime.getService<CustomService>("custom");
       // Your custom logic here
       const result = await service.processCustomRequest(message);
 
       // Callback sends message to user in chat
       await callback({
-        text: 'Custom functionality executed successfully',
-        action: 'CUSTOM_ACTION',
+        text: "Custom functionality executed successfully",
+        action: "CUSTOM_ACTION",
       });
 
       // Return ActionResult for action chaining
       return {
         success: true,
-        text: 'Custom action completed',
+        text: "Custom action completed",
         values: {
           customResult: result,
           processedAt: Date.now(),
         },
         data: {
-          actionName: 'CUSTOM_ACTION',
+          actionName: "CUSTOM_ACTION",
           result,
         },
       };
     } catch (error) {
       await callback({
-        text: 'Failed to execute custom action',
+        text: "Failed to execute custom action",
         error: true,
       });
 
@@ -460,8 +473,8 @@ const customAction: Action = {
 };
 
 export const customPlugin: Plugin = {
-  name: 'custom-project-plugin',
-  description: 'Project-specific functionality',
+  name: "custom-project-plugin",
+  description: "Project-specific functionality",
   services: [CustomService],
   actions: [customAction],
 };
@@ -471,15 +484,15 @@ export const customPlugin: Plugin = {
 
 ```typescript
 // src/character.ts
-import { customPlugin } from './plugin';
+import { customPlugin } from "./plugin";
 
 export const character: Character = {
   // ... other config
   plugins: [
     // Core plugins
-    '@elizaos/plugin-bootstrap',
-    '@elizaos/plugin-sql',
-    '@elizaos/plugin-openai',
+    "@elizaos/plugin-bootstrap",
+    "@elizaos/plugin-sql",
+    "@elizaos/plugin-openai",
 
     // Your custom plugin
     customPlugin,
@@ -509,8 +522,8 @@ const memories = await runtime.getMemories({
 
 // Add custom memory:
 await runtime.addMemory({
-  content: { text: 'Important user preference noted' },
-  type: 'preference',
+  content: { text: "Important user preference noted" },
+  type: "preference",
   roomId: currentRoomId,
 });
 ```
@@ -569,9 +582,9 @@ export const character: Character = {
   plugins: [
     {
       // Plugin with custom config
-      name: '@elizaos/plugin-openai',
+      name: "@elizaos/plugin-openai",
       config: {
-        model: 'gpt-4o-mini',
+        model: "gpt-4o-mini",
         temperature: 0.7,
         maxTokens: 2000,
       },
@@ -588,8 +601,8 @@ export const character: Character = {
   // ... base config
   settings: {
     // Optimize for speed
-    model: 'gpt-4o-mini', // Faster model
-    embeddingModel: 'text-embedding-3-small', // Smaller embeddings
+    model: "gpt-4o-mini", // Faster model
+    embeddingModel: "text-embedding-3-small", // Smaller embeddings
 
     // Memory management
     maxMemories: 1000, // Limit memory size
