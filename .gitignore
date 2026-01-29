@@ -50,3 +50,4 @@ ngrok*
 # Test scripts (keep main test files, ignore temp ones)
 # scripts/test-*.ts is ok, but ignore python tests
 scripts/*.py
+
