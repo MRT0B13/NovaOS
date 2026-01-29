@@ -25,7 +25,9 @@ RUN npm install -g bun
 WORKDIR /app
 
 # Install deps with cache-friendly layering
+# Copy package.json, lockfile, AND scripts needed for postinstall
 COPY package.json bun.lock* ./
+COPY scripts/patch-telegraf.cjs ./scripts/
 RUN bun install --frozen-lockfile
 
 # Copy source and build
