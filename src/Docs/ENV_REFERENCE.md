@@ -82,6 +82,25 @@ SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 
 ---
 
+## Nova Channel (Agent's Own TG Channel)
+
+| Variable               | Default                  | Description                                 |
+| ---------------------- | ------------------------ | ------------------------------------------- |
+| `NOVA_CHANNEL_ENABLE`  | `false`                  | Enable Nova's personal announcement channel |
+| `NOVA_CHANNEL_ID`      | -                        | Telegram channel/group ID for announcements |
+| `NOVA_CHANNEL_INVITE`  | -                        | Public t.me invite link (for X marketing)   |
+| `NOVA_CHANNEL_UPDATES` | `launches,wallet,health` | Comma-separated update types to post        |
+
+**Update Types:**
+
+- `launches` - New token launch announcements (with logo)
+- `wallet` - Withdrawal/deposit notifications with tx links
+- `health` - Hourly community health summaries
+- `marketing` - Notifications when X/TG marketing posts go out
+- `system` - Startup, shutdown, and error notifications
+
+---
+
 ## X/Twitter
 
 | Variable                      | Default | Description                     |
@@ -143,6 +162,86 @@ SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 
 ---
 
+## Autonomous Mode (Experimental)
+
+Let Nova autonomously generate and launch tokens using a hybrid approach:
+
+- **Scheduled**: Daily launch at a set time
+- **Reactive**: Event-driven launches triggered by trending topics
+
+### Scheduled Mode
+
+| Variable                      | Default | Description                            |
+| ----------------------------- | ------- | -------------------------------------- |
+| `AUTONOMOUS_ENABLE`           | `false` | Enable autonomous launching            |
+| `AUTONOMOUS_SCHEDULE`         | `14:00` | Daily launch time (HH:MM UTC)          |
+| `AUTONOMOUS_MAX_PER_DAY`      | `1`     | Max scheduled launches per day         |
+| `AUTONOMOUS_MIN_SOL`          | `0.3`   | Min wallet balance to launch           |
+| `AUTONOMOUS_DEV_BUY_SOL`      | `0.01`  | Dev buy amount per launch              |
+| `AUTONOMOUS_USE_NOVA_CHANNEL` | `true`  | Use Nova's channel as community        |
+| `AUTONOMOUS_DRY_RUN`          | `true`  | Generate ideas only (no real launches) |
+
+### Reactive/Event-Driven Mode
+
+| Variable                          | Default | Description                            |
+| --------------------------------- | ------- | -------------------------------------- |
+| `AUTONOMOUS_REACTIVE_ENABLE`      | `false` | Enable trend-reactive launches         |
+| `AUTONOMOUS_REACTIVE_MAX_PER_DAY` | `2`     | Max reactive launches per day          |
+| `AUTONOMOUS_REACTIVE_MIN_SCORE`   | `70`    | Minimum trend score (0-100) to trigger |
+
+**How scheduled mode works:**
+
+1. At the scheduled time, Nova generates a token idea using AI
+2. Creates logo using DALL-E
+3. Launches on pump.fun (if not in dry run mode)
+4. Announces to Nova's channel
+5. Marketing automation kicks in (X + TG)
+
+**How reactive mode works:**
+
+1. Trend monitor checks every 5 minutes for viral moments
+2. Sources: DexScreener (top boosted tokens), CryptoPanic (trending news)
+3. When a trend scores above MIN_SCORE, Nova generates a contextual idea
+4. Launches immediately (respects MAX_PER_DAY limit)
+5. Admin notified of trend detection and launch
+
+### Trend Sources
+
+| Variable              | Default | Description                             |
+| --------------------- | ------- | --------------------------------------- |
+| `CRYPTOPANIC_API_KEY` | –       | API key for CryptoPanic news (optional) |
+
+**Available Sources:**
+
+- **DexScreener** (FREE, no key needed): Monitors top boosted Solana tokens
+- **CryptoPanic** (free tier): Trending crypto news with sentiment. Get key from https://cryptopanic.com/developers/api/
+
+**Safety:** Dry run is enabled by default - ideas are generated and logged but no real launches occur.
+
+---
+
+## Admin Notifications
+
+| Variable        | Default | Description                                     |
+| --------------- | ------- | ----------------------------------------------- |
+| `ADMIN_CHAT_ID` | –       | Telegram chat ID for admin alerts               |
+| `ADMIN_ALERTS`  | `all`   | Alert types: withdrawal,error,autonomous,system |
+
+**Alert Types:**
+
+- `withdrawal` - SOL swept to treasury destination
+- `error` - Critical errors (scheduler failures, etc)
+- `autonomous` - Autonomous mode events (ideas, launches, guardrails, trend triggers)
+- `system` - System status updates
+
+**Setup:**
+
+1. Message @userinfobot on Telegram to get your chat ID
+2. Set `ADMIN_CHAT_ID` to your chat ID
+3. Optionally filter alerts with `ADMIN_ALERTS`
+
+---
+
 ## Sample .env File
 
 ```bash
@@ -174,6 +273,14 @@ AGENT_FUNDING_WALLET_SECRET=your-phantom-private-key
 # ================================
 TG_ENABLE=true
 TG_BOT_TOKEN=123456:ABC-DEF...
+
+# ================================
+# NOVA CHANNEL (Optional)
+# ================================
+NOVA_CHANNEL_ENABLE=true
+NOVA_CHANNEL_ID=-1001234567890
+NOVA_CHANNEL_INVITE=https://t.me/+abcdefg123456
+NOVA_CHANNEL_UPDATES=launches,wallet,health,marketing,system
 
 # ================================
 # X/TWITTER

@@ -3,6 +3,8 @@ import { canWrite, getQuota, recordWrite, getPostingAdvice } from './xRateLimite
 import { generateAITweet, generateTweet, suggestTweetType, type TokenContext, type TweetType, type GeneratedTweet } from './xMarketing.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
 import { getTokenPrice } from './priceService.ts';
+import { getEnv } from '../env.ts';
+import { recordTweetSent } from './systemReporter.ts';
 
 /**
  * X Tweet Scheduler
@@ -134,15 +136,23 @@ export async function scheduleTweet(
   
   let text = customText;
   if (!text) {
-    const generated = await generateAITweet(context, type);
-    text = generated.text;
+    // Use template for nova_channel_promo (AI doesn't know about Nova's channel)
+    // Templates have proper {{novaChannelUrl}} placeholders for channel promo
+    if (type === 'nova_channel_promo') {
+      const generated = generateTweet(context, type);
+      text = generated.text;
+    } else {
+      const generated = await generateAITweet(context, type);
+      text = generated.text;
+    }
   }
   
   const tweet: ScheduledTweet = {
     id: crypto.randomUUID(),
-    tokenTicker: launchPack.brand?.ticker || 'UNKNOWN',
-    tokenMint: launchPack.launch?.mint || '',
-    launchPackId: launchPack.id,
+    // nova_channel_promo is for Nova's channel, not a specific token
+    tokenTicker: type === 'nova_channel_promo' ? 'NOVA' : (launchPack.brand?.ticker || 'UNKNOWN'),
+    tokenMint: type === 'nova_channel_promo' ? '' : (launchPack.launch?.mint || ''),
+    launchPackId: type === 'nova_channel_promo' ? '' : launchPack.id,
     type,
     text,
     scheduledFor: scheduledFor.toISOString(),
@@ -176,7 +186,9 @@ export async function schedulePostLaunchMarketing(
   }
   
   const context = await buildTokenContext(launchPack);
-  const tweetTypes: TweetType[] = [
+  
+  // Base tweet types for token marketing
+  const baseTweetTypes: TweetType[] = [
     'chart_callout',      // Day 1
     'community_shoutout', // Day 1
     'daily_update',       // Day 2
@@ -187,6 +199,9 @@ export async function schedulePostLaunchMarketing(
     'daily_update',       // Day 6
     'community_shoutout', // Day 7
   ];
+  
+  // Channel promos are now handled separately by scheduleChannelPromos()
+  const tweetTypes: TweetType[] = [...baseTweetTypes];
   
   for (let i = 0; i < Math.min(tweetsToSchedule, tweetTypes.length); i++) {
     // Spread tweets: 1 per day, random time between 9am-7pm
@@ -236,6 +251,9 @@ export async function markTweetPosted(id: string, tweetId: string): Promise<void
     tweet.postedAt = new Date().toISOString();
     tweet.tweetId = tweetId;
     await saveScheduledTweets();
+    
+    // Record for system reporter
+    recordTweetSent();
     
     // Update schedule stats
     const schedule = marketingSchedules.find(s => s.launchPackId === tweet.launchPackId);
@@ -323,12 +341,11 @@ async function buildTokenContext(launchPack: LaunchPack): Promise<TokenContext> 
   const xHandle = launchPack.x?.handle;
   const mint = launchPack.launch?.mint || '';
   
-  // Debug log to verify xHandle is being read
+  // Log xHandle status (debug level - not all tokens have their own X account)
   if (xHandle) {
     logger.info(`[XScheduler] Token $${launchPack.brand?.ticker} has xHandle: ${xHandle}`);
-  } else {
-    logger.warn(`[XScheduler] Token $${launchPack.brand?.ticker} has NO xHandle set. x object: ${JSON.stringify(launchPack.x)}`);
   }
+  // No warning needed - tokens without dedicated X handles is normal
   
   // Fetch live price data from DexScreener
   let marketCap: number | undefined;
@@ -370,6 +387,8 @@ async function buildTokenContext(launchPack: LaunchPack): Promise<TokenContext> 
     volume24h,
     priceUsd,
     priceChange24h,
+    // Nova's channel for cross-promotion
+    novaChannelUrl: getEnv().NOVA_CHANNEL_INVITE,
   };
 }
 
@@ -410,6 +429,17 @@ export async function processScheduledTweets(
         await recordWrite(tweet.text);
         results.posted++;
         logger.info(`[XScheduler] ✅ Posted: ${tweet.text.substring(0, 50)}...`);
+        
+        // Notify Nova channel
+        try {
+          const { announceMarketingPost } = await import('./novaChannel.ts');
+          const announced = await announceMarketingPost('x', tweet.tokenTicker, tweet.text);
+          if (!announced) {
+            logger.debug(`[XScheduler] Nova channel notification skipped (disabled or not configured)`);
+          }
+        } catch (channelErr) {
+          logger.warn(`[XScheduler] Nova channel error: ${channelErr}`);
+        }
       } else {
         await markTweetFailed(tweet.id, 'No tweet ID returned');
         results.failed++;
@@ -417,17 +447,25 @@ export async function processScheduledTweets(
     } catch (error: any) {
       const errorCode = error?.code || 'UNKNOWN';
       const errorMsg = error?.message || String(error);
-      await markTweetFailed(tweet.id, errorMsg);
-      results.failed++;
       
       // Log gracefully based on error type
       if (errorCode === 'X_DUPLICATE') {
+        await markTweetFailed(tweet.id, errorMsg);
+        results.failed++;
         logger.warn(`[XScheduler] ⚠️ Skipped duplicate: ${tweet.text.substring(0, 40)}...`);
       } else if (errorCode === 'X_FORBIDDEN') {
+        await markTweetFailed(tweet.id, errorMsg);
+        results.failed++;
         logger.warn(`[XScheduler] ⚠️ Permission denied: ${errorMsg}`);
       } else if (errorCode === 'X_RATE_LIMIT') {
-        logger.warn(`[XScheduler] ⚠️ Rate limited - will retry later`);
+        // Don't mark as failed - leave pending so it retries later
+        results.skipped++;
+        logger.warn(`[XScheduler] ⚠️ Rate limited - will retry next cycle`);
+        // Break out of loop since we're rate limited
+        break;
       } else {
+        await markTweetFailed(tweet.id, errorMsg);
+        results.failed++;
         logger.error(`[XScheduler] ❌ Tweet failed: ${errorMsg}`);
       }
     }
@@ -589,13 +627,100 @@ export async function regeneratePendingTweets(
 // AUTO-REFILL SCHEDULER (Similar to TG Scheduler)
 // ============================================================================
 
-const AUTO_TWEETS_PER_DAY = 2; // Tweets per day per token (conservative for X rate limits)
-const MIN_PENDING_TWEETS = 5; // Auto-refill when below this
-const REFILL_DAYS = 3; // Days to schedule ahead
+// Get scheduler config from environment
+const getSchedulerConfig = () => {
+  const env = getEnv();
+  return {
+    AUTO_TWEETS_PER_DAY: env.X_AUTO_TWEETS_PER_DAY,       // Tweets per day per token
+    MIN_PENDING_TWEETS: env.X_MIN_PENDING_TWEETS,         // Auto-refill when below this
+    REFILL_DAYS: env.X_REFILL_DAYS,                       // Days to schedule ahead
+    CHANNEL_PROMO_INTERVAL_DAYS: env.X_CHANNEL_PROMO_INTERVAL_DAYS, // Channel promo frequency
+    MIN_PENDING_CHANNEL_PROMOS: env.X_MIN_PENDING_CHANNEL_PROMOS,   // Keep this many promos scheduled
+  };
+};
 
 let xSchedulerInterval: ReturnType<typeof setInterval> | null = null;
 let xRefillInterval: ReturnType<typeof setInterval> | null = null;
 let xStore: { list: () => Promise<LaunchPack[]> } | null = null;
+
+/**
+ * Schedule channel promo tweets (Nova's TG channel, not token-specific)
+ */
+async function scheduleChannelPromos(): Promise<number> {
+  const novaChannelUrl = getEnv().NOVA_CHANNEL_INVITE;
+  if (!novaChannelUrl) {
+    return 0;
+  }
+
+  const config = getSchedulerConfig();
+
+  // Check how many pending channel promos we have
+  const pendingPromos = scheduledTweets.filter(
+    t => t.type === 'nova_channel_promo' && t.status === 'pending'
+  );
+
+  if (pendingPromos.length >= config.MIN_PENDING_CHANNEL_PROMOS) {
+    logger.info(`[XScheduler] Already have ${pendingPromos.length} pending channel promos`);
+    return 0;
+  }
+
+  // Find the last scheduled channel promo date
+  const allPromos = scheduledTweets.filter(t => t.type === 'nova_channel_promo');
+  let lastPromoDate = new Date();
+  if (allPromos.length > 0) {
+    const dates = allPromos.map(t => new Date(t.scheduledFor));
+    lastPromoDate = new Date(Math.max(...dates.map(d => d.getTime())));
+  }
+
+  // Schedule enough promos to reach MIN_PENDING_CHANNEL_PROMOS
+  const promosToSchedule = config.MIN_PENDING_CHANNEL_PROMOS - pendingPromos.length;
+  let scheduled = 0;
+
+  // Create a minimal context for channel promos (no token data needed)
+  const context: TokenContext = {
+    ticker: 'NOVA',
+    name: 'Nova',
+    mint: '',
+    pumpUrl: '',
+    novaChannelUrl,
+  };
+
+  for (let i = 0; i < promosToSchedule; i++) {
+    // Schedule each promo CHANNEL_PROMO_INTERVAL_DAYS apart
+    const scheduleDate = new Date(lastPromoDate);
+    scheduleDate.setDate(scheduleDate.getDate() + config.CHANNEL_PROMO_INTERVAL_DAYS * (i + 1));
+    // Random hour between 10am and 6pm
+    scheduleDate.setHours(10 + Math.floor(Math.random() * 8), Math.floor(Math.random() * 45), 0, 0);
+
+    // Generate using template (picks randomly from the 5 templates)
+    const generated = generateTweet(context, 'nova_channel_promo');
+
+    const tweet: ScheduledTweet = {
+      id: crypto.randomUUID(),
+      tokenTicker: 'NOVA',
+      tokenMint: '',
+      launchPackId: '',
+      type: 'nova_channel_promo',
+      text: generated.text,
+      scheduledFor: scheduleDate.toISOString(),
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    };
+
+    scheduledTweets.push(tweet);
+    scheduled++;
+    lastPromoDate = scheduleDate;
+
+    logger.info(`[XScheduler] Scheduled channel promo for ${scheduleDate.toLocaleDateString()}`);
+  }
+
+  if (scheduled > 0) {
+    await saveScheduledTweets();
+    logger.info(`[XScheduler] ✅ Scheduled ${scheduled} channel promo tweets`);
+  }
+
+  return scheduled;
+}
 
 /**
  * Auto-refill X marketing queue for all launched tokens
@@ -611,6 +736,13 @@ async function autoRefillXMarketing(): Promise<void> {
   if (quota.writes.remaining < 5) {
     logger.info('[XScheduler] Quota too low for auto-refill, skipping');
     return;
+  }
+
+  // Schedule channel promos (independent of tokens)
+  try {
+    await scheduleChannelPromos();
+  } catch (err) {
+    logger.warn('[XScheduler] Failed to schedule channel promos:', err);
   }
   
   try {
@@ -631,11 +763,12 @@ async function autoRefillXMarketing(): Promise<void> {
         t.launchPackId === pack.id && t.status === 'pending'
       );
       
-      if (pendingForToken.length < MIN_PENDING_TWEETS) {
+      const config = getSchedulerConfig();
+      if (pendingForToken.length < config.MIN_PENDING_TWEETS) {
         logger.info(`[XScheduler] Auto-refilling tweets for $${ticker} (${pendingForToken.length} pending)`);
         
         try {
-          const newTweets = await schedulePostLaunchMarketing(pack, REFILL_DAYS);
+          const newTweets = await schedulePostLaunchMarketing(pack, config.REFILL_DAYS);
           logger.info(`[XScheduler] ✅ Auto-scheduled ${newTweets.length} tweets for $${ticker}`);
         } catch (err) {
           logger.warn(`[XScheduler] Failed to auto-refill for $${ticker}:`, err);
@@ -665,7 +798,23 @@ export function startXScheduler(
   xSchedulerInterval = setInterval(async () => {
     try {
       const pending = getPendingTweets();
-      if (pending.length === 0) return;
+      const due = getDueTweets();
+      
+      if (pending.length === 0) {
+        logger.info('[XScheduler] No pending tweets in queue');
+        return;
+      }
+      
+      if (due.length === 0) {
+        // Log next scheduled tweet time for visibility
+        const nextTweet = pending[0];
+        if (nextTweet) {
+          const nextTime = new Date(nextTweet.scheduledFor);
+          const minsUntil = Math.round((nextTime.getTime() - Date.now()) / 60000);
+          logger.info(`[XScheduler] ${pending.length} pending, next tweet in ${minsUntil} min ($${nextTweet.tokenTicker})`);
+        }
+        return;
+      }
       
       const results = await processScheduledTweets(tweetFn);
       if (results.posted > 0 || results.failed > 0) {
@@ -685,10 +834,30 @@ export function startXScheduler(
     }
   }, 2 * 60 * 60 * 1000); // 2 hours
   
-  // Initial refill after 30 seconds
+  // Heartbeat every 30 minutes to show scheduler is alive
+  setInterval(() => {
+    const pending = getPendingTweets();
+    const due = getDueTweets();
+    logger.info(`[XScheduler] 💓 Heartbeat: ${pending.length} pending, ${due.length} due`);
+  }, 30 * 60 * 1000); // 30 minutes
+  
+  // Initial refill after 30 seconds, then immediately process due tweets
   setTimeout(async () => {
-    logger.info('[XScheduler] Running initial auto-refill...');
-    await autoRefillXMarketing();
+    try {
+      logger.info('[XScheduler] Running initial auto-refill...');
+      await autoRefillXMarketing();
+      
+      // Immediately process any due tweets after refill
+      const dueTweets = getDueTweets();
+      if (dueTweets.length > 0) {
+        logger.info(`[XScheduler] Processing ${dueTweets.length} due tweets after startup...`);
+        await processScheduledTweets(tweetFn);
+      } else {
+        logger.info('[XScheduler] No due tweets to process on startup');
+      }
+    } catch (err) {
+      logger.error('[XScheduler] Initial startup error:', err);
+    }
   }, 30000);
   
   logger.info('[XScheduler] ✅ Auto-tweet scheduler started (checking every 5 min, refill every 2 hours)');

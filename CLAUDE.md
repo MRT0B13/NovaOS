@@ -268,6 +268,23 @@ TWITTER_EMAIL=your-email
 # Telegram
 TELEGRAM_BOT_TOKEN=your-telegram-token
 
+# Nova Channel (Agent's announcement channel)
+NOVA_CHANNEL_ENABLE=true
+NOVA_CHANNEL_ID=-1001234567890
+NOVA_CHANNEL_INVITE=https://t.me/+abcdefg123456
+NOVA_CHANNEL_UPDATES=launches,wallet,health,marketing,system
+
+# Autonomous Mode (Experimental)
+AUTONOMOUS_ENABLE=false
+AUTONOMOUS_SCHEDULE=14:00
+AUTONOMOUS_MAX_PER_DAY=1
+AUTONOMOUS_MIN_SOL=0.3
+AUTONOMOUS_DRY_RUN=true
+
+# Admin Notifications
+ADMIN_CHAT_ID=your-telegram-chat-id
+ADMIN_ALERTS=withdrawal,error,autonomous,system
+
 # ================================
 # BLOCKCHAIN (Optional)
 # ================================

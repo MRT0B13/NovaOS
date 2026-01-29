@@ -491,4 +491,14 @@ LaunchPack {
 - **Manual Approve Mode**: Creates intents without executing ✅
 - **Policy JSON Config**: Custom take-profit ladder via env var ✅
 
+### Nova Channel (Agent Announcement Channel):
+
+- **Centralized Announcements**: Nova's own TG channel for transparency ✅
+- **Launch Broadcasts**: Auto-posts when tokens launch (with logo) ✅
+- **Wallet Activity**: Notifies on withdrawals/deposits with tx links ✅
+- **Health Summaries**: Hourly community health reports for all tokens ✅
+- **Marketing Notifications**: Posts when X/TG marketing goes out ✅
+- **System Status**: Startup/shutdown notifications ✅
+- **Configurable Updates**: Choose which update types to post ✅
+
 All features tested with real tokens (DUMP, RUG, FRB) and working in production.

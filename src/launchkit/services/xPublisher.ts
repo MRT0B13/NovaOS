@@ -78,7 +78,7 @@ class StandaloneTwitterClient {
         accessSecret: accessSecret,
       });
       this.initialized = true;
-      logger.info('[StandaloneTwitter] ✅ Twitter client initialized (no polling, write-only)');
+      logger.info('[StandaloneTwitter] ✅ Twitter client initialized (read + write, no polling)');
       return true;
     } catch (error) {
       logger.error('[StandaloneTwitter] Failed to initialize:', error);
@@ -88,6 +88,141 @@ class StandaloneTwitterClient {
 
   isReady(): boolean {
     return this.initialized && this.client !== null;
+  }
+
+  /**
+   * Get the authenticated user's info
+   */
+  async getMe(): Promise<{ id: string; username: string; name: string } | null> {
+    if (!this.client) return null;
+    try {
+      const me = await this.client.v2.me();
+      return { id: me.data.id, username: me.data.username, name: me.data.name };
+    } catch (error) {
+      logger.error('[StandaloneTwitter] Failed to get authenticated user:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get a specific tweet by ID
+   */
+  async getTweet(tweetId: string): Promise<{
+    id: string;
+    text: string;
+    authorId?: string;
+    createdAt?: string;
+    metrics?: { likes: number; retweets: number; replies: number };
+  } | null> {
+    if (!this.client) return null;
+    try {
+      const tweet = await this.client.v2.singleTweet(tweetId, {
+        'tweet.fields': ['created_at', 'public_metrics', 'author_id'],
+      });
+      return {
+        id: tweet.data.id,
+        text: tweet.data.text,
+        authorId: tweet.data.author_id,
+        createdAt: tweet.data.created_at,
+        metrics: tweet.data.public_metrics ? {
+          likes: tweet.data.public_metrics.like_count,
+          retweets: tweet.data.public_metrics.retweet_count,
+          replies: tweet.data.public_metrics.reply_count,
+        } : undefined,
+      };
+    } catch (error) {
+      logger.error('[StandaloneTwitter] Failed to get tweet:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get recent tweets from a user's timeline
+   */
+  async getUserTweets(userId: string, maxResults = 10): Promise<Array<{
+    id: string;
+    text: string;
+    createdAt?: string;
+  }>> {
+    if (!this.client) return [];
+    try {
+      const timeline = await this.client.v2.userTimeline(userId, {
+        max_results: maxResults,
+        'tweet.fields': ['created_at'],
+      });
+      return timeline.data.data?.map(t => ({
+        id: t.id,
+        text: t.text,
+        createdAt: t.created_at,
+      })) || [];
+    } catch (error) {
+      logger.error('[StandaloneTwitter] Failed to get user tweets:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Search for recent tweets (requires Basic or higher API tier)
+   */
+  async searchTweets(query: string, maxResults = 10): Promise<Array<{
+    id: string;
+    text: string;
+    authorId?: string;
+    createdAt?: string;
+  }>> {
+    if (!this.client) return [];
+    try {
+      const results = await this.client.v2.search(query, {
+        max_results: maxResults,
+        'tweet.fields': ['created_at', 'author_id'],
+      });
+      return results.data.data?.map(t => ({
+        id: t.id,
+        text: t.text,
+        authorId: t.author_id,
+        createdAt: t.created_at,
+      })) || [];
+    } catch (error: any) {
+      // Search requires Basic tier - Free tier won't work
+      if (error?.code === 403) {
+        logger.warn('[StandaloneTwitter] Search requires Basic API tier (not available on Free)');
+      } else {
+        logger.error('[StandaloneTwitter] Failed to search tweets:', error);
+      }
+      return [];
+    }
+  }
+
+  /**
+   * Get mentions of the authenticated user (requires Basic or higher)
+   */
+  async getMentions(maxResults = 10): Promise<Array<{
+    id: string;
+    text: string;
+    authorId?: string;
+    createdAt?: string;
+  }>> {
+    if (!this.client) return [];
+    try {
+      const me = await this.client.v2.me();
+      const mentions = await this.client.v2.userMentionTimeline(me.data.id, {
+        max_results: maxResults,
+        'tweet.fields': ['created_at', 'author_id'],
+      });
+      return mentions.data.data?.map(t => ({
+        id: t.id,
+        text: t.text,
+        authorId: t.author_id,
+        createdAt: t.created_at,
+      })) || [];
+    } catch (error: any) {
+      if (error?.code === 403) {
+        logger.warn('[StandaloneTwitter] Mentions requires Basic API tier');
+      } else {
+        logger.error('[StandaloneTwitter] Failed to get mentions:', error);
+      }
+      return [];
+    }
   }
 
   async sendTweet(text: string, replyToTweetId?: string): Promise<{ id: string }> {
@@ -296,4 +431,38 @@ export class XPublisherService {
       throw err;
     }
   }
+}
+
+// ============================================================================
+// Export read methods for on-demand use (no polling)
+// ============================================================================
+
+/**
+ * Get the Twitter client for read operations
+ * Use sparingly - each call uses API quota
+ */
+export function getTwitterReader() {
+  if (!twitterClient.isReady()) {
+    twitterClient.initialize();
+  }
+  
+  return {
+    /** Check if client is ready */
+    isReady: () => twitterClient.isReady(),
+    
+    /** Get authenticated user info */
+    getMe: () => twitterClient.getMe(),
+    
+    /** Get a specific tweet by ID */
+    getTweet: (tweetId: string) => twitterClient.getTweet(tweetId),
+    
+    /** Get recent tweets from a user (by user ID) */
+    getUserTweets: (userId: string, maxResults?: number) => twitterClient.getUserTweets(userId, maxResults),
+    
+    /** Search tweets (requires Basic API tier) */
+    searchTweets: (query: string, maxResults?: number) => twitterClient.searchTweets(query, maxResults),
+    
+    /** Get mentions (requires Basic API tier) */
+    getMentions: (maxResults?: number) => twitterClient.getMentions(maxResults),
+  };
 }

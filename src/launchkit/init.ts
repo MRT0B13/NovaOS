@@ -15,6 +15,7 @@ import { XPublisherService } from './services/xPublisher.ts';
 import { registerBanCommands } from './services/telegramBanHandler.ts';
 import { initializeFromStore as initGroupTracker } from './services/groupTracker.ts';
 import { processScheduledTweets, getPendingTweets, recoverMarketingFromStore, syncMarketingToStore, startXScheduler, stopXScheduler } from './services/xScheduler.ts';
+import { startAutonomousMode, stopAutonomousMode } from './services/autonomousMode.ts';
 
 /**
  * Log Railway-specific environment info at startup
@@ -197,8 +198,15 @@ export async function initLaunchKit(
     });
   }
 
+  // Start autonomous mode if enabled
+  if (env.autonomousEnabled) {
+    startAutonomousMode(store, pumpService);
+  }
+
   const close = async () => {
     try {
+      // Clean up autonomous mode
+      stopAutonomousMode();
       // Clean up X scheduler
       stopXScheduler();
       // Ban commands don't need explicit cleanup - they're registered on ElizaOS's bot

@@ -36,6 +36,63 @@ const EnvSchema = z.object({
   TG_ENABLE: z.enum(['true', 'false']).optional(),
   TG_BOT_TOKEN: z.string().optional(),
   TG_CHAT_ID: z.string().optional(),
+  
+  // ==========================================
+  // Admin Notifications
+  // ==========================================
+  // Private chat/group for admin alerts (withdrawals, errors, system status)
+  ADMIN_CHAT_ID: z.string().optional(),
+  // Types of admin alerts: withdrawals, errors, autonomous, system (comma-separated)
+  ADMIN_ALERTS: z.string().default('withdrawals,errors,autonomous,system'),
+  
+  // ==========================================
+  // Telegram Security
+  // ==========================================
+  // Comma-separated list of Telegram user IDs allowed to run admin commands
+  // Get your ID from @userinfobot on Telegram
+  TELEGRAM_ADMIN_IDS: z.string().optional(),
+  // Secret token for webhook verification (set when configuring webhook)
+  // Must match the secret_token passed to setWebhook API
+  TG_WEBHOOK_SECRET: z.string().optional(),
+  
+  // ==========================================
+  // Nova Channel Configuration (Agent's own TG channel)
+  // ==========================================
+  // Enable Nova's personal channel for announcements and community engagement
+  NOVA_CHANNEL_ENABLE: z.enum(['true', 'false']).default('false'),
+  // The Telegram channel/group ID where Nova posts announcements
+  NOVA_CHANNEL_ID: z.string().optional(),
+  // Public invite link for Nova's channel (for marketing tweets)
+  NOVA_CHANNEL_INVITE: z.string().optional(),
+  // Types of updates to post: launches, wallet, health, marketing (comma-separated)
+  NOVA_CHANNEL_UPDATES: z.string().default('launches,wallet,health'),
+  // Nova's X/Twitter handle (e.g., 'NovaAgent' without @) - used for autonomous launches
+  NOVA_X_HANDLE: z.string().optional(),
+  
+  // ==========================================
+  // Community Voting Configuration
+  // ==========================================
+  // Enable community voting on autonomous ideas before launch
+  COMMUNITY_VOTING_ENABLED: z.enum(['true', 'false']).default('false'),
+  // Voting window in minutes (default: 30)
+  COMMUNITY_VOTING_WINDOW_MINUTES: z.string().default('30'),
+  // Minimum votes required to count (default: 3, less = auto-approve)
+  COMMUNITY_VOTING_MIN_VOTES: z.string().default('3'),
+  // Sentiment threshold for approval (-1 to 1, default: 0.4 = 40% positive)
+  COMMUNITY_VOTING_APPROVAL_THRESHOLD: z.string().default('0.4'),
+  // Confidence level to skip voting (default: 0.95 = 95%)
+  COMMUNITY_VOTING_CONFIDENCE_SKIP: z.string().default('0.95'),
+  
+  // ==========================================
+  // System Reporter Configuration
+  // ==========================================
+  // Enable periodic system status reports to admin (every 4h + daily summary)
+  SYSTEM_REPORTS_ENABLE: z.enum(['true', 'false']).default('false'),
+  // Disable auto-restart of Telegram polling (set to true if using webhooks)
+  TG_DISABLE_AUTO_RESTART: z.enum(['true', 'false']).default('false'),
+  // Auto-register webhook URL on startup (to counter ElizaOS deleteWebhook)
+  TG_WEBHOOK_URL: z.string().optional(),
+
   X_ENABLE: z.enum(['true', 'false']).optional(),
   X_API_KEY: z.string().optional(),
   X_API_SECRET: z.string().optional(),
@@ -48,6 +105,14 @@ const EnvSchema = z.object({
   TWITTER_ACCESS_TOKEN_SECRET: z.string().optional(),
   X_MONTHLY_WRITE_LIMIT: z.coerce.number().default(500),  // Free tier: 500 tweets/month
   X_MONTHLY_READ_LIMIT: z.coerce.number().default(100),   // Free tier: 100 reads/month
+  
+  // X Scheduler Configuration
+  X_AUTO_TWEETS_PER_DAY: z.coerce.number().default(2),       // Tweets per day per token
+  X_MIN_PENDING_TWEETS: z.coerce.number().default(5),        // Auto-refill when below this
+  X_REFILL_DAYS: z.coerce.number().default(3),               // Days to schedule ahead
+  X_CHANNEL_PROMO_INTERVAL_DAYS: z.coerce.number().default(1), // Channel promo frequency (days)
+  X_MIN_PENDING_CHANNEL_PROMOS: z.coerce.number().default(7),  // Keep this many channel promos scheduled
+  
   AI_LOGO_ENABLE: z.enum(['true', 'false']).default('true'),
   AI_MEME_ENABLE: z.enum(['true', 'false']).default('true'), // Enable AI meme generation for TG posts
   OPENAI_API_KEY: z.string().optional(),
@@ -91,6 +156,62 @@ const EnvSchema = z.object({
   AUTO_SELL_MAX_PERCENT_PER_TX: z.coerce.number().default(20),
   // Max sell transactions per hour (rate limit)
   AUTO_SELL_MAX_TX_PER_HOUR: z.coerce.number().default(10),
+  
+  // ==========================================
+  // Autonomous Mode Configuration
+  // ==========================================
+  // Enable autonomous token launching (Nova generates & launches on its own)
+  AUTONOMOUS_ENABLE: z.enum(['true', 'false']).default('false'),
+  // Schedule for daily launch slot (HH:MM in UTC, e.g., "14:00")
+  AUTONOMOUS_SCHEDULE: z.string().default('14:00'),
+  // Maximum launches per day (scheduled + reactive combined)
+  AUTONOMOUS_MAX_PER_DAY: z.coerce.number().default(1),
+  // Minimum SOL balance required to launch
+  AUTONOMOUS_MIN_SOL: z.coerce.number().default(0.3),
+  // Dev buy amount for autonomous launches (SOL)
+  AUTONOMOUS_DEV_BUY_SOL: z.coerce.number().default(0.01),
+  // Use Nova's channel as community (no separate TG group)
+  AUTONOMOUS_USE_NOVA_CHANNEL: z.enum(['true', 'false']).default('true'),
+  // Dry run mode - generate ideas but don't actually launch
+  AUTONOMOUS_DRY_RUN: z.enum(['true', 'false']).default('true'),
+  
+  // ==========================================
+  // Reactive/Event-Driven Mode (supplements scheduled)
+  // ==========================================
+  // Enable trend-reactive launches (monitors for viral moments)
+  AUTONOMOUS_REACTIVE_ENABLE: z.enum(['true', 'false']).default('false'),
+  // Max reactive launches per day (in addition to scheduled)
+  AUTONOMOUS_REACTIVE_MAX_PER_DAY: z.coerce.number().default(2),
+  // Minimum trend score to trigger (0-100)
+  AUTONOMOUS_REACTIVE_MIN_SCORE: z.coerce.number().default(70),
+  
+  // Trend Monitor Configuration
+  // ==========================================
+  // Poll interval in minutes (default: 10 min, more conservative)
+  TREND_POLL_INTERVAL_MINUTES: z.coerce.number().default(10),
+  // Min times trend must be seen before triggering (default: 2)
+  TREND_MIN_PERSISTENCE: z.coerce.number().default(2),
+  
+  // Trend Pool Configuration (persistent trend storage)
+  // ==========================================
+  // Max trends to keep in pool (default: 30)
+  TREND_POOL_MAX_SIZE: z.coerce.number().default(30),
+  // Score decay per hour when trend not seen (default: 5)
+  TREND_POOL_DECAY_PER_HOUR: z.coerce.number().default(5),
+  // Remove trends below this score (default: 40)
+  TREND_POOL_MIN_SCORE: z.coerce.number().default(40),
+  // Consider trend stale after this many hours (default: 6)
+  TREND_POOL_STALE_HOURS: z.coerce.number().default(6),
+  
+  // Trend Source APIs
+  // ==========================================
+  // CryptoPanic API key for trending news (free developer tier)
+  // Get from: https://cryptopanic.com/developers/api/
+  CRYPTOPANIC_API_KEY: z.string().optional(),
+  
+  // CryptoNews API key for trending headlines & top mentions
+  // Get from: https://cryptonews-api.com/register
+  CRYPTONEWS_API_KEY: z.string().optional(),
 });
 
 export type LaunchkitEnv = z.infer<typeof EnvSchema> & {
@@ -101,6 +222,9 @@ export type LaunchkitEnv = z.infer<typeof EnvSchema> & {
   treasuryLogOnly: boolean;
   autoWithdrawEnabled: boolean;
   autoSellEnabled: boolean;
+  autonomousEnabled: boolean;
+  autonomousDryRun: boolean;
+  autonomousReactiveEnabled: boolean;
 };
 
 /**
@@ -163,6 +287,9 @@ function parseEnv(source: Record<string, unknown>): LaunchkitEnv {
     treasuryLogOnly: parsed.TREASURY_LOG_ONLY === 'true',
     autoWithdrawEnabled: parsed.AUTO_WITHDRAW_ENABLE === 'true',
     autoSellEnabled: parsed.AUTO_SELL_ENABLE === 'true',
+    autonomousEnabled: parsed.AUTONOMOUS_ENABLE === 'true',
+    autonomousDryRun: parsed.AUTONOMOUS_DRY_RUN === 'true',
+    autonomousReactiveEnabled: parsed.AUTONOMOUS_REACTIVE_ENABLE === 'true',
   } as LaunchkitEnv;
 }
 

@@ -17,6 +17,9 @@ import { TelegramPublisherService } from '../services/telegramPublisher.ts';
 import { XPublisherService } from '../services/xPublisher.ts';
 import { cacheTelegramUser } from '../services/telegramCommunity.ts';
 import { processUpdate as processBanUpdate } from '../services/telegramBanHandler.ts';
+import { recordMessageReceived } from '../services/telegramHealthMonitor.ts';
+import { verifyWebhookSignature, isWebhookSecurityEnabled, initTelegramSecurity } from '../services/telegramSecurity.ts';
+import { processReactionUpdate } from '../services/communityVoting.ts';
 import { getEnv } from '../env.ts';
 import { checkDatabaseReadiness, logDbReadinessSummary, type DbReadiness } from '../db/railwayReady.ts';
 
@@ -195,6 +198,9 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
   const telegramPublisher = options.telegramPublisher || new TelegramPublisherService(store);
   const xPublisher = options.xPublisher || new XPublisherService(store);
 
+  // Initialize Telegram security (admin IDs, webhook secret)
+  initTelegramSecurity();
+
   // Check DB readiness on startup
   if (!cachedDbReadiness) {
     cachedDbReadiness = await checkDatabaseReadiness(env.DATABASE_URL);
@@ -233,7 +239,19 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
     // This endpoint receives Telegram updates and extracts user_id for kick functionality
     if (pathname === '/telegram-webhook' || pathname.startsWith('/telegram-webhook/')) {
       try {
+        // SECURITY: Verify webhook signature before processing
+        const headers = req.headers as Record<string, string | string[] | undefined>;
+        if (!verifyWebhookSignature(headers)) {
+          console.warn('[TG_WEBHOOK] 🚨 REJECTED: Invalid or missing webhook secret token');
+          sendJson(res, 401, { ok: false, error: 'Unauthorized - invalid webhook signature' });
+          return;
+        }
+        
         const update = await readJson<any>(req);
+        
+        // DEBUG: Log all incoming updates
+        const updateKeys = Object.keys(update).filter(k => k !== 'update_id');
+        console.log(`[TG_WEBHOOK] 📥 Update received: ${updateKeys.join(', ')} | update_id: ${update.update_id}`);
         
         // Extract user info from various update types
         const message = update.message || update.edited_message || update.channel_post;
@@ -254,6 +272,9 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
         }
         
         if (from && chatId) {
+          // Record that we received a message (for health monitoring)
+          recordMessageReceived();
+          
           cacheTelegramUser(chatId, {
             id: from.id,
             username: from.username,
@@ -270,6 +291,28 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
           await processBanUpdate(update);
         } catch (banErr) {
           console.error('[TG_WEBHOOK] Ban handler error:', banErr);
+        }
+        
+        // Process message reactions for community voting
+        // message_reaction = individual user reactions (groups/private chats)
+        // message_reaction_count = anonymous reactions (channels)
+        if (update.message_reaction) {
+          console.log(`[TG_WEBHOOK] 🗳️ Reaction received:`, JSON.stringify(update.message_reaction));
+          try {
+            processReactionUpdate(update);
+          } catch (reactionErr) {
+            console.error('[TG_WEBHOOK] Reaction handler error:', reactionErr);
+          }
+        }
+        
+        // Handle channel anonymous reactions (message_reaction_count)
+        if (update.message_reaction_count) {
+          console.log(`[TG_WEBHOOK] 🗳️ Channel reaction count:`, JSON.stringify(update.message_reaction_count));
+          try {
+            processReactionUpdate(update);
+          } catch (reactionErr) {
+            console.error('[TG_WEBHOOK] Reaction count handler error:', reactionErr);
+          }
         }
         
         // Forward to ElizaOS webhook if configured
@@ -632,6 +675,42 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
   console.log(`[LaunchKit] Server listening on ${host}:${actualPort}`);
   if (process.env.RAILWAY_PUBLIC_DOMAIN) {
     console.log(`[LaunchKit] Public URL: ${publicUrl}`);
+  }
+
+  // Auto-register Telegram webhook after delay (to counter ElizaOS deleteWebhook)
+  const webhookUrl = env.TG_WEBHOOK_URL;
+  if (webhookUrl && env.TG_BOT_TOKEN) {
+    // Delay to let ElizaOS finish its deleteWebhook call
+    setTimeout(async () => {
+      try {
+        const allowedUpdates = [
+          'message', 'edited_message', 'channel_post', 'edited_channel_post',
+          'callback_query', 'my_chat_member', 'chat_member',
+          'message_reaction', 'message_reaction_count'
+        ];
+        const fullUrl = webhookUrl.endsWith('/telegram-webhook') 
+          ? webhookUrl 
+          : `${webhookUrl}/telegram-webhook`;
+        
+        const response = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/setWebhook`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: fullUrl,
+            secret_token: env.TG_WEBHOOK_SECRET,
+            allowed_updates: allowedUpdates,
+          }),
+        });
+        const result = await response.json() as any;
+        if (result.ok) {
+          console.log(`[LaunchKit] ✅ Auto-registered Telegram webhook: ${fullUrl}`);
+        } else {
+          console.error(`[LaunchKit] ❌ Failed to auto-register webhook:`, result);
+        }
+      } catch (err) {
+        console.error(`[LaunchKit] ❌ Webhook auto-registration error:`, err);
+      }
+    }, 5000); // 5 second delay
   }
 
   return {

@@ -2,6 +2,43 @@ import { type IAgentRuntime, type Memory, type Provider, type State, logger } fr
 import type { LaunchPackStore } from '../db/launchPackRepository.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
 import { trackGroup, linkGroupToPack } from '../services/groupTracker.ts';
+import { getEnv } from '../env.ts';
+
+/**
+ * Helper to normalize telegram chat IDs for comparison
+ * Handles both -100XXXXXXXX and -XXXXXXXX formats and plain numbers
+ */
+function normalizeTgChatId(id: string | undefined): string {
+  if (!id) return '';
+  const str = String(id);
+  // Extract just the numeric portion without any -100 prefix
+  if (str.startsWith('-100')) {
+    return str.slice(4); // Remove -100, keep the rest
+  } else if (str.startsWith('-')) {
+    return str.slice(1); // Remove -, keep the rest
+  }
+  return str;
+}
+
+/**
+ * Check if a chat ID matches the admin chat
+ */
+function isAdminChat(chatId: string | null): boolean {
+  if (!chatId) return false;
+  try {
+    const env = getEnv();
+    const adminChatId = env.ADMIN_CHAT_ID;
+    if (!adminChatId) return false;
+    
+    // Normalize both for comparison
+    const normalizedChatId = normalizeTgChatId(chatId);
+    const normalizedAdminId = normalizeTgChatId(adminChatId);
+    
+    return normalizedChatId === normalizedAdminId;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Group Context Provider
@@ -92,20 +129,6 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
       console.log(`[GroupContext] Pack "${p.brand?.name}": tg.chat_id=${(p.tg as any)?.chat_id}, tg.telegram_chat_id=${(p.tg as any)?.telegram_chat_id}`);
     }
     
-    // Helper to normalize telegram chat IDs for comparison
-    // Handles both -100XXXXXXXX and -XXXXXXXX formats
-    const normalizeTgChatId = (id: string | undefined): string => {
-      if (!id) return '';
-      const str = String(id);
-      // Extract just the numeric portion without any -100 prefix
-      if (str.startsWith('-100')) {
-        return str.slice(4); // Remove -100, keep the rest
-      } else if (str.startsWith('-')) {
-        return str.slice(1); // Remove -, keep the rest
-      }
-      return str;
-    };
-    
     let linkedPack = null;
     
     // First try to match by telegram_chat_id (the actual Telegram chat ID we stored)
@@ -141,6 +164,16 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
     }
 
     if (!linkedPack) {
+      // Check if this is the admin chat - don't complain about no LaunchPack
+      if (isAdminChat(telegramChatId)) {
+        console.log(`[GroupContext] ✅ This is the ADMIN CHAT (${telegramChatId}) - no LaunchPack needed`);
+        return {
+          data: { isGroupMessage: true, roomId, telegramChatId, isAdminChat: true, linkedPack: null },
+          values: { isGroupMessage: true, isAdminChat: true, hasLinkedPack: false },
+          text: generateAdminChatContext(),
+        };
+      }
+      
       console.log(`[GroupContext] ❌ No LaunchPack linked to roomId ${roomId} or telegramChatId ${telegramChatId}`);
       
       // Only show unlinked context for Telegram groups
@@ -429,6 +462,28 @@ Be welcoming but stay vigilant - some scammers pretend to be new to gain trust.
 `;
 
   return context;
+}
+
+/**
+ * Generate context for the admin notification chat
+ */
+function generateAdminChatContext(): string {
+  return `
+## ADMIN CHAT CONTEXT
+
+**This is your ADMIN NOTIFICATION CHAT.**
+
+You (Nova) are talking directly to your admin/operator here. This is where you:
+- Receive commands and configuration
+- Discuss operational matters
+- Report status and issues
+- Get instructions for launches, marketing, etc.
+
+Behave as Nova (not a mascot). Be helpful, professional, and direct.
+You can discuss any token, any LaunchPack, and operational details here.
+
+---
+`;
 }
 
 /**

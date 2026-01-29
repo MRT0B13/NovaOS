@@ -33,3 +33,20 @@ Thumbs.db
 *.tsbuildinfo
 .parcel-cache/
 .cache/
+
+# Data files (runtime state)
+data/
+.eliza/data/
+.pglite-test/
+
+# Logs
+*.log
+agent.log
+
+# Downloaded binaries
+ngrok*
+*.tgz
+
+# Test scripts (keep main test files, ignore temp ones)
+# scripts/test-*.ts is ok, but ignore python tests
+scripts/*.py

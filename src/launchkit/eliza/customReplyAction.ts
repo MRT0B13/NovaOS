@@ -1,5 +1,6 @@
 import type { Action, HandlerCallback, IAgentRuntime, Memory, State, ActionExample } from '@elizaos/core';
 import { composePromptFromState, ModelType, logger, parseKeyValueXml } from '@elizaos/core';
+import { recordMessageReceived } from '../services/telegramHealthMonitor.ts';
 
 /**
  * Custom REPLY action that skips itself when certain other actions should handle the response.
@@ -48,6 +49,9 @@ export const customReplyAction: Action = {
   description: 'Replies to the current conversation with the text from the generated message. Default if the agent is responding with a message and no other action.',
   
   validate: async (_runtime: IAgentRuntime, message: Memory) => {
+    // Record that we received a message (for health monitoring)
+    recordMessageReceived();
+    
     const text = String(message.content?.text ?? '').toLowerCase();
     
     // Check if this message should be handled by a self-responding action instead

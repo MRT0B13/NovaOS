@@ -107,6 +107,79 @@ When the bot detects it's in a linked Telegram group:
 
 ---
 
+## 📢 Nova Channel (Agent's Announcement Channel)
+
+Nova can manage its own Telegram channel for transparency and community engagement.
+
+### What Gets Posted
+
+| Update Type | Trigger                     | Content                                          |
+| ----------- | --------------------------- | ------------------------------------------------ |
+| `launches`  | Token launched on pump.fun  | Token name, ticker, pump.fun link, TG link, logo |
+| `wallet`    | Treasury sweep executed     | Amount withdrawn, destination, Solscan tx link   |
+| `health`    | Every hour (health monitor) | All tokens: members, sentiment, trend            |
+| `marketing` | X tweet or TG post sent     | Platform, ticker, post preview                   |
+| `system`    | Startup/shutdown            | Status message                                   |
+
+### Setup
+
+1. **Create a Telegram channel** (or use a group)
+2. **Add Nova's bot as admin** with "Post Messages" permission
+3. **Get the channel ID**:
+   - Add `@RawDataBot` or `@getidsbot` to your channel
+   - Copy the ID (starts with `-100`)
+   - Remove the helper bot
+
+4. **Configure in `.env`**:
+
+```bash
+NOVA_CHANNEL_ENABLE=true
+NOVA_CHANNEL_ID=-1001234567890
+NOVA_CHANNEL_INVITE=https://t.me/+abcdefg123456
+NOVA_CHANNEL_UPDATES=launches,wallet,health,marketing,system
+```
+
+> **Pro Tip**: Setting `NOVA_CHANNEL_INVITE` enables channel promotion in X marketing tweets! Nova will periodically tweet about the channel to grow your community.
+
+### Channel vs Group
+
+- **Channel**: One-way broadcast only. Community can't chat, Nova can't respond.
+- **Group**: Two-way. Community can chat, but Nova responds to everything (may be noisy).
+- **Channel + Linked Discussion Group**: Best of both worlds - announcements in channel, discussion in linked group.
+
+### Example Posts
+
+**Launch Announcement:**
+
+```
+🚀 NEW LAUNCH: $RUG
+
+Meet GPTRug! The token that embraces the chaos just launched on pump.fun!
+
+📈 Trade on Pump.fun
+💬 Join Telegram
+
+#RUG #launch #pumpdotfun
+```
+
+**Health Summary:**
+
+```
+📊 Community Health Update
+
+$RUG 📈
+👥 24 members (5 active)
+🟡 Sentiment: neutral
+
+$DUMP ➡️
+👥 93 members (12 active)
+🟢 Sentiment: bullish
+
+Updated 2:30 PM
+```
+
+---
+
 ## Setup Telegram Bot
 
 ### 1. Create Bot (if not done)

@@ -8,6 +8,7 @@ import { getEnv } from '../env.ts';
 import type { LaunchPackStore } from '../db/launchPackRepository.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
 import type { IAgentRuntime } from '@elizaos/core';
+import { recordBannedUser } from './systemReporter.ts';
 
 interface TGMessage {
   message_id: number;
@@ -370,10 +371,14 @@ export class TelegramCommunityService {
    * @param userId - The Telegram user ID to kick
    * @param untilDate - Optional unix timestamp when the ban will be lifted. If 0 or not specified, user is banned forever
    * @param revokeMessages - Optional, delete all messages from the user in the chat
+   * @param reason - Optional reason for the ban (for logging)
+   * @param userInfo - Optional user info for recording (username, firstName)
    */
   async kickUser(chatId: string, userId: number, options?: {
     untilDate?: number;
     revokeMessages?: boolean;
+    reason?: string;
+    userInfo?: { username?: string; firstName?: string };
   }): Promise<{ success: boolean; error?: string }> {
     if (!this.botToken) {
       return { success: false, error: 'TG_BOT_TOKEN not configured' };
@@ -387,6 +392,17 @@ export class TelegramCommunityService {
         user_id: userId,
         until_date: options?.untilDate,
         revoke_messages: options?.revokeMessages ?? false,
+      });
+      
+      // Record the banned user to persistent memory
+      recordBannedUser({
+        id: userId,
+        username: options?.userInfo?.username,
+        firstName: options?.userInfo?.firstName,
+        chatId: chatId,
+        bannedAt: Date.now(),
+        bannedBy: 0, // 0 = automated/agent
+        reason: options?.reason || 'Automated ban',
       });
       
       console.log(`[TG_COMMUNITY] ✅ Successfully kicked user ${userId}`);

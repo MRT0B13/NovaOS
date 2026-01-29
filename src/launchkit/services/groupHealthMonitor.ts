@@ -275,6 +275,20 @@ export class GroupHealthMonitor {
     console.log('[GROUP_HEALTH] Starting health check for all tokens...');
     
     const packs = await this.store.list();
+    const healthSummaries: Array<{
+      ticker: string;
+      name?: string;
+      description?: string;
+      members: number;
+      active: number;
+      sentiment: string;
+      trend: string;
+      tgInviteLink?: string;
+      marketCap?: number;
+      priceChange24h?: number;
+      messagesPerDay?: number;
+      memberChange24h?: number;
+    }> = [];
     
     for (const pack of packs) {
       const chatId = pack.tg?.telegram_chat_id;
@@ -297,9 +311,33 @@ export class GroupHealthMonitor {
             sentiment: health.sentiment,
             trend: health.trend,
           });
+          
+          // Collect for Nova channel summary with full details
+          healthSummaries.push({
+            ticker: pack.brand?.ticker || 'UNKNOWN',
+            name: pack.brand?.name,
+            description: pack.brand?.description || pack.brand?.tagline,
+            members: health.memberCount,
+            active: health.activeMembers24h,
+            sentiment: health.sentiment,
+            trend: health.trend,
+            tgInviteLink: pack.tg?.invite_link || pack.links?.telegram,
+            messagesPerDay: health.messagesPerDay,
+            memberChange24h: health.memberChange24h,
+          });
         }
       } catch (err) {
         console.error(`[GROUP_HEALTH] Failed to update ${pack.brand?.ticker}:`, err);
+      }
+    }
+    
+    // Post to Nova channel if we have health data
+    if (healthSummaries.length > 0) {
+      try {
+        const { announceHealthSummary } = await import('./novaChannel.ts');
+        await announceHealthSummary(healthSummaries);
+      } catch {
+        // Non-fatal
       }
     }
   }

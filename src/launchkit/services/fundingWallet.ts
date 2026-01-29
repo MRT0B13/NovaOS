@@ -66,11 +66,14 @@ export async function depositToPumpWallet(amountSol: number): Promise<{ signatur
   }
   
   // Create transfer transaction
+  // Use Math.floor to ensure lamports is an integer (JS floating point can cause issues)
+  const lamportsToSend = Math.floor(amountSol * LAMPORTS_PER_SOL);
+  
   const transaction = new Transaction().add(
     SystemProgram.transfer({
       fromPubkey: fundingKeypair.publicKey,
       toPubkey: pumpWalletPubkey,
-      lamports: amountSol * LAMPORTS_PER_SOL,
+      lamports: lamportsToSend,
     })
   );
   

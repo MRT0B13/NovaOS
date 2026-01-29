@@ -10,6 +10,7 @@ import { getEnv } from '../env.ts';
 import { redactSensitive } from './redact.ts';
 import { getPumpWalletBalance, getFundingWalletBalance, depositToPumpWallet } from './fundingWallet.ts';
 import { schedulePostLaunchMarketing, createMarketingSchedule } from './xScheduler.ts';
+import { announceLaunch } from './novaChannel.ts';
 
 interface PumpLauncherOptions {
   maxDevBuy: number;
@@ -725,6 +726,15 @@ export class PumpLauncherService {
           // Non-fatal - launch succeeded, just couldn't schedule tweets
           logger.warn(`[Launch] Could not auto-schedule marketing tweets: ${(scheduleErr as Error).message}`);
         }
+      }
+
+      // === ANNOUNCE TO NOVA CHANNEL ===
+      // If Nova channel is enabled, announce the launch
+      try {
+        await announceLaunch(saved);
+      } catch (channelErr) {
+        // Non-fatal - launch succeeded, just couldn't post to channel
+        logger.warn(`[Launch] Could not post to Nova channel: ${(channelErr as Error).message}`);
       }
 
       return saved;

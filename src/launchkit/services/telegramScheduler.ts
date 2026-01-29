@@ -5,6 +5,7 @@ import { homedir } from 'os';
 import { generateAITGPost, generatePostSchedule, TGPostType, TokenContext } from './telegramMarketing.ts';
 import { generateMeme, isMemeGenerationAvailable } from './memeGenerator.ts';
 import { getTokenPrice } from './priceService.ts';
+import { recordTGPostSent } from './systemReporter.ts';
 import type { LaunchPackStore } from '../db/launchPackRepository.ts';
 
 /**
@@ -438,6 +439,17 @@ async function checkAndPostDue(): Promise<void> {
       // Track successful post time to enforce minimum gap
       lastPostTimes.set(post.telegramChatId, now.getTime());
       logger.info(`[TGScheduler] ✅ Posted to TG: ${post.text.substring(0, 50)}...`);
+      
+      // Record for system reporter
+      recordTGPostSent();
+      
+      // Notify Nova channel
+      try {
+        const { announceMarketingPost } = await import('./novaChannel.ts');
+        await announceMarketingPost('telegram', post.tokenTicker, post.text);
+      } catch {
+        // Non-fatal
+      }
     } else {
       posts[postIndex].status = 'failed';
       posts[postIndex].error = result.error;

@@ -6,6 +6,9 @@
  * instead of using long-polling. This allows us to intercept the raw updates and
  * cache user IDs before ElizaOS processes them.
  * 
+ * SECURITY: This script now supports secret tokens for webhook verification.
+ * Set TG_WEBHOOK_SECRET in your .env file to enable signature verification.
+ * 
  * IMPORTANT: You need a publicly accessible URL with HTTPS for webhooks.
  * Options:
  * 1. Use ngrok: ngrok http 3333 (then use the HTTPS URL)
@@ -16,9 +19,13 @@
  *   bun run scripts/setup-telegram-webhook.ts https://your-domain.com/telegram-webhook
  *   bun run scripts/setup-telegram-webhook.ts --delete  # Remove webhook (go back to polling)
  *   bun run scripts/setup-telegram-webhook.ts --info    # Check current webhook status
+ *   bun run scripts/setup-telegram-webhook.ts --generate-secret  # Generate a random secret
  */
 
+import { randomBytes } from 'crypto';
+
 const BOT_TOKEN = process.env.TG_BOT_TOKEN;
+const WEBHOOK_SECRET = process.env.TG_WEBHOOK_SECRET;
 
 if (!BOT_TOKEN) {
   console.error('❌ TG_BOT_TOKEN environment variable not set');
@@ -75,8 +82,8 @@ async function setWebhook(url: string) {
     process.exit(1);
   }
   
-  // Set webhook with allowed_updates including chat_member for join tracking
-  await tgApi('setWebhook', {
+  // Build webhook params
+  const webhookParams: Record<string, any> = {
     url,
     allowed_updates: [
       'message',
@@ -86,10 +93,24 @@ async function setWebhook(url: string) {
       'callback_query',
       'chat_member',  // Important: Get notified when users join/leave
       'my_chat_member', // When bot is added/removed from chats
+      'message_reaction', // For community voting reactions (groups)
+      'message_reaction_count', // For community voting reactions (channels - anonymous)
     ],
     drop_pending_updates: false,
     max_connections: 40,
-  });
+  };
+  
+  // Add secret token for signature verification
+  if (WEBHOOK_SECRET) {
+    webhookParams.secret_token = WEBHOOK_SECRET;
+    console.log('🔐 Secret token configured (webhook signature verification enabled)');
+  } else {
+    console.log('⚠️  No TG_WEBHOOK_SECRET set - webhook requests will NOT be verified!');
+    console.log('   Run with --generate-secret to create one');
+  }
+  
+  // Set webhook
+  await tgApi('setWebhook', webhookParams);
   
   console.log('✅ Webhook set successfully!');
   console.log('\n📋 Allowed update types:');
@@ -104,7 +125,17 @@ async function setWebhook(url: string) {
 // Parse command line arguments
 const args = process.argv.slice(2);
 
-if (args.includes('--info') || args.length === 0) {
+if (args.includes('--generate-secret')) {
+  // Generate a cryptographically secure random secret
+  const secret = randomBytes(32).toString('hex');
+  console.log('\n🔐 Generated Webhook Secret:');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(secret);
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('\n📝 Add this to your .env file:');
+  console.log(`TG_WEBHOOK_SECRET=${secret}`);
+  console.log('\n⚠️  Then re-run this script to set the webhook with the secret.\n');
+} else if (args.includes('--info') || args.length === 0) {
   await getWebhookInfo();
 } else if (args.includes('--delete')) {
   await deleteWebhook();
@@ -113,9 +144,14 @@ if (args.includes('--info') || args.length === 0) {
   const webhookUrl = args[0];
   await setWebhook(webhookUrl);
   
-  console.log('📝 Next steps:');
+  console.log('\n📝 Next steps:');
   console.log('1. Your LaunchKit server must be running on port 3333');
   console.log('2. The webhook URL should point to /telegram-webhook');
   console.log('3. User IDs will now be cached when messages arrive');
-  console.log('4. KICK_SPAMMER will be able to ban users directly\n');
+  console.log('4. KICK_SPAMMER will be able to ban users directly');
+  if (!WEBHOOK_SECRET) {
+    console.log('\n🔒 SECURITY: Consider setting TG_WEBHOOK_SECRET for request verification');
+    console.log('   Run: bun run scripts/setup-telegram-webhook.ts --generate-secret');
+  }
+  console.log('');
 }

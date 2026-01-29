@@ -194,6 +194,33 @@ async function runScheduledCheck(): Promise<void> {
       if (result.result.signature) {
         logger.info(`[TreasuryScheduler] Transaction: ${result.result.signature}`);
       }
+      
+      // Notify admin of withdrawal
+      try {
+        const { notifyWithdrawal } = await import('./adminNotify.ts');
+        await notifyWithdrawal({
+          amount: result.result.withdrawn,
+          destination: result.result.destination,
+          destinationType: result.result.destinationType,
+          txSignature: result.result.signature,
+          remainingBalance: result.checkResult?.newBalance,
+        });
+      } catch {
+        // Non-fatal
+      }
+      
+      // Announce to Nova channel
+      try {
+        const { announceWalletActivity } = await import('./novaChannel.ts');
+        await announceWalletActivity({
+          type: 'withdraw',
+          amount: result.result.withdrawn,
+          destination: result.result.destination,
+          txSignature: result.result.signature,
+        });
+      } catch {
+        // Non-fatal
+      }
     } else if (result.result?.logOnly) {
       logger.info(`[TreasuryScheduler] [LOG_ONLY] Would sweep: ${result.result.withdrawn.toFixed(4)} SOL`);
     } else {
@@ -208,6 +235,19 @@ async function runScheduledCheck(): Promise<void> {
     
     if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
       logger.error(`[TreasuryScheduler] Too many consecutive errors - stopping scheduler`);
+      
+      // Notify admin of critical failure
+      try {
+        const { notifyError } = await import('./adminNotify.ts');
+        await notifyError(
+          'TreasuryScheduler',
+          `Too many consecutive errors (${MAX_CONSECUTIVE_ERRORS}). Scheduler stopped.`,
+          error
+        );
+      } catch {
+        // Non-fatal
+      }
+      
       stopTreasuryScheduler();
     }
   }

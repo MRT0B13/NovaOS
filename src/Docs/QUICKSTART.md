@@ -162,3 +162,4 @@ Expected: Shows CA, pump.fun link, TG/X scheduler status
 - [AUTO_TRADING.md](AUTO_TRADING.md) - Auto-sell, take-profit, sweep
 - [TWITTER_PLUGIN_INTEGRATION.md](TWITTER_PLUGIN_INTEGRATION.md) - X/Twitter setup & troubleshooting
 - [SOCIAL_LINKS_GUIDE.md](SOCIAL_LINKS_GUIDE.md) - Setting X handles, website, Telegram
+- [TELEGRAM_GUIDE.md](TELEGRAM_GUIDE.md) - Telegram setup & Nova Channel

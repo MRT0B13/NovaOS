@@ -8,7 +8,9 @@
 const SENSITIVE_KEYS = new Set([
   // Telegram
   'TG_BOT_TOKEN',
+  'TELEGRAM_BOT_TOKEN',
   'TG_CHAT_ID',
+  'TG_WEBHOOK_SECRET',
   // X/Twitter
   'X_API_KEY',
   'X_API_SECRET',
@@ -18,6 +20,8 @@ const SENSITIVE_KEYS = new Set([
   'TWITTER_API_SECRET_KEY',
   'TWITTER_ACCESS_TOKEN',
   'TWITTER_ACCESS_TOKEN_SECRET',
+  'TWITTER_CLIENT_ID',
+  'TWITTER_CLIENT_SECRET',
   // Wallet secrets - CRITICAL: never expose
   'apiKey',
   'wallet',
@@ -33,11 +37,26 @@ const SENSITIVE_KEYS = new Set([
   'private_key',
   'secretKey',
   'secret_key',
-  // OpenAI
+  // AI providers
   'OPENAI_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'OPENROUTER_API_KEY',
   // Admin tokens
   'ADMIN_TOKEN',
   'LAUNCHKIT_ADMIN_TOKEN',
+  // Trend sources
+  'CRYPTOPANIC_API_KEY',
+  'CRYPTONEWS_API_KEY',
+  // RPC URLs (may contain API keys)
+  'SOLANA_RPC_URL',
+  'RPC_URL',
+  // Database URLs (may contain passwords)
+  'DATABASE_URL',
+  'POSTGRES_URL',
+  'POSTGRES_PASSWORD',
+  // Discord
+  'DISCORD_API_TOKEN',
+  'DISCORD_APPLICATION_ID',
 ]);
 
 /**
@@ -110,13 +129,20 @@ export function redactEnvForLogging(env: Record<string, any>): Record<string, an
     'MAX_SLIPPAGE_PERCENT',
     'PGLITE_PATH',
     'PGLITE_DATA_DIR',
-    'SOLANA_RPC_URL',
+    // SOLANA_RPC_URL removed - may contain API keys
     'TG_ENABLE',
     'X_ENABLE',
     'X_MONTHLY_WRITE_LIMIT',
     'X_MONTHLY_READ_LIMIT',
     'AI_LOGO_ENABLE',
     'AI_MEME_ENABLE',
+    // Twitter settings (non-secret)
+    'TWITTER_DRY_RUN',
+    'TWITTER_ENABLE_POSTING',
+    'TWITTER_SEARCH_ENABLE',
+    'TWITTER_POLL_INTERVAL',
+    'POST_INTERVAL_MIN',
+    'POST_INTERVAL_MAX',
     // Treasury config (address is public info)
     'TREASURY_ENABLE',
     'TREASURY_ADDRESS',
@@ -132,6 +158,33 @@ export function redactEnvForLogging(env: Record<string, any>): Record<string, an
     'AUTO_SELL_MODE',
     'AUTO_SELL_COOLDOWN_SECONDS',
     'AUTO_SELL_MAX_PERCENT_PER_TX',
+    'AUTO_SELL_MAX_TX_PER_HOUR',
+    // Autonomous mode config
+    'AUTONOMOUS_ENABLE',
+    'AUTONOMOUS_SCHEDULE',
+    'AUTONOMOUS_MAX_PER_DAY',
+    'AUTONOMOUS_MIN_SOL',
+    'AUTONOMOUS_DEV_BUY_SOL',
+    'AUTONOMOUS_USE_NOVA_CHANNEL',
+    'AUTONOMOUS_DRY_RUN',
+    // Reactive/Event-driven mode
+    'AUTONOMOUS_REACTIVE_ENABLE',
+    'AUTONOMOUS_REACTIVE_MAX_PER_DAY',
+    'AUTONOMOUS_REACTIVE_MIN_SCORE',
+    // API keys show [configured] status (in SENSITIVE_KEYS)
+    // Admin notifications config
+    'ADMIN_CHAT_ID',
+    'ADMIN_ALERTS',
+    // Nova channel config
+    'NOVA_CHANNEL_ENABLE',
+    'NOVA_CHANNEL_ID',
+    'NOVA_CHANNEL_UPDATES',
+    'NOVA_CHANNEL_INVITE',
+    // System reporter config
+    'SYSTEM_REPORTS_ENABLE',
+    // Eliza UI config
+    'ELIZA_UI_ENABLE',
+    'ELIZA_DISABLE_SERVER',
     // Computed flags
     'launchEnabled',
     'launchkitEnabled',
@@ -140,6 +193,9 @@ export function redactEnvForLogging(env: Record<string, any>): Record<string, an
     'treasuryLogOnly',
     'autoWithdrawEnabled',
     'autoSellEnabled',
+    'autonomousEnabled',
+    'autonomousDryRun',
+    'autonomousReactiveEnabled',
   ]);
   
   for (const [key, value] of Object.entries(env)) {

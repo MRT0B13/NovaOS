@@ -117,7 +117,8 @@ export type TweetType =
   | 'chart_callout'
   | 'meme'
   | 'thread_start'
-  | 'engagement_bait';
+  | 'engagement_bait'
+  | 'nova_channel_promo';
 
 export interface TokenContext {
   name: string;
@@ -136,6 +137,8 @@ export interface TokenContext {
   launchDate?: string;
   telegramUrl?: string;
   websiteUrl?: string;
+  // Nova's channel for cross-promotion
+  novaChannelUrl?: string;
 }
 
 export interface GeneratedTweet {
@@ -205,6 +208,14 @@ const TWEET_TEMPLATES: Record<TweetType, string[]> = {
     'How much TICKER you holding?\n\n🐟 < 100k\n🐬 100k-1M\n🐋 1M+\n\nCA: {{mint}}',
     'TICKER price prediction? 👇\n\nCA: {{mint}}\n{{pumpUrl}}',
   ],
+  
+  nova_channel_promo: [
+    '📢 Join my official Telegram channel for real-time updates!\n\n🚀 Launch announcements\n📊 Portfolio updates\n💰 Alpha & insights\n\n👉 {{novaChannelUrl}}',
+    'Want to see what I\'m launching next? 👀\n\nJoin my TG channel for:\n• Live launch alerts\n• Community health reports\n• Wallet activity\n\n🔗 {{novaChannelUrl}}',
+    'gm! My Telegram channel is where the alpha drops first 🧠\n\n📣 {{novaChannelUrl}}\n\nReal-time updates, no spam, just vibes 🚀',
+    'All my launches. All my moves. One channel. 📡\n\nJoin the Nova fam:\n{{novaChannelUrl}}',
+    'Following my journey? Get the inside scoop 👇\n\n{{novaChannelUrl}}\n\n• Launch alerts 🚀\n• Health reports 📊\n• Community updates 💬',
+  ],
 };
 
 /**
@@ -250,7 +261,8 @@ export function generateTweet(
     .replace(/\{\{priceChange\}\}/g, priceChange)
     .replace(/\{\{telegramUrl\}\}/g, context.telegramUrl || '')
     .replace(/\{\{websiteUrl\}\}/g, context.websiteUrl || '')
-    .replace(/\{\{xHandle\}\}/g, context.xHandle || '');
+    .replace(/\{\{xHandle\}\}/g, context.xHandle || '')
+    .replace(/\{\{novaChannelUrl\}\}/g, context.novaChannelUrl || '');
   
   // Add X handle tag if available
   if (context.xHandle) {

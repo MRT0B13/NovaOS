@@ -77,13 +77,18 @@ import {
   sendTGShillAction
 } from './launchkit/eliza/telegramMarketingActions.ts';
 
+import { systemReportAction } from './launchkit/eliza/systemReportAction.ts';
+
 import { startTGScheduler, stopTGScheduler } from './launchkit/services/telegramScheduler.ts';
 import { startHealthMonitor } from './launchkit/services/groupHealthMonitor.ts';
 import { validateStartupInvariants } from './launchkit/services/operatorGuardrails.ts';
 import { startAutoSellScheduler, stopAutoSellScheduler } from './launchkit/services/autoSellPolicy.ts';
 import { startTreasuryScheduler, stopTreasuryScheduler } from './launchkit/services/treasuryScheduler.ts';
+import { startTelegramHealthMonitor, stopTelegramHealthMonitor } from './launchkit/services/telegramHealthMonitor.ts';
+import { startSystemReporter, stopSystemReporter } from './launchkit/services/systemReporter.ts';
 import { redactEnvForLogging } from './launchkit/services/redact.ts';
 import { getEnv } from './launchkit/env.ts';
+import { initNovaChannel, announceSystem } from './launchkit/services/novaChannel.ts';
 
 
 
@@ -147,11 +152,24 @@ class LaunchKitBootstrapService extends Service {
       logger.info('[HealthMonitor] Started group health monitoring');
     }
     
+    // Initialize Nova channel (agent's own TG channel for announcements)
+    const novaChannelConfig = initNovaChannel();
+    if (novaChannelConfig.enabled) {
+      // Announce startup
+      await announceSystem('startup', `Nova is online! 🚀\n\nMonitoring ${store ? 'LaunchKit' : 'services'}...`);
+    }
+    
     // Start auto-sell scheduler (disabled by default via env flags)
     startAutoSellScheduler();
     
     // Start treasury sweep scheduler (disabled by default via env flags)
     startTreasuryScheduler();
+    
+    // Start Telegram health monitor (alerts if bot stops receiving messages)
+    startTelegramHealthMonitor(runtime);
+    
+    // Start system reporter (periodic status updates to admin)
+    startSystemReporter();
     
     return service;
   }
@@ -170,6 +188,12 @@ class LaunchKitBootstrapService extends Service {
     
     // Stop treasury scheduler
     stopTreasuryScheduler();
+    
+    // Stop Telegram health monitor
+    stopTelegramHealthMonitor();
+    
+    // Stop system reporter
+    stopSystemReporter();
     
     if (this.closeFn) {
       await this.closeFn();
@@ -256,7 +280,9 @@ const plugin: Plugin = {
     groupHealthCheckAction,
     analyzeSentimentAction,
     pinMessageAction,
-    crossPostAction
+    crossPostAction,
+    // System
+    systemReportAction
   ],
   providers: [groupContextProvider, recentMessagesProvider],
 };

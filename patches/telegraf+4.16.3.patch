@@ -1,0 +1,16 @@
+diff --git a/node_modules/telegraf/lib/core/network/client.js b/node_modules/telegraf/lib/core/network/client.js
+--- a/node_modules/telegraf/lib/core/network/client.js
++++ b/node_modules/telegraf/lib/core/network/client.js
+@@ -245,7 +245,11 @@ async function pipeResponse(body, response) {
+     return true;
+ }
+ function redactToken(error) {
+-    error.message = error.message.replace(/\/(bot|user)(\d+):[^/]+\//, '/$1$2:[REDACTED]/');
++    try {
++        error.message = error.message.replace(/\/(bot|user)(\d+):[^/]+\//, '/$1$2:[REDACTED]/');
++    } catch {
++        // Some error objects have readonly message property
++    }
+     throw error;
+ }
+ class ApiClient {
