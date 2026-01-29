@@ -354,6 +354,9 @@ async function postToTelegram(
   }
 }
 
+// Heartbeat counter for TG scheduler
+let tgHeartbeatCounter = 0;
+
 /**
  * Check for due posts and send them
  */
@@ -362,10 +365,34 @@ async function checkAndPostDue(): Promise<void> {
   const now = new Date();
   let updated = false;
   
+  // Log heartbeat every 5 minutes (every 5th call since we run every minute)
+  tgHeartbeatCounter++;
+  const pendingCount = posts.filter(p => p.status === 'pending').length;
+  
   // Sort by scheduled time so we process in order
   const duePosts = posts
     .filter(p => p.status === 'pending' && new Date(p.scheduledFor) <= now)
     .sort((a, b) => new Date(a.scheduledFor).getTime() - new Date(b.scheduledFor).getTime());
+  
+  // Heartbeat log every 5 minutes
+  if (tgHeartbeatCounter % 5 === 0) {
+    if (duePosts.length > 0) {
+      const nextDue = duePosts[0];
+      logger.info(`[TGScheduler] 💓 Heartbeat: ${pendingCount} pending, ${duePosts.length} due (next: $${nextDue.tokenTicker})`);
+    } else {
+      // Find next scheduled post
+      const nextPending = posts
+        .filter(p => p.status === 'pending')
+        .sort((a, b) => new Date(a.scheduledFor).getTime() - new Date(b.scheduledFor).getTime())[0];
+      
+      if (nextPending) {
+        const minsUntil = Math.ceil((new Date(nextPending.scheduledFor).getTime() - now.getTime()) / 60000);
+        logger.info(`[TGScheduler] 💓 Heartbeat: ${pendingCount} pending, next in ${minsUntil} min ($${nextPending.tokenTicker})`);
+      } else {
+        logger.info(`[TGScheduler] 💓 Heartbeat: No pending posts`);
+      }
+    }
+  }
   
   for (const post of duePosts) {
     // Enforce minimum gap between posts to the same group
@@ -581,6 +608,7 @@ export function startTGScheduler(launchPackStore: LaunchPackStore): void {
 async function autoScheduleAllTokens(launchPackStore: LaunchPackStore): Promise<void> {
   try {
     const allPacks = await launchPackStore.list();
+    logger.info(`[TGScheduler] Checking ${allPacks.length} packs for auto-scheduling`);
     
     // Find all launched tokens with TG groups
     const eligiblePacks = allPacks.filter((p: any) => 
@@ -589,11 +617,15 @@ async function autoScheduleAllTokens(launchPackStore: LaunchPackStore): Promise<
     );
     
     if (eligiblePacks.length === 0) {
-      logger.info('[TGScheduler] No eligible tokens for auto-scheduling');
+      logger.info('[TGScheduler] No eligible tokens for auto-scheduling (need launch.mint AND tg.telegram_chat_id)');
       return;
     }
     
+    logger.info(`[TGScheduler] Found ${eligiblePacks.length} eligible tokens for TG marketing`);
+    
     const posts = loadScheduledPosts();
+    logger.info(`[TGScheduler] Loaded ${posts.length} existing scheduled posts from file`);
+    
     
     for (const pack of eligiblePacks) {
       const ticker = pack.brand?.ticker || 'UNKNOWN';

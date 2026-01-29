@@ -16,6 +16,7 @@ import { registerBanCommands } from './services/telegramBanHandler.ts';
 import { initializeFromStore as initGroupTracker } from './services/groupTracker.ts';
 import { processScheduledTweets, getPendingTweets, recoverMarketingFromStore, syncMarketingToStore, startXScheduler, stopXScheduler } from './services/xScheduler.ts';
 import { startAutonomousMode, stopAutonomousMode } from './services/autonomousMode.ts';
+import { startTGScheduler, stopTGScheduler } from './services/telegramScheduler.ts';
 
 /**
  * Log Railway-specific environment info at startup
@@ -184,6 +185,12 @@ export async function initLaunchKit(
     }
   }, 5000); // Wait 5 seconds for Telegram service to initialize
 
+  // Start TG marketing scheduler
+  if (env.TG_ENABLE === 'true') {
+    startTGScheduler(store);
+    logger.info('[LaunchKit] Started TG marketing scheduler');
+  }
+
   // Start auto-tweet scheduler with auto-refill
   if (env.X_ENABLE === 'true') {
     startXScheduler(store, async (text: string) => {
@@ -207,6 +214,8 @@ export async function initLaunchKit(
     try {
       // Clean up autonomous mode
       stopAutonomousMode();
+      // Clean up TG scheduler
+      stopTGScheduler();
       // Clean up X scheduler
       stopXScheduler();
       // Ban commands don't need explicit cleanup - they're registered on ElizaOS's bot
