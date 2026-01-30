@@ -701,7 +701,7 @@ export async function regeneratePendingTweets(
     }
   }
   
-  await saveScheduledTweets();
+  await saveScheduledTweetsToFile();
   logger.info(`[XScheduler] Regeneration complete: ${results.regenerated} regenerated, ${results.failed} failed`);
   return results;
 }
@@ -798,7 +798,7 @@ async function scheduleChannelPromos(): Promise<number> {
   }
 
   if (scheduled > 0) {
-    await saveScheduledTweets();
+    await saveScheduledTweetsToFile();
     logger.info(`[XScheduler] ✅ Scheduled ${scheduled} channel promo tweets`);
   }
 

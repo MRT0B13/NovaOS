@@ -93,6 +93,12 @@ export interface PooledTrend {
   metadata?: Record<string, unknown>;
 }
 
+export interface TrendPoolData {
+  trends: PooledTrend[];
+  launchedTokens: string[];
+  lastUpdated: number;
+}
+
 export interface CommunityFeedback {
   id: string;
   ideaId: string;
@@ -716,6 +722,24 @@ export class PostgresScheduleRepository {
       triggered: row.triggered,
       metadata: row.metadata || undefined,
     };
+  }
+
+  // Alias methods for trendPool.ts compatibility
+  async getTrendPool(): Promise<TrendPoolData | null> {
+    const trends = await this.getTrends();
+    if (trends.length === 0) return null;
+    return {
+      trends,
+      launchedTokens: [],
+      lastUpdated: Date.now(),
+    };
+  }
+
+  async saveTrendPool(data: TrendPoolData): Promise<void> {
+    // Upsert all trends
+    for (const trend of data.trends) {
+      await this.upsertTrend(trend);
+    }
   }
 
   // ==========================================================================
