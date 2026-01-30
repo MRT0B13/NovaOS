@@ -112,6 +112,9 @@ async function loadSchedulesFromFile(): Promise<void> {
 async function saveSchedulesToFile(): Promise<void> {
   try {
     const fs = await import('fs/promises');
+    const path = await import('path');
+    const dir = path.dirname(SCHEDULES_FILE);
+    await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(SCHEDULES_FILE, JSON.stringify(marketingSchedules, null, 2));
   } catch (err) {
     logger.warn('[XScheduler] Failed to save schedules:', err);
