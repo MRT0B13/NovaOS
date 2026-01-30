@@ -221,12 +221,12 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           await ctx.telegram.banChatMember(chatId, targetUserId, 0);
           
           // Record the banned user to persistent memory
-          const targetUsername = replyToMessage?.from?.username || targetUsername || undefined;
+          const bannedUsername = replyToMessage?.from?.username || targetUsername || undefined;
           const targetFirstName = replyToMessage?.from?.first_name || targetName;
           
           recordBannedUser({
             id: targetUserId,
-            username: targetUsername,
+            username: bannedUsername,
             firstName: targetFirstName,
             chatId: String(chatId),
             bannedAt: Date.now(),

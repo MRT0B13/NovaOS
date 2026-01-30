@@ -11,6 +11,7 @@ import { redactSensitive } from './redact.ts';
 import { getPumpWalletBalance, getFundingWalletBalance, depositToPumpWallet } from './fundingWallet.ts';
 import { schedulePostLaunchMarketing, createMarketingSchedule } from './xScheduler.ts';
 import { announceLaunch } from './novaChannel.ts';
+import { recordBuy } from './pnlTracker.ts';
 
 interface PumpLauncherOptions {
   maxDevBuy: number;
@@ -311,7 +312,9 @@ export class PumpLauncherService {
     }
     
     // Check for stale "in progress" launches (older than 5 minutes = likely crashed)
-    if (pack.launch?.requested_at && pack.launch.status !== 'failed' && pack.launch.status !== 'launched') {
+    // Note: After the above check, TypeScript narrows status type, so we cast to string for comparison
+    const currentStatus = pack.launch?.status as string | undefined;
+    if (pack.launch?.requested_at && currentStatus !== 'failed' && currentStatus !== 'launched') {
       const requestedAt = new Date(pack.launch.requested_at).getTime();
       const now = Date.now();
       const staleLockMs = 5 * 60 * 1000; // 5 minutes
@@ -699,6 +702,26 @@ export class PumpLauncherService {
           },
         });
         logger.info(`[Launch] Status auto-corrected to 'launched'`);
+      }
+
+      // === RECORD IN PNL TRACKER ===
+      // Track the dev buy as a cost basis for this token
+      if (launched.launch?.dev_buy?.enabled && launched.launch?.dev_buy?.amount_sol && launched.launch?.mint) {
+        try {
+          await recordBuy({
+            tokenMint: launched.launch.mint,
+            tokenTicker: saved.brand?.ticker,
+            tokenName: saved.brand?.name,
+            tokenAmount: launched.launch.dev_buy.tokens_received || 0, // Will be 0 if not tracked
+            solSpent: launched.launch.dev_buy.amount_sol,
+            isLaunchBuy: true,
+            signature: launched.launch.tx_signature,
+            launchPackId: id,
+          });
+          logger.info(`[Launch] PnL tracker: Recorded dev buy of ${launched.launch.dev_buy.amount_sol} SOL for $${saved.brand?.ticker}`);
+        } catch (pnlErr) {
+          logger.warn(`[Launch] Failed to record dev buy in PnL tracker: ${pnlErr}`);
+        }
       }
 
       // === AUTO-SCHEDULE MARKETING TWEETS ===

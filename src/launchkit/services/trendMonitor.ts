@@ -806,9 +806,9 @@ async function monitorTick(): Promise<void> {
  * Start the trend monitor
  * @param onTrend Callback when a trend triggers a launch opportunity
  */
-export function startTrendMonitor(
+export async function startTrendMonitor(
   onTrend: (trend: TrendSignal) => Promise<void>
-): void {
+): Promise<void> {
   const env = getEnv();
   
   // Check if reactive mode is enabled
@@ -836,8 +836,8 @@ export function startTrendMonitor(
     sources.push('CryptoNews (headlines)');
   }
   
-  // Initialize the trend pool with config
-  trendPool.initPool({
+  // Initialize the trend pool with config (async to support PostgreSQL)
+  await trendPool.initPoolAsync({
     maxPoolSize: config.POOL_MAX_SIZE,
     decayPerHour: config.POOL_DECAY_PER_HOUR,
     minScoreToKeep: config.POOL_MIN_SCORE,

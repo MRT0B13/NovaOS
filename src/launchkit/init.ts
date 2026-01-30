@@ -187,13 +187,13 @@ export async function initLaunchKit(
 
   // Start TG marketing scheduler
   if (env.TG_ENABLE === 'true') {
-    startTGScheduler(store);
+    await startTGScheduler(store);
     logger.info('[LaunchKit] Started TG marketing scheduler');
   }
 
   // Start auto-tweet scheduler with auto-refill
   if (env.X_ENABLE === 'true') {
-    startXScheduler(store, async (text: string) => {
+    await startXScheduler(store, async (text: string) => {
       try {
         const result = await xPublisher.tweet(text);
         return result.id;
@@ -207,7 +207,7 @@ export async function initLaunchKit(
 
   // Start autonomous mode if enabled
   if (env.autonomousEnabled) {
-    startAutonomousMode(store, pumpService);
+    await startAutonomousMode(store, pumpService);
   }
 
   const close = async () => {

@@ -685,10 +685,10 @@ async function schedulerTick(): Promise<void> {
 /**
  * Start the autonomous mode scheduler
  */
-export function startAutonomousMode(
+export async function startAutonomousMode(
   store: LaunchPackStore,
   pumpLauncher: PumpLauncherService
-): void {
+): Promise<void> {
   const env = getEnv();
   
   if (!env.autonomousEnabled) {
@@ -739,7 +739,7 @@ export function startAutonomousMode(
   
   // Start trend monitor for reactive launches
   if (state.reactiveEnabled) {
-    startTrendMonitor(handleReactiveTrend);
+    await startTrendMonitor(handleReactiveTrend);
     logger.info('[Autonomous] 🔥 Reactive trend monitor started');
   }
   

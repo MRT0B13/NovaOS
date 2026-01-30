@@ -164,30 +164,43 @@ async function attemptRestart(): Promise<boolean> {
 
 /**
  * Check Telegram health and alert if needed
+ * 
+ * For marketing bots in webhook mode, we consider BOTH received AND sent messages.
+ * If we're successfully sending scheduled posts, the bot is healthy even if
+ * no users are interacting with it.
  */
 async function checkHealth(): Promise<void> {
   const now = Date.now();
   
-  // If we've never received a message, skip (bot might just be starting)
-  if (!state.lastMessageReceived) {
+  // Get time since last activity (either received OR sent)
+  const lastReceivedTime = state.lastMessageReceived?.getTime() || 0;
+  const lastSentTime = state.lastMessageSent?.getTime() || 0;
+  const lastActivity = Math.max(lastReceivedTime, lastSentTime);
+  
+  // If we've never had any activity, skip (bot might just be starting)
+  if (lastActivity === 0) {
     return;
   }
   
-  const timeSinceLastReceived = now - state.lastMessageReceived.getTime();
+  const timeSinceLastActivity = now - lastActivity;
   
-  // If we've received a message recently, we're healthy
-  if (timeSinceLastReceived < STALE_THRESHOLD_MS) {
+  // If we've had activity recently (sent OR received), we're healthy
+  if (timeSinceLastActivity < STALE_THRESHOLD_MS) {
     state.isHealthy = true;
     return;
   }
   
-  // We haven't received messages in a while - might be disconnected
+  // No activity in a while - might be disconnected
   state.isHealthy = false;
   
-  const minutesAgo = Math.round(timeSinceLastReceived / 60000);
+  const minutesAgo = Math.round(timeSinceLastActivity / 60000);
+  
+  // For logging, indicate what type of activity we're measuring
+  const lastWasSent = lastSentTime > lastReceivedTime;
+  const activityType = lastWasSent ? 'sent' : 'received';
   
   // If past restart threshold, attempt restart
-  if (timeSinceLastReceived >= RESTART_THRESHOLD_MS) {
+  if (timeSinceLastActivity >= RESTART_THRESHOLD_MS) {
     const restarted = await attemptRestart();
     if (restarted) {
       return; // Don't also alert on same check
@@ -199,7 +212,7 @@ async function checkHealth(): Promise<void> {
     (now - state.lastAdminAlert.getTime() >= ALERT_COOLDOWN_MS);
   
   if (shouldAlert) {
-    logger.warn(`[TelegramHealth] ⚠️ No messages received in ${minutesAgo} minutes - bot may be disconnected`);
+    logger.warn(`[TelegramHealth] ⚠️ No messages ${activityType} in ${minutesAgo} minutes - bot may be disconnected`);
     
     const restartInfo = state.restartAttempts > 0 
       ? `\n\nRestart attempts: ${state.restartAttempts}/${MAX_RESTART_ATTEMPTS}`
@@ -207,8 +220,8 @@ async function checkHealth(): Promise<void> {
     
     await notifyError({
       source: 'TelegramHealth',
-      error: `No messages received in ${minutesAgo} minutes`,
-      context: `The Telegram bot may have lost its connection. Consider restarting if this persists.${restartInfo}`,
+      error: `No Telegram activity in ${minutesAgo} minutes`,
+      context: `The Telegram bot may have lost its connection. Last ${activityType} message was ${minutesAgo} minutes ago.${restartInfo}`,
       severity: 'medium',
     });
     
@@ -256,9 +269,18 @@ export function getTelegramHealthStatus(): {
   lastMessageSent: Date | null;
   messageCount: number;
   minutesSinceLastMessage: number | null;
+  minutesSinceLastActivity: number | null;
 } {
+  const lastReceivedTime = state.lastMessageReceived?.getTime() || 0;
+  const lastSentTime = state.lastMessageSent?.getTime() || 0;
+  const lastActivity = Math.max(lastReceivedTime, lastSentTime);
+  
   const minutesSinceLastMessage = state.lastMessageReceived
     ? Math.round((Date.now() - state.lastMessageReceived.getTime()) / 60000)
+    : null;
+  
+  const minutesSinceLastActivity = lastActivity > 0
+    ? Math.round((Date.now() - lastActivity) / 60000)
     : null;
   
   return {
@@ -267,5 +289,6 @@ export function getTelegramHealthStatus(): {
     lastMessageSent: state.lastMessageSent,
     messageCount: state.messageCount,
     minutesSinceLastMessage,
+    minutesSinceLastActivity,
   };
 }

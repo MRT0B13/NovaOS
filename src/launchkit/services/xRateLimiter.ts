@@ -1,5 +1,6 @@
 import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
+import { PostgresScheduleRepository, type XUsageData } from '../db/postgresScheduleRepository.ts';
 
 /**
  * X/Twitter Free Tier Rate Limiter
@@ -11,6 +12,10 @@ import { getEnv } from '../env.ts';
  * This service tracks usage and prevents exceeding limits
  */
 
+// PostgreSQL support
+let pgRepo: PostgresScheduleRepository | null = null;
+let usePostgres = false;
+
 interface UsageData {
   month: string; // YYYY-MM format
   reads: number;
@@ -20,7 +25,7 @@ interface UsageData {
   writeHistory: { timestamp: string; text: string }[];
 }
 
-// In-memory usage tracking (persisted to file for durability)
+// In-memory usage tracking (persisted to file or PostgreSQL for durability)
 let usageData: UsageData = {
   month: getCurrentMonth(),
   reads: 0,
@@ -53,19 +58,37 @@ function resetIfNewMonth(): void {
 // Load/save usage from file for persistence across restarts
 const USAGE_FILE = './data/x_usage.json';
 
-async function loadUsage(): Promise<void> {
+/**
+ * Initialize PostgreSQL if DATABASE_URL is available
+ */
+export async function initXRateLimiter(): Promise<void> {
+  const dbUrl = process.env.DATABASE_URL;
+  if (dbUrl) {
+    try {
+      pgRepo = await PostgresScheduleRepository.create(dbUrl);
+      usePostgres = true;
+      logger.info('[X-RateLimiter] PostgreSQL storage initialized');
+    } catch (err) {
+      logger.warn('[X-RateLimiter] Failed to init PostgreSQL, using file:', err);
+      pgRepo = null;
+      usePostgres = false;
+    }
+  }
+  await loadUsage();
+}
+
+async function loadUsageFromFile(): Promise<void> {
   try {
     const fs = await import('fs/promises');
     const data = await fs.readFile(USAGE_FILE, 'utf-8');
     usageData = JSON.parse(data);
-    logger.info(`[X-RateLimiter] Loaded usage: ${usageData.writes}/${getWriteLimit()} writes, ${usageData.reads}/${getReadLimit()} reads`);
+    logger.info(`[X-RateLimiter] Loaded usage from file: ${usageData.writes}/${getWriteLimit()} writes, ${usageData.reads}/${getReadLimit()} reads`);
   } catch {
     // File doesn't exist yet, use defaults
   }
-  resetIfNewMonth();
 }
 
-async function saveUsage(): Promise<void> {
+async function saveUsageToFile(): Promise<void> {
   try {
     const fs = await import('fs/promises');
     await fs.writeFile(USAGE_FILE, JSON.stringify(usageData, null, 2));
@@ -74,8 +97,26 @@ async function saveUsage(): Promise<void> {
   }
 }
 
-// Initialize on import
-loadUsage();
+async function loadUsage(): Promise<void> {
+  if (usePostgres && pgRepo) {
+    const data = await pgRepo.getXUsage(getCurrentMonth());
+    if (data) {
+      usageData = data as UsageData;
+      logger.info(`[X-RateLimiter] Loaded usage from PostgreSQL: ${usageData.writes}/${getWriteLimit()} writes`);
+    }
+  } else {
+    await loadUsageFromFile();
+  }
+  resetIfNewMonth();
+}
+
+async function saveUsage(): Promise<void> {
+  if (usePostgres && pgRepo) {
+    await pgRepo.saveXUsage(usageData as XUsageData);
+  } else {
+    await saveUsageToFile();
+  }
+}
 
 /**
  * Get configured limits from env (defaults to free tier)

@@ -144,7 +144,7 @@ class LaunchKitBootstrapService extends Service {
     
     // Start TG marketing scheduler
     if (store) {
-      startTGScheduler(store);
+      await startTGScheduler(store);
       logger.info('[TGScheduler] Started Telegram marketing scheduler');
       
       // Start group health monitor
@@ -169,7 +169,7 @@ class LaunchKitBootstrapService extends Service {
     startTelegramHealthMonitor(runtime);
     
     // Start system reporter (periodic status updates to admin)
-    startSystemReporter();
+    await startSystemReporter();
     
     return service;
   }

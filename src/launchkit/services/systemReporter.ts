@@ -5,8 +5,14 @@ import { getAutonomousStatus } from './autonomousMode.ts';
 import { getPumpWalletBalance, getFundingWalletBalance } from './fundingWallet.ts';
 import { getEnv } from '../env.ts';
 import { getFailedAttempts, isAdminSecurityEnabled, isWebhookSecurityEnabled } from './telegramSecurity.ts';
+import { getPnLSummary, initPnLTracker, type PnLSummary } from './pnlTracker.ts';
+import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
 import * as fs from 'fs';
 import * as path from 'path';
+
+// PostgreSQL support
+let pgRepo: PostgresScheduleRepository | null = null;
+let usePostgres = false;
 
 // Persistence file for metrics that should survive restarts
 const METRICS_FILE = './data/system_metrics.json';
@@ -50,6 +56,9 @@ interface SystemStats {
   pumpWalletBalance: number | null;
   fundingWalletBalance: number | null;
   fundingWalletAddress: string | null;
+  
+  // PnL
+  pnl: PnLSummary | null;
   
   // System
   uptimeHours: number;
@@ -96,7 +105,7 @@ interface PersistedMetrics {
   failedAttempts: FailedAttemptRecord[];  // Blocked command attempts
 }
 
-function loadMetrics(): PersistedMetrics {
+function loadMetricsFromFile(): PersistedMetrics {
   try {
     if (fs.existsSync(METRICS_FILE)) {
       const data = fs.readFileSync(METRICS_FILE, 'utf-8');
@@ -125,11 +134,11 @@ function loadMetrics(): PersistedMetrics {
       
       // Update session start time (restart)
       loaded.sessionStartTime = Date.now();
-      logger.info(`[SystemReporter] Loaded persisted metrics (uptime since: ${new Date(loaded.startTime).toISOString()})`);
+      logger.info(`[SystemReporter] Loaded persisted metrics from file`);
       return loaded;
     }
   } catch (err) {
-    logger.warn('[SystemReporter] Could not load persisted metrics, starting fresh');
+    logger.warn('[SystemReporter] Could not load persisted metrics from file, starting fresh');
   }
   
   // Default metrics for first run
@@ -151,7 +160,37 @@ function loadMetrics(): PersistedMetrics {
   };
 }
 
-function saveMetrics(): void {
+function loadMetrics(): PersistedMetrics {
+  return loadMetricsFromFile();
+}
+
+async function loadMetricsFromPostgres(): Promise<PersistedMetrics | null> {
+  if (!pgRepo) return null;
+  try {
+    const data = await pgRepo.getSystemMetrics();
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Check if we need to reset daily counters
+    if (data.lastDailyReportDate !== today) {
+      await pgRepo.resetDailyMetrics();
+      data.tweetsSentToday = 0;
+      data.tgPostsSentToday = 0;
+      data.trendsDetectedToday = 0;
+      data.errors24h = 0;
+      data.warnings24h = 0;
+      data.lastDailyReportDate = today;
+    }
+    
+    data.sessionStartTime = Date.now();
+    logger.info(`[SystemReporter] Loaded persisted metrics from PostgreSQL`);
+    return data as PersistedMetrics;
+  } catch (err) {
+    logger.warn('[SystemReporter] Failed to load metrics from PostgreSQL:', err);
+    return null;
+  }
+}
+
+function saveMetricsToFile(): void {
   try {
     metrics.lastUpdated = new Date().toISOString();
     const dir = path.dirname(METRICS_FILE);
@@ -160,8 +199,13 @@ function saveMetrics(): void {
     }
     fs.writeFileSync(METRICS_FILE, JSON.stringify(metrics, null, 2));
   } catch (err) {
-    logger.debug('[SystemReporter] Could not save metrics:', err);
+    logger.debug('[SystemReporter] Could not save metrics to file:', err);
   }
+}
+
+function saveMetrics(): void {
+  // Always save to file as backup
+  saveMetricsToFile();
 }
 
 const metrics = loadMetrics();
@@ -180,6 +224,9 @@ const DAILY_REPORT_HOUR_UTC = 9; // 9 AM UTC
 export function recordMessageReceivedPersistent(): void {
   metrics.totalMessagesReceived++;
   saveMetrics();
+  if (usePostgres && pgRepo) {
+    pgRepo.incrementMetric('totalMessagesReceived').catch(() => {});
+  }
 }
 
 /**
@@ -195,6 +242,9 @@ export function getTotalMessagesReceived(): number {
 export function recordTweetSent(): void {
   metrics.tweetsSentToday++;
   saveMetrics();
+  if (usePostgres && pgRepo) {
+    pgRepo.incrementMetric('tweetsSentToday').catch(() => {});
+  }
 }
 
 /**
@@ -203,6 +253,9 @@ export function recordTweetSent(): void {
 export function recordTGPostSent(): void {
   metrics.tgPostsSentToday++;
   saveMetrics();
+  if (usePostgres && pgRepo) {
+    pgRepo.incrementMetric('tgPostsSentToday').catch(() => {});
+  }
 }
 
 /**
@@ -211,6 +264,9 @@ export function recordTGPostSent(): void {
 export function recordTrendDetected(): void {
   metrics.trendsDetectedToday++;
   saveMetrics();
+  if (usePostgres && pgRepo) {
+    pgRepo.incrementMetric('trendsDetectedToday').catch(() => {});
+  }
 }
 
 /**
@@ -219,6 +275,9 @@ export function recordTrendDetected(): void {
 export function recordError(): void {
   metrics.errors24h++;
   saveMetrics();
+  if (usePostgres && pgRepo) {
+    pgRepo.incrementMetric('errors24h').catch(() => {});
+  }
 }
 
 /**
@@ -227,6 +286,9 @@ export function recordError(): void {
 export function recordWarning(): void {
   metrics.warnings24h++;
   saveMetrics();
+  if (usePostgres && pgRepo) {
+    pgRepo.incrementMetric('warnings24h').catch(() => {});
+  }
 }
 
 /**
@@ -252,6 +314,12 @@ export function recordBannedUser(record: BannedUserRecord): void {
   }
   
   saveMetrics();
+  
+  // Also sync to PostgreSQL
+  if (usePostgres && pgRepo) {
+    pgRepo.updateSystemMetrics({ bannedUsers: metrics.bannedUsers }).catch(() => {});
+  }
+  
   logger.info(`[SystemReporter] Recorded banned user: ${record.id} (@${record.username || record.firstName})`);
 }
 
@@ -297,6 +365,12 @@ export function recordFailedAttempt(record: FailedAttemptRecord): void {
   }
   
   saveMetrics();
+  
+  // Also sync to PostgreSQL
+  if (usePostgres && pgRepo) {
+    pgRepo.updateSystemMetrics({ failedAttempts: metrics.failedAttempts }).catch(() => {});
+  }
+  
   logger.info(`[SystemReporter] 🚨 Recorded failed attempt: ${record.username || record.userId} tried /${record.command}`);
 }
 
@@ -359,6 +433,14 @@ async function collectStats(): Promise<SystemStats> {
   const uptimeMs = Date.now() - metrics.startTime;
   const uptimeHours = Math.round(uptimeMs / (60 * 60 * 1000) * 10) / 10;
   
+  // Get PnL summary
+  let pnl: PnLSummary | null = null;
+  try {
+    pnl = await getPnLSummary();
+  } catch {
+    // PnL tracker might not be initialized
+  }
+  
   return {
     // Telegram health
     telegramHealthy: tgHealth.isHealthy,
@@ -385,6 +467,9 @@ async function collectStats(): Promise<SystemStats> {
     pumpWalletBalance,
     fundingWalletBalance,
     fundingWalletAddress,
+    
+    // PnL
+    pnl,
     
     // System
     uptimeHours,
@@ -479,6 +564,23 @@ async function sendStatusReport(): Promise<void> {
     message += `  Funding Wallet: ⚠️ Not configured\n`;
   }
   message += '\n';
+  
+  // PnL Section
+  if (stats.pnl) {
+    const pnl = stats.pnl;
+    const realizedEmoji = pnl.totalRealizedPnl >= 0 ? '🟢' : '🔴';
+    const realizedSign = pnl.totalRealizedPnl >= 0 ? '+' : '';
+    
+    message += `<b>📈 PnL Tracking:</b>\n`;
+    message += `  Realized: ${realizedEmoji} ${realizedSign}${pnl.totalRealizedPnl.toFixed(4)} SOL\n`;
+    message += `  Active positions: ${pnl.activePositions}\n`;
+    message += `  Total trades: ${pnl.totalTrades}\n`;
+    if (pnl.winningTrades + pnl.losingTrades > 0) {
+      message += `  Win rate: ${pnl.winRate.toFixed(0)}% (${pnl.winningTrades}W/${pnl.losingTrades}L)\n`;
+    }
+    message += `  Net SOL flow: ${pnl.netSolFlow >= 0 ? '+' : ''}${pnl.netSolFlow.toFixed(4)} SOL\n`;
+    message += '\n';
+  }
   
   // Security - Banned users and alerts
   const bannedUsers = getBannedUsers();
@@ -622,8 +724,35 @@ function checkDailyReport(): void {
 /**
  * Start the system reporter
  */
-export function startSystemReporter(): void {
+export async function startSystemReporter(): Promise<void> {
   const env = getEnv();
+  
+  // Initialize PostgreSQL if available
+  const dbUrl = process.env.DATABASE_URL;
+  if (dbUrl) {
+    try {
+      pgRepo = await PostgresScheduleRepository.create(dbUrl);
+      usePostgres = true;
+      logger.info('[SystemReporter] PostgreSQL storage initialized');
+      
+      // Load metrics from PostgreSQL (overrides file-loaded metrics)
+      const pgMetrics = await loadMetricsFromPostgres();
+      if (pgMetrics) {
+        Object.assign(metrics, pgMetrics);
+      }
+    } catch (err) {
+      logger.warn('[SystemReporter] PostgreSQL init failed, using file storage:', err);
+      pgRepo = null;
+      usePostgres = false;
+    }
+  }
+  
+  // Initialize PnL tracker (loads persisted data)
+  try {
+    await initPnLTracker();
+  } catch (err) {
+    logger.warn('[SystemReporter] Failed to init PnL tracker:', err);
+  }
   
   // Check if system reports are enabled
   const enableReports = env.SYSTEM_REPORTS_ENABLE === 'true';

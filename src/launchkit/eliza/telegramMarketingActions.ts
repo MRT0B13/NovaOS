@@ -1,5 +1,5 @@
 import { Action, type IAgentRuntime, type Memory, type State, type HandlerCallback, type ActionResult, logger } from '@elizaos/core';
-import { scheduleTGMarketing, getPendingPosts, getAllPosts, cancelTGMarketing, regeneratePendingTGPosts } from '../services/telegramScheduler.ts';
+import { scheduleTGMarketing, getPendingPostsForToken, getAllPosts, cancelTGMarketing, regeneratePendingTGPosts } from '../services/telegramScheduler.ts';
 import { generateAITGPost, suggestTGPostType, type TokenContext } from '../services/telegramMarketing.ts';
 import { generateMeme, isMemeGenerationAvailable } from '../services/memeGenerator.ts';
 
@@ -125,7 +125,7 @@ export const viewTGScheduleAction: Action = {
     const tickerMatch = text.match(/\$([A-Z]+)/i) || text.match(/for\s+(\w+)/i);
     const ticker = tickerMatch ? tickerMatch[1] : undefined;
     
-    const pending = getPendingPosts(ticker);
+    const pending = await getPendingPostsForToken(ticker);
     
     if (pending.length === 0) {
       await callback({ 

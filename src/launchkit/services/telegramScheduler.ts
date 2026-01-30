@@ -7,6 +7,7 @@ import { generateMeme, isMemeGenerationAvailable } from './memeGenerator.ts';
 import { getTokenPrice } from './priceService.ts';
 import { recordTGPostSent } from './systemReporter.ts';
 import type { LaunchPackStore } from '../db/launchPackRepository.ts';
+import { PostgresScheduleRepository, type ScheduledTGPost as PGScheduledTGPost } from '../db/postgresScheduleRepository.ts';
 
 /**
  * Telegram Marketing Scheduler
@@ -14,6 +15,10 @@ import type { LaunchPackStore } from '../db/launchPackRepository.ts';
  * Manages scheduled Telegram posts for token communities
  * Auto-posts at scheduled times using the mascot persona
  * Can attach AI-generated memes when enabled
+ * 
+ * Storage:
+ * - PostgreSQL when DATABASE_URL is set (Railway production)
+ * - JSON file fallback for local development
  */
 
 export interface ScheduledTGPost {
@@ -43,6 +48,10 @@ const SCHEDULE_FILE = './data/tg_scheduled_posts.json';
 let schedulerInterval: NodeJS.Timeout | null = null;
 let autoRefillInterval: NodeJS.Timeout | null = null;
 let store: LaunchPackStore | null = null;
+
+// PostgreSQL repository (null if using file storage)
+let pgRepo: PostgresScheduleRepository | null = null;
+let usePostgres = false;
 
 // Config: Posts per day for autonomous mode
 const AUTO_POSTS_PER_DAY = 4;
@@ -90,9 +99,9 @@ async function buildTokenContextWithPrice(launchPack: any): Promise<TokenContext
 const lastPostTimes: Map<string, number> = new Map();
 
 /**
- * Load scheduled posts from file
+ * Load scheduled posts from file (fallback mode)
  */
-function loadScheduledPosts(): ScheduledTGPost[] {
+function loadScheduledPostsFromFile(): ScheduledTGPost[] {
   try {
     if (fs.existsSync(SCHEDULE_FILE)) {
       const data = fs.readFileSync(SCHEDULE_FILE, 'utf-8');
@@ -105,9 +114,10 @@ function loadScheduledPosts(): ScheduledTGPost[] {
 }
 
 /**
- * Save scheduled posts to file
+ * Save scheduled posts to file (fallback mode)
  */
-function saveScheduledPosts(posts: ScheduledTGPost[]): void {
+function saveScheduledPostsToFile(posts: ScheduledTGPost[]): void {
+  if (usePostgres) return; // PostgreSQL handles persistence
   try {
     const dir = path.dirname(SCHEDULE_FILE);
     if (!fs.existsSync(dir)) {
@@ -117,6 +127,80 @@ function saveScheduledPosts(posts: ScheduledTGPost[]): void {
   } catch (error) {
     logger.error('[TGScheduler] Failed to save scheduled posts:', error);
   }
+}
+
+// In-memory cache for file mode
+let scheduledPostsCache: ScheduledTGPost[] = [];
+
+/**
+ * Load scheduled posts (from PostgreSQL or file)
+ */
+async function loadScheduledPosts(): Promise<ScheduledTGPost[]> {
+  if (usePostgres && pgRepo) {
+    try {
+      const posts = await pgRepo.getTGPosts();
+      return posts as ScheduledTGPost[];
+    } catch (err) {
+      logger.error('[TGScheduler] PostgreSQL error loading posts:', err);
+      return [];
+    }
+  }
+  scheduledPostsCache = loadScheduledPostsFromFile();
+  return scheduledPostsCache;
+}
+
+/**
+ * Save a scheduled post
+ */
+async function saveScheduledPost(post: ScheduledTGPost): Promise<void> {
+  if (usePostgres && pgRepo) {
+    try {
+      await pgRepo.insertTGPost(post as PGScheduledTGPost);
+    } catch (err) {
+      logger.error('[TGScheduler] PostgreSQL error saving post:', err);
+    }
+  } else {
+    scheduledPostsCache.push(post);
+    saveScheduledPostsToFile(scheduledPostsCache);
+  }
+}
+
+/**
+ * Update post status
+ */
+async function updatePostStatus(id: string, status: ScheduledTGPost['status'], extras?: { postedAt?: string; messageId?: number; error?: string }): Promise<void> {
+  if (usePostgres && pgRepo) {
+    try {
+      await pgRepo.updateTGPostStatus(id, status, extras);
+    } catch (err) {
+      logger.error('[TGScheduler] PostgreSQL error updating post:', err);
+    }
+  } else {
+    const post = scheduledPostsCache.find(p => p.id === id);
+    if (post) {
+      post.status = status;
+      if (extras?.postedAt) post.postedAt = extras.postedAt;
+      if (extras?.messageId) post.messageId = extras.messageId;
+      if (extras?.error) post.error = extras.error;
+      saveScheduledPostsToFile(scheduledPostsCache);
+    }
+  }
+}
+
+/**
+ * Get pending posts
+ */
+async function getPendingPosts(): Promise<ScheduledTGPost[]> {
+  if (usePostgres && pgRepo) {
+    try {
+      const posts = await pgRepo.getPendingTGPosts();
+      return posts as ScheduledTGPost[];
+    } catch (err) {
+      logger.error('[TGScheduler] PostgreSQL error getting pending posts:', err);
+      return [];
+    }
+  }
+  return scheduledPostsCache.filter(p => p.status === 'pending');
 }
 
 /**
@@ -138,7 +222,6 @@ export async function scheduleTGMarketing(
   days: number = 5,
   postsPerDay: number = 4
 ): Promise<{ scheduled: number; firstPost: string; lastPost: string }> {
-  const posts = loadScheduledPosts();
   const schedule = generatePostSchedule(days, postsPerDay);
   
   const telegramChatId = launchPack.tg?.telegram_chat_id;
@@ -203,11 +286,9 @@ export async function scheduleTGMarketing(
     };
     
     newPosts.push(post);
+    // Save each post individually (works for both PostgreSQL and file mode)
+    await saveScheduledPost(post);
   }
-  
-  // Add to existing posts
-  posts.push(...newPosts);
-  saveScheduledPosts(posts);
   
   logger.info(`[TGScheduler] Scheduled ${newPosts.length} posts for $${tokenContext.ticker}`);
   
@@ -219,10 +300,10 @@ export async function scheduleTGMarketing(
 }
 
 /**
- * Get pending posts for a token
+ * Get pending posts for a token (exported wrapper)
  */
-export function getPendingPosts(ticker?: string): ScheduledTGPost[] {
-  const posts = loadScheduledPosts();
+export async function getPendingPostsForToken(ticker?: string): Promise<ScheduledTGPost[]> {
+  const posts = await loadScheduledPosts();
   return posts.filter(p => 
     p.status === 'pending' && 
     (!ticker || p.tokenTicker.toLowerCase() === ticker.toLowerCase())
@@ -232,8 +313,8 @@ export function getPendingPosts(ticker?: string): ScheduledTGPost[] {
 /**
  * Get all posts (for display)
  */
-export function getAllPosts(ticker?: string): ScheduledTGPost[] {
-  const posts = loadScheduledPosts();
+export async function getAllPosts(ticker?: string): Promise<ScheduledTGPost[]> {
+  const posts = await loadScheduledPosts();
   if (!ticker) return posts;
   return posts.filter(p => p.tokenTicker.toLowerCase() === ticker.toLowerCase());
 }
@@ -241,18 +322,17 @@ export function getAllPosts(ticker?: string): ScheduledTGPost[] {
 /**
  * Cancel all pending posts for a token
  */
-export function cancelTGMarketing(ticker: string): number {
-  const posts = loadScheduledPosts();
+export async function cancelTGMarketing(ticker: string): Promise<number> {
+  const posts = await loadScheduledPosts();
   let cancelled = 0;
   
   for (const post of posts) {
     if (post.tokenTicker.toLowerCase() === ticker.toLowerCase() && post.status === 'pending') {
-      post.status = 'cancelled';
+      await updatePostStatus(post.id, 'cancelled');
       cancelled++;
     }
   }
   
-  saveScheduledPosts(posts);
   logger.info(`[TGScheduler] Cancelled ${cancelled} posts for $${ticker}`);
   return cancelled;
 }
@@ -361,9 +441,8 @@ let tgHeartbeatCounter = 0;
  * Check for due posts and send them
  */
 async function checkAndPostDue(): Promise<void> {
-  const posts = loadScheduledPosts();
+  const posts = await loadScheduledPosts();
   const now = new Date();
-  let updated = false;
   
   // Log heartbeat every 5 minutes (every 5th call since we run every minute)
   tgHeartbeatCounter++;
@@ -406,10 +485,6 @@ async function checkAndPostDue(): Promise<void> {
       }
     }
     
-    // Find this post in the original array
-    const postIndex = posts.findIndex(p => p.id === post.id);
-    if (postIndex === -1) continue;
-    
     // Generate meme at post time (DALL-E URLs expire after ~1 hour)
     let imageUrl: string | undefined;
     if (post.tokenContext && isMemeGenerationAvailable()) {
@@ -445,24 +520,18 @@ async function checkAndPostDue(): Promise<void> {
         logger.info(`[TGScheduler] Found new chat ID: ${newChatId}, retrying...`);
         result = await postToTelegram(newChatId, post.text, imageUrl);
         
-        // Update all pending posts for this token with new chat ID
+        // Update the LaunchPack in store if successful
         if (result.success) {
-          for (const p of posts) {
-            if (p.telegramChatId === post.telegramChatId) {
-              p.telegramChatId = newChatId;
-            }
-          }
-          // Also update the LaunchPack in store
           await updateLaunchPackChatId(post.launchPackId, newChatId);
         }
       }
     }
     
     if (result.success) {
-      posts[postIndex].status = 'posted';
-      posts[postIndex].postedAt = new Date().toISOString();
-      posts[postIndex].messageId = result.messageId;
-      posts[postIndex].imageUrl = imageUrl; // Store the URL that was used
+      await updatePostStatus(post.id, 'posted', {
+        postedAt: new Date().toISOString(),
+        messageId: result.messageId,
+      });
       // Track successful post time to enforce minimum gap
       lastPostTimes.set(post.telegramChatId, now.getTime());
       logger.info(`[TGScheduler] ✅ Posted to TG: ${post.text.substring(0, 50)}...`);
@@ -478,19 +547,12 @@ async function checkAndPostDue(): Promise<void> {
         // Non-fatal
       }
     } else {
-      posts[postIndex].status = 'failed';
-      posts[postIndex].error = result.error;
+      await updatePostStatus(post.id, 'failed', { error: result.error });
       logger.error(`[TGScheduler] ❌ Failed to post: ${result.error}`);
     }
     
-    updated = true;
-    
     // Small delay between posts to avoid rate limiting
     await new Promise(r => setTimeout(r, 1000));
-  }
-  
-  if (updated) {
-    saveScheduledPosts(posts);
   }
 }
 
@@ -547,9 +609,30 @@ async function updateLaunchPackChatId(launchPackId: string, newChatId: string): 
 }
 
 /**
+ * Initialize PostgreSQL connection if DATABASE_URL is set
+ */
+async function initPostgresIfAvailable(): Promise<void> {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (databaseUrl) {
+    try {
+      const { PostgresScheduleRepository } = await import('../db/postgresScheduleRepository.ts');
+      pgRepo = await PostgresScheduleRepository.create(databaseUrl);
+      usePostgres = true;
+      logger.info('[TGScheduler] Initialized with PostgreSQL storage (Railway)');
+    } catch (err) {
+      logger.error(`[TGScheduler] Failed to connect to PostgreSQL, using file storage: ${err}`);
+      scheduledPostsCache = loadScheduledPostsFromFile();
+    }
+  } else {
+    scheduledPostsCache = loadScheduledPostsFromFile();
+    logger.info('[TGScheduler] Initialized with file storage (local)');
+  }
+}
+
+/**
  * Start the TG scheduler
  */
-export function startTGScheduler(launchPackStore: LaunchPackStore): void {
+export async function startTGScheduler(launchPackStore: LaunchPackStore): Promise<void> {
   store = launchPackStore;
   
   if (schedulerInterval) {
@@ -557,8 +640,11 @@ export function startTGScheduler(launchPackStore: LaunchPackStore): void {
     return;
   }
   
+  // Initialize PostgreSQL if available
+  await initPostgresIfAvailable();
+  
   // Initialize lastPostTimes from existing posted messages to prevent double-posting after restart
-  const posts = loadScheduledPosts();
+  const posts = await loadScheduledPosts();
   for (const post of posts) {
     if (post.status === 'posted' && post.postedAt) {
       const postedTime = new Date(post.postedAt).getTime();
@@ -623,15 +709,15 @@ async function autoScheduleAllTokens(launchPackStore: LaunchPackStore): Promise<
     
     logger.info(`[TGScheduler] Found ${eligiblePacks.length} eligible tokens for TG marketing`);
     
-    const posts = loadScheduledPosts();
-    logger.info(`[TGScheduler] Loaded ${posts.length} existing scheduled posts from file`);
+    const posts = await loadScheduledPosts();
+    logger.info(`[TGScheduler] Loaded ${posts.length} existing scheduled posts`);
     
     
     for (const pack of eligiblePacks) {
       const ticker = pack.brand?.ticker || 'UNKNOWN';
       
       // Count pending posts for this token
-      const pendingCount = posts.filter(p => 
+      const pendingCount = posts.filter((p: ScheduledTGPost) => 
         p.tokenTicker === ticker && 
         p.status === 'pending'
       ).length;
@@ -673,8 +759,8 @@ export function stopTGScheduler(): void {
  * Regenerate pending posts with fresh content
  */
 export async function regeneratePendingTGPosts(launchPackStore: LaunchPackStore): Promise<{ regenerated: number; failed: number }> {
-  const posts = loadScheduledPosts();
-  const pendingPosts = posts.filter(p => p.status === 'pending');
+  const posts = await loadScheduledPosts();
+  const pendingPosts = posts.filter((p: ScheduledTGPost) => p.status === 'pending');
   
   let regenerated = 0;
   let failed = 0;
@@ -701,7 +787,12 @@ export async function regeneratePendingTGPosts(launchPackStore: LaunchPackStore)
       for (const post of packPosts) {
         try {
           const result = await generateAITGPost(tokenContext, post.type);
-          post.text = result.text;
+          // Update in storage
+          if (usePostgres && pgRepo) {
+            await pgRepo.insertTGPost({ ...post, text: result.text } as PGScheduledTGPost);
+          } else {
+            post.text = result.text;
+          }
           regenerated++;
         } catch (err) {
           failed++;
@@ -712,7 +803,10 @@ export async function regeneratePendingTGPosts(launchPackStore: LaunchPackStore)
     }
   }
   
-  saveScheduledPosts(posts);
+  // Save file mode changes
+  if (!usePostgres) {
+    saveScheduledPostsToFile(posts);
+  }
   logger.info(`[TGScheduler] Regenerated ${regenerated} TG posts, ${failed} failed`);
   
   return { regenerated, failed };
@@ -720,7 +814,7 @@ export async function regeneratePendingTGPosts(launchPackStore: LaunchPackStore)
 
 export default {
   scheduleTGMarketing,
-  getPendingPosts,
+  getPendingPostsForToken,
   getAllPosts,
   cancelTGMarketing,
   startTGScheduler,

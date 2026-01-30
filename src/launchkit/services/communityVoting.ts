@@ -18,6 +18,16 @@ import { getEnv } from '../env.ts';
 import type { TokenIdea } from './ideaGenerator.ts';
 import * as fs from 'fs';
 import * as path from 'path';
+import { 
+  PostgresScheduleRepository, 
+  type CommunityPreferences as PGCommunityPreferences,
+  type IdeaFeedback as PGIdeaFeedback,
+  type PendingVote as PGPendingVote
+} from '../db/postgresScheduleRepository.ts';
+
+// PostgreSQL support
+let pgRepo: PostgresScheduleRepository | null = null;
+let usePostgres = false;
 
 // Reaction weights for sentiment calculation
 const REACTION_WEIGHTS: Record<string, number> = {
@@ -100,7 +110,7 @@ const state: VotingState = {
 // Persistence
 const DATA_FILE = './data/community_voting.json';
 
-function loadState(): void {
+function loadStateFromFile(): void {
   try {
     if (fs.existsSync(DATA_FILE)) {
       const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
@@ -112,14 +122,14 @@ function loadState(): void {
           state.pendingVotes.set(vote.id, vote);
         }
       }
-      logger.info(`[CommunityVoting] Loaded ${state.feedbackHistory.length} feedback records, ${state.pendingVotes.size} pending votes`);
+      logger.info(`[CommunityVoting] Loaded ${state.feedbackHistory.length} feedback from file, ${state.pendingVotes.size} pending`);
     }
   } catch (err) {
-    logger.warn('[CommunityVoting] Failed to load state:', err);
+    logger.warn('[CommunityVoting] Failed to load state from file:', err);
   }
 }
 
-function saveState(): void {
+function saveStateToFile(): void {
   try {
     const dir = path.dirname(DATA_FILE);
     if (!fs.existsSync(dir)) {
@@ -136,8 +146,84 @@ function saveState(): void {
   }
 }
 
-// Initialize
-loadState();
+async function loadStateFromPostgres(): Promise<boolean> {
+  if (!pgRepo) return false;
+  try {
+    // Load preferences
+    const prefs = await pgRepo.getCommunityPreferences();
+    if (prefs) {
+      state.communityPreferences = prefs as any;
+    }
+    
+    // Load feedback history
+    const feedback = await pgRepo.getIdeaFeedbackHistory(100);
+    state.feedbackHistory = feedback as IdeaFeedback[];
+    
+    // Load pending votes
+    const pending = await pgRepo.getPendingVotesList();
+    for (const vote of pending) {
+      state.pendingVotes.set(vote.id, vote as PendingVote);
+    }
+    
+    logger.info(`[CommunityVoting] Loaded ${state.feedbackHistory.length} feedback from PostgreSQL, ${state.pendingVotes.size} pending`);
+    return true;
+  } catch (err) {
+    logger.warn('[CommunityVoting] Failed to load from PostgreSQL:', err);
+    return false;
+  }
+}
+
+async function saveStateToPostgres(): Promise<void> {
+  if (!pgRepo) return;
+  try {
+    await pgRepo.saveCommunityPreferences(state.communityPreferences as PGCommunityPreferences);
+  } catch (err) {
+    logger.warn('[CommunityVoting] Failed to save preferences to PostgreSQL:', err);
+  }
+}
+
+/**
+ * Initialize community voting (async for PostgreSQL support)
+ */
+export async function initCommunityVoting(): Promise<void> {
+  const dbUrl = process.env.DATABASE_URL;
+  if (dbUrl) {
+    try {
+      pgRepo = await PostgresScheduleRepository.create(dbUrl);
+      usePostgres = true;
+      logger.info('[CommunityVoting] PostgreSQL storage initialized');
+      
+      // Load from PostgreSQL
+      const loaded = await loadStateFromPostgres();
+      if (!loaded) {
+        // Fall back to file
+        loadStateFromFile();
+      }
+    } catch (err) {
+      logger.warn('[CommunityVoting] PostgreSQL init failed:', err);
+      pgRepo = null;
+      usePostgres = false;
+      loadStateFromFile();
+    }
+  } else {
+    loadStateFromFile();
+  }
+}
+
+function saveState(): void {
+  // Always save to file as backup
+  saveStateToFile();
+  
+  // Also save to PostgreSQL if available
+  if (usePostgres && pgRepo) {
+    saveStateToPostgres().catch((err: Error) => {
+      logger.warn(`[CommunityVoting] Failed to sync to PostgreSQL: ${err.message}`);
+    });
+  }
+}
+
+// Initialize synchronously from file on import (for backwards compatibility)
+loadStateFromFile();
 
 /**
  * Generate the agent's reasoning for why this idea could work
@@ -316,6 +402,14 @@ export async function postIdeaForVoting(
     };
     
     state.pendingVotes.set(vote.id, vote);
+    
+    // Save to PostgreSQL if available
+    if (usePostgres && pgRepo) {
+      await pgRepo.insertPendingVote(vote as PGPendingVote).catch((err: Error) => {
+        logger.warn(`[CommunityVoting] Failed to save vote to PostgreSQL: ${err.message}`);
+      });
+    }
+    
     saveState();
     
     logger.info(`[CommunityVoting] Posted idea $${idea.ticker} for voting (messageId: ${messageId})`);
@@ -565,14 +659,23 @@ export async function checkPendingVotes(): Promise<PendingVote[]> {
       logger.info(`[CommunityVoting] $${vote.idea.ticker}: REJECTED (sentiment: ${votes.sentiment.toFixed(2)})`);
     }
     
-    // Record feedback
-    recordFeedback(vote);
+    // Record feedback (async but don't block)
+    recordFeedback(vote).catch(err => {
+      logger.warn('[CommunityVoting] Failed to record feedback:', err);
+    });
     resolved.push(vote);
   }
   
   // Clean up resolved votes
   for (const vote of resolved) {
     state.pendingVotes.delete(vote.id);
+    
+    // Remove from PostgreSQL
+    if (usePostgres && pgRepo) {
+      pgRepo.deletePendingVote(vote.id).catch((err: Error) => {
+        logger.warn(`[CommunityVoting] Failed to delete vote from PostgreSQL: ${err.message}`);
+      });
+    }
   }
   
   if (resolved.length > 0) {
@@ -585,7 +688,7 @@ export async function checkPendingVotes(): Promise<PendingVote[]> {
 /**
  * Record feedback for learning
  */
-function recordFeedback(vote: PendingVote): void {
+async function recordFeedback(vote: PendingVote): Promise<void> {
   const feedback: IdeaFeedback = {
     id: vote.id,
     idea: vote.idea,
@@ -594,6 +697,13 @@ function recordFeedback(vote: PendingVote): void {
   };
   
   state.feedbackHistory.push(feedback);
+  
+  // Save to PostgreSQL if available
+  if (usePostgres && pgRepo) {
+    await pgRepo.insertIdeaFeedback(feedback as PGIdeaFeedback).catch((err: Error) => {
+      logger.warn(`[CommunityVoting] Failed to save feedback to PostgreSQL: ${err.message}`);
+    });
+  }
   
   // Update community preferences
   const theme = vote.idea.theme || 'general';

@@ -1,10 +1,19 @@
 import { logger } from '@elizaos/core';
-import { canWrite, getQuota, recordWrite, getPostingAdvice } from './xRateLimiter.ts';
+import { canWrite, getQuota, recordWrite, getPostingAdvice, initXRateLimiter } from './xRateLimiter.ts';
 import { generateAITweet, generateTweet, suggestTweetType, type TokenContext, type TweetType, type GeneratedTweet } from './xMarketing.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
 import { getTokenPrice } from './priceService.ts';
 import { getEnv } from '../env.ts';
 import { recordTweetSent } from './systemReporter.ts';
+import { 
+  PostgresScheduleRepository, 
+  type ScheduledXTweet as PGScheduledXTweet,
+  type XMarketingSchedule as PGXMarketingSchedule
+} from '../db/postgresScheduleRepository.ts';
+
+// PostgreSQL support
+let pgRepo: PostgresScheduleRepository | null = null;
+let usePostgres = false;
 
 /**
  * X Tweet Scheduler
@@ -38,7 +47,7 @@ export interface MarketingSchedule {
   createdAt: string;
 }
 
-// In-memory storage (persisted to file)
+// In-memory storage (persisted to file or PostgreSQL)
 let scheduledTweets: ScheduledTweet[] = [];
 let marketingSchedules: MarketingSchedule[] = [];
 
@@ -46,20 +55,41 @@ const STORAGE_FILE = './data/x_scheduled_tweets.json';
 const SCHEDULES_FILE = './data/x_marketing_schedules.json';
 
 /**
- * Load scheduled tweets from file
+ * Initialize PostgreSQL if DATABASE_URL is available
  */
-async function loadScheduledTweets(): Promise<void> {
+async function initPostgresIfAvailable(): Promise<void> {
+  const dbUrl = process.env.DATABASE_URL;
+  if (!dbUrl) {
+    logger.info('[XScheduler] No DATABASE_URL, using file storage');
+    return;
+  }
+  
+  try {
+    pgRepo = await PostgresScheduleRepository.create(dbUrl);
+    usePostgres = true;
+    logger.info('[XScheduler] PostgreSQL storage initialized');
+  } catch (err) {
+    logger.warn('[XScheduler] Failed to init PostgreSQL, falling back to file:', err);
+    pgRepo = null;
+    usePostgres = false;
+  }
+}
+
+/**
+ * Load scheduled tweets from file (fallback)
+ */
+async function loadScheduledTweetsFromFile(): Promise<void> {
   try {
     const fs = await import('fs/promises');
     const data = await fs.readFile(STORAGE_FILE, 'utf-8');
     scheduledTweets = JSON.parse(data);
-    logger.info(`[XScheduler] Loaded ${scheduledTweets.length} scheduled tweets`);
+    logger.info(`[XScheduler] Loaded ${scheduledTweets.length} scheduled tweets from file`);
   } catch {
     scheduledTweets = [];
   }
 }
 
-async function saveScheduledTweets(): Promise<void> {
+async function saveScheduledTweetsToFile(): Promise<void> {
   try {
     const fs = await import('fs/promises');
     await fs.writeFile(STORAGE_FILE, JSON.stringify(scheduledTweets, null, 2));
@@ -68,18 +98,18 @@ async function saveScheduledTweets(): Promise<void> {
   }
 }
 
-async function loadSchedules(): Promise<void> {
+async function loadSchedulesFromFile(): Promise<void> {
   try {
     const fs = await import('fs/promises');
     const data = await fs.readFile(SCHEDULES_FILE, 'utf-8');
     marketingSchedules = JSON.parse(data);
-    logger.info(`[XScheduler] Loaded ${marketingSchedules.length} marketing schedules`);
+    logger.info(`[XScheduler] Loaded ${marketingSchedules.length} marketing schedules from file`);
   } catch {
     marketingSchedules = [];
   }
 }
 
-async function saveSchedules(): Promise<void> {
+async function saveSchedulesToFile(): Promise<void> {
   try {
     const fs = await import('fs/promises');
     await fs.writeFile(SCHEDULES_FILE, JSON.stringify(marketingSchedules, null, 2));
@@ -88,9 +118,75 @@ async function saveSchedules(): Promise<void> {
   }
 }
 
-// Initialize
-loadScheduledTweets();
-loadSchedules();
+/**
+ * Load all scheduled tweets (PostgreSQL or file)
+ */
+async function loadScheduledTweets(): Promise<ScheduledTweet[]> {
+  if (usePostgres && pgRepo) {
+    const tweets = await pgRepo.getXTweetsByStatus('pending');
+    // Also load posted/failed for in-memory tracking if needed
+    const posted = await pgRepo.getXTweetsByStatus('posted');
+    const failed = await pgRepo.getXTweetsByStatus('failed');
+    scheduledTweets = [...tweets, ...posted, ...failed] as ScheduledTweet[];
+    return scheduledTweets;
+  }
+  await loadScheduledTweetsFromFile();
+  return scheduledTweets;
+}
+
+/**
+ * Load all marketing schedules (PostgreSQL or file)
+ */
+async function loadMarketingSchedules(): Promise<MarketingSchedule[]> {
+  if (usePostgres && pgRepo) {
+    marketingSchedules = await pgRepo.getXMarketingSchedules() as MarketingSchedule[];
+    return marketingSchedules;
+  }
+  await loadSchedulesFromFile();
+  return marketingSchedules;
+}
+
+/**
+ * Save a single tweet (PostgreSQL) or all tweets (file)
+ */
+async function saveTweet(tweet: ScheduledTweet): Promise<void> {
+  if (usePostgres && pgRepo) {
+    await pgRepo.insertXTweet(tweet as PGScheduledXTweet);
+  } else {
+    await saveScheduledTweetsToFile();
+  }
+}
+
+/**
+ * Update a tweet status
+ */
+async function updateTweetStatus(id: string, status: 'pending' | 'posted' | 'failed' | 'skipped', extra?: { tweetId?: string; error?: string; postedAt?: string }): Promise<void> {
+  if (usePostgres && pgRepo) {
+    await pgRepo.updateXTweetStatus(id, status, extra?.tweetId, extra?.error);
+  }
+  // Also update in-memory
+  const tweet = scheduledTweets.find(t => t.id === id);
+  if (tweet) {
+    tweet.status = status;
+    if (extra?.tweetId) tweet.tweetId = extra.tweetId;
+    if (extra?.error) tweet.error = extra.error;
+    if (extra?.postedAt) tweet.postedAt = extra.postedAt;
+  }
+  if (!usePostgres) {
+    await saveScheduledTweetsToFile();
+  }
+}
+
+/**
+ * Save a marketing schedule
+ */
+async function saveSchedule(schedule: MarketingSchedule): Promise<void> {
+  if (usePostgres && pgRepo) {
+    await pgRepo.upsertXMarketingSchedule(schedule as PGXMarketingSchedule);
+  } else {
+    await saveSchedulesToFile();
+  }
+}
 
 /**
  * Create a marketing schedule for a launched token
@@ -103,7 +199,7 @@ export async function createMarketingSchedule(
   if (existing) {
     existing.tweetsPerWeek = tweetsPerWeek;
     existing.enabled = true;
-    await saveSchedules();
+    await saveSchedule(existing);
     return existing;
   }
   
@@ -117,7 +213,7 @@ export async function createMarketingSchedule(
   };
   
   marketingSchedules.push(schedule);
-  await saveSchedules();
+  await saveSchedule(schedule);
   
   logger.info(`[XScheduler] Created marketing schedule for $${schedule.tokenTicker} (${tweetsPerWeek} tweets/week)`);
   return schedule;
@@ -161,7 +257,7 @@ export async function scheduleTweet(
   };
   
   scheduledTweets.push(tweet);
-  await saveScheduledTweets();
+  await saveTweet(tweet);
   
   logger.info(`[XScheduler] Scheduled tweet for $${tweet.tokenTicker} at ${scheduledFor.toLocaleString()}`);
   return tweet;
@@ -245,22 +341,20 @@ export function getDueTweets(): ScheduledTweet[] {
  * Mark a tweet as posted
  */
 export async function markTweetPosted(id: string, tweetId: string): Promise<void> {
+  const postedAt = new Date().toISOString();
+  await updateTweetStatus(id, 'posted', { tweetId, postedAt });
+  
+  // Record for system reporter
+  recordTweetSent();
+  
+  // Update schedule stats
   const tweet = scheduledTweets.find(t => t.id === id);
   if (tweet) {
-    tweet.status = 'posted';
-    tweet.postedAt = new Date().toISOString();
-    tweet.tweetId = tweetId;
-    await saveScheduledTweets();
-    
-    // Record for system reporter
-    recordTweetSent();
-    
-    // Update schedule stats
     const schedule = marketingSchedules.find(s => s.launchPackId === tweet.launchPackId);
     if (schedule) {
       schedule.totalTweeted++;
-      schedule.lastTweetAt = tweet.postedAt;
-      await saveSchedules();
+      schedule.lastTweetAt = postedAt;
+      await saveSchedule(schedule);
     }
   }
 }
@@ -269,12 +363,7 @@ export async function markTweetPosted(id: string, tweetId: string): Promise<void
  * Mark a tweet as failed
  */
 export async function markTweetFailed(id: string, error: string): Promise<void> {
-  const tweet = scheduledTweets.find(t => t.id === id);
-  if (tweet) {
-    tweet.status = 'failed';
-    tweet.error = error;
-    await saveScheduledTweets();
-  }
+  await updateTweetStatus(id, 'failed', { error });
 }
 
 /**
@@ -282,11 +371,7 @@ export async function markTweetFailed(id: string, error: string): Promise<void> 
  */
 export async function skipTweet(id: string, reason: string): Promise<void> {
   const tweet = scheduledTweets.find(t => t.id === id);
-  if (tweet) {
-    tweet.status = 'skipped';
-    tweet.error = reason;
-    await saveScheduledTweets();
-  }
+  await updateTweetStatus(id, 'skipped', { error: reason });
 }
 
 /**
@@ -296,12 +381,10 @@ export async function cancelTokenTweets(launchPackId: string): Promise<number> {
   let cancelled = 0;
   for (const tweet of scheduledTweets) {
     if (tweet.launchPackId === launchPackId && tweet.status === 'pending') {
-      tweet.status = 'skipped';
-      tweet.error = 'Cancelled by user';
+      await updateTweetStatus(tweet.id, 'skipped', { error: 'Cancelled by user' });
       cancelled++;
     }
   }
-  await saveScheduledTweets();
   return cancelled;
 }
 
@@ -783,11 +866,21 @@ async function autoRefillXMarketing(): Promise<void> {
 /**
  * Start the X scheduler with auto-refill
  */
-export function startXScheduler(
+export async function startXScheduler(
   store: { list: () => Promise<LaunchPack[]> },
   tweetFn: (text: string) => Promise<string | null>
-): void {
+): Promise<void> {
   xStore = store;
+  
+  // Initialize PostgreSQL if available
+  await initPostgresIfAvailable();
+  
+  // Initialize rate limiter (also uses PostgreSQL if available)
+  await initXRateLimiter();
+  
+  // Load data
+  await loadScheduledTweets();
+  await loadMarketingSchedules();
   
   if (xSchedulerInterval) {
     logger.info('[XScheduler] Scheduler already running');

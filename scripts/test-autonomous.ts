@@ -150,7 +150,7 @@ if (createPack) {
   
   // Dynamic import to avoid initialization issues
   const { LaunchPackRepository } = await import('../src/launchkit/db/launchPackRepository.ts');
-  const store = new LaunchPackRepository();
+  const store = await LaunchPackRepository.create();
   
   try {
     const created = await store.create(launchPack);

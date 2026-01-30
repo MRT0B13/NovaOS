@@ -1,6 +1,11 @@
 import { logger } from '@elizaos/core';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
+import { PostgresScheduleRepository, type TrendPoolData } from '../db/postgresScheduleRepository.ts';
+
+// PostgreSQL support
+let pgRepo: PostgresScheduleRepository | null = null;
+let usePostgres = false;
 
 /**
  * Trend Pool - Persistent Trend Storage
@@ -75,6 +80,8 @@ function getPoolPath(): string {
 }
 
 function loadPool(): TrendPoolState {
+  // PostgreSQL loading is async, so this returns the cached file data
+  // Actual PostgreSQL loading happens in initPoolAsync
   const poolPath = getPoolPath();
   
   try {
@@ -96,7 +103,31 @@ function loadPool(): TrendPoolState {
   };
 }
 
+async function loadPoolFromPostgres(): Promise<TrendPoolState | null> {
+  if (!pgRepo) return null;
+  try {
+    const data = await pgRepo.getTrendPool();
+    if (data) {
+      logger.info(`[TrendPool] Loaded ${data.trends.length} trends from PostgreSQL`);
+      return data as TrendPoolState;
+    }
+  } catch (err) {
+    logger.warn('[TrendPool] Failed to load from PostgreSQL:', err);
+  }
+  return null;
+}
+
 function savePool(state: TrendPoolState): void {
+  state.lastUpdated = Date.now();
+  
+  // If PostgreSQL is available, also save async
+  if (usePostgres && pgRepo) {
+    pgRepo.saveTrendPool(state as TrendPoolData).catch(err => {
+      logger.warn('[TrendPool] Failed to save to PostgreSQL:', err);
+    });
+  }
+  
+  // Always save to file as backup
   const poolPath = getPoolPath();
   
   try {
@@ -106,7 +137,6 @@ function savePool(state: TrendPoolState): void {
       mkdirSync(dir, { recursive: true });
     }
     
-    state.lastUpdated = Date.now();
     writeFileSync(poolPath, JSON.stringify(state, null, 2), 'utf-8');
     logger.debug(`[TrendPool] Saved ${state.trends.length} trends to disk`);
   } catch (err) {
@@ -447,7 +477,7 @@ export function getPoolConfig(): TrendPoolConfig {
 // ============================================================================
 
 /**
- * Initialize the pool (load from disk, apply decay)
+ * Initialize the pool (load from disk, apply decay) - synchronous version
  */
 export function initPool(customConfig?: Partial<TrendPoolConfig>): void {
   if (customConfig) {
@@ -459,6 +489,50 @@ export function initPool(customConfig?: Partial<TrendPoolConfig>): void {
   prunePool();
   
   logger.info(`[TrendPool] Initialized with ${poolState.trends.length} trends`);
+}
+
+/**
+ * Initialize the pool with PostgreSQL support - async version
+ */
+export async function initPoolAsync(customConfig?: Partial<TrendPoolConfig>): Promise<void> {
+  if (customConfig) {
+    config = { ...config, ...customConfig };
+  }
+  
+  // Try PostgreSQL first
+  const dbUrl = process.env.DATABASE_URL;
+  if (dbUrl) {
+    try {
+      pgRepo = await PostgresScheduleRepository.create(dbUrl);
+      usePostgres = true;
+      logger.info('[TrendPool] PostgreSQL storage initialized');
+      
+      // Load from PostgreSQL
+      const pgData = await loadPoolFromPostgres();
+      if (pgData) {
+        poolState = pgData;
+      } else {
+        // Fall back to file and migrate to PostgreSQL
+        poolState = loadPool();
+        if (poolState.trends.length > 0) {
+          await pgRepo.saveTrendPool(poolState as TrendPoolData);
+          logger.info(`[TrendPool] Migrated ${poolState.trends.length} trends to PostgreSQL`);
+        }
+      }
+    } catch (err) {
+      logger.warn('[TrendPool] PostgreSQL init failed, using file storage:', err);
+      pgRepo = null;
+      usePostgres = false;
+      poolState = loadPool();
+    }
+  } else {
+    poolState = loadPool();
+  }
+  
+  applyDecay();
+  prunePool();
+  
+  logger.info(`[TrendPool] Initialized with ${poolState.trends.length} trends (PostgreSQL: ${usePostgres})`);
 }
 
 /**
@@ -507,6 +581,7 @@ export default {
   
   // Lifecycle
   initPool,
+  initPoolAsync,
   resetPool,
   reloadPool,
 };

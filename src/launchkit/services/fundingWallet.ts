@@ -2,6 +2,7 @@ import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transa
 import bs58 from 'bs58';
 import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
+import { recordBuy, recordSell, recordDeposit, recordWithdrawal } from './pnlTracker.ts';
 
 /**
  * Funding Wallet Service
@@ -136,6 +137,13 @@ export async function depositToPumpWallet(amountSol: number): Promise<{ signatur
   logger.info(`[FundingWallet] ✅ Deposited ${amountSol} SOL`);
   logger.info(`[FundingWallet] Signature: ${signature}`);
   logger.info(`[FundingWallet] Pump wallet balance: ${pumpBalanceSol.toFixed(4)} SOL`);
+  
+  // Record in PnL tracker
+  try {
+    await recordDeposit(amountSol, signature);
+  } catch (err) {
+    logger.warn(`[FundingWallet] Failed to record deposit in PnL tracker: ${err}`);
+  }
   
   return {
     signature,
@@ -320,6 +328,13 @@ export async function withdrawFromPumpWallet(
   logger.info(`[Withdrawal] New pump wallet balance: ${newPumpBalance.toFixed(4)} SOL`);
   logger.info(`[Withdrawal] New funding wallet balance: ${newFundingBalance.toFixed(4)} SOL`);
   
+  // Record in PnL tracker
+  try {
+    await recordWithdrawal(withdrawAmount, signature);
+  } catch (err) {
+    logger.warn(`[Withdrawal] Failed to record in PnL tracker: ${err}`);
+  }
+  
   return {
     signature,
     withdrawn: withdrawAmount,
@@ -433,6 +448,18 @@ export async function sellToken(
   logger.info(`[SellToken] ✅ Successfully sold ${sellAmount} tokens`);
   logger.info(`[SellToken] Transaction: ${signature}`);
   logger.info(`[SellToken] SOL received: ~${solReceived} SOL`);
+  
+  // Record in PnL tracker
+  try {
+    await recordSell({
+      tokenMint: mintAddress,
+      tokenAmount: sellAmount,
+      solReceived: solReceived,
+      signature,
+    });
+  } catch (err) {
+    logger.warn(`[SellToken] Failed to record in PnL tracker: ${err}`);
+  }
   
   return {
     signature,
@@ -573,6 +600,19 @@ export async function buyToken(
   logger.info('[BuyToken] ✅ Successfully bought tokens');
   logger.info('[BuyToken] Transaction: ' + signature);
   logger.info('[BuyToken] SOL spent: ' + amountSol);
+  
+  // Record in PnL tracker
+  try {
+    await recordBuy({
+      tokenMint: mintAddress,
+      tokenAmount: tokensReceived,
+      solSpent: amountSol,
+      isLaunchBuy: false,
+      signature,
+    });
+  } catch (err) {
+    logger.warn('[BuyToken] Failed to record in PnL tracker: ' + err);
+  }
   
   return {
     signature,
