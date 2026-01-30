@@ -498,6 +498,19 @@ export class PostgresScheduleRepository {
     };
   }
 
+  // Alias methods for xScheduler compatibility
+  async getXTweetsByStatus(status: string): Promise<ScheduledTweet[]> {
+    return this.getTweets(status);
+  }
+
+  async insertXTweet(tweet: ScheduledTweet): Promise<void> {
+    return this.insertTweet(tweet);
+  }
+
+  async updateXTweetStatus(id: string, status: string, tweetId?: string, error?: string): Promise<void> {
+    return this.updateTweetStatus(id, status, { tweetId, error });
+  }
+
   // ==========================================================================
   // X Marketing Schedules
   // ==========================================================================
@@ -531,6 +544,15 @@ export class PostgresScheduleRepository {
   async getAllMarketingSchedules(): Promise<MarketingSchedule[]> {
     const result = await this.pool.query(`SELECT * FROM sched_x_marketing WHERE enabled = TRUE`);
     return result.rows.map(this.rowToMarketingSchedule);
+  }
+
+  // Alias methods for xScheduler compatibility
+  async getXMarketingSchedules(): Promise<MarketingSchedule[]> {
+    return this.getAllMarketingSchedules();
+  }
+
+  async upsertXMarketingSchedule(schedule: MarketingSchedule): Promise<void> {
+    return this.upsertMarketingSchedule(schedule);
   }
 
   private rowToMarketingSchedule(row: any): MarketingSchedule {

@@ -627,7 +627,7 @@ export async function recoverMarketingFromStore(
     }
     
     if (results.recovered > 0 || results.rescheduled > 0) {
-      await saveSchedules();
+      await saveSchedulesToFile();
       logger.info(`[XScheduler] Recovery complete: ${results.recovered} recovered, ${results.rescheduled} rescheduled`);
     }
   } catch (err) {
