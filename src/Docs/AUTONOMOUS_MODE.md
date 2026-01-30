@@ -154,9 +154,30 @@ When `AUTONOMOUS_DRY_RUN=true`:
 
 ### Trend Deduplication
 
-- Seen topics tracked in memory
+- Seen topics tracked in memory and **persisted to PostgreSQL**
 - Same trend won't trigger twice
-- Resets on service restart
+- Data survives service restarts when `DATABASE_URL` is set
+- Stored in `sched_trend_pool` table
+
+---
+
+## Data Persistence
+
+All autonomous mode data persists to PostgreSQL when deployed on Railway:
+
+| Data | PostgreSQL Table | Survives Restart |
+|------|------------------|------------------|
+| Trend pool | `sched_trend_pool` | ✅ Yes |
+| Community voting preferences | `sched_community_prefs` | ✅ Yes |
+| Pending votes | `sched_pending_votes` | ✅ Yes |
+| Idea feedback | `sched_community_feedback` | ✅ Yes |
+| System metrics | `sched_system_metrics` | ✅ Yes |
+
+Services initialize asynchronously to connect to PostgreSQL:
+- `initPoolAsync()` - Trend pool
+- `initCommunityVoting()` - Community voting
+
+See [POSTGRESQL_ARCHITECTURE.md](./POSTGRESQL_ARCHITECTURE.md) for full details.
 
 ---
 

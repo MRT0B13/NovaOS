@@ -35,6 +35,13 @@ Nova is an AI agent specialized in pump.fun token launches with full automation 
 - **Context-Aware**: Understands which token you're discussing
 - **Conversation Intelligence**: Refines concepts, guides strategy
 
+### 🚂 Railway Deployment
+
+- **PostgreSQL Persistence**: All data survives restarts on Railway
+- **Auto-Schema Creation**: Tables created automatically on first boot
+- **Hybrid Storage**: PostgreSQL primary, JSON file fallback for local dev
+- **17 Database Tables**: Scheduling, metrics, PnL tracking, community voting
+
 ## Quick Start
 
 ### 1. Install Dependencies
@@ -110,9 +117,12 @@ elizaos dev
 | ----------------------------------------------------------------------- | --------------------------------- |
 | [QUICKSTART.md](src/Docs/QUICKSTART.md)                                 | Quick reference guide             |
 | [ENV_REFERENCE.md](src/Docs/ENV_REFERENCE.md)                           | All environment variables         |
+| [RAILWAY_DEPLOYMENT.md](src/Docs/RAILWAY_DEPLOYMENT.md)                 | Railway + PostgreSQL deployment   |
+| [POSTGRESQL_ARCHITECTURE.md](src/Docs/POSTGRESQL_ARCHITECTURE.md)       | Database schema & persistence     |
 | [API_ENDPOINTS.md](src/Docs/API_ENDPOINTS.md)                           | REST API reference (port 8787)    |
 | [TELEGRAM_GUIDE.md](src/Docs/TELEGRAM_GUIDE.md)                         | Telegram bot setup & features     |
 | [TWITTER_PLUGIN_INTEGRATION.md](src/Docs/TWITTER_PLUGIN_INTEGRATION.md) | X/Twitter integration details     |
+| [AUTONOMOUS_MODE.md](src/Docs/AUTONOMOUS_MODE.md)                       | Autonomous launches & trends      |
 | [WALLET_SETUP.md](src/Docs/WALLET_SETUP.md)                             | Complete wallet configuration     |
 | [PHANTOM_INTEGRATION.md](src/Docs/PHANTOM_INTEGRATION.md)               | Using Phantom wallet              |
 | [TREASURY_GUARDRAILS.md](src/Docs/TREASURY_GUARDRAILS.md)               | Treasury & security guardrails    |
@@ -178,18 +188,19 @@ elizaos dev
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Nova v1                          │
+│                         Nova v1                                 │
 ├─────────────────────────────────────────────────────────────────┤
 │  Character: Nova (Default) / Token Mascots (in TG groups)      │
 ├─────────────────┬───────────────────┬───────────────────────────┤
 │   52+ Actions   │    Services       │       Database            │
 ├─────────────────┼───────────────────┼───────────────────────────┤
-│ • Wallet Mgmt   │ • FundingWallet   │ PGlite (embedded SQL)     │
-│ • Token Launch  │ • PumpLauncher    │ • LaunchPacks table       │
-│ • TG Moderation │ • TelegramSetup   │ • Status persistence      │
-│ • X Marketing   │ • XMarketing      │ • Audit logs              │
-│ • List Actions  │ • XScheduler      │                           │
-│ • Scam Detection│ • GroupTracker    │                           │
+│ • Wallet Mgmt   │ • FundingWallet   │ PostgreSQL (Railway)      │
+│ • Token Launch  │ • PumpLauncher    │ • LaunchPacks             │
+│ • TG Moderation │ • TelegramSetup   │ • Scheduled Posts (TG/X)  │
+│ • X Marketing   │ • XMarketing      │ • PnL & Positions         │
+│ • List Actions  │ • XScheduler      │ • System Metrics          │
+│ • Scam Detection│ • TrendMonitor    │ • Community Voting        │
+│ • Autonomous    │ • PnLTracker      │ • Trend Pool              │
 └─────────────────┴───────────────────┴───────────────────────────┘
 ```
 
@@ -219,7 +230,7 @@ elizaos dev
 ### Rate Limiting & Quota Tracking
 
 - Tracks X/Twitter Free Tier limits (500 writes/month)
-- Persists usage data across restarts
+- Persists usage data to PostgreSQL (survives Railway restarts)
 - Provides quota status and posting advice
 - Refuses to post when limits reached
 

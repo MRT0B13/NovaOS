@@ -74,11 +74,29 @@ SQL_EMBEDDINGS_ENABLE=false
 
 LaunchKit automatically creates these tables on startup:
 
+**Core Tables:**
 - `launch_packs` - Token launch configurations
 - `central_messages` - Message bus persistence
 - `central_channels` - Channel metadata
 
-No manual SQL or SSH required.
+**Scheduling Tables (`sched_*`):**
+- `sched_tg_posts` - Telegram scheduled posts
+- `sched_x_tweets` - X/Twitter scheduled tweets
+- `sched_x_marketing` - X marketing campaign schedules
+- `sched_x_usage` - X API rate limit tracking
+- `sched_trend_pool` - Detected trends pool
+- `sched_community_prefs` - Community voting preferences
+- `sched_community_feedback` - Idea feedback from community
+- `sched_pending_votes` - Active voting sessions
+- `sched_system_metrics` - System metrics, banned users, failed attempts
+
+**PnL Tables (`pnl_*`):**
+- `pnl_trades` - Trade history (buys/sells)
+- `pnl_positions` - Current token positions
+- `pnl_sol_flows` - SOL in/out tracking
+- `pnl_summary` - Aggregate P&L summary
+
+No manual SQL or SSH required. See [POSTGRESQL_ARCHITECTURE.md](./POSTGRESQL_ARCHITECTURE.md) for full schema details.
 
 ## Health Endpoint
 
