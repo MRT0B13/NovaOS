@@ -764,6 +764,8 @@ export async function startAutonomousMode(
       } else if (savedState.lastLaunchDate) {
         logger.info(`[AutonomousMode] New day detected (was: ${savedState.lastLaunchDate}, now: ${today}), starting fresh`);
         await pgRepo.resetDailyLaunchCounts(today);
+      } else {
+        logger.info(`[AutonomousMode] First run - no previous launch data`);
       }
       
       state.lastLaunchDate = today;
