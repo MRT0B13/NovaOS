@@ -17,6 +17,11 @@ import {
   generateIdeaReasoning,
   type PendingVote 
 } from './communityVoting.ts';
+import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
+
+// PostgreSQL support for persistence
+let pgRepo: PostgresScheduleRepository | null = null;
+let usePostgres = false;
 
 /**
  * Autonomous Mode Service
@@ -112,11 +117,41 @@ function isWithinLaunchWindow(scheduledTime: Date): boolean {
 /**
  * Reset daily counter if it's a new day
  */
-function checkDayReset(): void {
+async function checkDayReset(): Promise<void> {
   const today = new Date().toISOString().split('T')[0];
   if (state.lastLaunchDate !== today) {
+    logger.info(`[AutonomousMode] New day detected (was: ${state.lastLaunchDate}, now: ${today}), resetting launch counts`);
     state.launchesToday = 0;
+    state.reactiveLaunchesToday = 0;
     state.lastLaunchDate = today;
+    
+    // Persist to PostgreSQL
+    if (usePostgres && pgRepo) {
+      await pgRepo.resetDailyLaunchCounts(today).catch(err => {
+        logger.warn('[AutonomousMode] Failed to reset daily launch counts in PostgreSQL:', err);
+      });
+    }
+  }
+}
+
+/**
+ * Persist state to PostgreSQL
+ */
+async function persistState(updates: {
+  launchesToday?: number;
+  reactiveLaunchesToday?: number;
+  lastLaunchDate?: string | null;
+  nextScheduledTime?: number | null;
+  pendingIdea?: TokenIdea | null;
+  pendingVoteId?: string | null;
+}): Promise<void> {
+  if (usePostgres && pgRepo) {
+    await pgRepo.updateAutonomousState({
+      ...updates,
+      nextScheduledTime: updates.nextScheduledTime ?? (state.nextScheduledTime ? state.nextScheduledTime.getTime() : null),
+    }).catch(err => {
+      logger.warn('[AutonomousMode] Failed to persist state to PostgreSQL:', err);
+    });
   }
 }
 
@@ -131,7 +166,7 @@ async function checkGuardrails(): Promise<{ canLaunch: boolean; reason?: string 
   const env = getEnv();
   
   // Check daily limit
-  checkDayReset();
+  await checkDayReset();
   if (state.launchesToday >= env.AUTONOMOUS_MAX_PER_DAY) {
     return { canLaunch: false, reason: `Daily limit reached (${state.launchesToday}/${env.AUTONOMOUS_MAX_PER_DAY})` };
   }
@@ -220,9 +255,10 @@ async function checkAndProcessVotes(): Promise<void> {
       // Execute the launch with the approved idea
       await executeAutonomousLaunchWithIdea(vote.idea);
       
-      // Update launch count
+      // Update launch count and persist
       state.launchesToday++;
       state.lastLaunchDate = new Date().toISOString().split('T')[0];
+      await persistState({ launchesToday: state.launchesToday, lastLaunchDate: state.lastLaunchDate, pendingVoteId: null, pendingIdea: null });
       
     } else if (vote.status === 'rejected') {
       logger.info(`[Autonomous] ❌ Vote rejected for $${vote.idea.ticker} - skipping launch`);
@@ -331,6 +367,7 @@ async function executeAutonomousLaunch(): Promise<void> {
       if (vote) {
         state.pendingIdea = idea;
         state.pendingVoteId = vote.id;
+        await persistState({ pendingIdea: idea, pendingVoteId: vote.id });
         logger.info(`[Autonomous] Idea posted for voting. Will check results in ${env.COMMUNITY_VOTING_WINDOW_MINUTES || '30'} minutes.`);
         // The vote checker will handle launching after voting ends
         return;
@@ -407,9 +444,13 @@ async function executeAutonomousLaunch(): Promise<void> {
     
     logger.info(`[Autonomous] 🎉 Token launched! Mint: ${launched.launch?.mint}`);
     
-    // Update state
+    // Update state and persist
     state.launchesToday++;
     state.pendingIdea = null;
+    await persistState({ launchesToday: state.launchesToday, pendingIdea: null });
+    if (usePostgres && pgRepo) {
+      pgRepo.incrementLaunchCount('scheduled').catch(err => logger.warn('[AutonomousMode] Failed to increment launch count:', err));
+    }
     
     // Announce to Nova channel
     await announceLaunch(launched);
@@ -541,9 +582,13 @@ async function executeAutonomousLaunchWithIdea(idea: TokenIdea): Promise<void> {
     
     logger.info(`[Autonomous] 🎉 Token launched! Mint: ${launched.launch?.mint}`);
     
-    // Update state
+    // Update state and persist
     state.launchesToday++;
     state.pendingIdea = null;
+    await persistState({ launchesToday: state.launchesToday, pendingIdea: null });
+    if (usePostgres && pgRepo) {
+      pgRepo.incrementLaunchCount('scheduled').catch(err => logger.warn('[AutonomousMode] Failed to increment launch count:', err));
+    }
     
     // Announce to Nova channel
     await announceLaunch(launched);
@@ -588,6 +633,7 @@ async function schedulerTick(): Promise<void> {
   // Update next scheduled time if needed
   if (!state.nextScheduledTime || state.nextScheduledTime.getTime() < Date.now()) {
     state.nextScheduledTime = getNextScheduledTime(env.AUTONOMOUS_SCHEDULE);
+    await persistState({ nextScheduledTime: state.nextScheduledTime.getTime() });
   }
   
   // Check if we're in the launch window
@@ -627,6 +673,7 @@ async function schedulerTick(): Promise<void> {
       logger.warn(`[Autonomous] Invalid idea generated: ${validation.issues.join(', ')}`);
       state.lastCheckTime = state.nextScheduledTime.getTime();
       state.nextScheduledTime = getNextScheduledTime(env.AUTONOMOUS_SCHEDULE);
+      await persistState({ nextScheduledTime: state.nextScheduledTime.getTime() });
       return;
     }
     
@@ -644,6 +691,7 @@ async function schedulerTick(): Promise<void> {
     logger.error('[Autonomous] Idea generation failed:', err);
     state.lastCheckTime = state.nextScheduledTime.getTime();
     state.nextScheduledTime = getNextScheduledTime(env.AUTONOMOUS_SCHEDULE);
+    await persistState({ nextScheduledTime: state.nextScheduledTime.getTime() });
     return;
   }
   
@@ -662,6 +710,7 @@ async function schedulerTick(): Promise<void> {
     
     state.lastCheckTime = state.nextScheduledTime.getTime();
     state.nextScheduledTime = getNextScheduledTime(env.AUTONOMOUS_SCHEDULE);
+    await persistState({ nextScheduledTime: state.nextScheduledTime.getTime() });
     return;
   }
   
@@ -675,8 +724,9 @@ async function schedulerTick(): Promise<void> {
     logger.error('[Autonomous] Launch execution error:', err);
   }
   
-  // Schedule next window
+  // Schedule next window and persist
   state.nextScheduledTime = getNextScheduledTime(env.AUTONOMOUS_SCHEDULE);
+  await persistState({ nextScheduledTime: state.nextScheduledTime.getTime() });
   logger.info(`[Autonomous] Next launch window: ${state.nextScheduledTime.toISOString()}`);
 }
 
@@ -694,11 +744,55 @@ export async function startAutonomousMode(
     return;
   }
   
+  // Initialize PostgreSQL if available
+  const dbUrl = process.env.DATABASE_URL;
+  if (dbUrl) {
+    try {
+      pgRepo = await PostgresScheduleRepository.create(dbUrl);
+      usePostgres = true;
+      logger.info('[AutonomousMode] PostgreSQL storage initialized');
+      
+      // Load persisted state from PostgreSQL
+      const savedState = await pgRepo.getAutonomousState();
+      const today = new Date().toISOString().split('T')[0];
+      
+      // Check if we need to reset daily counters
+      if (savedState.lastLaunchDate === today) {
+        state.launchesToday = savedState.launchesToday;
+        state.reactiveLaunchesToday = savedState.reactiveLaunchesToday;
+        logger.info(`[AutonomousMode] Loaded persisted launch counts: ${state.launchesToday} scheduled, ${state.reactiveLaunchesToday} reactive`);
+      } else if (savedState.lastLaunchDate) {
+        logger.info(`[AutonomousMode] New day detected (was: ${savedState.lastLaunchDate}, now: ${today}), starting fresh`);
+        await pgRepo.resetDailyLaunchCounts(today);
+      }
+      
+      state.lastLaunchDate = today;
+      state.pendingIdea = savedState.pendingIdea;
+      state.pendingVoteId = savedState.pendingVoteId;
+      
+      // Load next scheduled time if persisted
+      if (savedState.nextScheduledTime && savedState.nextScheduledTime > Date.now()) {
+        state.nextScheduledTime = new Date(savedState.nextScheduledTime);
+        logger.info(`[AutonomousMode] Loaded persisted next scheduled time: ${state.nextScheduledTime.toISOString()}`);
+      }
+    } catch (err) {
+      logger.warn('[AutonomousMode] PostgreSQL init failed, using in-memory state:', err);
+      pgRepo = null;
+      usePostgres = false;
+    }
+  }
+  
   deps = { store, pumpLauncher };
   state.enabled = true;
   state.dryRun = env.autonomousDryRun;
   state.reactiveEnabled = env.autonomousReactiveEnabled;
-  state.nextScheduledTime = getNextScheduledTime(env.AUTONOMOUS_SCHEDULE);
+  
+  // Only calculate new nextScheduledTime if we didn't load one from PostgreSQL
+  if (!state.nextScheduledTime) {
+    state.nextScheduledTime = getNextScheduledTime(env.AUTONOMOUS_SCHEDULE);
+    // Persist next scheduled time
+    await persistState({ nextScheduledTime: state.nextScheduledTime.getTime() });
+  }
   
   logger.info('[Autonomous] ============================================');
   logger.info('[Autonomous] 🤖 AUTONOMOUS MODE ACTIVATED');
@@ -709,6 +803,7 @@ export async function startAutonomousMode(
   logger.info(`[Autonomous]    Dev buy: ${env.AUTONOMOUS_DEV_BUY_SOL} SOL`);
   logger.info(`[Autonomous]    Next window: ${state.nextScheduledTime.toISOString()}`);
   logger.info(`[Autonomous]    Reactive mode: ${state.reactiveEnabled ? 'ON' : 'OFF'}`);
+  logger.info(`[Autonomous]    Launches today: ${state.launchesToday} scheduled, ${state.reactiveLaunchesToday} reactive`);
   logger.info('[Autonomous] ============================================');
   
   // Check every minute
@@ -775,8 +870,9 @@ async function handleReactiveTrend(trend: TrendSignal): Promise<void> {
     return;
   }
   
-  // Execute launch with trend context
+  // Execute launch with trend context - increment reactive counter and persist
   state.reactiveLaunchesToday++;
+  await persistState({ reactiveLaunchesToday: state.reactiveLaunchesToday });
   
   await executeReactiveLaunch(trend);
 }
@@ -892,8 +988,9 @@ async function executeReactiveLaunch(trend: TrendSignal): Promise<void> {
       skipTelegramCheck: true, // No separate TG group for autonomous launches
     });
     
-    // Update state
+    // Update state and persist
     state.launchesToday++;
+    await persistState({ launchesToday: state.launchesToday });
     
     logger.info(`[Autonomous] 🎉 REACTIVE LAUNCH SUCCESS: ${launched.launch?.mint}`);
     

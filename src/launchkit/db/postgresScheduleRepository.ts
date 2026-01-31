@@ -322,6 +322,20 @@ export class PostgresScheduleRepository {
       );
     `);
 
+    // Autonomous Mode State (single row - persists launch counts across restarts)
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS sched_autonomous_state (
+        id TEXT PRIMARY KEY DEFAULT 'main',
+        launches_today INTEGER DEFAULT 0,
+        reactive_launches_today INTEGER DEFAULT 0,
+        last_launch_date TEXT,
+        next_scheduled_time BIGINT,
+        pending_idea JSONB,
+        pending_vote_id TEXT,
+        last_updated TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
     // Create indexes
     await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_tg_posts_status ON sched_tg_posts (status);`);
     await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_tg_posts_scheduled ON sched_tg_posts (scheduled_for);`);
@@ -341,6 +355,11 @@ export class PostgresScheduleRepository {
       VALUES ('main', $1, $1)
       ON CONFLICT (id) DO NOTHING;
     `, [now]);
+
+    await this.pool.query(`
+      INSERT INTO sched_autonomous_state (id) VALUES ('main')
+      ON CONFLICT (id) DO NOTHING;
+    `);
 
     logger.info('[ScheduleRepository] PostgreSQL schema ensured');
   }
@@ -936,5 +955,98 @@ export class PostgresScheduleRepository {
 
   async deletePendingVote(id: string): Promise<void> {
     await this.pool.query(`DELETE FROM sched_pending_votes WHERE id = $1`, [id]);
+  }
+
+  // ==========================================================================
+  // Autonomous Mode State
+  // ==========================================================================
+
+  async getAutonomousState(): Promise<{
+    launchesToday: number;
+    reactiveLaunchesToday: number;
+    lastLaunchDate: string | null;
+    nextScheduledTime: number | null;
+    pendingIdea: any | null;
+    pendingVoteId: string | null;
+  }> {
+    const result = await this.pool.query(`SELECT * FROM sched_autonomous_state WHERE id = 'main'`);
+    const row = result.rows[0];
+    if (!row) {
+      return {
+        launchesToday: 0,
+        reactiveLaunchesToday: 0,
+        lastLaunchDate: null,
+        nextScheduledTime: null,
+        pendingIdea: null,
+        pendingVoteId: null,
+      };
+    }
+    return {
+      launchesToday: row.launches_today || 0,
+      reactiveLaunchesToday: row.reactive_launches_today || 0,
+      lastLaunchDate: row.last_launch_date || null,
+      nextScheduledTime: row.next_scheduled_time ? Number(row.next_scheduled_time) : null,
+      pendingIdea: row.pending_idea || null,
+      pendingVoteId: row.pending_vote_id || null,
+    };
+  }
+
+  async updateAutonomousState(updates: {
+    launchesToday?: number;
+    reactiveLaunchesToday?: number;
+    lastLaunchDate?: string | null;
+    nextScheduledTime?: number | null;
+    pendingIdea?: any | null;
+    pendingVoteId?: string | null;
+  }): Promise<void> {
+    const sets: string[] = ['last_updated = NOW()'];
+    const values: any[] = [];
+    let paramIndex = 1;
+
+    const fieldMap: Record<string, string> = {
+      launchesToday: 'launches_today',
+      reactiveLaunchesToday: 'reactive_launches_today',
+      lastLaunchDate: 'last_launch_date',
+      nextScheduledTime: 'next_scheduled_time',
+      pendingIdea: 'pending_idea',
+      pendingVoteId: 'pending_vote_id',
+    };
+
+    for (const [key, value] of Object.entries(updates)) {
+      const dbField = fieldMap[key];
+      if (dbField && value !== undefined) {
+        sets.push(`${dbField} = $${paramIndex++}`);
+        if (key === 'pendingIdea') {
+          values.push(value ? JSON.stringify(value) : null);
+        } else {
+          values.push(value);
+        }
+      }
+    }
+
+    if (values.length > 0) {
+      await this.pool.query(
+        `UPDATE sched_autonomous_state SET ${sets.join(', ')} WHERE id = 'main'`,
+        values
+      );
+    }
+  }
+
+  async incrementLaunchCount(type: 'scheduled' | 'reactive'): Promise<void> {
+    const field = type === 'scheduled' ? 'launches_today' : 'reactive_launches_today';
+    await this.pool.query(
+      `UPDATE sched_autonomous_state SET ${field} = ${field} + 1, last_updated = NOW() WHERE id = 'main'`
+    );
+  }
+
+  async resetDailyLaunchCounts(date: string): Promise<void> {
+    await this.pool.query(`
+      UPDATE sched_autonomous_state SET 
+        launches_today = 0,
+        reactive_launches_today = 0,
+        last_launch_date = $1,
+        last_updated = NOW()
+      WHERE id = 'main'
+    `, [date]);
   }
 }
