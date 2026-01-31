@@ -6,10 +6,10 @@ This document covers the PostgreSQL persistence layer used by LaunchKit for data
 
 LaunchKit uses a **hybrid storage strategy**:
 
-| Environment | Primary Storage | Fallback |
-|-------------|-----------------|----------|
-| Railway (Production) | PostgreSQL via `DATABASE_URL` | None |
-| Local Development | PostgreSQL if `DATABASE_URL` set | JSON files in `./data/` |
+| Environment          | Primary Storage                  | Fallback                |
+| -------------------- | -------------------------------- | ----------------------- |
+| Railway (Production) | PostgreSQL via `DATABASE_URL`    | None                    |
+| Local Development    | PostgreSQL if `DATABASE_URL` set | JSON files in `./data/` |
 
 All data is automatically synced to PostgreSQL when available, ensuring persistence across deployments and restarts.
 
@@ -24,13 +24,13 @@ LaunchKit uses the **Factory Pattern** with async initialization for database re
 Central repository for all scheduling, voting, and metrics data.
 
 ```typescript
-import { PostgresScheduleRepository } from './launchkit/db/postgresScheduleRepository';
+import { PostgresScheduleRepository } from "./launchkit/db/postgresScheduleRepository";
 
 // Create with factory pattern (NOT new)
 const repo = await PostgresScheduleRepository.create(process.env.DATABASE_URL);
 
 // Use the repository
-const posts = await repo.getTGPosts('pending');
+const posts = await repo.getTGPosts("pending");
 await repo.insertTGPost(post);
 ```
 
@@ -39,7 +39,7 @@ await repo.insertTGPost(post);
 Repository for trading, positions, and P&L tracking.
 
 ```typescript
-import { PostgresPnLRepository } from './launchkit/db/postgresPnLRepository';
+import { PostgresPnLRepository } from "./launchkit/db/postgresPnLRepository";
 
 const pnlRepo = await PostgresPnLRepository.create(process.env.DATABASE_URL);
 
@@ -53,34 +53,34 @@ await pnlRepo.insertTrade(trade);
 
 ### Scheduling Tables (`sched_*`)
 
-| Table | Purpose | Service |
-|-------|---------|---------|
-| `sched_tg_posts` | Telegram scheduled posts | `telegramScheduler.ts` |
-| `sched_x_tweets` | X/Twitter scheduled tweets | `xScheduler.ts` |
-| `sched_x_marketing` | X marketing campaign schedules | `xScheduler.ts` |
-| `sched_x_usage` | X API rate limit tracking | `xRateLimiter.ts` |
-| `sched_trend_pool` | Detected trends pool | `trendPool.ts` |
-| `sched_community_prefs` | Community voting preferences | `communityVoting.ts` |
-| `sched_community_feedback` | Idea feedback from community | `communityVoting.ts` |
-| `sched_pending_votes` | Active voting sessions | `communityVoting.ts` |
-| `sched_system_metrics` | System metrics, banned users, failed attempts | `systemReporter.ts` |
+| Table                      | Purpose                                       | Service                |
+| -------------------------- | --------------------------------------------- | ---------------------- |
+| `sched_tg_posts`           | Telegram scheduled posts                      | `telegramScheduler.ts` |
+| `sched_x_tweets`           | X/Twitter scheduled tweets                    | `xScheduler.ts`        |
+| `sched_x_marketing`        | X marketing campaign schedules                | `xScheduler.ts`        |
+| `sched_x_usage`            | X API rate limit tracking                     | `xRateLimiter.ts`      |
+| `sched_trend_pool`         | Detected trends pool                          | `trendPool.ts`         |
+| `sched_community_prefs`    | Community voting preferences                  | `communityVoting.ts`   |
+| `sched_community_feedback` | Idea feedback from community                  | `communityVoting.ts`   |
+| `sched_pending_votes`      | Active voting sessions                        | `communityVoting.ts`   |
+| `sched_system_metrics`     | System metrics, banned users, failed attempts | `systemReporter.ts`    |
 
 ### PnL Tables (`pnl_*`)
 
-| Table | Purpose | Service |
-|-------|---------|---------|
-| `pnl_trades` | Trade history (buys/sells) | `pnlTracker.ts` |
-| `pnl_positions` | Current token positions | `pnlTracker.ts` |
-| `pnl_sol_flows` | SOL in/out tracking | `pnlTracker.ts` |
-| `pnl_summary` | Aggregate P&L summary | `pnlTracker.ts` |
+| Table           | Purpose                    | Service         |
+| --------------- | -------------------------- | --------------- |
+| `pnl_trades`    | Trade history (buys/sells) | `pnlTracker.ts` |
+| `pnl_positions` | Current token positions    | `pnlTracker.ts` |
+| `pnl_sol_flows` | SOL in/out tracking        | `pnlTracker.ts` |
+| `pnl_summary`   | Aggregate P&L summary      | `pnlTracker.ts` |
 
 ### Core Tables
 
-| Table | Purpose | Service |
-|-------|---------|---------|
-| `launch_packs` | Token launch configurations | `launchPackRepository.ts` |
-| `central_messages` | Message bus persistence | ElizaOS core |
-| `central_channels` | Channel metadata | ElizaOS core |
+| Table              | Purpose                     | Service                   |
+| ------------------ | --------------------------- | ------------------------- |
+| `launch_packs`     | Token launch configurations | `launchPackRepository.ts` |
+| `central_messages` | Message bus persistence     | ElizaOS core              |
+| `central_channels` | Channel metadata            | ElizaOS core              |
 
 ---
 
@@ -90,12 +90,12 @@ Services with PostgreSQL support require async initialization. This happens auto
 
 ```typescript
 // In init.ts
-import { initTelegramScheduler } from './services/telegramScheduler';
-import { initXScheduler } from './services/xScheduler';
-import { initXRateLimiter } from './services/xRateLimiter';
-import { initPoolAsync } from './services/trendPool';
-import { initCommunityVoting } from './services/communityVoting';
-import { startSystemReporter } from './services/systemReporter';
+import { initTelegramScheduler } from "./services/telegramScheduler";
+import { initXScheduler } from "./services/xScheduler";
+import { initXRateLimiter } from "./services/xRateLimiter";
+import { initPoolAsync } from "./services/trendPool";
+import { initCommunityVoting } from "./services/communityVoting";
+import { startSystemReporter } from "./services/systemReporter";
 
 // All called with await during LaunchKit startup
 await initTelegramScheduler();
@@ -236,11 +236,11 @@ CREATE TABLE pnl_positions (
 
 ## Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | _(none)_ |
-| `PGLITE_PATH` | Path for embedded PGlite | `./data/pglite` |
-| `SQL_EMBEDDINGS_ENABLE` | Enable vector embeddings | `true` |
+| Variable                | Description                  | Default         |
+| ----------------------- | ---------------------------- | --------------- |
+| `DATABASE_URL`          | PostgreSQL connection string | _(none)_        |
+| `PGLITE_PATH`           | Path for embedded PGlite     | `./data/pglite` |
+| `SQL_EMBEDDINGS_ENABLE` | Enable vector embeddings     | `true`          |
 
 ---
 

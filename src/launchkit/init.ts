@@ -17,6 +17,7 @@ import { initializeFromStore as initGroupTracker } from './services/groupTracker
 import { processScheduledTweets, getPendingTweets, recoverMarketingFromStore, syncMarketingToStore, startXScheduler, stopXScheduler } from './services/xScheduler.ts';
 import { startAutonomousMode, stopAutonomousMode } from './services/autonomousMode.ts';
 import { startTGScheduler, stopTGScheduler } from './services/telegramScheduler.ts';
+import { startSystemReporter, stopSystemReporter } from './services/systemReporter.ts';
 
 /**
  * Log Railway-specific environment info at startup
@@ -185,6 +186,10 @@ export async function initLaunchKit(
     }
   }, 5000); // Wait 5 seconds for Telegram service to initialize
 
+  // Start system reporter FIRST (initializes PostgreSQL for metric tracking)
+  // Must be before TG/X schedulers so recordTGPostSent()/recordTweetSent() can use PostgreSQL
+  await startSystemReporter();
+
   // Start TG marketing scheduler
   if (env.TG_ENABLE === 'true') {
     await startTGScheduler(store);
@@ -218,6 +223,8 @@ export async function initLaunchKit(
       stopTGScheduler();
       // Clean up X scheduler
       stopXScheduler();
+      // Clean up system reporter
+      stopSystemReporter();
       // Ban commands don't need explicit cleanup - they're registered on ElizaOS's bot
       await serverHandle.close();
     } catch (err) {

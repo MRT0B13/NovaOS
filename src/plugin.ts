@@ -79,13 +79,13 @@ import {
 
 import { systemReportAction } from './launchkit/eliza/systemReportAction.ts';
 
-import { startTGScheduler, stopTGScheduler } from './launchkit/services/telegramScheduler.ts';
 import { startHealthMonitor } from './launchkit/services/groupHealthMonitor.ts';
 import { validateStartupInvariants } from './launchkit/services/operatorGuardrails.ts';
 import { startAutoSellScheduler, stopAutoSellScheduler } from './launchkit/services/autoSellPolicy.ts';
 import { startTreasuryScheduler, stopTreasuryScheduler } from './launchkit/services/treasuryScheduler.ts';
 import { startTelegramHealthMonitor, stopTelegramHealthMonitor } from './launchkit/services/telegramHealthMonitor.ts';
-import { startSystemReporter, stopSystemReporter } from './launchkit/services/systemReporter.ts';
+import { stopSystemReporter } from './launchkit/services/systemReporter.ts';
+import { stopTGScheduler } from './launchkit/services/telegramScheduler.ts';
 import { redactEnvForLogging } from './launchkit/services/redact.ts';
 import { getEnv } from './launchkit/env.ts';
 import { initNovaChannel, announceSystem } from './launchkit/services/novaChannel.ts';
@@ -142,12 +142,11 @@ class LaunchKitBootstrapService extends Service {
     service.telegramCommunity = telegramCommunity;
     service.xPublisher = xPublisher;
     
-    // Start TG marketing scheduler
+    // NOTE: startSystemReporter() and startTGScheduler() are now called in init.ts
+    // to ensure proper initialization order (systemReporter must be first for PostgreSQL)
+    
+    // Start group health monitor (if store available)
     if (store) {
-      await startTGScheduler(store);
-      logger.info('[TGScheduler] Started Telegram marketing scheduler');
-      
-      // Start group health monitor
       startHealthMonitor(store);
       logger.info('[HealthMonitor] Started group health monitoring');
     }
@@ -167,9 +166,6 @@ class LaunchKitBootstrapService extends Service {
     
     // Start Telegram health monitor (alerts if bot stops receiving messages)
     startTelegramHealthMonitor(runtime);
-    
-    // Start system reporter (periodic status updates to admin)
-    await startSystemReporter();
     
     return service;
   }

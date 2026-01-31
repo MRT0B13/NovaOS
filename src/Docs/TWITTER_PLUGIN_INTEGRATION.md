@@ -180,17 +180,18 @@ If the Twitter plugin is not loaded or credentials are missing:
 
 All X/Twitter scheduling data persists to PostgreSQL when `DATABASE_URL` is set:
 
-| Data | PostgreSQL Table | Description |
-|------|------------------|-------------|
-| Scheduled tweets | `sched_x_tweets` | All pending/posted/failed tweets |
-| Marketing schedules | `sched_x_marketing` | Per-token campaign settings |
-| Rate limiting | `sched_x_usage` | API usage tracking per month |
+| Data                | PostgreSQL Table    | Description                      |
+| ------------------- | ------------------- | -------------------------------- |
+| Scheduled tweets    | `sched_x_tweets`    | All pending/posted/failed tweets |
+| Marketing schedules | `sched_x_marketing` | Per-token campaign settings      |
+| Rate limiting       | `sched_x_usage`     | API usage tracking per month     |
 
 **Survives restarts:** Yes - scheduled tweets are restored after Railway redeploys.
 
 **Local Development:** Falls back to JSON files in `./data/`.
 
 Services require async initialization:
+
 - `initXScheduler()` - Tweet scheduling
 - `initXRateLimiter()` - Rate limit tracking
 

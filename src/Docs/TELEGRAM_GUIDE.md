@@ -510,10 +510,10 @@ The bot can automatically shill all launched tokens with linked Telegram groups.
 
 All scheduled posts persist to PostgreSQL when `DATABASE_URL` is set:
 
-| Data | PostgreSQL Table | Description |
-|------|------------------|-------------|
-| Scheduled posts | `sched_tg_posts` | All pending/posted/failed TG posts |
-| System metrics | `sched_system_metrics` | Post counts, banned users |
+| Data            | PostgreSQL Table       | Description                        |
+| --------------- | ---------------------- | ---------------------------------- |
+| Scheduled posts | `sched_tg_posts`       | All pending/posted/failed TG posts |
+| System metrics  | `sched_system_metrics` | Post counts, banned users          |
 
 **Survives restarts:** Yes - scheduled posts are restored after Railway redeploys.
 

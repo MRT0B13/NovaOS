@@ -172,6 +172,7 @@ async function loadMetricsFromPostgres(): Promise<PersistedMetrics | null> {
     
     // Check if we need to reset daily counters
     if (data.lastDailyReportDate !== today) {
+      logger.info(`[SystemReporter] New day detected (was: ${data.lastDailyReportDate}, now: ${today}), resetting daily counters`);
       await pgRepo.resetDailyMetrics();
       data.tweetsSentToday = 0;
       data.tgPostsSentToday = 0;
@@ -182,7 +183,7 @@ async function loadMetricsFromPostgres(): Promise<PersistedMetrics | null> {
     }
     
     data.sessionStartTime = Date.now();
-    logger.info(`[SystemReporter] Loaded persisted metrics from PostgreSQL`);
+    logger.info(`[SystemReporter] Loaded persisted metrics from PostgreSQL (tweets: ${data.tweetsSentToday}, TG posts: ${data.tgPostsSentToday}, trends: ${data.trendsDetectedToday})`);
     return data as PersistedMetrics;
   } catch (err) {
     logger.warn('[SystemReporter] Failed to load metrics from PostgreSQL:', err);
@@ -243,7 +244,9 @@ export function recordTweetSent(): void {
   metrics.tweetsSentToday++;
   saveMetrics();
   if (usePostgres && pgRepo) {
-    pgRepo.incrementMetric('tweetsSentToday').catch(() => {});
+    pgRepo.incrementMetric('tweetsSentToday').catch(err => {
+      logger.warn('[SystemReporter] Failed to increment tweetsSentToday in PostgreSQL:', err);
+    });
   }
 }
 
@@ -254,7 +257,9 @@ export function recordTGPostSent(): void {
   metrics.tgPostsSentToday++;
   saveMetrics();
   if (usePostgres && pgRepo) {
-    pgRepo.incrementMetric('tgPostsSentToday').catch(() => {});
+    pgRepo.incrementMetric('tgPostsSentToday').catch(err => {
+      logger.warn('[SystemReporter] Failed to increment tgPostsSentToday in PostgreSQL:', err);
+    });
   }
 }
 
@@ -265,7 +270,9 @@ export function recordTrendDetected(): void {
   metrics.trendsDetectedToday++;
   saveMetrics();
   if (usePostgres && pgRepo) {
-    pgRepo.incrementMetric('trendsDetectedToday').catch(() => {});
+    pgRepo.incrementMetric('trendsDetectedToday').catch(err => {
+      logger.warn('[SystemReporter] Failed to increment trendsDetectedToday in PostgreSQL:', err);
+    });
   }
 }
 
@@ -276,7 +283,9 @@ export function recordError(): void {
   metrics.errors24h++;
   saveMetrics();
   if (usePostgres && pgRepo) {
-    pgRepo.incrementMetric('errors24h').catch(() => {});
+    pgRepo.incrementMetric('errors24h').catch(err => {
+      logger.warn('[SystemReporter] Failed to increment errors24h in PostgreSQL:', err);
+    });
   }
 }
 
@@ -287,7 +296,9 @@ export function recordWarning(): void {
   metrics.warnings24h++;
   saveMetrics();
   if (usePostgres && pgRepo) {
-    pgRepo.incrementMetric('warnings24h').catch(() => {});
+    pgRepo.incrementMetric('warnings24h').catch(err => {
+      logger.warn('[SystemReporter] Failed to increment warnings24h in PostgreSQL:', err);
+    });
   }
 }
 

@@ -75,11 +75,13 @@ SQL_EMBEDDINGS_ENABLE=false
 LaunchKit automatically creates these tables on startup:
 
 **Core Tables:**
+
 - `launch_packs` - Token launch configurations
 - `central_messages` - Message bus persistence
 - `central_channels` - Channel metadata
 
 **Scheduling Tables (`sched_*`):**
+
 - `sched_tg_posts` - Telegram scheduled posts
 - `sched_x_tweets` - X/Twitter scheduled tweets
 - `sched_x_marketing` - X marketing campaign schedules
@@ -91,6 +93,7 @@ LaunchKit automatically creates these tables on startup:
 - `sched_system_metrics` - System metrics, banned users, failed attempts
 
 **PnL Tables (`pnl_*`):**
+
 - `pnl_trades` - Trade history (buys/sells)
 - `pnl_positions` - Current token positions
 - `pnl_sol_flows` - SOL in/out tracking

@@ -133,12 +133,12 @@ TREASURY_SWEEP_THRESHOLD_SOL=1.0
 
 All trading and P&L data persists to PostgreSQL when `DATABASE_URL` is set:
 
-| Data | PostgreSQL Table | Description |
-|------|------------------|-------------|
-| Trade history | `pnl_trades` | All buys/sells with timestamps |
-| Positions | `pnl_positions` | Current holdings per token |
-| SOL flows | `pnl_sol_flows` | SOL in/out tracking |
-| P&L summary | `pnl_summary` | Aggregate realized/unrealized P&L |
+| Data          | PostgreSQL Table | Description                       |
+| ------------- | ---------------- | --------------------------------- |
+| Trade history | `pnl_trades`     | All buys/sells with timestamps    |
+| Positions     | `pnl_positions`  | Current holdings per token        |
+| SOL flows     | `pnl_sol_flows`  | SOL in/out tracking               |
+| P&L summary   | `pnl_summary`    | Aggregate realized/unrealized P&L |
 
 The `pnlTracker.ts` service handles all position tracking and syncs to PostgreSQL automatically.
 
