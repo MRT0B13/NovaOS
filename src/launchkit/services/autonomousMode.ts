@@ -14,6 +14,7 @@ import {
   announceVoteResult, 
   shouldSkipVoting,
   getCommunityPreferences,
+  generateIdeaReasoning,
   type PendingVote 
 } from './communityVoting.ts';
 
@@ -303,21 +304,15 @@ async function executeAutonomousLaunch(): Promise<void> {
   // DRY RUN: Stop here and just log
   if (state.dryRun) {
     logger.info('[Autonomous] 🧪 DRY RUN - Would launch this token (set AUTONOMOUS_DRY_RUN=false to enable real launches)');
-    await announceSystem('info', 
-      `🧪 *Dry Run* - Autonomous idea generated:\n\n` +
-      `*$${idea.ticker}* - ${idea.name}\n` +
-      `${idea.description}\n\n` +
-      `_Set AUTONOMOUS_DRY_RUN=false to enable real launches_`
-    );
     state.pendingIdea = idea;
     
-    // Still post for voting in dry run mode (for testing)
-    if (env.COMMUNITY_VOTING_ENABLED === 'true') {
-      const vote = await postIdeaForVoting(idea);
-      if (vote) {
-        state.pendingVoteId = vote.id;
-        logger.info(`[Autonomous] Posted idea for community voting (dry run)`);
-      }
+    // Post for community voting with reactions (scheduled launch type)
+    const vote = await postIdeaForVoting(idea, undefined, { launchType: 'scheduled' });
+    if (vote) {
+      state.pendingVoteId = vote.id;
+      logger.info(`[Autonomous] Posted scheduled idea for community voting`);
+    } else {
+      logger.warn(`[Autonomous] Failed to post for voting - check COMMUNITY_VOTING_ENABLED and channel config`);
     }
     return;
   }
@@ -466,13 +461,16 @@ async function executeAutonomousLaunchWithIdea(idea: TokenIdea): Promise<void> {
   // DRY RUN: Stop here and just log
   if (state.dryRun) {
     logger.info('[Autonomous] 🧪 DRY RUN - Would launch this token (set AUTONOMOUS_DRY_RUN=false to enable real launches)');
-    await announceSystem('info', 
-      `🧪 *Dry Run* - Autonomous idea generated:\n\n` +
-      `*$${idea.ticker}* - ${idea.name}\n` +
-      `${idea.description}\n\n` +
-      `_Set AUTONOMOUS_DRY_RUN=false to enable real launches_`
-    );
     state.pendingIdea = idea;
+    
+    // Post for community voting with reactions (scheduled launch type)
+    const vote = await postIdeaForVoting(idea, undefined, { launchType: 'scheduled' });
+    if (vote) {
+      state.pendingVoteId = vote.id;
+      logger.info(`[Autonomous] Posted scheduled idea for community voting`);
+    } else {
+      logger.warn(`[Autonomous] Failed to post for voting - check COMMUNITY_VOTING_ENABLED and channel config`);
+    }
     return;
   }
   
@@ -824,14 +822,12 @@ async function executeReactiveLaunch(trend: TrendSignal): Promise<void> {
   if (state.dryRun) {
     logger.info('[Autonomous] 🧪 DRY RUN: Skipping actual reactive launch');
     
-    // Still post for voting in dry run mode
-    if (env.COMMUNITY_VOTING_ENABLED === 'true') {
-      const vote = await postIdeaForVoting(idea, trend.topic);
-      if (vote) {
-        state.pendingVoteId = vote.id;
-        state.pendingIdea = idea;
-        logger.info(`[Autonomous] Posted reactive idea for community voting (dry run)`);
-      }
+    // Post for voting with reactive type
+    const vote = await postIdeaForVoting(idea, trend.topic, { launchType: 'reactive' });
+    if (vote) {
+      state.pendingVoteId = vote.id;
+      state.pendingIdea = idea;
+      logger.info(`[Autonomous] Posted reactive idea for community voting`);
     }
     return;
   }
@@ -845,7 +841,7 @@ async function executeReactiveLaunch(trend: TrendSignal): Promise<void> {
     } else {
       // Post for community voting (with trend context)
       logger.info('[Autonomous] 🗳️ Posting reactive idea for community voting...');
-      const vote = await postIdeaForVoting(idea, trend.topic);
+      const vote = await postIdeaForVoting(idea, trend.topic, { launchType: 'reactive' });
       
       if (vote) {
         state.pendingIdea = idea;

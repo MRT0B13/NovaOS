@@ -5,6 +5,7 @@ import { getEnv } from '../env.ts';
 import { nowIso } from './time.ts';
 import { appendAudit } from './audit.ts';
 import { canWrite, recordWrite, getQuota, getPostingAdvice, getUsageSummary } from './xRateLimiter.ts';
+import { recordTweetSent } from './systemReporter.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
 
 interface PublishOptions {
@@ -310,6 +311,7 @@ export class XPublisherService {
 
     const result = await twitterClient.sendTweet(text);
     await recordWrite(text);
+    recordTweetSent();
     
     const quota = getQuota();
     logger.info(`[XPublisher] ✅ Tweet posted. ${quota.writes.remaining} remaining this month.`);
@@ -379,6 +381,7 @@ export class XPublisherService {
         logger.info(`[XPublisher] Sending main tweet (${quota.writes.remaining} remaining)...`);
         const result = await twitterClient.sendTweet(mainText);
         await recordWrite(mainText);
+        recordTweetSent();
         tweetIds.push(result.id);
         previousId = result.id;
       }
@@ -393,6 +396,7 @@ export class XPublisherService {
         const post = resolvePlaceholders(rawPost, mint, telegramUrl, websiteUrl);
         const result = await twitterClient.sendTweet(post, previousId);
         await recordWrite(post);
+        recordTweetSent();
         tweetIds.push(result.id);
         previousId = result.id;
       }

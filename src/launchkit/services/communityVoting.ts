@@ -304,7 +304,8 @@ function generateFallbackReasoning(idea: TokenIdea, trendContext?: string): stri
  */
 export async function postIdeaForVoting(
   idea: TokenIdea,
-  trendContext?: string
+  trendContext?: string,
+  options?: { launchType?: 'scheduled' | 'reactive' }
 ): Promise<PendingVote | null> {
   const env = getEnv();
   const botToken = env.TG_BOT_TOKEN;
@@ -328,7 +329,12 @@ export async function postIdeaForVoting(
   const votingMinutes = parseInt(env.COMMUNITY_VOTING_WINDOW_MINUTES || '30', 10);
   const votingEndsAt = new Date(Date.now() + votingMinutes * 60 * 1000);
   
-  let message = `💡 <b>New Idea: $${idea.ticker}</b>\n\n`;
+  // Use different title based on launch type
+  const isScheduled = options?.launchType === 'scheduled' || (!trendContext && !options?.launchType);
+  let message = isScheduled
+    ? `💡 <b>Nova's Daily Creation: $${idea.ticker}</b>\n\n`
+    : `🔥 <b>Reactive Idea: $${idea.ticker}</b>\n\n`;
+  
   message += `<b>${idea.name}</b>\n`;
   message += `${idea.description}\n\n`;
   
@@ -337,10 +343,10 @@ export async function postIdeaForVoting(
   }
   
   if (trendContext) {
-    message += `🔥 <b>Reactive Launch</b> - Inspired by: ${trendContext}\n\n`;
+    message += `🌊 <b>Riding the wave:</b> ${trendContext}\n\n`;
   }
   
-  message += `<b>Why I think this works:</b>\n${reasoning}\n\n`;
+  message += `<b>Why I think this slaps:</b>\n${reasoning}\n\n`;
   message += `━━━━━━━━━━━━━━━\n`;
   message += `<b>Should we launch this?</b>\n\n`;
   message += `👍 = Yes, send it!\n`;
