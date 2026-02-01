@@ -488,55 +488,126 @@ export class PumpLauncherService {
       form.append('file', new File([blob], filename, { type: mime }));
     }
 
-    // Retry logic for IPFS upload (Cloudflare can be flaky)
-    const maxRetries = 3;
-    let lastError: Error | null = null;
-    
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const res = await fetch('https://pump.fun/api/ipfs', {
-          method: 'POST',
-          body: form,
-          headers: {
-            'Accept': 'application/json',
-            'Origin': 'https://pump.fun',
-            'Referer': 'https://pump.fun/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          },
-        });
-        
-        if (!res.ok) {
-          const errorBody = await res.text().catch(() => '');
-          logger.warn({ status: res.status, errorBody, attempt }, 'IPFS upload attempt failed');
-          lastError = new Error(`IPFS upload failed (${res.status})`);
-          
-          // Don't retry on 4xx errors (except 429 rate limit)
-          if (res.status >= 400 && res.status < 500 && res.status !== 429) {
-            throw lastError;
-          }
-          
-          // Wait before retry with exponential backoff
-          if (attempt < maxRetries) {
-            await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
-            continue;
-          }
-          throw lastError;
-        }
-        
+    // Try pump.fun first, fallback to Bonk's IPFS service if blocked
+    // First try pump.fun's IPFS endpoint
+    try {
+      const res = await fetch('https://pump.fun/api/ipfs', {
+        method: 'POST',
+        body: form,
+        headers: {
+          'Accept': 'application/json',
+          'Origin': 'https://pump.fun',
+          'Referer': 'https://pump.fun/',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
+      });
+      
+      if (res.ok) {
         const body = await safeJson(res);
         const uri = body?.metadataUri || body?.uri;
-        if (!uri) throw new Error('No metadataUri returned');
-        return uri as string;
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-        if (attempt < maxRetries) {
-          logger.warn({ error: lastError.message, attempt }, 'IPFS upload failed, retrying...');
-          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+        if (uri) {
+          logger.info({ uri }, 'IPFS upload via pump.fun succeeded');
+          return uri as string;
         }
       }
+      
+      const status = res.status;
+      logger.warn({ status }, 'pump.fun IPFS failed, trying Bonk fallback...');
+      
+      // If blocked by Cloudflare (403) or server error, try Bonk's IPFS service
+      if (status === 403 || status >= 500) {
+        return await this.uploadToBonkIPFS(pack);
+      }
+      
+      throw new Error(`IPFS upload failed (${status})`);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      
+      // If pump.fun failed, use Bonk's IPFS as fallback (free, no API key needed)
+      if (errMsg.includes('403') || errMsg.includes('blocked') || errMsg.includes('Cloudflare')) {
+        logger.warn({ error: errMsg }, 'pump.fun IPFS blocked, falling back to Bonk IPFS');
+        return await this.uploadToBonkIPFS(pack);
+      }
+      
+      throw err;
+    }
+  }
+
+  /**
+   * Upload metadata to Bonk's IPFS service (free fallback when pump.fun is blocked)
+   * Uses letsbonk's Cloudflare Worker - no API key needed
+   */
+  private async uploadToBonkIPFS(pack: LaunchPack): Promise<string> {
+    if (!pack.assets?.logo_url) {
+      throw errorWithCode('LOGO_REQUIRED', 'Token logo is required');
+    }
+
+    // First, fetch and upload the image
+    const logoUrl = pack.assets.logo_url;
+    const logoResponse = await fetchWithTimeout(logoUrl, { redirect: 'follow' });
+    if (!logoResponse.ok) {
+      throw errorWithCode('LOGO_FETCH_FAILED', `Failed to fetch logo (${logoResponse.status})`);
+    }
+    const logoBytes = await readStreamWithLimit(logoResponse, MAX_LOGO_BYTES);
+    const mime = logoResponse.headers.get('content-type') || 'image/png';
+    
+    // Upload image to Bonk's IPFS
+    const imageForm = new FormData();
+    const blob = new Blob([logoBytes], { type: mime });
+    imageForm.append('image', new File([blob], 'logo.png', { type: mime }));
+    
+    const imageRes = await fetch('https://nft-storage.letsbonk22.workers.dev/upload/img', {
+      method: 'POST',
+      body: imageForm,
+    });
+    
+    if (!imageRes.ok) {
+      const errText = await imageRes.text().catch(() => '');
+      throw new Error(`Bonk IPFS image upload failed (${imageRes.status}): ${errText}`);
     }
     
-    throw lastError || new Error('IPFS upload failed after retries');
+    const imageUri = await imageRes.text();
+    if (!imageUri || !imageUri.includes('ipfs')) {
+      throw new Error('Bonk IPFS returned invalid image URI');
+    }
+    
+    logger.info({ imageUri }, 'Image uploaded to Bonk IPFS');
+    
+    // Now upload metadata JSON
+    // Note: Bonk's service only allows specific createdOn values (bonk.fun)
+    // This is just metadata and doesn't affect pump.fun token functionality
+    const metadata = {
+      name: pack.brand.name,
+      symbol: pack.brand.ticker,
+      description: pack.brand.description || pack.brand.tagline || '',
+      image: imageUri,
+      createdOn: 'https://bonk.fun', // Required by Bonk's IPFS service
+      ...(pack.links?.x && { twitter: pack.links.x }),
+      ...(pack.links?.telegram && { telegram: pack.links.telegram }),
+      ...(pack.links?.website && { website: pack.links.website }),
+    };
+    
+    const metadataRes = await fetch('https://nft-storage.letsbonk22.workers.dev/upload/meta', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(metadata),
+    });
+    
+    if (!metadataRes.ok) {
+      const errText = await metadataRes.text().catch(() => '');
+      throw new Error(`Bonk IPFS metadata upload failed (${metadataRes.status}): ${errText}`);
+    }
+    
+    const metadataUri = await metadataRes.text();
+    if (!metadataUri || !metadataUri.includes('ipfs')) {
+      throw new Error('Bonk IPFS returned invalid metadata URI');
+    }
+    
+    logger.info({ metadataUri }, 'Metadata uploaded to Bonk IPFS');
+    
+    return metadataUri;
   }
 
   async createTokenOnPumpPortal(

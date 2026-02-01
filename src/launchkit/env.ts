@@ -33,6 +33,7 @@ const EnvSchema = z.object({
   PUMP_PORTAL_WALLET_ADDRESS: z.string().optional(),
   AGENT_FUNDING_WALLET_SECRET: z.string().optional(),
   SOLANA_RPC_URL: z.string().default('https://api.mainnet-beta.solana.com'),
+  
   TG_ENABLE: z.enum(['true', 'false']).optional(),
   TG_BOT_TOKEN: z.string().optional(),
   TG_CHAT_ID: z.string().optional(),
