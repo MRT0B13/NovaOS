@@ -467,7 +467,7 @@ async function executeAutonomousLaunch(): Promise<void> {
     
   } catch (err: any) {
     logger.error(`[Autonomous] Launch failed: ${err.message}`);
-    
+    await announceSystem('error', `❌ Autonomous launch failed: ${err.message}`);
     
     // Notify admin of failure
     await notifyAutonomous({
@@ -605,7 +605,7 @@ async function executeAutonomousLaunchWithIdea(idea: TokenIdea): Promise<void> {
     
   } catch (err: any) {
     logger.error(`[Autonomous] Launch failed: ${err.message}`);
-    
+    await announceSystem('error', `❌ Autonomous launch failed: ${err.message}`);
     
     // Notify admin of failure
     await notifyAutonomous({
@@ -991,6 +991,9 @@ async function executeReactiveLaunch(trend: TrendSignal): Promise<void> {
     // Update state and persist - increment REACTIVE counter (not scheduled)
     state.reactiveLaunchesToday++;
     await persistState({ reactiveLaunchesToday: state.reactiveLaunchesToday });
+    if (usePostgres && pgRepo) {
+      pgRepo.incrementLaunchCount('reactive').catch(err => logger.warn('[AutonomousMode] Failed to increment reactive launch count:', err));
+    }
     
     logger.info(`[Autonomous] 🎉 REACTIVE LAUNCH SUCCESS: ${launched.launch?.mint}`);
     
