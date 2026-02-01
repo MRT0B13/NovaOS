@@ -488,15 +488,55 @@ export class PumpLauncherService {
       form.append('file', new File([blob], filename, { type: mime }));
     }
 
-    const res = await fetch('https://pump.fun/api/ipfs', {
-      method: 'POST',
-      body: form,
-    });
-    if (!res.ok) throw new Error(`IPFS upload failed (${res.status})`);
-    const body = await safeJson(res);
-    const uri = body?.metadataUri || body?.uri;
-    if (!uri) throw new Error('No metadataUri returned');
-    return uri as string;
+    // Retry logic for IPFS upload (Cloudflare can be flaky)
+    const maxRetries = 3;
+    let lastError: Error | null = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const res = await fetch('https://pump.fun/api/ipfs', {
+          method: 'POST',
+          body: form,
+          headers: {
+            'Accept': 'application/json',
+            'Origin': 'https://pump.fun',
+            'Referer': 'https://pump.fun/',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          },
+        });
+        
+        if (!res.ok) {
+          const errorBody = await res.text().catch(() => '');
+          logger.warn({ status: res.status, errorBody, attempt }, 'IPFS upload attempt failed');
+          lastError = new Error(`IPFS upload failed (${res.status})`);
+          
+          // Don't retry on 4xx errors (except 429 rate limit)
+          if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+            throw lastError;
+          }
+          
+          // Wait before retry with exponential backoff
+          if (attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+            continue;
+          }
+          throw lastError;
+        }
+        
+        const body = await safeJson(res);
+        const uri = body?.metadataUri || body?.uri;
+        if (!uri) throw new Error('No metadataUri returned');
+        return uri as string;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (attempt < maxRetries) {
+          logger.warn({ error: lastError.message, attempt }, 'IPFS upload failed, retrying...');
+          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+        }
+      }
+    }
+    
+    throw lastError || new Error('IPFS upload failed after retries');
   }
 
   async createTokenOnPumpPortal(
