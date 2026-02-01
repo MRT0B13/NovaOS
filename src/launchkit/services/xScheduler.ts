@@ -286,7 +286,17 @@ export async function schedulePostLaunchMarketing(
   
   const context = await buildTokenContext(launchPack);
   
-  // Base tweet types for token marketing
+  // === IMMEDIATE LAUNCH ANNOUNCEMENT ===
+  // Schedule a launch_announcement tweet for RIGHT NOW so it gets picked up on next scheduler tick
+  try {
+    const launchTweet = await scheduleTweet(launchPack, 'launch_announcement', new Date());
+    scheduled.push(launchTweet);
+    logger.info(`[XScheduler] 🚀 Scheduled IMMEDIATE launch announcement for $${launchPack.brand?.ticker}`);
+  } catch (err) {
+    logger.error(`[XScheduler] Failed to schedule launch announcement:`, err);
+  }
+  
+  // Base tweet types for follow-up marketing (starting tomorrow)
   const baseTweetTypes: TweetType[] = [
     'chart_callout',      // Day 1
     'community_shoutout', // Day 1
@@ -316,7 +326,7 @@ export async function schedulePostLaunchMarketing(
     scheduled.push(tweet);
   }
   
-  logger.info(`[XScheduler] Scheduled ${scheduled.length} marketing tweets for $${launchPack.brand?.ticker}`);
+  logger.info(`[XScheduler] Scheduled ${scheduled.length} marketing tweets for $${launchPack.brand?.ticker} (including immediate launch announcement)`);
   return scheduled;
 }
 

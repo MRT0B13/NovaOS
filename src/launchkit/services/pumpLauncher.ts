@@ -9,7 +9,7 @@ import type { SecretsStore } from './secrets.ts';
 import { getEnv } from '../env.ts';
 import { redactSensitive } from './redact.ts';
 import { getPumpWalletBalance, getFundingWalletBalance, depositToPumpWallet } from './fundingWallet.ts';
-import { schedulePostLaunchMarketing, createMarketingSchedule } from './xScheduler.ts';
+import { schedulePostLaunchMarketing, createMarketingSchedule, getDueTweets, processScheduledTweets } from './xScheduler.ts';
 import { announceLaunch } from './novaChannel.ts';
 import { recordBuy } from './pnlTracker.ts';
 
@@ -885,7 +885,7 @@ export class PumpLauncherService {
       const env = getEnv();
       if (env.X_ENABLE === 'true') {
         try {
-          const scheduled = await schedulePostLaunchMarketing(saved, 7); // 7 days of tweets
+          const scheduled = await schedulePostLaunchMarketing(saved, 7); // 7 days of tweets (includes immediate launch announcement)
           await createMarketingSchedule(saved, 3); // 3 tweets per week ongoing
           
           // Save marketing info to database for recovery
@@ -901,6 +901,35 @@ export class PumpLauncherService {
           });
           
           logger.info(`[Launch] ✅ Auto-scheduled ${scheduled.length} marketing tweets for $${saved.brand?.ticker}`);
+          
+          // === IMMEDIATELY PROCESS LAUNCH ANNOUNCEMENT ===
+          // Don't wait for the 5-minute scheduler - post the launch announcement now!
+          const dueTweets = getDueTweets();
+          if (dueTweets.length > 0) {
+            logger.info(`[Launch] 🐦 Processing ${dueTweets.length} immediate tweet(s)...`);
+            try {
+              // Import XPublisher to send tweet
+              const { XPublisherService } = await import('./xPublisher.ts');
+              const xPublisher = new XPublisherService(this.store);
+              
+              const results = await processScheduledTweets(async (text: string) => {
+                try {
+                  const result = await xPublisher.tweet(text);
+                  return result.id;
+                } catch (err: any) {
+                  logger.error(`[Launch] Tweet failed: ${err.message}`);
+                  return null;
+                }
+              });
+              
+              if (results.posted > 0) {
+                logger.info(`[Launch] 🐦 ✅ Posted launch announcement to X/Twitter!`);
+              }
+            } catch (tweetErr) {
+              // Non-fatal - scheduled tweets will still process later
+              logger.warn(`[Launch] Could not post immediate tweet: ${(tweetErr as Error).message}`);
+            }
+          }
         } catch (scheduleErr) {
           // Non-fatal - launch succeeded, just couldn't schedule tweets
           logger.warn(`[Launch] Could not auto-schedule marketing tweets: ${(scheduleErr as Error).message}`);
