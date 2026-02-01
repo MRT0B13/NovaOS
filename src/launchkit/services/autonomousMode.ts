@@ -254,12 +254,14 @@ async function checkAndProcessVotes(): Promise<void> {
       }
       
       // Execute the launch with the approved idea
-      await executeAutonomousLaunchWithIdea(vote.idea);
+      // Note: executeAutonomousLaunchWithIdea handles its own state updates on success
+      // Determine launch type from vote context (has trendContext = reactive)
+      const launchType = vote.trendContext ? 'reactive' : 'scheduled';
+      await executeAutonomousLaunchWithIdea(vote.idea, launchType);
       
-      // Update launch count and persist
-      state.launchesToday++;
+      // Just update the date and clear pending state (counter is updated inside executeAutonomousLaunchWithIdea)
       state.lastLaunchDate = new Date().toISOString().split('T')[0];
-      await persistState({ launchesToday: state.launchesToday, lastLaunchDate: state.lastLaunchDate, pendingVoteId: null, pendingIdea: null });
+      await persistState({ lastLaunchDate: state.lastLaunchDate, pendingVoteId: null, pendingIdea: null });
       
     } else if (vote.status === 'rejected') {
       logger.info(`[Autonomous] ❌ Vote rejected for $${vote.idea.ticker} - skipping launch`);
@@ -488,8 +490,9 @@ async function executeAutonomousLaunch(): Promise<void> {
 /**
  * Execute an autonomous launch with a pre-generated idea
  * Used when idea is generated before guardrail check
+ * @param launchType - 'scheduled' or 'reactive' to track the right counter
  */
-async function executeAutonomousLaunchWithIdea(idea: TokenIdea): Promise<void> {
+async function executeAutonomousLaunchWithIdea(idea: TokenIdea, launchType: 'scheduled' | 'reactive' = 'scheduled'): Promise<void> {
   if (!deps) {
     logger.error('[Autonomous] Dependencies not initialized');
     return;
@@ -576,31 +579,40 @@ async function executeAutonomousLaunchWithIdea(idea: TokenIdea): Promise<void> {
     logger.info(`[Autonomous] ✅ Created LaunchPack: ${pack.id}`);
     
     // Step 4: Launch the token
-    logger.info('[Autonomous] Step 4: Launching on pump.fun...');
+    logger.info('[Autonomous] Step 4: Launching on pump.fun... (type: ' + launchType + ')');
     const launched = await deps.pumpLauncher.launch(pack.id as string, { 
       skipTelegramCheck: true // No separate TG group for autonomous launches
     });
     
     logger.info(`[Autonomous] 🎉 Token launched! Mint: ${launched.launch?.mint}`);
     
-    // Update state and persist
-    state.launchesToday++;
+    // Update state and persist - use the correct counter based on launch type
     state.pendingIdea = null;
-    await persistState({ launchesToday: state.launchesToday, pendingIdea: null });
-    if (usePostgres && pgRepo) {
-      pgRepo.incrementLaunchCount('scheduled').catch(err => logger.warn('[AutonomousMode] Failed to increment launch count:', err));
+    if (launchType === 'reactive') {
+      state.reactiveLaunchesToday++;
+      await persistState({ reactiveLaunchesToday: state.reactiveLaunchesToday, pendingIdea: null });
+      if (usePostgres && pgRepo) {
+        pgRepo.incrementLaunchCount('reactive').catch(err => logger.warn('[AutonomousMode] Failed to increment reactive launch count:', err));
+      }
+    } else {
+      state.launchesToday++;
+      await persistState({ launchesToday: state.launchesToday, pendingIdea: null });
+      if (usePostgres && pgRepo) {
+        pgRepo.incrementLaunchCount('scheduled').catch(err => logger.warn('[AutonomousMode] Failed to increment launch count:', err));
+      }
     }
     
     // Announce to Nova channel
     await announceLaunch(launched);
     
     // Notify admin of successful launch
+    const launchCount = launchType === 'reactive' ? state.reactiveLaunchesToday : state.launchesToday;
     await notifyAutonomous({
       event: 'launch_success',
       ticker: idea.ticker,
       name: idea.name,
       mint: launched.launch?.mint,
-      details: `Launch #${state.launchesToday} today`,
+      details: `${launchType === 'reactive' ? '🔥 Reactive' : '📅 Scheduled'} Launch #${launchCount} today`,
     });
     
   } catch (err: any) {
