@@ -87,7 +87,8 @@ export const systemReportAction: Action = {
       report += `🚀 **Autonomous:** ${autoStatus}\n`;
       
       if (autonomousStatus?.enabled) {
-        report += `   • Launches today: ${autonomousStatus.launchesToday} scheduled, ${autonomousStatus.reactiveLaunchesToday} reactive\n`;
+        const totalLaunches = (autonomousStatus.launchesToday || 0) + (autonomousStatus.reactiveLaunchesToday || 0);
+        report += `   • Launches today: ${totalLaunches} total (${autonomousStatus.launchesToday || 0} scheduled, ${autonomousStatus.reactiveLaunchesToday || 0} reactive)\n`;
         if (autonomousStatus.nextScheduledTime) {
           const next = new Date(autonomousStatus.nextScheduledTime);
           report += `   • Next launch: ${next.toLocaleTimeString()} UTC\n`;

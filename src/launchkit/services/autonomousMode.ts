@@ -165,10 +165,11 @@ async function persistState(updates: {
 async function checkGuardrails(): Promise<{ canLaunch: boolean; reason?: string }> {
   const env = getEnv();
   
-  // Check daily limit
+  // Check daily limit (includes BOTH scheduled and reactive launches)
   await checkDayReset();
-  if (state.launchesToday >= env.AUTONOMOUS_MAX_PER_DAY) {
-    return { canLaunch: false, reason: `Daily limit reached (${state.launchesToday}/${env.AUTONOMOUS_MAX_PER_DAY})` };
+  const totalLaunchesToday = state.launchesToday + state.reactiveLaunchesToday;
+  if (totalLaunchesToday >= env.AUTONOMOUS_MAX_PER_DAY) {
+    return { canLaunch: false, reason: `Daily limit reached (${totalLaunchesToday}/${env.AUTONOMOUS_MAX_PER_DAY})` };
   }
   
   // Check treasury balance and auto-fund if needed
@@ -872,10 +873,7 @@ async function handleReactiveTrend(trend: TrendSignal): Promise<void> {
     return;
   }
   
-  // Execute launch with trend context - increment reactive counter and persist
-  state.reactiveLaunchesToday++;
-  await persistState({ reactiveLaunchesToday: state.reactiveLaunchesToday });
-  
+  // Execute launch with trend context (counter incremented only on success)
   await executeReactiveLaunch(trend);
 }
 
@@ -990,9 +988,9 @@ async function executeReactiveLaunch(trend: TrendSignal): Promise<void> {
       skipTelegramCheck: true, // No separate TG group for autonomous launches
     });
     
-    // Update state and persist
-    state.launchesToday++;
-    await persistState({ launchesToday: state.launchesToday });
+    // Update state and persist - increment REACTIVE counter (not scheduled)
+    state.reactiveLaunchesToday++;
+    await persistState({ reactiveLaunchesToday: state.reactiveLaunchesToday });
     
     logger.info(`[Autonomous] 🎉 REACTIVE LAUNCH SUCCESS: ${launched.launch?.mint}`);
     
