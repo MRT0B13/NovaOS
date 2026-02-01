@@ -80,6 +80,9 @@ CRITICAL ACTION RULES:
   * LIST_LAUNCHPACKS - sends list directly
   * GENERATE_LAUNCHPACK_COPY - generates marketing copy directly
   * RENAME_LAUNCHPACK - renames and confirms directly
+  * VIEW_SCHEDULED_TWEETS - displays scheduled tweets directly
+  * CANCEL_MARKETING - cancels marketing and confirms directly
+  * SCHEDULE_MARKETING - schedules tweets and confirms directly
   * SET_MASCOT - configures mascot and confirms directly
   * GROUP_HEALTH_CHECK - fetches and displays group health metrics
   * ANALYZE_SENTIMENT - analyzes community sentiment/vibe
