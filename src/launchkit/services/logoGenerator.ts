@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
  * Generates eye-catching meme token logos using AI (DALL-E 3)
  * Falls back to DiceBear if no OpenAI key or on failure
  * 
- * NOTE: Images are uploaded to IPFS for permanent storage
+ * NOTE: Images are uploaded to Catbox.moe (fast CDN) for permanent storage
  */
 
 export interface LogoGenerationResult {
@@ -42,6 +42,46 @@ function detectImageFormat(buffer: Buffer): { format: string; mime: string } | n
   }
   
   return null;
+}
+
+/**
+ * Upload image to Catbox.moe (fast CDN, no API key needed)
+ * Returns a permanent URL that's instantly accessible
+ */
+async function uploadToCatbox(imageBuffer: Buffer): Promise<string | null> {
+  try {
+    const detected = detectImageFormat(imageBuffer);
+    if (!detected) {
+      throw new Error('Could not detect image format');
+    }
+    
+    logger.info(`[LogoGenerator] Uploading to Catbox (${detected.format})...`);
+    
+    const ext = detected.format === 'jpeg' ? 'jpg' : detected.format;
+    const form = new FormData();
+    form.append('reqtype', 'fileupload');
+    form.append('fileToUpload', new File([imageBuffer], `logo.${ext}`, { type: detected.mime }));
+    
+    const response = await fetch('https://catbox.moe/user/api.php', {
+      method: 'POST',
+      body: form,
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Catbox upload failed (${response.status})`);
+    }
+    
+    const url = await response.text();
+    if (!url || !url.startsWith('https://files.catbox.moe/')) {
+      throw new Error('Invalid Catbox URL returned');
+    }
+    
+    logger.info(`[LogoGenerator] ✅ Uploaded to Catbox: ${url}`);
+    return url;
+  } catch (error: any) {
+    logger.warn(`[LogoGenerator] Catbox upload failed: ${error.message}`);
+    return null;
+  }
 }
 
 /**
@@ -169,7 +209,7 @@ export async function generateMemeLogo(
     
     logger.info('[LogoGenerator] ✅ Generated logo with DALL-E 3');
     
-    // Download the image and upload to IPFS for permanent storage
+    // Download the image and upload to fast CDN for permanent storage
     // DALL-E URLs expire after ~2 hours
     const dalleResponse = await fetch(imageUrl);
     if (!dalleResponse.ok) {
@@ -177,8 +217,19 @@ export async function generateMemeLogo(
     }
     const imageBuffer = Buffer.from(await dalleResponse.arrayBuffer());
     
-    const ipfsUrl = await uploadToIPFS(imageBuffer, tokenName);
+    // Try Catbox first (fast CDN, instant access)
+    const catboxUrl = await uploadToCatbox(imageBuffer);
+    if (catboxUrl) {
+      logger.info('[LogoGenerator] ✅ Logo saved to Catbox: ' + catboxUrl);
+      return {
+        url: catboxUrl,
+        source: 'dalle',
+        prompt: prompt,
+      };
+    }
     
+    // Fall back to IPFS if Catbox fails
+    const ipfsUrl = await uploadToIPFS(imageBuffer, tokenName);
     if (ipfsUrl) {
       logger.info('[LogoGenerator] ✅ Logo saved to IPFS: ' + ipfsUrl);
       return {
@@ -188,7 +239,7 @@ export async function generateMemeLogo(
       };
     }
     
-    // Fall back to returning DALL-E URL if IPFS upload fails (will expire)
+    // Fall back to returning DALL-E URL if all uploads fail (will expire)
     logger.warn('[LogoGenerator] Using temporary DALL-E URL (expires in ~2 hours)');
     return {
       url: imageUrl,

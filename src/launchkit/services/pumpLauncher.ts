@@ -34,8 +34,8 @@ interface CapsResult {
 }
 
 const MAX_LOGO_BYTES = 8 * 1024 * 1024; // 8MB ceiling for logo downloads
-const LOGO_FETCH_TOTAL_TIMEOUT_MS = 20000;
-const LOGO_FETCH_CONNECT_TIMEOUT_MS = 10000;
+const LOGO_FETCH_TOTAL_TIMEOUT_MS = 45000;   // 45s total (IPFS can be slow on first pin)
+const LOGO_FETCH_CONNECT_TIMEOUT_MS = 30000; // 30s connect (increased for IPFS)
 
 async function fetchWithTimeout(
   url: string,
