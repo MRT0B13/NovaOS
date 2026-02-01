@@ -85,7 +85,7 @@
     "cypress:e2e": "bun run test:install && cypress run --e2e",
     "cypress:open": "bun run test:install && cypress open",
     "build:watch": "bun run build.ts --watch",
-    "postinstall": "node scripts/patch-telegraf.cjs"
+    "postinstall": "node scripts/postinstall-patches.cjs"
   },
   "publishConfig": {
     "access": "public"

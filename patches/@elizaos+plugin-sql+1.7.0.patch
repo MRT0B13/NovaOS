@@ -1,0 +1,55 @@
+diff --git a/node_modules/@elizaos/plugin-sql/dist/node/index.node.js b/node_modules/@elizaos/plugin-sql/dist/node/index.node.js
+--- a/node_modules/@elizaos/plugin-sql/dist/node/index.node.js
++++ b/node_modules/@elizaos/plugin-sql/dist/node/index.node.js
+@@ -10323,10 +10323,29 @@ var BaseDrizzleAdapter = class {
+       throw error;
+     }
+   }
++  // Fix broken Unicode surrogate pairs that cause PostgreSQL JSON parsing errors
++  // This handles cases like \uD83D without its matching low surrogate
++  fixBrokenSurrogates(str) {
++    // First, handle actual malformed surrogate pairs in the string
++    // High surrogates: \uD800-\uDBFF, Low surrogates: \uDC00-\uDFFF
++    let result = '';
++    for (let i = 0; i < str.length; i++) {
++      const code = str.charCodeAt(i);
++      // Check if this is a high surrogate
++      if (code >= 0xD800 && code <= 0xDBFF) {
++        const nextCode = i + 1 < str.length ? str.charCodeAt(i + 1) : 0;
++        // Check if next char is a valid low surrogate
++        if (nextCode >= 0xDC00 && nextCode <= 0xDFFF) {
++          // Valid pair, keep both
++          result += str[i] + str[i + 1];
++          i++; // Skip the low surrogate
++        }
++        // else: orphan high surrogate, skip it
++      } else if (code >= 0xDC00 && code <= 0xDFFF) {
++        // Orphan low surrogate, skip it
++      } else {
++        result += str[i];
++      }
++    }
++    return result;
++  }
+   sanitizeJsonObject(value, seen = new WeakSet) {
+     if (value === null || value === undefined) {
+       return value;
+     }
+     if (typeof value === "string") {
+-      return value.replace(/\u0000/g, "").replace(/\\(?!["\\/bfnrtu])/g, "\\\\").replace(/\\u(?![0-9a-fA-F]{4})/g, "\\\\u");
++      // First fix broken surrogate pairs, then do the other sanitization
++      const fixed = this.fixBrokenSurrogates(value);
++      return fixed.replace(/\u0000/g, "").replace(/\\(?!["\\/bfnrtu])/g, "\\\\").replace(/\\u(?![0-9a-fA-F]{4})/g, "\\\\u");
+     }
+     if (typeof value === "object") {
+       if (seen.has(value)) {
+@@ -10338,7 +10357,8 @@ var BaseDrizzleAdapter = class {
+         return value.map((item) => this.sanitizeJsonObject(item, seen));
+       } else {
+         const result = {};
+         for (const [key, val] of Object.entries(value)) {
+-          const sanitizedKey = typeof key === "string" ? key.replace(/\u0000/g, "").replace(/\\u(?![0-9a-fA-F]{4})/g, "\\\\u") : key;
++          const sanitizedKey = typeof key === "string" ? this.fixBrokenSurrogates(key).replace(/\u0000/g, "").replace(/\\u(?![0-9a-fA-F]{4})/g, "\\\\u") : key;
+           result[sanitizedKey] = this.sanitizeJsonObject(val, seen);
+         }
+         return result;
