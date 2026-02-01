@@ -1,8 +1,5 @@
 import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
-import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 /**
@@ -11,8 +8,7 @@ import { randomUUID } from 'node:crypto';
  * Generates eye-catching meme token logos using AI (DALL-E 3)
  * Falls back to DiceBear if no OpenAI key or on failure
  * 
- * NOTE: DALL-E URLs expire after ~2 hours, so we auto-download
- * and store them locally for permanent access.
+ * NOTE: Images are uploaded to IPFS for permanent storage
  */
 
 export interface LogoGenerationResult {
@@ -23,49 +19,82 @@ export interface LogoGenerationResult {
 }
 
 /**
- * Download an image from URL and save it locally
- * Returns the local URL that can be served by the web server
+ * Detect image format from magic bytes
  */
-async function downloadAndStoreImage(
-  imageUrl: string,
-  tokenName: string,
-  agentId?: string
+function detectImageFormat(buffer: Buffer): { format: string; mime: string } | null {
+  if (buffer.length < 4) return null;
+  
+  // PNG: 89 50 4E 47
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+    return { format: 'png', mime: 'image/png' };
+  }
+  // JPEG: FF D8 FF
+  if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) {
+    return { format: 'jpeg', mime: 'image/jpeg' };
+  }
+  // GIF: 47 49 46
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) {
+    return { format: 'gif', mime: 'image/gif' };
+  }
+  // WebP: RIFF....WEBP
+  if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46) {
+    return { format: 'webp', mime: 'image/webp' };
+  }
+  
+  return null;
+}
+
+/**
+ * Upload an image to IPFS via Bonk's free service
+ * Returns a permanent IPFS URL
+ * NOTE: Only PNG, JPEG, and GIF are supported - WebP will be rejected
+ */
+async function uploadToIPFS(
+  imageBuffer: Buffer,
+  tokenName: string
 ): Promise<string | null> {
   try {
-    logger.info('[LogoGenerator] Downloading DALL-E image to local storage...');
+    logger.info('[LogoGenerator] Uploading image to IPFS...');
     
-    // Fetch the image
-    const response = await fetch(imageUrl);
+    // Detect actual image format from magic bytes
+    const detected = detectImageFormat(imageBuffer);
+    if (!detected) {
+      throw new Error('Could not detect image format');
+    }
+    
+    logger.info(`[LogoGenerator] Detected format: ${detected.format}`);
+    
+    // WebP is not supported by Bonk's IPFS - would need conversion
+    if (detected.format === 'webp') {
+      throw new Error('WebP format not supported - PNG, JPEG, or GIF required');
+    }
+    
+    // Create form data with correct MIME type
+    const form = new FormData();
+    const blob = new Blob([imageBuffer], { type: detected.mime });
+    const ext = detected.format === 'jpeg' ? 'jpg' : detected.format;
+    form.append('image', new File([blob], `logo.${ext}`, { type: detected.mime }));
+    
+    // Upload to Bonk's IPFS service (free, no API key needed)
+    const response = await fetch('https://nft-storage.letsbonk22.workers.dev/upload/img', {
+      method: 'POST',
+      body: form,
+    });
+    
     if (!response.ok) {
-      throw new Error(`Failed to fetch image: ${response.status}`);
+      const errText = await response.text().catch(() => '');
+      throw new Error(`IPFS upload failed (${response.status}): ${errText}`);
     }
     
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    
-    // Determine storage path
-    const baseDir = join(homedir(), '.eliza', 'data', 'uploads', 'logos');
-    if (!existsSync(baseDir)) {
-      mkdirSync(baseDir, { recursive: true });
+    const ipfsUrl = await response.text();
+    if (!ipfsUrl || !ipfsUrl.includes('ipfs')) {
+      throw new Error('Invalid IPFS URL returned');
     }
     
-    // Generate filename
-    const sanitizedName = tokenName.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase();
-    const filename = `${sanitizedName}-${randomUUID().slice(0, 8)}.png`;
-    const filePath = join(baseDir, filename);
-    
-    // Save the file
-    writeFileSync(filePath, buffer);
-    logger.info(`[LogoGenerator] ✅ Saved logo to ${filePath}`);
-    
-    // Return URL that can be served by the web server
-    const serverPort = process.env.SERVER_PORT || '3000';
-    const serverHost = process.env.SERVER_HOST || 'localhost';
-    const localUrl = `http://${serverHost}:${serverPort}/media/uploads/logos/${filename}`;
-    
-    return localUrl;
+    logger.info(`[LogoGenerator] ✅ Uploaded to IPFS: ${ipfsUrl}`);
+    return ipfsUrl;
   } catch (error: any) {
-    logger.warn(`[LogoGenerator] Failed to download image: ${error.message}`);
+    logger.warn(`[LogoGenerator] Failed to upload to IPFS: ${error.message}`);
     return null;
   }
 }
@@ -132,20 +161,26 @@ export async function generateMemeLogo(
     
     logger.info('[LogoGenerator] ✅ Generated logo with DALL-E 3');
     
-    // Download and store locally since DALL-E URLs expire after ~2 hours
-    const localUrl = await downloadAndStoreImage(imageUrl, tokenName);
+    // Download the image and upload to IPFS for permanent storage
+    // DALL-E URLs expire after ~2 hours
+    const dalleResponse = await fetch(imageUrl);
+    if (!dalleResponse.ok) {
+      throw new Error('Failed to download DALL-E image');
+    }
+    const imageBuffer = Buffer.from(await dalleResponse.arrayBuffer());
     
-    if (localUrl) {
-      logger.info('[LogoGenerator] ✅ Logo saved permanently: ' + localUrl);
+    const ipfsUrl = await uploadToIPFS(imageBuffer, tokenName);
+    
+    if (ipfsUrl) {
+      logger.info('[LogoGenerator] ✅ Logo saved to IPFS: ' + ipfsUrl);
       return {
-        url: localUrl,
+        url: ipfsUrl,
         source: 'dalle',
         prompt: prompt,
-        localPath: localUrl,
       };
     }
     
-    // Fall back to returning DALL-E URL if download fails (will expire)
+    // Fall back to returning DALL-E URL if IPFS upload fails (will expire)
     logger.warn('[LogoGenerator] Using temporary DALL-E URL (expires in ~2 hours)');
     return {
       url: imageUrl,

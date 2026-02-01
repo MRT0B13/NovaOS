@@ -549,12 +549,25 @@ export class PumpLauncherService {
       throw errorWithCode('LOGO_FETCH_FAILED', `Failed to fetch logo (${logoResponse.status})`);
     }
     const logoBytes = await readStreamWithLimit(logoResponse, MAX_LOGO_BYTES);
-    const mime = logoResponse.headers.get('content-type') || 'image/png';
     
-    // Upload image to Bonk's IPFS
+    // Detect actual image format from magic bytes
+    const detected = this.detectImageFormat(logoBytes);
+    if (!detected) {
+      throw errorWithCode('INVALID_IMAGE', 'Could not detect image format');
+    }
+    
+    logger.info({ format: detected.format }, 'Detected image format');
+    
+    // WebP is not supported - would need conversion
+    if (detected.format === 'webp') {
+      throw errorWithCode('INVALID_IMAGE', 'WebP format not supported - PNG, JPEG, or GIF required');
+    }
+    
+    // Upload image to Bonk's IPFS with correct MIME type
     const imageForm = new FormData();
-    const blob = new Blob([logoBytes], { type: mime });
-    imageForm.append('image', new File([blob], 'logo.png', { type: mime }));
+    const blob = new Blob([logoBytes], { type: detected.mime });
+    const ext = detected.format === 'jpeg' ? 'jpg' : detected.format;
+    imageForm.append('image', new File([blob], `logo.${ext}`, { type: detected.mime }));
     
     const imageRes = await fetch('https://nft-storage.letsbonk22.workers.dev/upload/img', {
       method: 'POST',
@@ -608,6 +621,32 @@ export class PumpLauncherService {
     logger.info({ metadataUri }, 'Metadata uploaded to Bonk IPFS');
     
     return metadataUri;
+  }
+
+  /**
+   * Detect image format from magic bytes
+   */
+  private detectImageFormat(buffer: Uint8Array): { format: string; mime: string } | null {
+    if (buffer.length < 4) return null;
+    
+    // PNG: 89 50 4E 47
+    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+      return { format: 'png', mime: 'image/png' };
+    }
+    // JPEG: FF D8 FF
+    if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) {
+      return { format: 'jpeg', mime: 'image/jpeg' };
+    }
+    // GIF: 47 49 46
+    if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) {
+      return { format: 'gif', mime: 'image/gif' };
+    }
+    // WebP: RIFF....WEBP
+    if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46) {
+      return { format: 'webp', mime: 'image/webp' };
+    }
+    
+    return null;
   }
 
   async createTokenOnPumpPortal(

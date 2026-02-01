@@ -274,7 +274,9 @@ export class GroupHealthMonitor {
   async updateAllTokenHealth(): Promise<void> {
     console.log('[GROUP_HEALTH] Starting health check for all tokens...');
     
-    const packs = await this.store.list();
+    const allPacks = await this.store.list();
+    // Only check health for launched tokens (not draft/failed)
+    const packs = allPacks.filter(p => p.launch?.status === 'launched');
     const healthSummaries: Array<{
       ticker: string;
       name?: string;

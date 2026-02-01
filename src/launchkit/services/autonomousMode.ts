@@ -467,7 +467,7 @@ async function executeAutonomousLaunch(): Promise<void> {
     
   } catch (err: any) {
     logger.error(`[Autonomous] Launch failed: ${err.message}`);
-    await announceSystem('error', `❌ Autonomous launch failed: ${err.message}`);
+    
     
     // Notify admin of failure
     await notifyAutonomous({
@@ -605,7 +605,7 @@ async function executeAutonomousLaunchWithIdea(idea: TokenIdea): Promise<void> {
     
   } catch (err: any) {
     logger.error(`[Autonomous] Launch failed: ${err.message}`);
-    await announceSystem('error', `❌ Autonomous launch failed: ${err.message}`);
+    
     
     // Notify admin of failure
     await notifyAutonomous({
