@@ -579,9 +579,15 @@ export class PumpLauncherService {
       throw new Error(`Bonk IPFS image upload failed (${imageRes.status}): ${errText}`);
     }
     
-    const imageUri = await imageRes.text();
+    let imageUri = await imageRes.text();
     if (!imageUri || !imageUri.includes('ipfs')) {
       throw new Error('Bonk IPFS returned invalid image URI');
+    }
+    
+    // Convert to faster dweb.link gateway (ipfs.io can be slow)
+    const cidMatch = imageUri.match(/ipfs\.io\/ipfs\/([a-zA-Z0-9]+)/);
+    if (cidMatch) {
+      imageUri = `https://${cidMatch[1]}.ipfs.dweb.link`;
     }
     
     logger.info({ imageUri }, 'Image uploaded to Bonk IPFS');

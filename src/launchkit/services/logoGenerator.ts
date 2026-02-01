@@ -91,8 +91,16 @@ async function uploadToIPFS(
       throw new Error('Invalid IPFS URL returned');
     }
     
-    logger.info(`[LogoGenerator] ✅ Uploaded to IPFS: ${ipfsUrl}`);
-    return ipfsUrl;
+    // Convert to faster dweb.link gateway (ipfs.io can be slow on first fetch)
+    // ipfs.io/ipfs/CID -> CID.ipfs.dweb.link
+    let fastUrl = ipfsUrl;
+    const cidMatch = ipfsUrl.match(/ipfs\.io\/ipfs\/([a-zA-Z0-9]+)/);
+    if (cidMatch) {
+      fastUrl = `https://${cidMatch[1]}.ipfs.dweb.link`;
+    }
+    
+    logger.info(`[LogoGenerator] ✅ Uploaded to IPFS: ${fastUrl}`);
+    return fastUrl;
   } catch (error: any) {
     logger.warn(`[LogoGenerator] Failed to upload to IPFS: ${error.message}`);
     return null;
