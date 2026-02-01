@@ -655,6 +655,29 @@ export class PostgresScheduleRepository {
     `, [month, now]);
   }
 
+  /**
+   * Save full X usage data (upsert) - used by xRateLimiter
+   */
+  async saveXUsage(data: XUsageData): Promise<void> {
+    await this.pool.query(`
+      INSERT INTO sched_x_usage (month, reads, writes, last_read, last_write, write_history)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (month) DO UPDATE SET
+        reads = $2,
+        writes = $3,
+        last_read = $4,
+        last_write = $5,
+        write_history = $6
+    `, [
+      data.month,
+      data.reads || 0,
+      data.writes || 0,
+      data.lastRead,
+      data.lastWrite,
+      JSON.stringify(data.writeHistory || [])
+    ]);
+  }
+
   // ==========================================================================
   // Trend Pool
   // ==========================================================================

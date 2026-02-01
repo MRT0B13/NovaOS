@@ -543,10 +543,10 @@ async function sendStatusReport(): Promise<void> {
   message += `  Messages received: ${totalMessages}\n\n`;
   
   // Autonomous mode
+  const totalLaunches = (stats.launchesToday || 0) + (stats.reactiveLaunchesToday || 0);
   message += `<b>🚀 Autonomous Mode:</b>\n`;
   message += `  Status: ${autonomousStatus}\n`;
-  message += `  Scheduled launches today: ${stats.launchesToday}\n`;
-  message += `  Reactive launches today: ${stats.reactiveLaunchesToday}\n`;
+  message += `  Launches today: ${totalLaunches} total (${stats.launchesToday || 0} scheduled, ${stats.reactiveLaunchesToday || 0} reactive)\n`;
   if (stats.nextScheduledLaunch) {
     const next = new Date(stats.nextScheduledLaunch);
     message += `  Next scheduled: ${next.toUTCString()}\n`;
