@@ -697,13 +697,15 @@ async function autoScheduleAllTokens(launchPackStore: LaunchPackStore): Promise<
     logger.info(`[TGScheduler] Checking ${allPacks.length} packs for auto-scheduling`);
     
     // Find all launched tokens with TG groups
+    // SKIP autonomous launches - they use Nova's channel, not individual TG groups
     const eligiblePacks = allPacks.filter((p: any) => 
       (p.launch?.mint || p.launch?.status === 'launched') &&
-      p.tg?.telegram_chat_id
+      p.tg?.telegram_chat_id &&
+      !p.ops?.checklist?.autonomous // Skip autonomous launches
     );
     
     if (eligiblePacks.length === 0) {
-      logger.info('[TGScheduler] No eligible tokens for auto-scheduling (need launch.mint AND tg.telegram_chat_id)');
+      logger.info('[TGScheduler] No eligible tokens for auto-scheduling (need launch.mint AND tg.telegram_chat_id AND not autonomous)');
       return;
     }
     

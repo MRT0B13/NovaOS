@@ -276,7 +276,11 @@ export class GroupHealthMonitor {
     
     const allPacks = await this.store.list();
     // Only check health for launched tokens (not draft/failed)
-    const packs = allPacks.filter(p => p.launch?.status === 'launched');
+    // SKIP autonomous launches - they share Nova's channel, not individual TG groups
+    const packs = allPacks.filter(p => 
+      p.launch?.status === 'launched' &&
+      !p.ops?.checklist?.autonomous // Skip autonomous launches
+    );
     const healthSummaries: Array<{
       ticker: string;
       name?: string;

@@ -156,20 +156,97 @@ async function persistState(updates: {
 }
 
 /**
+ * Parse time string (HH:MM) to minutes since midnight
+ */
+function parseTimeToMinutes(time: string): number {
+  const [hours, minutes] = time.split(':').map(Number);
+  return hours * 60 + (minutes || 0);
+}
+
+/**
+ * Check if current time is within a time window (in UTC)
+ */
+function isWithinTimeWindow(startTime: string, endTime: string): boolean {
+  const now = new Date();
+  const currentMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const startMinutes = parseTimeToMinutes(startTime);
+  const endMinutes = parseTimeToMinutes(endTime);
+  
+  // Handle overnight windows (e.g., 22:00 - 06:00)
+  if (startMinutes > endMinutes) {
+    return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+  }
+  
+  return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+}
+
+/**
+ * Check if reactive launches are allowed at current time
+ * Returns { allowed: boolean, reason?: string }
+ */
+function checkReactiveTimeWindow(): { allowed: boolean; reason?: string } {
+  const env = getEnv();
+  
+  // Check quiet hours first (no reactive launches during this window)
+  const quietStart = env.AUTONOMOUS_REACTIVE_QUIET_START || '00:00';
+  const quietEnd = env.AUTONOMOUS_REACTIVE_QUIET_END || '10:00';
+  
+  if (isWithinTimeWindow(quietStart, quietEnd)) {
+    const now = new Date();
+    const currentTime = `${now.getUTCHours().toString().padStart(2, '0')}:${now.getUTCMinutes().toString().padStart(2, '0')}`;
+    return { 
+      allowed: false, 
+      reason: `Quiet hours active (${quietStart}-${quietEnd} UTC). Current: ${currentTime} UTC. Reactive launches paused to preserve daily limits.` 
+    };
+  }
+  
+  // Check busy hours (reactive launches ONLY during this window)
+  const busyStart = env.AUTONOMOUS_REACTIVE_BUSY_START || '12:00';
+  const busyEnd = env.AUTONOMOUS_REACTIVE_BUSY_END || '22:00';
+  
+  if (!isWithinTimeWindow(busyStart, busyEnd)) {
+    const now = new Date();
+    const currentTime = `${now.getUTCHours().toString().padStart(2, '0')}:${now.getUTCMinutes().toString().padStart(2, '0')}`;
+    return { 
+      allowed: false, 
+      reason: `Outside busy hours (${busyStart}-${busyEnd} UTC). Current: ${currentTime} UTC. Reactive launches only during peak activity.` 
+    };
+  }
+  
+  return { allowed: true };
+}
+
+/**
  * Check all guardrails before launching
  * 
  * AUTO-FUNDING: If pump wallet is low but funding wallet has SOL,
  * we auto-deposit to pump wallet. This happens even in dry run mode
  * so the wallet stays funded for when you go live.
+ * 
+ * @param launchType - 'scheduled' or 'reactive' to apply appropriate limits
  */
-async function checkGuardrails(): Promise<{ canLaunch: boolean; reason?: string }> {
+async function checkGuardrails(launchType: 'scheduled' | 'reactive' = 'scheduled'): Promise<{ canLaunch: boolean; reason?: string }> {
   const env = getEnv();
   
-  // Check daily limit (includes BOTH scheduled and reactive launches)
   await checkDayReset();
-  const totalLaunchesToday = state.launchesToday + state.reactiveLaunchesToday;
-  if (totalLaunchesToday >= env.AUTONOMOUS_MAX_PER_DAY) {
-    return { canLaunch: false, reason: `Daily limit reached (${totalLaunchesToday}/${env.AUTONOMOUS_MAX_PER_DAY})` };
+  
+  // Check limits based on launch type
+  if (launchType === 'reactive') {
+    // Reactive launches have their own limit
+    if (state.reactiveLaunchesToday >= env.AUTONOMOUS_REACTIVE_MAX_PER_DAY) {
+      return { canLaunch: false, reason: `Reactive daily limit reached (${state.reactiveLaunchesToday}/${env.AUTONOMOUS_REACTIVE_MAX_PER_DAY})` };
+    }
+    
+    // Also check time windows for reactive launches
+    const timeCheck = checkReactiveTimeWindow();
+    if (!timeCheck.allowed) {
+      return { canLaunch: false, reason: timeCheck.reason };
+    }
+  } else {
+    // Scheduled launches have their own limit (separate from reactive)
+    if (state.launchesToday >= env.AUTONOMOUS_MAX_PER_DAY) {
+      return { canLaunch: false, reason: `Scheduled daily limit reached (${state.launchesToday}/${env.AUTONOMOUS_MAX_PER_DAY})` };
+    }
   }
   
   // Check treasury balance and auto-fund if needed
@@ -430,6 +507,7 @@ async function executeAutonomousLaunch(): Promise<void> {
       tg: env.AUTONOMOUS_USE_NOVA_CHANNEL === 'true' && env.NOVA_CHANNEL_ID
         ? {
             telegram_chat_id: env.NOVA_CHANNEL_ID,
+            invite_link: env.NOVA_CHANNEL_INVITE || undefined, // For X tweets to include TG link
             verified: true,
             pins: { welcome: '', how_to_buy: '', memekit: '' },
             schedule: [],
@@ -569,6 +647,7 @@ async function executeAutonomousLaunchWithIdea(idea: TokenIdea, launchType: 'sch
       tg: env.AUTONOMOUS_USE_NOVA_CHANNEL === 'true' && env.NOVA_CHANNEL_ID
         ? {
             telegram_chat_id: env.NOVA_CHANNEL_ID,
+            invite_link: env.NOVA_CHANNEL_INVITE || undefined, // For X tweets to include TG link
             verified: true,
             pins: { welcome: '', how_to_buy: '', memekit: '' },
             schedule: [],
@@ -708,8 +787,8 @@ async function schedulerTick(): Promise<void> {
     return;
   }
   
-  // Check guardrails AFTER idea generation
-  const guardrails = await checkGuardrails();
+  // Check guardrails AFTER idea generation (scheduled launch)
+  const guardrails = await checkGuardrails('scheduled');
   if (!guardrails.canLaunch) {
     logger.info(`[Autonomous] Skipping launch: ${guardrails.reason}`);
     
@@ -874,8 +953,8 @@ async function handleReactiveTrend(trend: TrendSignal): Promise<void> {
   
   logger.info(`[Autonomous] 🔥 REACTIVE LAUNCH triggered by trend: "${trend.topic}"`);
   
-  // Check guardrails (balance, daily limits still apply)
-  const guardrails = await checkGuardrails();
+  // Check guardrails (balance, daily limits, time windows for reactive)
+  const guardrails = await checkGuardrails('reactive');
   if (!guardrails.canLaunch) {
     logger.info(`[Autonomous] Reactive launch blocked: ${guardrails.reason}`);
     await notifyAutonomous({
@@ -988,6 +1067,7 @@ async function executeReactiveLaunch(trend: TrendSignal): Promise<void> {
       tg: env.AUTONOMOUS_USE_NOVA_CHANNEL === 'true' && env.NOVA_CHANNEL_ID
         ? {
             telegram_chat_id: env.NOVA_CHANNEL_ID,
+            invite_link: env.NOVA_CHANNEL_INVITE || undefined, // For X tweets to include TG link
             verified: true,
             pins: { welcome: '', how_to_buy: '', memekit: '' },
             schedule: [],
@@ -1077,7 +1157,7 @@ export async function triggerAutonomousLaunch(): Promise<{ success: boolean; err
     return { success: false, error: 'Autonomous mode not initialized' };
   }
   
-  const guardrails = await checkGuardrails();
+  const guardrails = await checkGuardrails('scheduled');
   if (!guardrails.canLaunch) {
     return { success: false, error: guardrails.reason };
   }
