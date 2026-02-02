@@ -269,6 +269,26 @@ export class GroupHealthMonitor {
   }
   
   /**
+   * Get health report for Nova's own channel
+   * Tracks the main community channel where autonomous launches are announced
+   */
+  async getNovaChannelHealth(): Promise<GroupHealth | null> {
+    const env = getEnv();
+    const channelId = env.NOVA_CHANNEL_ID;
+    
+    if (!channelId || env.NOVA_CHANNEL_ENABLE !== 'true') {
+      return null;
+    }
+    
+    try {
+      return await this.getHealthReport(channelId);
+    } catch (err) {
+      console.warn('[GROUP_HEALTH] Failed to get Nova channel health:', err);
+      return null;
+    }
+  }
+  
+  /**
    * Update health for all tokens
    */
   async updateAllTokenHealth(): Promise<void> {
@@ -335,6 +355,25 @@ export class GroupHealthMonitor {
       } catch (err) {
         console.error(`[GROUP_HEALTH] Failed to update ${pack.brand?.ticker}:`, err);
       }
+    }
+    
+    // Also track Nova's own channel (where autonomous launches go)
+    const novaChannelHealth = await this.getNovaChannelHealth();
+    if (novaChannelHealth) {
+      const env = getEnv();
+      healthSummaries.unshift({
+        ticker: 'NOVA',
+        name: 'Nova Community',
+        description: 'Main community channel',
+        members: novaChannelHealth.memberCount,
+        active: novaChannelHealth.activeMembers24h,
+        sentiment: novaChannelHealth.sentiment,
+        trend: novaChannelHealth.trend,
+        tgInviteLink: env.NOVA_CHANNEL_INVITE,
+        messagesPerDay: novaChannelHealth.messagesPerDay,
+        memberChange24h: novaChannelHealth.memberChange24h,
+      });
+      console.log(`[GROUP_HEALTH] Nova channel health: ${novaChannelHealth.memberCount} members, ${novaChannelHealth.activeMembers24h} active, ${novaChannelHealth.sentiment}`);
     }
     
     // Post to Nova channel if we have health data

@@ -112,19 +112,26 @@ function loadMetricsFromFile(): PersistedMetrics {
       const loaded = JSON.parse(data) as PersistedMetrics;
       
       // Check if we need to reset daily counters (new day)
+      // IMPORTANT: Use lastUpdated to determine if counters are stale, not lastDailyReportDate
       const today = new Date().toISOString().split('T')[0];
-      if (loaded.lastDailyReportDate !== today) {
+      const lastUpdateDate = loaded.lastUpdated ? loaded.lastUpdated.split('T')[0] : '';
+      
+      if (lastUpdateDate && lastUpdateDate !== today) {
+        // Counters are from a previous day - reset them
+        logger.info(`[SystemReporter] File metrics from previous day (${lastUpdateDate}), resetting daily counters`);
         loaded.tweetsSentToday = 0;
         loaded.tgPostsSentToday = 0;
         loaded.trendsDetectedToday = 0;
         loaded.errors24h = 0;
         loaded.warnings24h = 0;
+        loaded.lastDailyReportDate = today;
         // Also clear old failed attempts on new day
         if (loaded.failedAttempts) {
           const threshold = Date.now() - 24 * 60 * 60 * 1000;
           loaded.failedAttempts = loaded.failedAttempts.filter(a => a.timestamp >= threshold);
         }
-        loaded.lastDailyReportDate = today;
+      } else {
+        logger.info(`[SystemReporter] Same day (${today}), preserving file metrics`);
       }
       
       // Initialize missing fields (migration from older versions)
@@ -171,8 +178,14 @@ async function loadMetricsFromPostgres(): Promise<PersistedMetrics | null> {
     const today = new Date().toISOString().split('T')[0];
     
     // Check if we need to reset daily counters
-    if (data.lastDailyReportDate !== today) {
-      logger.info(`[SystemReporter] New day detected (was: ${data.lastDailyReportDate}, now: ${today}), resetting daily counters`);
+    // IMPORTANT: Use lastUpdated to determine if counters are stale, not lastDailyReportDate
+    // lastDailyReportDate only updates when the daily summary runs (9 AM UTC)
+    // but counters represent today's activity regardless
+    const lastUpdateDate = data.lastUpdated ? data.lastUpdated.split('T')[0] : '';
+    
+    if (lastUpdateDate && lastUpdateDate !== today) {
+      // Counters are from a previous day - reset them
+      logger.info(`[SystemReporter] New day detected (last update: ${lastUpdateDate}, now: ${today}), resetting daily counters`);
       await pgRepo.resetDailyMetrics();
       data.tweetsSentToday = 0;
       data.tgPostsSentToday = 0;
@@ -180,6 +193,9 @@ async function loadMetricsFromPostgres(): Promise<PersistedMetrics | null> {
       data.errors24h = 0;
       data.warnings24h = 0;
       data.lastDailyReportDate = today;
+    } else {
+      // Same day - preserve counters
+      logger.info(`[SystemReporter] Same day (${today}), preserving counters`);
     }
     
     data.sessionStartTime = Date.now();
@@ -750,6 +766,18 @@ export async function startSystemReporter(): Promise<void> {
       const pgMetrics = await loadMetricsFromPostgres();
       if (pgMetrics) {
         Object.assign(metrics, pgMetrics);
+      }
+      
+      // Self-healing: recover metrics from actual post tables if needed
+      try {
+        const recovery = await pgRepo.recoverMetricsFromPosts();
+        if (recovery.recovered) {
+          logger.info(`[SystemReporter] 🔧 Self-healed metrics from post tables (X: ${recovery.tweets}, TG: ${recovery.tgPosts})`);
+          metrics.tweetsSentToday = recovery.tweets;
+          metrics.tgPostsSentToday = recovery.tgPosts;
+        }
+      } catch (recoveryErr) {
+        logger.warn('[SystemReporter] Metrics recovery check failed:', recoveryErr);
       }
     } catch (err) {
       logger.warn('[SystemReporter] PostgreSQL init failed, using file storage:', err);

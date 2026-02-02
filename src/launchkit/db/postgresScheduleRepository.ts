@@ -893,6 +893,56 @@ export class PostgresScheduleRepository {
     `, [new Date().toISOString().slice(0, 10)]);
   }
 
+  /**
+   * Count posts sent today from actual post tables (for metrics recovery)
+   * This provides a source of truth when metrics get reset accidentally
+   */
+  async countTodaysPosts(): Promise<{ tweetsSentToday: number; tgPostsSentToday: number }> {
+    const today = new Date().toISOString().slice(0, 10);
+    
+    // X tweets: use created_at because posted_at may not be set
+    const tweetsResult = await this.pool.query(`
+      SELECT COUNT(*) as count FROM sched_x_tweets 
+      WHERE status = 'posted' AND created_at::date = $1
+    `, [today]);
+    
+    // TG posts: use posted_at (which is properly set)
+    const tgResult = await this.pool.query(`
+      SELECT COUNT(*) as count FROM sched_tg_posts 
+      WHERE status = 'posted' AND posted_at::date = $1
+    `, [today]);
+    
+    return {
+      tweetsSentToday: parseInt(tweetsResult.rows[0]?.count || '0', 10),
+      tgPostsSentToday: parseInt(tgResult.rows[0]?.count || '0', 10),
+    };
+  }
+
+  /**
+   * Recover metrics from actual post tables
+   * Call this on startup to ensure metrics match reality
+   */
+  async recoverMetricsFromPosts(): Promise<{ recovered: boolean; tweets: number; tgPosts: number }> {
+    const counts = await this.countTodaysPosts();
+    const current = await this.getSystemMetrics();
+    
+    // Only recover if current metrics are lower than actual (data loss)
+    if (counts.tweetsSentToday > current.tweetsSentToday || 
+        counts.tgPostsSentToday > current.tgPostsSentToday) {
+      await this.pool.query(`
+        UPDATE sched_system_metrics SET
+          tweets_sent_today = GREATEST(tweets_sent_today, $1),
+          tg_posts_sent_today = GREATEST(tg_posts_sent_today, $2),
+          last_updated = NOW()
+        WHERE id = 'main'
+      `, [counts.tweetsSentToday, counts.tgPostsSentToday]);
+      
+      return { recovered: true, tweets: counts.tweetsSentToday, tgPosts: counts.tgPostsSentToday };
+    }
+    
+    return { recovered: false, tweets: current.tweetsSentToday, tgPosts: current.tgPostsSentToday };
+  }
+
   // ==========================================================================
   // Community Voting
   // ==========================================================================
