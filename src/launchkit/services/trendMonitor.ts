@@ -571,6 +571,14 @@ function isQuietHours(): boolean {
 }
 
 /**
+ * Check if we're in busy hours (when reactive launches ARE allowed)
+ */
+function isBusyHours(): boolean {
+  const config = getConfig();
+  return isWithinTimeWindow(config.BUSY_START, config.BUSY_END);
+}
+
+/**
  * Check if we're within buffer zone around scheduled launch
  */
 function isNearScheduledLaunch(): boolean {
@@ -643,6 +651,18 @@ async function evaluateAndTrigger(): Promise<void> {
   checkDayReset();
   
   const config = getConfig();
+  
+  // Check quiet hours - NO reactive launches during this window
+  if (isQuietHours()) {
+    logger.debug(`[TrendMonitor] Quiet hours active (${config.QUIET_START}-${config.QUIET_END} UTC), skipping reactive`);
+    return;
+  }
+  
+  // Check busy hours - reactive launches ONLY during this window
+  if (!isBusyHours()) {
+    logger.debug(`[TrendMonitor] Outside busy hours (${config.BUSY_START}-${config.BUSY_END} UTC), skipping reactive`);
+    return;
+  }
   
   // Check daily limit
   if (state.triggeredToday >= config.MAX_REACTIVE_PER_DAY) {
@@ -1028,6 +1048,20 @@ export function stopTrendMonitor(): void {
   trendPool.persist();
   
   logger.info('[TrendMonitor] Stopped');
+}
+
+/**
+ * Sync the triggered today count from an external source (e.g., PostgreSQL)
+ * This ensures consistency after restarts
+ */
+export function syncTriggeredCount(count: number, lastLaunchTime?: Date): void {
+  const today = new Date().toISOString().split('T')[0];
+  state.triggeredToday = count;
+  state.lastTriggerDate = today;
+  if (lastLaunchTime) {
+    state.lastReactiveLaunchTime = lastLaunchTime;
+  }
+  logger.info(`[TrendMonitor] Synced triggered count: ${count} reactive launches today`);
 }
 
 /**

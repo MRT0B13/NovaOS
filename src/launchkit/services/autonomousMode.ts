@@ -7,7 +7,7 @@ import { generateMemeLogo } from './logoGenerator.ts';
 import { getPumpWalletBalance, getFundingWalletBalance, depositToPumpWallet } from './fundingWallet.ts';
 import { announceLaunch, announceSystem } from './novaChannel.ts';
 import { notifyAutonomous, notifyError } from './adminNotify.ts';
-import { startTrendMonitor, stopTrendMonitor, type TrendSignal } from './trendMonitor.ts';
+import { startTrendMonitor, stopTrendMonitor, syncTriggeredCount, type TrendSignal } from './trendMonitor.ts';
 import { 
   postIdeaForVoting, 
   checkPendingVotes, 
@@ -910,7 +910,8 @@ export async function startAutonomousMode(
     const minsUntil = state.nextScheduledTime 
       ? Math.round((state.nextScheduledTime.getTime() - Date.now()) / 60000)
       : 'N/A';
-    logger.info(`[Autonomous] 💓 Heartbeat: ${state.launchesToday} launches today, next in ${minsUntil} min, dry_run=${state.dryRun}`);
+    const totalLaunches = state.launchesToday + state.reactiveLaunchesToday;
+    logger.info(`[Autonomous] 💓 Heartbeat: ${totalLaunches} launches today (${state.launchesToday} scheduled, ${state.reactiveLaunchesToday} reactive), next in ${minsUntil} min, dry_run=${state.dryRun}`);
   }, 30 * 60 * 1000);
   
   // Vote checker every 2 minutes (when voting is enabled)
@@ -927,6 +928,8 @@ export async function startAutonomousMode(
   // Start trend monitor for reactive launches
   if (state.reactiveEnabled) {
     await startTrendMonitor(handleReactiveTrend);
+    // Sync the triggered count from PostgreSQL to prevent inconsistency after restart
+    syncTriggeredCount(state.reactiveLaunchesToday);
     logger.info('[Autonomous] 🔥 Reactive trend monitor started');
   }
   
