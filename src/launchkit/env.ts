@@ -185,6 +185,10 @@ const EnvSchema = z.object({
   AUTONOMOUS_REACTIVE_MAX_PER_DAY: z.coerce.number().default(3),
   // Minimum trend score to trigger (0-100)
   AUTONOMOUS_REACTIVE_MIN_SCORE: z.coerce.number().default(70),
+  // Minimum hours between reactive launches (spread them out)
+  AUTONOMOUS_REACTIVE_COOLDOWN_HOURS: z.coerce.number().default(2),
+  // Buffer around scheduled launch time (don't reactive launch within X hours)
+  AUTONOMOUS_SCHEDULED_BUFFER_HOURS: z.coerce.number().default(1),
   
   // Reactive Launch Time Windows (HH:MM in UTC)
   // Quiet hours - NO reactive launches allowed (e.g., after midnight reset)
@@ -196,8 +200,10 @@ const EnvSchema = z.object({
   
   // Trend Monitor Configuration
   // ==========================================
-  // Poll interval in minutes (default: 30 min, relies on trend pool for persistence)
+  // Poll interval during busy hours (default: 30 min)
   TREND_POLL_INTERVAL_MINUTES: z.coerce.number().default(30),
+  // Poll interval during quiet hours (default: 45 min - more conservative)
+  TREND_POLL_INTERVAL_QUIET_MINUTES: z.coerce.number().default(45),
   // Min times trend must be seen before triggering (default: 2)
   TREND_MIN_PERSISTENCE: z.coerce.number().default(2),
   

@@ -45,6 +45,7 @@ interface TrendMonitorState {
   activeTrends: TrendSignal[];
   triggeredToday: number;
   lastTriggerDate: string | null;
+  lastReactiveLaunchTime: Date | null;  // For cooldown between launches
   seenTopics: Set<string>;       // Avoid re-triggering same trends
   trendPersistence: Map<string, number>;  // id -> times seen consecutively
   lastNotifyTime: Date | null;   // Avoid spam notifications
@@ -59,6 +60,7 @@ const state: TrendMonitorState = {
   activeTrends: [],
   triggeredToday: 0,
   lastTriggerDate: null,
+  lastReactiveLaunchTime: null,
   seenTopics: new Set(),
   trendPersistence: new Map(),
   lastNotifyTime: null,
@@ -76,12 +78,21 @@ let onTrendCallback: ((trend: TrendSignal) => Promise<void>) | null = null;
 
 const getConfig = () => {
   const env = getEnv();
-  // Poll interval: default 10 min (more conservative), configurable via env
-  const pollIntervalMinutes = env.TREND_POLL_INTERVAL_MINUTES ?? 10;
+  // Poll interval: default 30 min during busy hours, 45 min during quiet
+  const pollIntervalMinutes = env.TREND_POLL_INTERVAL_MINUTES ?? 30;
+  const pollIntervalQuietMinutes = env.TREND_POLL_INTERVAL_QUIET_MINUTES ?? 45;
   return {
     CHECK_INTERVAL_MS: pollIntervalMinutes * 60 * 1000,
+    CHECK_INTERVAL_QUIET_MS: pollIntervalQuietMinutes * 60 * 1000,
     MIN_SCORE_TO_TRIGGER: env.AUTONOMOUS_REACTIVE_MIN_SCORE || 70,
-    MAX_REACTIVE_PER_DAY: env.AUTONOMOUS_REACTIVE_MAX_PER_DAY || 2,
+    MAX_REACTIVE_PER_DAY: env.AUTONOMOUS_REACTIVE_MAX_PER_DAY || 3,
+    REACTIVE_COOLDOWN_HOURS: env.AUTONOMOUS_REACTIVE_COOLDOWN_HOURS ?? 2,
+    SCHEDULED_BUFFER_HOURS: env.AUTONOMOUS_SCHEDULED_BUFFER_HOURS ?? 1,
+    SCHEDULED_LAUNCH_TIME: env.AUTONOMOUS_SCHEDULE || '14:00',
+    QUIET_START: env.AUTONOMOUS_REACTIVE_QUIET_START || '00:00',
+    QUIET_END: env.AUTONOMOUS_REACTIVE_QUIET_END || '10:00',
+    BUSY_START: env.AUTONOMOUS_REACTIVE_BUSY_START || '12:00',
+    BUSY_END: env.AUTONOMOUS_REACTIVE_BUSY_END || '22:00',
     TREND_EXPIRY_MINUTES: 60,           // Trends expire after 60 min (pool handles longer persistence)
     COOLDOWN_AFTER_TRIGGER_MS: 60 * 60 * 1000, // 1 hour cooldown after trigger
     MIN_PERSISTENCE_TO_TRIGGER: env.TREND_MIN_PERSISTENCE ?? 2, // Must see trend N times before triggering
@@ -523,6 +534,87 @@ export async function injectTrend(params: {
 }
 
 // ============================================================================
+// Time Helpers
+// ============================================================================
+
+/**
+ * Parse time string (HH:MM) to minutes since midnight
+ */
+function parseTimeToMinutes(timeStr: string): number {
+  const [hours, minutes] = timeStr.split(':').map(Number);
+  return hours * 60 + (minutes || 0);
+}
+
+/**
+ * Check if current time is within a time window
+ */
+function isWithinTimeWindow(startTime: string, endTime: string): boolean {
+  const now = new Date();
+  const currentMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const startMinutes = parseTimeToMinutes(startTime);
+  const endMinutes = parseTimeToMinutes(endTime);
+  
+  if (startMinutes <= endMinutes) {
+    return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+  } else {
+    // Wraps around midnight
+    return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+  }
+}
+
+/**
+ * Check if we're in quiet hours
+ */
+function isQuietHours(): boolean {
+  const config = getConfig();
+  return isWithinTimeWindow(config.QUIET_START, config.QUIET_END);
+}
+
+/**
+ * Check if we're within buffer zone around scheduled launch
+ */
+function isNearScheduledLaunch(): boolean {
+  const config = getConfig();
+  const [schedHours, schedMinutes] = config.SCHEDULED_LAUNCH_TIME.split(':').map(Number);
+  const scheduledMinutes = schedHours * 60 + (schedMinutes || 0);
+  
+  const now = new Date();
+  const currentMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+  
+  const bufferMinutes = config.SCHEDULED_BUFFER_HOURS * 60;
+  const diff = Math.abs(currentMinutes - scheduledMinutes);
+  
+  // Account for wrapping around midnight
+  const wrappedDiff = Math.min(diff, 24 * 60 - diff);
+  
+  return wrappedDiff < bufferMinutes;
+}
+
+/**
+ * Check if cooldown between reactive launches has passed
+ */
+function isCooldownPassed(): boolean {
+  if (!state.lastReactiveLaunchTime) return true;
+  
+  const config = getConfig();
+  const cooldownMs = config.REACTIVE_COOLDOWN_HOURS * 60 * 60 * 1000;
+  const elapsed = Date.now() - state.lastReactiveLaunchTime.getTime();
+  
+  return elapsed >= cooldownMs;
+}
+
+/**
+ * Get current poll interval based on time of day
+ */
+function getCurrentPollInterval(): number {
+  const config = getConfig();
+  if (isQuietHours()) {
+    return config.CHECK_INTERVAL_QUIET_MS;
+  }
+  return config.CHECK_INTERVAL_MS;
+}
+
+// ============================================================================
 // Trigger Logic
 // ============================================================================
 
@@ -534,6 +626,7 @@ function checkDayReset(): void {
   if (state.lastTriggerDate !== today) {
     state.triggeredToday = 0;
     state.lastTriggerDate = today;
+    state.lastReactiveLaunchTime = null; // Reset cooldown on new day
   }
 }
 
@@ -554,6 +647,21 @@ async function evaluateAndTrigger(): Promise<void> {
   // Check daily limit
   if (state.triggeredToday >= config.MAX_REACTIVE_PER_DAY) {
     logger.debug('[TrendMonitor] Daily reactive limit reached');
+    return;
+  }
+  
+  // Check cooldown between launches (spread them out)
+  if (!isCooldownPassed()) {
+    const elapsed = state.lastReactiveLaunchTime 
+      ? Math.round((Date.now() - state.lastReactiveLaunchTime.getTime()) / (60 * 1000))
+      : 0;
+    logger.debug(`[TrendMonitor] Cooldown active (${elapsed}/${config.REACTIVE_COOLDOWN_HOURS * 60} min)`);
+    return;
+  }
+  
+  // Check if we're near the scheduled launch time
+  if (isNearScheduledLaunch()) {
+    logger.debug(`[TrendMonitor] Near scheduled launch time, skipping reactive`);
     return;
   }
   
@@ -629,6 +737,7 @@ async function evaluateAndTrigger(): Promise<void> {
   state.activeTrends = state.activeTrends.filter(t => t !== bestTrend);
   state.trendPersistence.delete(trendId);
   state.triggeredToday++;
+  state.lastReactiveLaunchTime = new Date(); // Start cooldown
   
   logger.info(`[TrendMonitor] 🚀 Triggering reactive launch for: "${bestTrend.topic}"`);
   
@@ -798,6 +907,39 @@ async function monitorTick(): Promise<void> {
   }
 }
 
+/**
+ * Schedule the next monitor tick using dynamic interval
+ * Uses shorter intervals during busy hours and longer during quiet hours
+ */
+function scheduleNextTick(): void {
+  if (!state.enabled) {
+    return;
+  }
+  
+  const intervalMs = getCurrentPollInterval();
+  const intervalMin = Math.round(intervalMs / 60000);
+  const isQuiet = isQuietHours();
+  
+  // Clear any existing interval/timeout
+  if (monitorInterval) {
+    clearInterval(monitorInterval);
+    clearTimeout(monitorInterval);
+    monitorInterval = null;
+  }
+  
+  // Schedule next tick
+  monitorInterval = setTimeout(() => {
+    monitorTick();
+    scheduleNextTick(); // Recursive - schedule next after this one
+  }, intervalMs);
+  
+  // Log when interval changes (at boundary of quiet/busy hours)
+  const nextQuiet = isQuietHours();
+  if (nextQuiet !== isQuiet) {
+    logger.info(`[TrendMonitor] ⏰ Poll interval now ${intervalMin}min (${isQuiet ? 'quiet' : 'busy'} hours)`);
+  }
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -844,18 +986,19 @@ export async function startTrendMonitor(
     staleAfterHours: config.POOL_STALE_HOURS,
   });
   
-  const pollIntervalMin = Math.round(config.CHECK_INTERVAL_MS / 60000);
-  logger.info(`[TrendMonitor] ✅ Started (checking every ${pollIntervalMin} min)`);
+  const busyPollMin = Math.round(config.CHECK_INTERVAL_MS / 60000);
+  const quietPollMin = Math.round(config.CHECK_INTERVAL_QUIET_MS / 60000);
+  logger.info(`[TrendMonitor] ✅ Started (busy: ${busyPollMin}min, quiet: ${quietPollMin}min)`);
   logger.info(`[TrendMonitor] Sources: ${sources.join(', ')}`);
-  logger.info(`[TrendMonitor] Config: min_score=${config.MIN_SCORE_TO_TRIGGER}, max_per_day=${config.MAX_REACTIVE_PER_DAY}, persistence=${config.MIN_PERSISTENCE_TO_TRIGGER} checks`);
+  logger.info(`[TrendMonitor] Config: min_score=${config.MIN_SCORE_TO_TRIGGER}, max_per_day=${config.MAX_REACTIVE_PER_DAY}, cooldown=${config.REACTIVE_COOLDOWN_HOURS}h, persistence=${config.MIN_PERSISTENCE_TO_TRIGGER} checks`);
   
   const poolStats = trendPool.getPoolStats();
   if (poolStats.totalInPool > 0) {
     logger.info(`[TrendMonitor] 📦 Loaded ${poolStats.available} available trends from pool (${poolStats.totalInPool} total)`);
   }
   
-  // Start monitor loop
-  monitorInterval = setInterval(monitorTick, config.CHECK_INTERVAL_MS);
+  // Start dynamic polling - schedules next tick based on time of day
+  scheduleNextTick();
   
   // Initial check
   monitorTick();
@@ -868,7 +1011,9 @@ export function stopTrendMonitor(): void {
   state.enabled = false;
   
   if (monitorInterval) {
+    // Clear both interval and timeout (we switched to setTimeout for dynamic polling)
     clearInterval(monitorInterval);
+    clearTimeout(monitorInterval);
     monitorInterval = null;
   }
   
@@ -942,6 +1087,7 @@ export async function selectTrendFromPool(trendId: string): Promise<trendPool.Po
     // Also mark as seen in local state
     state.seenTopics.add(trendId);
     state.triggeredToday++;
+    state.lastReactiveLaunchTime = new Date(); // Start cooldown
     
     logger.info(`[TrendMonitor] 🎯 Agent selected trend: "${trend.topic.slice(0, 40)}..."`);
     
