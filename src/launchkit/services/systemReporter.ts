@@ -1,6 +1,6 @@
 import { logger } from '@elizaos/core';
 import { notifySystem, notifyAdmin } from './adminNotify.ts';
-import { getTelegramHealthStatus } from './telegramHealthMonitor.ts';
+import { getTelegramHealthStatus, recordMessageSent } from './telegramHealthMonitor.ts';
 import { getAutonomousStatus } from './autonomousMode.ts';
 import { getPumpWalletBalance, getFundingWalletBalance } from './fundingWallet.ts';
 import { getEnv } from '../env.ts';
@@ -272,6 +272,10 @@ export function recordTweetSent(): void {
 export function recordTGPostSent(): void {
   metrics.tgPostsSentToday++;
   saveMetrics();
+  
+  // Also record for health monitoring (TG is alive if we're sending posts)
+  recordMessageSent();
+  
   if (usePostgres && pgRepo) {
     pgRepo.incrementMetric('tgPostsSentToday').catch(err => {
       logger.warn('[SystemReporter] Failed to increment tgPostsSentToday in PostgreSQL:', err);
@@ -469,10 +473,10 @@ async function collectStats(): Promise<SystemStats> {
   }
   
   return {
-    // Telegram health
+    // Telegram health (use minutesSinceLastActivity to include sent messages for autonomous mode)
     telegramHealthy: tgHealth.isHealthy,
     telegramMessagesReceived: tgHealth.messageCount,
-    telegramMinutesSinceLastMessage: tgHealth.minutesSinceLastMessage,
+    telegramMinutesSinceLastMessage: tgHealth.minutesSinceLastActivity ?? tgHealth.minutesSinceLastMessage,
     
     // Autonomous mode
     autonomousEnabled: autonomousStatus?.enabled ?? false,

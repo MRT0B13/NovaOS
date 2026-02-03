@@ -906,7 +906,10 @@ export async function startAutonomousMode(
   }, 60 * 1000);
   
   // Heartbeat every 30 minutes
-  heartbeatInterval = setInterval(() => {
+  heartbeatInterval = setInterval(async () => {
+    // Check for day reset even during quiet hours
+    await checkDayReset();
+    
     const minsUntil = state.nextScheduledTime 
       ? Math.round((state.nextScheduledTime.getTime() - Date.now()) / 60000)
       : 'N/A';
