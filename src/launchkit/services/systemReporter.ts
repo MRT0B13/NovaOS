@@ -92,11 +92,19 @@ export interface FailedAttemptRecord {
 interface PersistedMetrics {
   startTime: number;           // First start time (never reset)
   sessionStartTime: number;    // Current session start
+  
+  // Daily counters (reset at midnight)
   tweetsSentToday: number;
   tgPostsSentToday: number;
   trendsDetectedToday: number;
   errors24h: number;
   warnings24h: number;
+  
+  // All-time cumulative counters (NEVER reset)
+  totalLaunches: number;
+  totalTweetsSent: number;
+  totalTgPostsSent: number;
+  
   lastReportTime: number;
   lastDailyReportDate: string;
   totalMessagesReceived: number;
@@ -138,6 +146,10 @@ function loadMetricsFromFile(): PersistedMetrics {
       if (!loaded.bannedUsers) loaded.bannedUsers = [];
       if (!loaded.failedAttempts) loaded.failedAttempts = [];
       if (typeof loaded.totalMessagesReceived !== 'number') loaded.totalMessagesReceived = 0;
+      // Initialize all-time cumulative counters (migration)
+      if (typeof loaded.totalLaunches !== 'number') loaded.totalLaunches = 0;
+      if (typeof loaded.totalTweetsSent !== 'number') loaded.totalTweetsSent = 0;
+      if (typeof loaded.totalTgPostsSent !== 'number') loaded.totalTgPostsSent = 0;
       
       // Update session start time (restart)
       loaded.sessionStartTime = Date.now();
@@ -158,6 +170,10 @@ function loadMetricsFromFile(): PersistedMetrics {
     trendsDetectedToday: 0,
     errors24h: 0,
     warnings24h: 0,
+    // All-time cumulative (never reset)
+    totalLaunches: 0,
+    totalTweetsSent: 0,
+    totalTgPostsSent: 0,
     lastReportTime: 0,
     lastDailyReportDate: '',
     totalMessagesReceived: 0,
@@ -258,11 +274,13 @@ export function getTotalMessagesReceived(): number {
  */
 export function recordTweetSent(): void {
   metrics.tweetsSentToday++;
+  metrics.totalTweetsSent++;  // All-time cumulative
   saveMetrics();
   if (usePostgres && pgRepo) {
     pgRepo.incrementMetric('tweetsSentToday').catch(err => {
       logger.warn('[SystemReporter] Failed to increment tweetsSentToday in PostgreSQL:', err);
     });
+    pgRepo.incrementMetric('totalTweetsSent').catch(() => {});
   }
 }
 
@@ -271,6 +289,7 @@ export function recordTweetSent(): void {
  */
 export function recordTGPostSent(): void {
   metrics.tgPostsSentToday++;
+  metrics.totalTgPostsSent++;  // All-time cumulative
   saveMetrics();
   
   // Also record for health monitoring (TG is alive if we're sending posts)
@@ -280,6 +299,7 @@ export function recordTGPostSent(): void {
     pgRepo.incrementMetric('tgPostsSentToday').catch(err => {
       logger.warn('[SystemReporter] Failed to increment tgPostsSentToday in PostgreSQL:', err);
     });
+    pgRepo.incrementMetric('totalTgPostsSent').catch(() => {});
   }
 }
 
@@ -294,6 +314,31 @@ export function recordTrendDetected(): void {
       logger.warn('[SystemReporter] Failed to increment trendsDetectedToday in PostgreSQL:', err);
     });
   }
+}
+
+/**
+ * Record a launch was completed (call from AutonomousMode)
+ * Increments the all-time cumulative counter
+ */
+export function recordLaunchCompleted(): void {
+  metrics.totalLaunches++;
+  saveMetrics();
+  if (usePostgres && pgRepo) {
+    pgRepo.incrementMetric('totalLaunches').catch(err => {
+      logger.warn('[SystemReporter] Failed to increment totalLaunches in PostgreSQL:', err);
+    });
+  }
+}
+
+/**
+ * Get all-time cumulative stats
+ */
+export function getAllTimeStats(): { launches: number; tweets: number; tgPosts: number } {
+  return {
+    launches: metrics.totalLaunches || 0,
+    tweets: metrics.totalTweetsSent || 0,
+    tgPosts: metrics.totalTgPostsSent || 0,
+  };
 }
 
 /**
@@ -414,6 +459,9 @@ export function getPersistedFailedAttempts(): FailedAttemptRecord[] {
   return metrics.failedAttempts.filter(a => a.timestamp >= threshold);
 }
 
+// Track last checked date to detect day changes
+let lastCheckedDate: string = new Date().toISOString().split('T')[0];
+
 /**
  * Reset daily counters (call at midnight)
  */
@@ -425,6 +473,39 @@ function resetDailyCounters(): void {
   if (metrics.failedAttempts) {
     const threshold = Date.now() - 24 * 60 * 60 * 1000;
     metrics.failedAttempts = metrics.failedAttempts.filter(a => a.timestamp >= threshold);
+  }
+}
+
+/**
+ * Check if we've crossed midnight and reset counters if so
+ * Called hourly to catch the day change
+ */
+async function checkMidnightReset(): Promise<void> {
+  const today = new Date().toISOString().split('T')[0];
+  
+  if (lastCheckedDate !== today) {
+    logger.info(`[SystemReporter] 🌅 New day detected (was ${lastCheckedDate}, now ${today}), resetting daily counters`);
+    
+    // Reset in-memory counters
+    resetDailyCounters();
+    metrics.errors24h = 0;
+    metrics.warnings24h = 0;
+    
+    // Update tracking
+    lastCheckedDate = today;
+    
+    // Save to file
+    saveMetrics();
+    
+    // Reset in PostgreSQL
+    if (usePostgres && pgRepo) {
+      try {
+        await pgRepo.resetDailyMetrics();
+        logger.info('[SystemReporter] Reset daily metrics in PostgreSQL');
+      } catch (err) {
+        logger.warn('[SystemReporter] Failed to reset PostgreSQL metrics:', err);
+      }
+    }
   }
 }
 
@@ -713,22 +794,24 @@ async function sendDailySummary(): Promise<void> {
   
   message += `<i>Nova is working hard for you! 💪</i>`;
   
+  // All-time stats (cumulative, never reset)
+  const allTime = getAllTimeStats();
+  
   await notifySystem({
     event: 'daily_summary',
     message,
     stats: {
-      launches: stats.launchesToday + stats.reactiveLaunchesToday,
-      tweets: stats.tweetsSentToday,
-      tgPosts: stats.tgPostsSentToday,
+      launches: allTime.launches,
+      tweets: allTime.tweets,
+      tgPosts: allTime.tgPosts,
       uptime: formatUptime(stats.uptimeHours),
     },
   });
   
-  // Reset counters for new day
-  resetDailyCounters();
-  metrics.errors24h = 0;
-  metrics.warnings24h = 0;
+  // Note: Counter reset is handled by checkMidnightReset() which runs hourly
+  // Just update the daily report date to prevent duplicate reports
   metrics.lastDailyReportDate = new Date().toISOString().split('T')[0];
+  saveMetrics();
   
   logger.info('[SystemReporter] Sent daily summary to admin');
 }
@@ -823,10 +906,22 @@ export async function startSystemReporter(): Promise<void> {
     });
   }, STATUS_REPORT_INTERVAL_MS);
   
-  // Check for daily report every hour
-  dailyReportInterval = setInterval(checkDailyReport, 60 * 60 * 1000);
+  // Check for daily report and midnight reset every hour
+  dailyReportInterval = setInterval(() => {
+    // Check if we crossed midnight (reset counters)
+    checkMidnightReset().catch(err => {
+      logger.error('[SystemReporter] Failed midnight reset check:', err);
+    });
+    // Check if it's time for the daily summary
+    checkDailyReport();
+  }, 60 * 60 * 1000);
   
-  logger.info(`[SystemReporter] ✅ Started (reports every ${STATUS_REPORT_INTERVAL_MS / (60 * 60 * 1000)}h, daily summary at ${DAILY_REPORT_HOUR_UTC}:00 UTC)`);
+  // Also run midnight check immediately on startup
+  checkMidnightReset().catch(err => {
+    logger.error('[SystemReporter] Failed initial midnight check:', err);
+  });
+  
+  logger.info(`[SystemReporter] ✅ Started (reports every ${STATUS_REPORT_INTERVAL_MS / (60 * 60 * 1000)}h, daily summary at ${DAILY_REPORT_HOUR_UTC}:00 UTC, midnight reset check hourly)`);
 }
 
 /**

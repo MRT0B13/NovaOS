@@ -465,12 +465,47 @@ export class PumpLauncherService {
 
     if (pack.assets?.logo_url) {
       const logoUrl = pack.assets.logo_url;
-      const response = await fetchWithTimeout(logoUrl, { redirect: 'follow' });
-      if (!response.ok) {
-        throw errorWithCode('LOGO_FETCH_FAILED', `Failed to fetch logo (${response.status})`, {
-          status: response.status,
-        });
+      
+      // Retry logic for logo fetch with exponential backoff
+      const maxRetries = 3;
+      let lastError: Error | null = null;
+      let response: Response | null = null;
+      
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          response = await fetchWithTimeout(logoUrl, { redirect: 'follow' });
+          if (response.ok) {
+            break; // Success
+          }
+          
+          // Retry on 5xx errors (gateway timeout, etc.)
+          if (response.status >= 500 && attempt < maxRetries) {
+            const delay = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
+            logger.warn({ attempt, status: response.status, delay }, `Logo fetch failed with ${response.status}, retrying in ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+          
+          throw errorWithCode('LOGO_FETCH_FAILED', `Failed to fetch logo (${response.status})`, {
+            status: response.status,
+          });
+        } catch (err) {
+          lastError = err as Error;
+          if (attempt < maxRetries && !(err as any)?.code) {
+            // Network error, retry
+            const delay = Math.pow(2, attempt) * 1000;
+            logger.warn({ attempt, error: (err as Error).message, delay }, `Logo fetch error, retrying in ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+          throw err;
+        }
       }
+      
+      if (!response || !response.ok) {
+        throw lastError || errorWithCode('LOGO_FETCH_FAILED', 'Failed to fetch logo after retries');
+      }
+      
       const contentLength = Number(response.headers.get('content-length') || 0);
       if (contentLength && contentLength > MAX_LOGO_BYTES) {
         throw errorWithCode('LOGO_FETCH_FAILED', 'Logo exceeds max size', {
@@ -542,12 +577,44 @@ export class PumpLauncherService {
       throw errorWithCode('LOGO_REQUIRED', 'Token logo is required');
     }
 
-    // First, fetch and upload the image
+    // First, fetch and upload the image with retry logic
     const logoUrl = pack.assets.logo_url;
-    const logoResponse = await fetchWithTimeout(logoUrl, { redirect: 'follow' });
-    if (!logoResponse.ok) {
-      throw errorWithCode('LOGO_FETCH_FAILED', `Failed to fetch logo (${logoResponse.status})`);
+    const maxRetries = 3;
+    let logoResponse: Response | null = null;
+    let lastError: Error | null = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        logoResponse = await fetchWithTimeout(logoUrl, { redirect: 'follow' });
+        if (logoResponse.ok) {
+          break; // Success
+        }
+        
+        // Retry on 5xx errors
+        if (logoResponse.status >= 500 && attempt < maxRetries) {
+          const delay = Math.pow(2, attempt) * 1000;
+          logger.warn({ attempt, status: logoResponse.status, delay }, `Bonk: Logo fetch failed with ${logoResponse.status}, retrying...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        
+        throw errorWithCode('LOGO_FETCH_FAILED', `Failed to fetch logo (${logoResponse.status})`);
+      } catch (err) {
+        lastError = err as Error;
+        if (attempt < maxRetries && !(err as any)?.code) {
+          const delay = Math.pow(2, attempt) * 1000;
+          logger.warn({ attempt, error: (err as Error).message }, `Bonk: Logo fetch error, retrying...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        throw err;
+      }
     }
+    
+    if (!logoResponse || !logoResponse.ok) {
+      throw lastError || errorWithCode('LOGO_FETCH_FAILED', 'Failed to fetch logo after retries');
+    }
+    
     const logoBytes = await readStreamWithLimit(logoResponse, MAX_LOGO_BYTES);
     
     // Detect actual image format from magic bytes
@@ -883,56 +950,88 @@ export class PumpLauncherService {
       // === AUTO-SCHEDULE MARKETING TWEETS ===
       // If X is enabled, schedule post-launch marketing tweets
       const env = getEnv();
+      const isAutonomous = saved.ops?.checklist?.autonomous === true;
+      
       if (env.X_ENABLE === 'true') {
-        try {
-          const scheduled = await schedulePostLaunchMarketing(saved, 7); // 7 days of tweets (includes immediate launch announcement)
-          await createMarketingSchedule(saved, 3); // 3 tweets per week ongoing
-          
-          // Save marketing info to database for recovery
-          await this.store.update(id, {
-            ops: {
-              ...(saved.ops || {}),
-              x_marketing_enabled: true,
-              x_marketing_tweets_per_week: 3,
-              x_marketing_total_tweeted: 0,
-              x_marketing_created_at: nowIso(),
-              x_marketing_scheduled_count: scheduled.length,
-            },
-          });
-          
-          logger.info(`[Launch] ✅ Auto-scheduled ${scheduled.length} marketing tweets for $${saved.brand?.ticker}`);
-          
-          // === IMMEDIATELY PROCESS LAUNCH ANNOUNCEMENT ===
-          // Don't wait for the 5-minute scheduler - post the launch announcement now!
-          const dueTweets = getDueTweets();
-          if (dueTweets.length > 0) {
-            logger.info(`[Launch] 🐦 Processing ${dueTweets.length} immediate tweet(s)...`);
-            try {
-              // Import XPublisher to send tweet
-              const { XPublisherService } = await import('./xPublisher.ts');
-              const xPublisher = new XPublisherService(this.store);
-              
-              const results = await processScheduledTweets(async (text: string) => {
-                try {
-                  const result = await xPublisher.tweet(text);
-                  return result.id;
-                } catch (err: any) {
-                  logger.error(`[Launch] Tweet failed: ${err.message}`);
-                  return null;
-                }
-              });
-              
-              if (results.posted > 0) {
-                logger.info(`[Launch] 🐦 ✅ Posted launch announcement to X/Twitter!`);
-              }
-            } catch (tweetErr) {
-              // Non-fatal - scheduled tweets will still process later
-              logger.warn(`[Launch] Could not post immediate tweet: ${(tweetErr as Error).message}`);
+        // For autonomous tokens: Skip marketing queue, just post one launch announcement
+        if (isAutonomous) {
+          logger.info(`[Launch] 🤖 Autonomous token - skipping X marketing queue, posting single launch tweet`);
+          try {
+            const { XPublisherService } = await import('./xPublisher.ts');
+            const xPublisher = new XPublisherService(this.store);
+            
+            // Build launch announcement with channel link
+            const mint = saved.launch?.mint || '';
+            const ticker = saved.brand?.ticker || 'TOKEN';
+            const name = saved.brand?.name || ticker;
+            const pumpLink = `https://pump.fun/coin/${mint}`;
+            const channelLink = env.NOVA_CHANNEL_INVITE || '';
+            
+            let tweetText = `🚀 Just launched $${ticker} (${name}) on @pumpdotfun!\n\n`;
+            tweetText += `${pumpLink}\n\n`;
+            if (channelLink) {
+              tweetText += `Join my channel for more launches: ${channelLink}`;
             }
+            
+            const result = await xPublisher.tweet(tweetText);
+            if (result?.id) {
+              logger.info(`[Launch] 🐦 ✅ Posted autonomous launch announcement to X! Tweet ID: ${result.id}`);
+            }
+          } catch (tweetErr) {
+            logger.warn(`[Launch] Could not post autonomous launch tweet: ${(tweetErr as Error).message}`);
           }
-        } catch (scheduleErr) {
-          // Non-fatal - launch succeeded, just couldn't schedule tweets
-          logger.warn(`[Launch] Could not auto-schedule marketing tweets: ${(scheduleErr as Error).message}`);
+        } else {
+          // Non-autonomous tokens: Full marketing schedule
+          try {
+            const scheduled = await schedulePostLaunchMarketing(saved, 7); // 7 days of tweets (includes immediate launch announcement)
+            await createMarketingSchedule(saved, 3); // 3 tweets per week ongoing
+            
+            // Save marketing info to database for recovery
+            await this.store.update(id, {
+              ops: {
+                ...(saved.ops || {}),
+                x_marketing_enabled: true,
+                x_marketing_tweets_per_week: 3,
+                x_marketing_total_tweeted: 0,
+                x_marketing_created_at: nowIso(),
+                x_marketing_scheduled_count: scheduled.length,
+              },
+            });
+            
+            logger.info(`[Launch] ✅ Auto-scheduled ${scheduled.length} marketing tweets for $${saved.brand?.ticker}`);
+            
+            // === IMMEDIATELY PROCESS LAUNCH ANNOUNCEMENT ===
+            // Don't wait for the 5-minute scheduler - post the launch announcement now!
+            const dueTweets = getDueTweets();
+            if (dueTweets.length > 0) {
+              logger.info(`[Launch] 🐦 Processing ${dueTweets.length} immediate tweet(s)...`);
+              try {
+                // Import XPublisher to send tweet
+                const { XPublisherService } = await import('./xPublisher.ts');
+                const xPublisher = new XPublisherService(this.store);
+                
+                const results = await processScheduledTweets(async (text: string) => {
+                  try {
+                    const result = await xPublisher.tweet(text);
+                    return result.id;
+                  } catch (err: any) {
+                    logger.error(`[Launch] Tweet failed: ${err.message}`);
+                    return null;
+                  }
+                });
+                
+                if (results.posted > 0) {
+                  logger.info(`[Launch] 🐦 ✅ Posted launch announcement to X/Twitter!`);
+                }
+              } catch (tweetErr) {
+                // Non-fatal - scheduled tweets will still process later
+                logger.warn(`[Launch] Could not post immediate tweet: ${(tweetErr as Error).message}`);
+              }
+            }
+          } catch (scheduleErr) {
+            // Non-fatal - launch succeeded, just couldn't schedule tweets
+            logger.warn(`[Launch] Could not auto-schedule marketing tweets: ${(scheduleErr as Error).message}`);
+          }
         }
       }
 

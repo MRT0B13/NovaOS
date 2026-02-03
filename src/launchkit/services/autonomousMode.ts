@@ -8,6 +8,7 @@ import { getPumpWalletBalance, getFundingWalletBalance, depositToPumpWallet } fr
 import { announceLaunch, announceSystem } from './novaChannel.ts';
 import { notifyAutonomous, notifyError } from './adminNotify.ts';
 import { startTrendMonitor, stopTrendMonitor, syncTriggeredCount, type TrendSignal } from './trendMonitor.ts';
+import { recordLaunchCompleted } from './systemReporter.ts';
 import { 
   postIdeaForVoting, 
   checkPendingVotes, 
@@ -533,6 +534,9 @@ async function executeAutonomousLaunch(): Promise<void> {
       pgRepo.incrementLaunchCount('scheduled').catch(err => logger.warn('[AutonomousMode] Failed to increment launch count:', err));
     }
     
+    // Record all-time cumulative launch count
+    recordLaunchCompleted();
+    
     // Announce to Nova channel
     await announceLaunch(launched);
     
@@ -680,6 +684,9 @@ async function executeAutonomousLaunchWithIdea(idea: TokenIdea, launchType: 'sch
         pgRepo.incrementLaunchCount('scheduled').catch(err => logger.warn('[AutonomousMode] Failed to increment launch count:', err));
       }
     }
+    
+    // Record all-time cumulative launch count
+    recordLaunchCompleted();
     
     // Announce to Nova channel
     await announceLaunch(launched);
@@ -1092,6 +1099,9 @@ async function executeReactiveLaunch(trend: TrendSignal): Promise<void> {
     if (usePostgres && pgRepo) {
       pgRepo.incrementLaunchCount('reactive').catch(err => logger.warn('[AutonomousMode] Failed to increment reactive launch count:', err));
     }
+    
+    // Record all-time cumulative launch count
+    recordLaunchCompleted();
     
     logger.info(`[Autonomous] 🎉 REACTIVE LAUNCH SUCCESS: ${launched.launch?.mint}`);
     

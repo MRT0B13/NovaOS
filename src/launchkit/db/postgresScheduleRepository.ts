@@ -151,6 +151,10 @@ export interface SystemMetrics {
   lastReportTime: number;
   lastDailyReportDate: string;
   totalMessagesReceived: number;
+  // All-time cumulative counters (never reset)
+  totalLaunches: number;
+  totalTweetsSent: number;
+  totalTgPostsSent: number;
   lastUpdated: string;
 }
 
@@ -316,11 +320,23 @@ export class PostgresScheduleRepository {
         last_report_time BIGINT DEFAULT 0,
         last_daily_report_date TEXT,
         total_messages_received INTEGER DEFAULT 0,
+        -- All-time cumulative counters (never reset)
+        total_launches INTEGER DEFAULT 0,
+        total_tweets_sent INTEGER DEFAULT 0,
+        total_tg_posts_sent INTEGER DEFAULT 0,
         last_updated TIMESTAMPTZ DEFAULT NOW(),
         banned_users JSONB DEFAULT '[]'::jsonb,
         failed_attempts JSONB DEFAULT '[]'::jsonb
       );
     `);
+    
+    // Migration: Add all-time columns to existing tables
+    await this.pool.query(`
+      ALTER TABLE sched_system_metrics 
+      ADD COLUMN IF NOT EXISTS total_launches INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS total_tweets_sent INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS total_tg_posts_sent INTEGER DEFAULT 0;
+    `).catch(() => {/* columns may already exist */});
 
     // Autonomous Mode State (single row - persists launch counts across restarts)
     await this.pool.query(`
@@ -804,6 +820,10 @@ export class PostgresScheduleRepository {
         lastReportTime: 0,
         lastDailyReportDate: '',
         totalMessagesReceived: 0,
+        // All-time cumulative
+        totalLaunches: 0,
+        totalTweetsSent: 0,
+        totalTgPostsSent: 0,
         lastUpdated: new Date().toISOString(),
         bannedUsers: [],
         failedAttempts: [],
@@ -821,6 +841,10 @@ export class PostgresScheduleRepository {
       lastReportTime: Number(row.last_report_time),
       lastDailyReportDate: row.last_daily_report_date || '',
       totalMessagesReceived: row.total_messages_received,
+      // All-time cumulative
+      totalLaunches: row.total_launches || 0,
+      totalTweetsSent: row.total_tweets_sent || 0,
+      totalTgPostsSent: row.total_tg_posts_sent || 0,
       lastUpdated: row.last_updated instanceof Date ? row.last_updated.toISOString() : row.last_updated,
       bannedUsers: row.banned_users || [],
       failedAttempts: row.failed_attempts || [],
@@ -863,7 +887,7 @@ export class PostgresScheduleRepository {
     }
   }
 
-  async incrementMetric(field: 'tweetsSentToday' | 'tgPostsSentToday' | 'trendsDetectedToday' | 'errors24h' | 'warnings24h' | 'totalMessagesReceived', amount: number = 1): Promise<void> {
+  async incrementMetric(field: 'tweetsSentToday' | 'tgPostsSentToday' | 'trendsDetectedToday' | 'errors24h' | 'warnings24h' | 'totalMessagesReceived' | 'totalLaunches' | 'totalTweetsSent' | 'totalTgPostsSent', amount: number = 1): Promise<void> {
     const fieldMap: Record<string, string> = {
       tweetsSentToday: 'tweets_sent_today',
       tgPostsSentToday: 'tg_posts_sent_today',
@@ -871,6 +895,10 @@ export class PostgresScheduleRepository {
       errors24h: 'errors_24h',
       warnings24h: 'warnings_24h',
       totalMessagesReceived: 'total_messages_received',
+      // All-time cumulative counters
+      totalLaunches: 'total_launches',
+      totalTweetsSent: 'total_tweets_sent',
+      totalTgPostsSent: 'total_tg_posts_sent',
     };
     const dbField = fieldMap[field];
     if (dbField) {
