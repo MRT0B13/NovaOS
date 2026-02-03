@@ -855,6 +855,13 @@ async function autoRefillXMarketing(): Promise<void> {
     
     for (const pack of launchedPacks) {
       const ticker = pack.brand?.ticker || 'UNKNOWN';
+      
+      // Skip autonomous tokens - they only get single launch tweet, no marketing queue
+      const isAutonomous = pack.ops?.checklist?.autonomous === true;
+      if (isAutonomous) {
+        continue;
+      }
+      
       const pendingForToken = scheduledTweets.filter(t => 
         t.launchPackId === pack.id && t.status === 'pending'
       );
