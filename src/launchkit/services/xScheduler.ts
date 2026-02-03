@@ -588,6 +588,12 @@ export async function recoverMarketingFromStore(
     const launchedPacks = allPacks.filter(p => p.launch?.status === 'launched');
     
     for (const pack of launchedPacks) {
+      // Skip autonomous tokens - they only get single launch tweet, no marketing queue
+      const isAutonomous = pack.ops?.checklist?.autonomous === true;
+      if (isAutonomous) {
+        continue;
+      }
+      
       const hasMarketing = pack.ops?.x_marketing_enabled;
       const existingSchedule = marketingSchedules.find(s => s.launchPackId === pack.id);
       
