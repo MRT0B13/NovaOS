@@ -924,6 +924,13 @@ export async function startXScheduler(
   // Check for due tweets every 5 minutes
   xSchedulerInterval = setInterval(async () => {
     try {
+      const env = getEnv();
+      
+      // Skip if token marketing is disabled
+      if (env.TOKEN_X_MARKETING_ENABLE === 'false') {
+        return; // Silent skip - no need to log every 5 min
+      }
+      
       const pending = getPendingTweets();
       const due = getDueTweets();
       
@@ -963,6 +970,11 @@ export async function startXScheduler(
   
   // Heartbeat every 30 minutes to show scheduler is alive
   setInterval(() => {
+    const env = getEnv();
+    if (env.TOKEN_X_MARKETING_ENABLE === 'false') {
+      logger.info('[XScheduler] 💓 Heartbeat: Token marketing DISABLED (using Nova personal brand)');
+      return;
+    }
     const pending = getPendingTweets();
     const due = getDueTweets();
     logger.info(`[XScheduler] 💓 Heartbeat: ${pending.length} pending, ${due.length} due`);

@@ -442,11 +442,22 @@ let tgHeartbeatCounter = 0;
  * Check for due posts and send them
  */
 async function checkAndPostDue(): Promise<void> {
-  const posts = await loadScheduledPosts();
-  const now = new Date();
+  const env = getEnv();
   
   // Log heartbeat every 5 minutes (every 5th call since we run every minute)
   tgHeartbeatCounter++;
+  
+  // If token TG marketing is disabled, just log heartbeat and return
+  if (env.TOKEN_TG_MARKETING_ENABLE === 'false') {
+    if (tgHeartbeatCounter % 5 === 0) {
+      logger.info('[TGScheduler] 💓 Heartbeat: Token marketing DISABLED (using Nova personal brand)');
+    }
+    return;
+  }
+  
+  const posts = await loadScheduledPosts();
+  const now = new Date();
+  
   const pendingCount = posts.filter(p => p.status === 'pending').length;
   
   // Sort by scheduled time so we process in order
