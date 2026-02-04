@@ -175,10 +175,47 @@ async function sendPhotoToChannel(
 // ============================================================================
 
 /**
- * Announce a new token launch
+ * Pin a message in the channel
+ */
+async function pinMessage(messageId: number, disableNotification: boolean = false): Promise<boolean> {
+  if (!channelConfig?.enabled || !channelConfig.channelId || !channelConfig.botToken) {
+    return false;
+  }
+  
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${channelConfig.botToken}/pinChatMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: channelConfig.channelId,
+        message_id: messageId,
+        disable_notification: disableNotification,
+      }),
+    });
+    
+    const json = await res.json();
+    if (!res.ok || !json?.ok) {
+      logger.warn(`[NovaChannel] Failed to pin message: ${json?.description || res.status}`);
+      return false;
+    }
+    
+    logger.info(`[NovaChannel] 📌 Pinned message ${messageId}`);
+    return true;
+  } catch (err) {
+    logger.error('[NovaChannel] Error pinning message:', err);
+    return false;
+  }
+}
+
+/**
+ * Announce a new token launch (with pin and notification)
  */
 export async function announceLaunch(launchPack: LaunchPack): Promise<boolean> {
   if (!isUpdateEnabled('launches')) return false;
+  if (!channelConfig) initNovaChannel();
+  if (!channelConfig?.enabled || !channelConfig.channelId || !channelConfig.botToken) {
+    return false;
+  }
   
   const ticker = launchPack.brand?.ticker || 'TOKEN';
   const name = launchPack.brand?.name || 'New Token';
@@ -189,20 +226,80 @@ export async function announceLaunch(launchPack: LaunchPack): Promise<boolean> {
   const tgUrl = launchPack.tg?.invite_link;
   
   let message = `🚀 <b>NEW LAUNCH: $${ticker}</b>\n\n`;
-  message += `${mascot ? `Meet ${mascot}! ` : ''}${name} just launched on pump.fun!\n\n`;
+  message += `${mascot ? `Meet ${mascot}! ` : ''}${name} just launched on @Pumpfun!\n\n`;
   
   if (pumpUrl) message += `📈 <a href="${pumpUrl}">Trade on Pump.fun</a>\n`;
   if (tgUrl) message += `💬 <a href="${tgUrl}">Join Telegram</a>\n`;
   
-  message += `\n#${ticker} #launch #pumpdotfun`;
+  message += `\n#${ticker} #launch`;
   
   // Try to send with logo if available
   const logoUrl = (launchPack as any).brand?.image_url || (launchPack as any).brand?.logo_url;
+  
+  let messageId: number | null = null;
+  
   if (logoUrl) {
-    return sendPhotoToChannel(logoUrl, message);
+    // Send photo and get message ID
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${channelConfig.botToken}/sendPhoto`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: channelConfig.channelId,
+          photo: logoUrl,
+          caption: sanitizeForTelegram(message),
+          parse_mode: 'HTML',
+        }),
+      });
+      
+      const json = await res.json();
+      if (res.ok && json?.ok) {
+        messageId = json.result?.message_id;
+        recordMessageSent();
+        logger.info(`[NovaChannel] ✅ Posted launch with image: $${ticker}`);
+      } else {
+        logger.warn(`[NovaChannel] Failed to send photo: ${json?.description || res.status}`);
+      }
+    } catch (err) {
+      logger.error('[NovaChannel] Error sending photo:', err);
+    }
   }
   
-  return sendToChannel(message);
+  // Fallback to text-only if photo failed
+  if (!messageId) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${channelConfig.botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: channelConfig.channelId,
+          text: sanitizeForTelegram(message),
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        }),
+      });
+      
+      const json = await res.json();
+      if (res.ok && json?.ok) {
+        messageId = json.result?.message_id;
+        recordMessageSent();
+        logger.info(`[NovaChannel] ✅ Posted launch: $${ticker}`);
+      } else {
+        logger.warn(`[NovaChannel] Failed to send message: ${json?.description || res.status}`);
+        return false;
+      }
+    } catch (err) {
+      logger.error('[NovaChannel] Error sending message:', err);
+      return false;
+    }
+  }
+  
+  // Pin the launch announcement (with notification to alert users)
+  if (messageId) {
+    await pinMessage(messageId, false); // false = send notification
+  }
+  
+  return true;
 }
 
 // ============================================================================
@@ -441,10 +538,87 @@ function formatNumber(num: number): string {
   return num.toFixed(2);
 }
 
+// ============================================================================
+// Scheduled Idea Announcements (Nova's own creative ideas)
+// ============================================================================
+
+export interface ScheduledIdeaData {
+  ticker: string;
+  name: string;
+  description: string;
+  mascot?: string;
+  confidence: number;
+  reasoning?: string;
+}
+
+/**
+ * Announce a scheduled idea to the channel - Nova sharing his own creative vision
+ * This is NOT reactive to trends, this is Nova's original idea
+ */
+export async function announceScheduledIdea(idea: ScheduledIdeaData): Promise<{ success: boolean; messageId?: number }> {
+  if (!channelConfig) initNovaChannel();
+  if (!channelConfig?.enabled || !channelConfig.channelId || !channelConfig.botToken) {
+    return { success: false };
+  }
+  
+  // Nova explains his creative idea with personality
+  let message = `🧠 <b>yo frens, I've been cooking something up...</b>\n\n`;
+  message += `Meet <b>$${idea.ticker}</b> - ${idea.name}\n\n`;
+  message += `${idea.description}\n\n`;
+  
+  if (idea.mascot) {
+    message += `🎨 <i>The vibe: ${idea.mascot}</i>\n\n`;
+  }
+  
+  message += `💭 <b>Why I think this could be fire:</b>\n`;
+  message += idea.reasoning || `Been thinking about this concept for a while. The memetics are strong, the narrative is fresh, and I think the community would love it.`;
+  message += `\n\n`;
+  
+  message += `Confidence: ${(idea.confidence * 100).toFixed(0)}%\n\n`;
+  message += `━━━━━━━━━━━━━━━\n`;
+  message += `<b>What do you think frens?</b>\n\n`;
+  message += `🔥 = LFG, launch it!\n`;
+  message += `🤔 = Interesting, tell me more\n`;
+  message += `❌ = Nah, skip this one\n`;
+  message += `💡 = I have a better idea\n\n`;
+  message += `<i>React below and let me know! I read all your feedback 👀</i>`;
+  
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${channelConfig.botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: channelConfig.channelId,
+        text: sanitizeForTelegram(message),
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+    
+    const json = await res.json();
+    if (!res.ok || !json?.ok) {
+      logger.warn(`[NovaChannel] Failed to send scheduled idea: ${json?.description || res.status}`);
+      return { success: false };
+    }
+    
+    const messageId = json.result?.message_id;
+    
+    // Record successful send for health monitoring
+    recordMessageSent();
+    
+    logger.info(`[NovaChannel] ✅ Posted scheduled idea: $${idea.ticker}`);
+    return { success: true, messageId };
+  } catch (err) {
+    logger.error('[NovaChannel] Error sending scheduled idea:', err);
+    return { success: false };
+  }
+}
+
 export default {
   initNovaChannel,
   isUpdateEnabled,
   announceLaunch,
+  announceScheduledIdea,
   announceWalletActivity,
   announceHealthSummary,
   announceMarketingPost,

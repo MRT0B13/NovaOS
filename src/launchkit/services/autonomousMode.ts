@@ -11,6 +11,7 @@ import { startTrendMonitor, stopTrendMonitor, syncTriggeredCount, type TrendSign
 import { recordLaunchCompleted } from './systemReporter.ts';
 import { 
   postIdeaForVoting, 
+  postScheduledIdeaForFeedback,
   checkPendingVotes, 
   announceVoteResult, 
   shouldSkipVoting,
@@ -19,6 +20,7 @@ import {
   type PendingVote 
 } from './communityVoting.ts';
 import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
+import { initNovaPersonalBrand, startNovaPersonalScheduler, stopNovaPersonalScheduler } from './novaPersonalBrand.ts';
 
 // PostgreSQL support for persistence
 let pgRepo: PostgresScheduleRepository | null = null;
@@ -415,26 +417,32 @@ async function executeAutonomousLaunch(): Promise<void> {
     event: 'idea_generated',
     ticker: idea.ticker,
     name: idea.name,
-    details: `${idea.description}\n\nConfidence: ${(idea.confidence * 100).toFixed(0)}%\nDry run: ${state.dryRun ? 'Yes' : 'No'}`,
+    details: `${idea.description}\n\nMascot: ${idea.mascot || 'N/A'}\nConfidence: ${(idea.confidence * 100).toFixed(0)}%\nDry run: ${state.dryRun ? 'Yes' : 'No'}`,
   });
+  
+  // Generate reasoning for the channel announcement
+  const reasoning = await generateIdeaReasoning(idea);
+  
+  // ALWAYS post scheduled ideas to the channel for community feedback
+  // This is different from voting - just collects reactions, Nova responds later
+  logger.info('[Autonomous] 📢 Posting scheduled idea for community feedback...');
+  const feedbackPost = await postScheduledIdeaForFeedback(idea, reasoning);
+  
+  if (feedbackPost) {
+    state.pendingIdea = idea;
+    state.pendingVoteId = feedbackPost.id;
+    logger.info(`[Autonomous] ✅ Posted scheduled idea to channel (feedback tracking enabled)`);
+  } else {
+    logger.warn(`[Autonomous] Failed to post idea to channel - check NOVA_CHANNEL_ID config`);
+  }
   
   // DRY RUN: Stop here and just log
   if (state.dryRun) {
     logger.info('[Autonomous] 🧪 DRY RUN - Would launch this token (set AUTONOMOUS_DRY_RUN=false to enable real launches)');
-    state.pendingIdea = idea;
-    
-    // Post for community voting with reactions (scheduled launch type)
-    const vote = await postIdeaForVoting(idea, undefined, { launchType: 'scheduled' });
-    if (vote) {
-      state.pendingVoteId = vote.id;
-      logger.info(`[Autonomous] Posted scheduled idea for community voting`);
-    } else {
-      logger.warn(`[Autonomous] Failed to post for voting - check COMMUNITY_VOTING_ENABLED and channel config`);
-    }
     return;
   }
   
-  // Check if community voting is enabled
+  // Check if community voting is enabled (in addition to feedback)
   if (env.COMMUNITY_VOTING_ENABLED === 'true') {
     const skipCheck = shouldSkipVoting(idea);
     
@@ -943,6 +951,15 @@ export async function startAutonomousMode(
     logger.info('[Autonomous] 🔥 Reactive trend monitor started');
   }
   
+  // Start Nova personal brand scheduler
+  try {
+    await initNovaPersonalBrand();
+    startNovaPersonalScheduler();
+    logger.info('[Autonomous] 🌟 Nova personal brand scheduler started');
+  } catch (err) {
+    logger.warn('[Autonomous] Nova personal brand init failed:', err);
+  }
+  
   // Announce if system notifications enabled
   announceSystem('startup', 
     `🤖 Autonomous mode activated!\n\n` +
@@ -1142,6 +1159,9 @@ export function stopAutonomousMode(): void {
   
   // Stop trend monitor
   stopTrendMonitor();
+  
+  // Stop Nova personal brand scheduler
+  stopNovaPersonalScheduler();
   
   state.enabled = false;
   state.reactiveEnabled = false;

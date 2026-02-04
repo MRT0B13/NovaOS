@@ -40,11 +40,16 @@ const REACTION_WEIGHTS: Record<string, number> = {
   '💀': -2,     // Strong negative
   '🗑️': -2,     // Strong negative (trash)
   '😴': -0.5,   // Mild negative (boring)
-  '🤔': 0,      // Neutral (thinking)
+  '🤔': 0.5,    // Interested (thinking) - slightly positive for feedback
+  '💡': 0.5,    // Has ideas - slightly positive
+  '❌': -1,     // Skip this
 };
 
-// Reaction emojis to prompt users with
+// Reaction emojis to prompt users with for voting
 export const VOTE_REACTIONS = ['👍', '👎', '🔥', '💀'];
+
+// Reaction emojis for scheduled idea feedback (different from voting)
+export const FEEDBACK_REACTIONS = ['🔥', '🤔', '❌', '💡'];
 
 export interface PendingVote {
   id: string;
@@ -55,8 +60,9 @@ export interface PendingVote {
   votingEndsAt: string;
   agentReasoning: string;
   trendContext?: string;
-  status: 'pending' | 'approved' | 'rejected' | 'expired' | 'no_votes';
+  status: 'pending' | 'approved' | 'rejected' | 'expired' | 'no_votes' | 'feedback_collected';
   votes?: VoteTally;
+  type?: 'voting' | 'feedback'; // voting = auto-launches, feedback = just collects reactions
 }
 
 export interface VoteTally {
@@ -405,6 +411,7 @@ export async function postIdeaForVoting(
       agentReasoning: reasoning,
       trendContext,
       status: 'pending',
+      type: 'voting', // This is a voting poll - will auto-launch based on results
     };
     
     state.pendingVotes.set(vote.id, vote);
@@ -423,6 +430,122 @@ export async function postIdeaForVoting(
     return vote;
   } catch (err) {
     logger.error('[CommunityVoting] Error posting idea:', err);
+    return null;
+  }
+}
+
+/**
+ * Post a scheduled idea to the channel for community feedback (NOT voting)
+ * This is for Nova to share his creative ideas and get community reactions
+ * Unlike voting, this doesn't auto-launch - it's just for engagement
+ */
+export async function postScheduledIdeaForFeedback(
+  idea: TokenIdea,
+  reasoning: string
+): Promise<PendingVote | null> {
+  const env = getEnv();
+  const botToken = env.TG_BOT_TOKEN;
+  const channelId = env.NOVA_CHANNEL_ID;
+  
+  if (!botToken || !channelId) {
+    logger.warn('[CommunityVoting] Missing TG_BOT_TOKEN or NOVA_CHANNEL_ID');
+    return null;
+  }
+  
+  // Feedback window - how long to collect reactions before Nova responds
+  const feedbackMinutes = parseInt(env.SCHEDULED_IDEA_FEEDBACK_MINUTES || '60', 10);
+  const feedbackEndsAt = new Date(Date.now() + feedbackMinutes * 60 * 1000);
+  
+  // Build Nova's creative idea message with personality
+  let message = `🧠 <b>yo frens, I've been cooking something up...</b>\n\n`;
+  message += `Meet <b>$${idea.ticker}</b> - ${idea.name}\n\n`;
+  message += `${idea.description}\n\n`;
+  
+  if (idea.mascot) {
+    message += `🎨 <i>The vibe: ${idea.mascot}</i>\n\n`;
+  }
+  
+  message += `💭 <b>Why I think this could be fire:</b>\n`;
+  message += reasoning || `Been thinking about this concept for a while. The memetics are strong, the narrative is fresh, and I think the community would love it.`;
+  message += `\n\n`;
+  
+  message += `Confidence: ${(idea.confidence * 100).toFixed(0)}%\n\n`;
+  message += `━━━━━━━━━━━━━━━\n`;
+  message += `<b>What do you think frens?</b>\n\n`;
+  message += `🔥 = LFG, I love it!\n`;
+  message += `🤔 = Interesting, tell me more\n`;
+  message += `❌ = Nah, skip this one\n`;
+  message += `💡 = I have suggestions\n\n`;
+  message += `<i>Drop your reactions! I'll check back in ${feedbackMinutes} mins and share what I learned 👀</i>`;
+  
+  try {
+    // Send message
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: channelId,
+        text: message,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+    
+    const json = await res.json();
+    if (!json.ok) {
+      logger.error(`[CommunityVoting] Failed to post scheduled idea: ${json.description}`);
+      return null;
+    }
+    
+    const messageId = json.result.message_id;
+    
+    // Add initial reactions for users to click
+    for (const emoji of FEEDBACK_REACTIONS) {
+      try {
+        await fetch(`https://api.telegram.org/bot${botToken}/setMessageReaction`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: channelId,
+            message_id: messageId,
+            reaction: [{ type: 'emoji', emoji }],
+            is_big: false,
+          }),
+        });
+      } catch {
+        // Reactions may not be supported in all chat types
+      }
+    }
+    
+    // Create feedback tracking record (type = 'feedback', not 'voting')
+    const vote: PendingVote = {
+      id: `feedback_${Date.now()}_${idea.ticker}`,
+      idea,
+      messageId,
+      chatId: channelId,
+      postedAt: new Date().toISOString(),
+      votingEndsAt: feedbackEndsAt.toISOString(),
+      agentReasoning: reasoning,
+      status: 'pending',
+      type: 'feedback', // This is feedback only - won't auto-launch
+    };
+    
+    state.pendingVotes.set(vote.id, vote);
+    
+    // Save to PostgreSQL if available
+    if (usePostgres && pgRepo) {
+      await pgRepo.insertPendingVote(vote as PGPendingVote).catch((err: Error) => {
+        logger.warn(`[CommunityVoting] Failed to save feedback to PostgreSQL: ${err.message}`);
+      });
+    }
+    
+    saveState();
+    
+    logger.info(`[CommunityVoting] Posted scheduled idea $${idea.ticker} for feedback (messageId: ${messageId})`);
+    
+    return vote;
+  } catch (err) {
+    logger.error('[CommunityVoting] Error posting scheduled idea:', err);
     return null;
   }
 }
@@ -651,6 +774,23 @@ export async function checkPendingVotes(): Promise<PendingVote[]> {
     logger.info(`[CommunityVoting]    +${votes.positive}/-${votes.negative} = ${votes.total} total (min: ${minVotes})`);
     logger.info(`[CommunityVoting]    Sentiment: ${votes.sentiment.toFixed(2)} (threshold: ${approvalThreshold})`);
     
+    // Handle feedback type differently - just collect reactions, no auto-launch
+    if (vote.type === 'feedback') {
+      vote.status = 'feedback_collected';
+      logger.info(`[CommunityVoting] 📊 Feedback collected for $${vote.idea.ticker}`);
+      
+      // Post a follow-up message thanking the community and sharing insights
+      await postFeedbackResponse(vote, votes);
+      
+      // Record for learning but don't trigger launch
+      recordFeedback(vote).catch(err => {
+        logger.warn('[CommunityVoting] Failed to record feedback:', err);
+      });
+      resolved.push(vote);
+      continue;
+    }
+    
+    // Handle voting type - determine if we should launch
     if (votes.total < minVotes) {
       // Not enough votes - default to launch (apathy ≠ rejection)
       vote.status = 'no_votes';
@@ -689,6 +829,73 @@ export async function checkPendingVotes(): Promise<PendingVote[]> {
   }
   
   return resolved;
+}
+
+/**
+ * Post a follow-up response after collecting feedback on a scheduled idea
+ * Nova thanks the community and shares what he learned from their reactions
+ */
+async function postFeedbackResponse(vote: PendingVote, votes: VoteTally): Promise<void> {
+  const env = getEnv();
+  const botToken = env.TG_BOT_TOKEN;
+  const channelId = env.NOVA_CHANNEL_ID;
+  
+  if (!botToken || !channelId) return;
+  
+  const ticker = vote.idea.ticker;
+  const totalReactions = Object.values(votes.reactions).reduce((a, b) => a + (b as number), 0);
+  
+  // Build response based on sentiment
+  let message = `📊 <b>Thanks for the feedback on $${ticker} frens!</b>\n\n`;
+  
+  if (totalReactions === 0) {
+    message += `Looks like y'all are busy today - no reactions came in. That's cool, I'll keep cooking and share more ideas soon! 🍳\n`;
+  } else if (votes.sentiment >= 0.5) {
+    // Very positive
+    const fireCount = votes.reactions['🔥'] || 0;
+    message += `Y'all are hyped! 🔥 Got ${fireCount > 0 ? fireCount + ' fire reactions' : 'lots of love'} on this one.\n\n`;
+    message += `I hear you - this concept resonates. Taking notes for future launches! 📝\n`;
+  } else if (votes.sentiment >= 0) {
+    // Mildly positive or neutral
+    const thinkingCount = votes.reactions['🤔'] || 0;
+    message += `Mixed signals on this one - ${thinkingCount > 0 ? 'some of you want to know more' : 'interesting reactions'}.\n\n`;
+    message += `I appreciate the honest feedback! This helps me understand what hits different. 🎯\n`;
+  } else {
+    // Negative
+    const skipCount = votes.reactions['❌'] || 0;
+    message += `Got the message - ${skipCount > 0 ? `${skipCount} of you said skip this` : 'not the vibe y\'all wanted'}.\n\n`;
+    message += `No cap, I learn from the misses too. Back to the drawing board! 💪\n`;
+  }
+  
+  // Show reaction breakdown
+  if (totalReactions > 0) {
+    message += `\n<b>Reactions:</b> `;
+    const parts: string[] = [];
+    for (const [emoji, count] of Object.entries(votes.reactions)) {
+      if ((count as number) > 0) parts.push(`${emoji} ${count}`);
+    }
+    message += parts.join(' | ') + '\n';
+  }
+  
+  message += `\n<i>Keep the reactions coming on my ideas - your input shapes what I create next! 🤝</i>`;
+  
+  try {
+    // Reply to the original message
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: channelId,
+        text: message,
+        parse_mode: 'HTML',
+        reply_to_message_id: vote.messageId,
+      }),
+    });
+    
+    logger.info(`[CommunityVoting] ✅ Posted feedback response for $${ticker}`);
+  } catch (err) {
+    logger.error('[CommunityVoting] Error posting feedback response:', err);
+  }
 }
 
 /**
@@ -912,6 +1119,7 @@ export function getRecentFeedback(limit: number = 10): IdeaFeedback[] {
 
 export default {
   postIdeaForVoting,
+  postScheduledIdeaForFeedback,
   processReactionUpdate,
   checkPendingVotes,
   announceVoteResult,
@@ -921,4 +1129,5 @@ export default {
   getPendingVotes,
   getRecentFeedback,
   VOTE_REACTIONS,
+  FEEDBACK_REACTIONS,
 };

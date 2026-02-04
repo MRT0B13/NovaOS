@@ -114,6 +114,30 @@ const EnvSchema = z.object({
   X_CHANNEL_PROMO_INTERVAL_DAYS: z.coerce.number().default(1), // Channel promo frequency (days)
   X_MIN_PENDING_CHANNEL_PROMOS: z.coerce.number().default(7),  // Keep this many channel promos scheduled
   
+  // ==========================================
+  // Token Marketing (Per-Token X/TG Posts)
+  // ==========================================
+  // Enable per-token X marketing (scheduled tweets about individual tokens)
+  TOKEN_X_MARKETING_ENABLE: z.enum(['true', 'false']).default('true'),
+  // Enable per-token TG marketing (scheduled posts to token TG groups)
+  TOKEN_TG_MARKETING_ENABLE: z.enum(['true', 'false']).default('true'),
+  
+  // ==========================================
+  // Nova Personal Brand (Agent's Own Content)
+  // ==========================================
+  // Enable Nova's personal X posts (gm, recaps, teasers, NOT token shills)
+  NOVA_PERSONAL_X_ENABLE: z.enum(['true', 'false']).default('false'),
+  // Enable Nova's personal TG channel posts (ideas, polls, updates)
+  NOVA_PERSONAL_TG_ENABLE: z.enum(['true', 'false']).default('false'),
+  // Scheduled idea feedback window in minutes (how long to collect reactions)
+  SCHEDULED_IDEA_FEEDBACK_MINUTES: z.string().default('60'),
+  // GM post time (24h format, UTC) - e.g., "08:00"
+  NOVA_GM_POST_TIME: z.string().default('08:00'),
+  // Daily recap post time (24h format, UTC) - e.g., "22:00"
+  NOVA_RECAP_POST_TIME: z.string().default('22:00'),
+  // Weekly summary day (0=Sunday, 1=Monday, etc)
+  NOVA_WEEKLY_SUMMARY_DAY: z.coerce.number().default(0),
+  
   AI_LOGO_ENABLE: z.enum(['true', 'false']).default('true'),
   AI_MEME_ENABLE: z.enum(['true', 'false']).default('true'), // Enable AI meme generation for TG posts
   OPENAI_API_KEY: z.string().optional(),

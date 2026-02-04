@@ -828,6 +828,14 @@ async function scheduleChannelPromos(): Promise<number> {
  * Auto-refill X marketing queue for all launched tokens
  */
 async function autoRefillXMarketing(): Promise<void> {
+  const env = getEnv();
+  
+  // Check if token X marketing is disabled
+  if (env.TOKEN_X_MARKETING_ENABLE === 'false') {
+    logger.debug('[XScheduler] Token X marketing disabled, skipping auto-refill');
+    return;
+  }
+  
   if (!xStore) {
     logger.warn('[XScheduler] Store not initialized, skipping auto-refill');
     return;

@@ -967,7 +967,7 @@ export class PumpLauncherService {
             const pumpLink = `https://pump.fun/coin/${mint}`;
             const channelLink = env.NOVA_CHANNEL_INVITE || '';
             
-            let tweetText = `🚀 Just launched $${ticker} (${name}) on @pumpdotfun!\n\n`;
+            let tweetText = `🚀 Just launched $${ticker} (${name}) on @Pumpfun!\n\n`;
             tweetText += `${pumpLink}\n\n`;
             if (channelLink) {
               tweetText += `Join my channel for more launches: ${channelLink}`;

@@ -8,6 +8,7 @@ import { getTokenPrice } from './priceService.ts';
 import { recordTGPostSent } from './systemReporter.ts';
 import type { LaunchPackStore } from '../db/launchPackRepository.ts';
 import { PostgresScheduleRepository, type ScheduledTGPost as PGScheduledTGPost } from '../db/postgresScheduleRepository.ts';
+import { getEnv } from '../env.ts';
 
 /**
  * Telegram Marketing Scheduler
@@ -692,6 +693,14 @@ export async function startTGScheduler(launchPackStore: LaunchPackStore): Promis
  * This runs on startup and periodically to keep queues filled
  */
 async function autoScheduleAllTokens(launchPackStore: LaunchPackStore): Promise<void> {
+  const env = getEnv();
+  
+  // Check if token TG marketing is disabled
+  if (env.TOKEN_TG_MARKETING_ENABLE === 'false') {
+    logger.debug('[TGScheduler] Token TG marketing disabled, skipping auto-scheduling');
+    return;
+  }
+  
   try {
     const allPacks = await launchPackStore.list();
     logger.info(`[TGScheduler] Checking ${allPacks.length} packs for auto-scheduling`);

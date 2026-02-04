@@ -490,13 +490,13 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           
           const firstName = member.first_name || member.username || 'fren';
           
-          // Generate a fun personalized welcome
+          // Generate a fun personalized welcome for users joining after launch
           const welcomeMessages = [
-            `🎉 yo ${firstName}! welcome to the $${tokenTicker} zone! 💎\n\ngrab a seat, we're just getting started. LFG! 🚀`,
-            `👋 ${firstName} just joined the ${tokenName} fam! welcome aboard ser! 🔥\n\nask questions, vibe with the community, and HODL tight! 💪`,
-            `🚀 gm ${firstName}! you made it to the $${tokenTicker} community!\n\nwe don't rug here, we RUG together 😈💎`,
             `💎 ${firstName} is here! welcome to ${tokenName}!\n\nyou're early fren, make yourself at home! wagmi 🤝`,
-            `🔥 ayoo ${firstName}! glad you found us!\n\nwelcome to the $${tokenTicker} gang. diamond hands only! 💎🙌`,
+            `👋 yo ${firstName}! welcome to the $${tokenTicker} community!\n\ncheck the pinned messages to get up to speed, and enjoy the ride! 🚀`,
+            `🔥 gm ${firstName}! glad you found your way here!\n\njoin the $${tokenTicker} fam - we're building something special 💪`,
+            `🚀 ${firstName} just landed! welcome to $${tokenTicker}!\n\npull up a chair, the community is just getting started 🎯`,
+            `💫 ayoo ${firstName}! you made it!\n\nwelcome to the $${tokenTicker} zone - check the links above and vibe with us! 🤝`,
           ];
           
           const randomWelcome = welcomeMessages[Math.floor(Math.random() * welcomeMessages.length)];
