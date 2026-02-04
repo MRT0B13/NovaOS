@@ -2,6 +2,7 @@ import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
 import { recordMessageSent } from './telegramHealthMonitor.ts';
+import { recordTGPostSent } from './systemReporter.ts';
 
 /**
  * Nova Channel Service
@@ -115,6 +116,7 @@ async function sendToChannel(
     
     // Record successful send for health monitoring
     recordMessageSent();
+    recordTGPostSent();
     
     logger.info(`[NovaChannel] ✅ Posted: ${sanitizedText.substring(0, 50)}...`);
     return true;
@@ -161,6 +163,7 @@ async function sendPhotoToChannel(
     
     // Record successful send for health monitoring
     recordMessageSent();
+    recordTGPostSent();
     
     logger.info(`[NovaChannel] ✅ Posted with image: ${sanitizedCaption.substring(0, 50)}...`);
     return true;

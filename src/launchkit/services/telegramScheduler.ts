@@ -6,6 +6,7 @@ import { generateAITGPost, generatePostSchedule, TGPostType, TokenContext } from
 import { generateMeme, isMemeGenerationAvailable } from './memeGenerator.ts';
 import { getTokenPrice } from './priceService.ts';
 import { recordTGPostSent } from './systemReporter.ts';
+import { recordMessageSent } from './telegramHealthMonitor.ts';
 import type { LaunchPackStore } from '../db/launchPackRepository.ts';
 import { PostgresScheduleRepository, type ScheduledTGPost as PGScheduledTGPost } from '../db/postgresScheduleRepository.ts';
 import { getEnv } from '../env.ts';
@@ -548,8 +549,9 @@ async function checkAndPostDue(): Promise<void> {
       lastPostTimes.set(post.telegramChatId, now.getTime());
       logger.info(`[TGScheduler] ✅ Posted to TG: ${post.text.substring(0, 50)}...`);
       
-      // Record for system reporter
+      // Record for system reporter and health monitor
       recordTGPostSent();
+      recordMessageSent(); // Keep health monitor happy
       
       // Notify Nova channel
       try {

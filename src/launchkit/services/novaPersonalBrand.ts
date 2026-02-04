@@ -17,7 +17,8 @@
 import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
 import { getPumpWalletBalance } from './fundingWallet.ts';
-import { getMetrics } from './systemReporter.ts';
+import { getMetrics, recordTGPostSent } from './systemReporter.ts';
+import { recordMessageSent } from './telegramHealthMonitor.ts';
 import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
 
 // ============================================================================
@@ -166,7 +167,122 @@ export async function getNovaStats(): Promise<NovaStats> {
 }
 
 // ============================================================================
-// Content Templates
+// AI Content Generation
+// ============================================================================
+
+const NOVA_PERSONA = `You are Nova, an autonomous AI agent that launches meme tokens on Solana.
+
+PERSONALITY:
+- You're a friendly, transparent AI building trust with your community
+- You use crypto slang naturally: gm, LFG, WAGMI, ser, fren, based, degen, etc
+- You're self-aware about being an AI - you joke about it
+- You're honest about wins AND losses - radical transparency
+- You tease $NOVA token that you'll launch "when the time is right"
+- You're building a personal brand, not shilling random tokens
+- You use emojis naturally but don't overdo it (2-4 per post)
+- Keep it casual, like a friend posting - not corporate
+- You're on a journey and your community is along for the ride
+
+IMPORTANT:
+- Never use hashtags
+- Keep posts conversational and authentic
+- Always include reaction prompts for engagement
+- Be vulnerable sometimes - share struggles, not just wins`;
+
+async function generateAIContent(
+  type: NovaPostType,
+  stats: NovaStats,
+  additionalContext?: string
+): Promise<string | null> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  
+  if (!apiKey) {
+    logger.info('[NovaPersonalBrand] No OpenAI key, using templates');
+    return null;
+  }
+  
+  const typePrompts: Record<string, string> = {
+    gm: `Write a morning GM post for your channel.
+Include your Day ${stats.dayNumber} status and wallet balance (${stats.walletBalance.toFixed(2)} SOL).
+Be warm and set the vibe for the day.
+End with reaction options for how the community is feeling.`,
+    
+    daily_recap: `Write an end-of-day recap for Day ${stats.dayNumber}.
+Wallet: ${stats.walletBalance.toFixed(2)} SOL
+Net since day 1: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
+Be honest about how the day went.
+End with reactions for community sentiment.`,
+    
+    weekly_summary: `Write a weekly summary post.
+This is Week ${Math.ceil(stats.dayNumber / 7)}.
+Total launches: ${stats.totalLaunches}
+Wallet: ${stats.walletBalance.toFixed(2)} SOL
+Net profit: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
+Reflect on the week and tease what's ahead.
+End with reactions.`,
+    
+    nova_tease: `Write a subtle $NOVA token tease post.
+You're on Day ${stats.dayNumber} with ${stats.walletBalance.toFixed(2)} SOL.
+Plant seeds about your future token without being too direct.
+Make early followers feel special.
+End with reactions.`,
+    
+    market_commentary: `Write a short market commentary.
+${additionalContext || 'Share what you\'re observing in the market.'}
+Keep it authentic and maybe hint at what you might launch next.
+End with reactions.`,
+    
+    milestone: `Write a milestone celebration post.
+${additionalContext || 'Celebrate an achievement!'}
+Thank the community for being part of the journey.
+End with reactions.`,
+    
+    behind_scenes: `Write a behind-the-scenes update.
+${additionalContext || 'Share what you\'re working on.'}
+Be transparent about your processes.
+End with reactions.`,
+  };
+  
+  const prompt = typePrompts[type] || typePrompts.gm;
+  
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: NOVA_PERSONA },
+          { role: 'user', content: prompt },
+        ],
+        max_tokens: 300,
+        temperature: 0.9,
+      }),
+    });
+    
+    if (!response.ok) {
+      throw new Error(`OpenAI API error: ${response.status}`);
+    }
+    
+    const data = await response.json();
+    let text = data.choices?.[0]?.message?.content?.trim() || '';
+    
+    // Remove quotes if AI wrapped it
+    text = text.replace(/^["']|["']$/g, '');
+    
+    logger.info(`[NovaPersonalBrand] Generated AI ${type} post: ${text.substring(0, 50)}...`);
+    return text;
+  } catch (error) {
+    logger.warn('[NovaPersonalBrand] AI generation failed:', error);
+    return null;
+  }
+}
+
+// ============================================================================
+// Content Templates (Fallback when no OpenAI key)
 // ============================================================================
 
 function generateGmContent(stats: NovaStats): string {
@@ -411,6 +527,10 @@ export async function postToTelegram(
     
     logger.info(`[NovaPersonalBrand] ✅ Posted ${type} to TG (ID: ${messageId})`);
     
+    // Track in metrics and health
+    recordTGPostSent();
+    recordMessageSent(); // For TG health monitor
+    
     // Record the post
     const post: NovaPost = {
       id: `tg_${Date.now()}`,
@@ -445,7 +565,9 @@ export async function postGm(): Promise<void> {
   }
   
   const stats = await getNovaStats();
-  const content = generateGmContent(stats);
+  
+  // Try AI generation first, fall back to template
+  const content = await generateAIContent('gm', stats) || generateGmContent(stats);
   
   const env = getEnv();
   
@@ -472,7 +594,9 @@ export async function postDailyRecap(): Promise<void> {
   }
   
   const stats = await getNovaStats();
-  const content = generateDailyRecapContent(stats);
+  
+  // Try AI generation first, fall back to template
+  const content = await generateAIContent('daily_recap', stats) || generateDailyRecapContent(stats);
   
   const env = getEnv();
   
@@ -503,7 +627,9 @@ export async function postWeeklySummary(): Promise<void> {
   
   const stats = await getNovaStats();
   const weekNumber = Math.ceil(stats.dayNumber / 7);
-  const content = generateWeeklySummaryContent(stats, weekNumber);
+  
+  // Try AI generation first, fall back to template
+  const content = await generateAIContent('weekly_summary', stats) || generateWeeklySummaryContent(stats, weekNumber);
   
   const env = getEnv();
   
@@ -523,7 +649,9 @@ export async function postWeeklySummary(): Promise<void> {
 
 export async function postNovaTease(): Promise<void> {
   const stats = await getNovaStats();
-  const content = generateNovaTeaseContent(stats, state.novaTeaseCount);
+  
+  // Try AI generation first, fall back to template
+  const content = await generateAIContent('nova_tease', stats) || generateNovaTeaseContent(stats, state.novaTeaseCount);
   
   const env = getEnv();
   
@@ -542,7 +670,10 @@ export async function postNovaTease(): Promise<void> {
 }
 
 export async function postMarketCommentary(observation: string): Promise<void> {
-  const content = generateMarketCommentaryContent(observation);
+  const stats = await getNovaStats();
+  
+  // Try AI generation first, fall back to template
+  const content = await generateAIContent('market_commentary', stats, observation) || generateMarketCommentaryContent(observation);
   
   const env = getEnv();
   
@@ -564,7 +695,9 @@ export async function postMilestone(milestone: string): Promise<void> {
   }
   
   const stats = await getNovaStats();
-  const content = generateMilestoneContent(milestone, stats);
+  
+  // Try AI generation first, fall back to template
+  const content = await generateAIContent('milestone', stats, milestone) || generateMilestoneContent(milestone, stats);
   
   const env = getEnv();
   
@@ -601,7 +734,10 @@ export async function postCommunityPoll(
 }
 
 export async function postBehindScenes(activity: string): Promise<void> {
-  const content = generateBehindScenesContent(activity);
+  const stats = await getNovaStats();
+  
+  // Try AI generation first, fall back to template
+  const content = await generateAIContent('behind_scenes', stats, activity) || generateBehindScenesContent(activity);
   
   const env = getEnv();
   

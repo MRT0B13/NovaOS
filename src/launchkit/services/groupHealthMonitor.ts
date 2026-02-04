@@ -292,15 +292,12 @@ export class GroupHealthMonitor {
    * Update health for all tokens
    */
   async updateAllTokenHealth(): Promise<void> {
-    console.log('[GROUP_HEALTH] Starting health check for all tokens...');
+    console.log('[GROUP_HEALTH] Starting health check...');
+    const env = getEnv();
     
-    const allPacks = await this.store.list();
-    // Only check health for launched tokens (not draft/failed)
-    // SKIP autonomous launches - they share Nova's channel, not individual TG groups
-    const packs = allPacks.filter(p => 
-      p.launch?.status === 'launched' &&
-      !p.ops?.checklist?.autonomous // Skip autonomous launches
-    );
+    // If token marketing is disabled, only track Nova channel
+    const tokenTrackingDisabled = env.TOKEN_TG_MARKETING_ENABLE === 'false';
+    
     const healthSummaries: Array<{
       ticker: string;
       name?: string;
@@ -316,45 +313,58 @@ export class GroupHealthMonitor {
       memberChange24h?: number;
     }> = [];
     
-    for (const pack of packs) {
-      const chatId = pack.tg?.telegram_chat_id;
-      if (!chatId) continue;
+    // Only check individual token groups if token marketing is enabled
+    if (!tokenTrackingDisabled) {
+      const allPacks = await this.store.list();
+      // Only check health for launched tokens (not draft/failed)
+      // SKIP autonomous launches - they share Nova's channel, not individual TG groups
+      const packs = allPacks.filter(p => 
+        p.launch?.status === 'launched' &&
+        !p.ops?.checklist?.autonomous // Skip autonomous launches
+      );
       
-      try {
-        const health = await this.getHealthReport(chatId);
-        if (health) {
-          // Store in LaunchPack
-          await this.store.update(pack.id!, {
-            tg: {
-              ...pack.tg,
-              health: health as any,
-            }
-          } as Partial<LaunchPack>);
-          
-          console.log(`[GROUP_HEALTH] Updated health for ${pack.brand?.ticker || pack.id}:`, {
-            members: health.memberCount,
-            active: health.activeMembers24h,
-            sentiment: health.sentiment,
-            trend: health.trend,
-          });
-          
-          // Collect for Nova channel summary with full details
-          healthSummaries.push({
-            ticker: pack.brand?.ticker || 'UNKNOWN',
-            name: pack.brand?.name,
-            description: pack.brand?.description || pack.brand?.tagline,
-            members: health.memberCount,
-            active: health.activeMembers24h,
-            sentiment: health.sentiment,
-            trend: health.trend,
-            tgInviteLink: pack.tg?.invite_link || pack.links?.telegram,
-            messagesPerDay: health.messagesPerDay,
-            memberChange24h: health.memberChange24h,
-          });
+      for (const pack of packs) {
+        const chatId = pack.tg?.telegram_chat_id;
+        if (!chatId) continue;
+        
+        try {
+          const health = await this.getHealthReport(chatId);
+          if (health) {
+            // Store in LaunchPack
+            await this.store.update(pack.id!, {
+              tg: {
+                ...pack.tg,
+                health: health as any,
+              }
+            } as Partial<LaunchPack>);
+            
+            console.log(`[GROUP_HEALTH] Updated health for ${pack.brand?.ticker || pack.id}:`, {
+              members: health.memberCount,
+              active: health.activeMembers24h,
+              sentiment: health.sentiment,
+              trend: health.trend,
+            });
+            
+            // Collect for Nova channel summary with full details
+            healthSummaries.push({
+              ticker: pack.brand?.ticker || 'UNKNOWN',
+              name: pack.brand?.name,
+              description: pack.brand?.description || pack.brand?.tagline,
+              members: health.memberCount,
+              active: health.activeMembers24h,
+              sentiment: health.sentiment,
+              trend: health.trend,
+              tgInviteLink: pack.tg?.invite_link || pack.links?.telegram,
+              messagesPerDay: health.messagesPerDay,
+              memberChange24h: health.memberChange24h,
+            });
+          }
+        } catch (err) {
+          console.error(`[GROUP_HEALTH] Failed to update ${pack.brand?.ticker}:`, err);
         }
-      } catch (err) {
-        console.error(`[GROUP_HEALTH] Failed to update ${pack.brand?.ticker}:`, err);
       }
+    } else {
+      console.log('[GROUP_HEALTH] Token tracking disabled, only checking Nova channel');
     }
     
     // Also track Nova's own channel (where autonomous launches go)
@@ -377,10 +387,17 @@ export class GroupHealthMonitor {
     }
     
     // Post to Nova channel if we have health data
+    // When token marketing is disabled, only show Nova's channel health (not other tokens)
     if (healthSummaries.length > 0) {
       try {
         const { announceHealthSummary } = await import('./novaChannel.ts');
-        await announceHealthSummary(healthSummaries);
+        // If token tracking disabled, only show Nova channel
+        const summariesToPost = tokenTrackingDisabled 
+          ? healthSummaries.filter(s => s.ticker === 'NOVA')
+          : healthSummaries;
+        if (summariesToPost.length > 0) {
+          await announceHealthSummary(summariesToPost);
+        }
       } catch {
         // Non-fatal
       }
