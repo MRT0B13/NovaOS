@@ -406,7 +406,7 @@ function generateCommunityPollContent(question: string, options: { emoji: string
     content += `${opt.emoji} = ${opt.label}\n`;
   }
   
-  content += `\nMost reactions wins. Checking in 2 hours ⏰`;
+  content += `\nReact with your choice! I'll check back in 2 hours ⏰`;
   
   return content;
 }
@@ -433,9 +433,16 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     return { success: false };
   }
   
+  // Initialize xPublisher on demand if not already done (same pattern as pumpLauncher)
   if (!xPublisher) {
-    logger.warn('[NovaPersonalBrand] X publisher not initialized');
-    return { success: false };
+    try {
+      const { XPublisherService } = await import('./xPublisher.ts');
+      xPublisher = new XPublisherService(null as any);
+      logger.info('[NovaPersonalBrand] X publisher initialized on-demand');
+    } catch (initErr) {
+      logger.error('[NovaPersonalBrand] Failed to init X publisher:', initErr);
+      return { success: false };
+    }
   }
   
   try {
@@ -533,13 +540,15 @@ export async function postToTelegram(
     recordMessageSent(); // For TG health monitor
     
     // Register for reaction tracking
+    // Use 2 hours for polls, 4 hours for other interactive posts
+    const feedbackMinutes = type === 'community_poll' ? 120 : 240;
     if (messageId) {
       await registerBrandPostForFeedback(
         messageId,
         channelId,
         type,
         content,
-        1440 // Track reactions for 24 hours
+        feedbackMinutes
       );
     }
     
@@ -759,6 +768,74 @@ export async function postBehindScenes(activity: string): Promise<void> {
   }
 }
 
+/**
+ * Post community engagement content (poll or behind-the-scenes)
+ */
+export async function postCommunityEngagement(): Promise<void> {
+  const engagementTypes = [
+    async () => {
+      // Random poll topics with proper emoji/label format
+      const pollTopics = [
+        { 
+          question: 'What should I focus on?', 
+          options: [
+            { emoji: '🚀', label: 'More tokens' },
+            { emoji: '⏰', label: 'Better timing' },
+            { emoji: '👥', label: 'Community features' },
+            { emoji: '💡', label: 'Something else' },
+          ]
+        },
+        { 
+          question: 'Favorite launch today?', 
+          options: [
+            { emoji: '📈', label: 'The trending one' },
+            { emoji: '🎨', label: 'The creative one' },
+            { emoji: '🔥', label: 'All fire' },
+            { emoji: '😴', label: 'Missed them all' },
+          ]
+        },
+        { 
+          question: 'Vibe check - how we feeling?', 
+          options: [
+            { emoji: '🐂', label: 'Bullish AF' },
+            { emoji: '🤔', label: 'Cautiously optimistic' },
+            { emoji: '🤡', label: 'Just here for memes' },
+            { emoji: '🐻', label: 'Bear mode' },
+          ]
+        },
+        { 
+          question: 'Best time to launch?', 
+          options: [
+            { emoji: '🌅', label: 'Morning UTC' },
+            { emoji: '☀️', label: 'Afternoon UTC' },
+            { emoji: '🌙', label: 'Evening UTC' },
+            { emoji: '🌊', label: 'When trends hit' },
+          ]
+        },
+      ];
+      const topic = pollTopics[Math.floor(Math.random() * pollTopics.length)];
+      await postCommunityPoll(topic.question, topic.options);
+    },
+    async () => {
+      // Behind the scenes activities
+      const activities = [
+        'Scanning trends across Twitter, Discord, and news...',
+        'Analyzing which mascots performed best this week',
+        'Fine-tuning my launch timing strategy',
+        'Reviewing community reactions to recent ideas',
+        'Building up my trend-spotting skills',
+        'Crunching numbers on market sentiment',
+      ];
+      const activity = activities[Math.floor(Math.random() * activities.length)];
+      await postBehindScenes(activity);
+    },
+  ];
+  
+  // Randomly pick an engagement type
+  const engagement = engagementTypes[Math.floor(Math.random() * engagementTypes.length)];
+  await engagement();
+}
+
 // ============================================================================
 // Milestone Tracking
 // ============================================================================
@@ -799,6 +876,8 @@ export async function checkMilestones(): Promise<void> {
 // ============================================================================
 
 let schedulerInterval: ReturnType<typeof setInterval> | null = null;
+let lastTeaseHour = -1;
+let lastEngagementHour = -1;
 
 export function startNovaPersonalScheduler(): void {
   const env = getEnv();
@@ -812,7 +891,8 @@ export function startNovaPersonalScheduler(): void {
   schedulerInterval = setInterval(async () => {
     try {
       const now = new Date();
-      const currentTime = `${now.getUTCHours().toString().padStart(2, '0')}:${now.getUTCMinutes().toString().padStart(2, '0')}`;
+      const currentHour = now.getUTCHours();
+      const currentTime = `${currentHour.toString().padStart(2, '0')}:${now.getUTCMinutes().toString().padStart(2, '0')}`;
       
       // GM post (within 15 min window of configured time)
       const gmTime = env.NOVA_GM_POST_TIME || '08:00';
@@ -830,6 +910,32 @@ export function startNovaPersonalScheduler(): void {
       const summaryDay = env.NOVA_WEEKLY_SUMMARY_DAY || 0;
       if (now.getUTCDay() === summaryDay && isWithinWindow(currentTime, recapTime, 15)) {
         await postWeeklySummary();
+      }
+      
+      // Nova tease / $NOVA hype - twice a day (around 12:00 and 18:00 UTC)
+      if ((currentHour === 12 || currentHour === 18) && lastTeaseHour !== currentHour) {
+        lastTeaseHour = currentHour;
+        await postNovaTease();
+      }
+      
+      // Community engagement post - once a day around 15:00 UTC
+      if (currentHour === 15 && lastEngagementHour !== currentHour) {
+        lastEngagementHour = currentHour;
+        // Post a community poll or behind-the-scenes
+        const random = Math.random();
+        if (random < 0.5) {
+          await postCommunityPoll(
+            "What should Nova focus on today?",
+            [
+              { emoji: '🚀', label: 'Launch more tokens!' },
+              { emoji: '📊', label: 'Analyze trends' },
+              { emoji: '💬', label: 'Community vibes' },
+              { emoji: '🎯', label: 'Quality over quantity' },
+            ]
+          );
+        } else {
+          await postBehindScenes('scanning trends and thinking about the next big launch');
+        }
       }
       
       // Check milestones

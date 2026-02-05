@@ -180,8 +180,10 @@ async function sendPhotoToChannel(
 /**
  * Pin a message in the channel
  */
-async function pinMessage(messageId: number, disableNotification: boolean = false): Promise<boolean> {
+export async function pinMessage(messageId: number, disableNotification: boolean = false): Promise<boolean> {
+  if (!channelConfig) initNovaChannel();
   if (!channelConfig?.enabled || !channelConfig.channelId || !channelConfig.botToken) {
+    logger.warn(`[NovaChannel] Cannot pin - channel not configured`);
     return false;
   }
   

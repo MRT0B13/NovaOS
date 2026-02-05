@@ -18,6 +18,7 @@ import { processScheduledTweets, getPendingTweets, recoverMarketingFromStore, sy
 import { startAutonomousMode, stopAutonomousMode } from './services/autonomousMode.ts';
 import { startTGScheduler, stopTGScheduler } from './services/telegramScheduler.ts';
 import { startSystemReporter, stopSystemReporter } from './services/systemReporter.ts';
+import { initCommunityVoting } from './services/communityVoting.ts';
 
 /**
  * Log Railway-specific environment info at startup
@@ -157,6 +158,14 @@ export async function initLaunchKit(
     logger.info('[LaunchKit] Group tracker initialized from stored LaunchPacks');
   } catch (err) {
     logger.warn({ error: err }, 'Failed to initialize group tracker (non-fatal)');
+  }
+
+  // Initialize community voting (loads pending votes from PostgreSQL)
+  try {
+    await initCommunityVoting();
+    logger.info('[LaunchKit] Community voting initialized');
+  } catch (err) {
+    logger.warn({ error: err }, 'Failed to initialize community voting (non-fatal)');
   }
 
   // Recover X marketing schedules from database (in case JSON files were lost)

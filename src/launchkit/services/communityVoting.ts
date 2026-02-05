@@ -16,6 +16,7 @@
 import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
 import type { TokenIdea } from './ideaGenerator.ts';
+import { pinMessage } from './novaChannel.ts';
 import * as fs from 'fs';
 import * as path from 'path';
 import { 
@@ -428,6 +429,22 @@ export async function postIdeaForVoting(
     
     saveState();
     
+    // Pin the voting post so community can see it
+    try {
+      await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: channelId,
+          message_id: messageId,
+          disable_notification: false, // Notify users about new idea
+        }),
+      });
+      logger.info(`[CommunityVoting] 📌 Pinned voting post for $${idea.ticker}`);
+    } catch (pinErr) {
+      logger.warn(`[CommunityVoting] Failed to pin voting post:`, pinErr);
+    }
+    
     logger.info(`[CommunityVoting] Posted idea $${idea.ticker} for voting (messageId: ${messageId})`);
     
     return vote;
@@ -450,8 +467,11 @@ export async function postScheduledIdeaForFeedback(
   const botToken = env.TG_BOT_TOKEN;
   const channelId = env.NOVA_CHANNEL_ID;
   
+  logger.info(`[CommunityVoting] postScheduledIdeaForFeedback called for $${idea.ticker}`);
+  logger.info(`[CommunityVoting] Config: TG_BOT_TOKEN=${botToken ? 'SET' : 'MISSING'}, NOVA_CHANNEL_ID=${channelId || 'MISSING'}`);
+  
   if (!botToken || !channelId) {
-    logger.warn('[CommunityVoting] Missing TG_BOT_TOKEN or NOVA_CHANNEL_ID');
+    logger.error(`[CommunityVoting] ❌ Cannot post scheduled idea - Missing TG_BOT_TOKEN (${botToken ? 'set' : 'missing'}) or NOVA_CHANNEL_ID (${channelId || 'missing'})`);
     return null;
   }
   
@@ -543,6 +563,14 @@ export async function postScheduledIdeaForFeedback(
     }
     
     saveState();
+    
+    // Pin the idea so community can easily find it
+    try {
+      await pinMessage(messageId, true); // silent pin
+      logger.info(`[CommunityVoting] 📌 Pinned scheduled idea to channel`);
+    } catch (pinErr) {
+      logger.warn(`[CommunityVoting] Failed to pin scheduled idea: ${pinErr}`);
+    }
     
     logger.info(`[CommunityVoting] Posted scheduled idea $${idea.ticker} for feedback (messageId: ${messageId})`);
     

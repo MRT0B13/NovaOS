@@ -452,27 +452,34 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
         const newMembers = ctx.message.new_chat_members;
         const chatId = String(ctx.message.chat.id);
         
-        // Get the LaunchPack for this chat to personalize the greeting
-        const bootstrap = runtime.getService('launchkit_bootstrap') as any;
-        const kit = bootstrap?.getLaunchKit?.();
-        const store = kit?.store;
+        // Check if this is Nova's main channel
+        const env = getEnv();
+        const novaChannelId = env.NOVA_CHANNEL_ID;
+        const isNovaChannel = novaChannelId && chatId === novaChannelId;
         
-        let tokenName = '$RUG';
-        let tokenTicker = 'RUG';
+        let tokenName = '';
+        let tokenTicker = '';
         
-        if (store) {
-          try {
-            const packs = await store.list();
-            const pack = packs.find((p: any) => 
-              p.tg?.telegram_chat_id === chatId || 
-              p.tg?.chat_id === chatId
-            );
-            if (pack?.brand) {
-              tokenName = pack.brand.name || tokenName;
-              tokenTicker = pack.brand.ticker || tokenTicker;
+        // Only look up token info for token-specific groups (not Nova's main channel)
+        if (!isNovaChannel) {
+          const bootstrap = runtime.getService('launchkit_bootstrap') as any;
+          const kit = bootstrap?.getLaunchKit?.();
+          const store = kit?.store;
+          
+          if (store) {
+            try {
+              const packs = await store.list();
+              const pack = packs.find((p: any) => 
+                p.tg?.telegram_chat_id === chatId || 
+                p.tg?.chat_id === chatId
+              );
+              if (pack?.brand) {
+                tokenName = pack.brand.name || '';
+                tokenTicker = pack.brand.ticker || '';
+              }
+            } catch (e) {
+              console.log('[BAN_HANDLER] Could not get pack for welcome:', e);
             }
-          } catch (e) {
-            console.log('[BAN_HANDLER] Could not get pack for welcome:', e);
           }
         }
         
@@ -490,19 +497,35 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           
           const firstName = member.first_name || member.username || 'fren';
           
-          // Generate a fun personalized welcome for users joining after launch
-          const welcomeMessages = [
-            `💎 ${firstName} is here! welcome to ${tokenName}!\n\nyou're early fren, make yourself at home! wagmi 🤝`,
-            `👋 yo ${firstName}! welcome to the $${tokenTicker} community!\n\ncheck the pinned messages to get up to speed, and enjoy the ride! 🚀`,
-            `🔥 gm ${firstName}! glad you found your way here!\n\njoin the $${tokenTicker} fam - we're building something special 💪`,
-            `🚀 ${firstName} just landed! welcome to $${tokenTicker}!\n\npull up a chair, the community is just getting started 🎯`,
-            `💫 ayoo ${firstName}! you made it!\n\nwelcome to the $${tokenTicker} zone - check the links above and vibe with us! 🤝`,
-          ];
+          let welcomeMessage: string;
           
-          const randomWelcome = welcomeMessages[Math.floor(Math.random() * welcomeMessages.length)];
+          if (isNovaChannel) {
+            // Nova's main channel - personalized Nova welcome
+            const novaWelcomes = [
+              `👋 gm ${firstName}! welcome to Nova's corner of crypto!\n\ni'm Nova, an autonomous AI agent launching meme tokens on Solana. join me on this journey - we're building something wild together 🚀`,
+              `🤖 yo ${firstName}! glad you found your way here!\n\ni'm Nova - your friendly neighborhood AI degen. i generate ideas, launch tokens, and share everything transparently. let's vibe! 💎`,
+              `✨ ayoo ${firstName}! welcome fren!\n\nthis is where i share my trading journey, launch meme tokens, and keep it 100% transparent. wagmi 🤝`,
+              `🚀 ${firstName} just joined the Nova fam!\n\ni'm an AI agent doing autonomous token launches on pump.fun. check the pinned messages to see what we're cooking! 🧠`,
+              `💫 welcome ${firstName}!\n\nyou're now part of my community - where AI meets degen culture. i share everything: wins, losses, ideas. let's build together! 🔥`,
+            ];
+            welcomeMessage = novaWelcomes[Math.floor(Math.random() * novaWelcomes.length)];
+          } else if (tokenTicker) {
+            // Token-specific group
+            const tokenWelcomes = [
+              `💎 ${firstName} is here! welcome to ${tokenName}!\n\nyou're early fren, make yourself at home! wagmi 🤝`,
+              `👋 yo ${firstName}! welcome to the $${tokenTicker} community!\n\ncheck the pinned messages to get up to speed, and enjoy the ride! 🚀`,
+              `🔥 gm ${firstName}! glad you found your way here!\n\njoin the $${tokenTicker} fam - we're building something special 💪`,
+              `🚀 ${firstName} just landed! welcome to $${tokenTicker}!\n\npull up a chair, the community is just getting started 🎯`,
+              `💫 ayoo ${firstName}! you made it!\n\nwelcome to the $${tokenTicker} zone - check the links above and vibe with us! 🤝`,
+            ];
+            welcomeMessage = tokenWelcomes[Math.floor(Math.random() * tokenWelcomes.length)];
+          } else {
+            // Unknown group - generic welcome
+            welcomeMessage = `👋 welcome ${firstName}! glad you're here fren 🤝`;
+          }
           
-          await ctx.reply(randomWelcome);
-          console.log(`[BAN_HANDLER] 👋 Welcomed new member: ${member.id} (${firstName})`);
+          await ctx.reply(welcomeMessage);
+          console.log(`[BAN_HANDLER] 👋 Welcomed new member: ${member.id} (${firstName}) in ${isNovaChannel ? 'Nova channel' : tokenTicker || 'unknown group'}`);
         }
       } catch (err: any) {
         console.error('[BAN_HANDLER] Error welcoming new member:', err.message);
@@ -542,44 +565,58 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           lastName: user.last_name,
         });
         
-        // Get the LaunchPack for this chat to personalize the greeting
-        const bootstrap = runtime.getService('launchkit_bootstrap') as any;
-        const kit = bootstrap?.getLaunchKit?.();
-        const store = kit?.store;
-        
-        let tokenName = '$RUG';
-        let tokenTicker = 'RUG';
-        let mascotName = '';
-        
-        if (store) {
-          try {
-            const packs = await store.list();
-            const pack = packs.find((p: any) => 
-              p.tg?.telegram_chat_id === chatId || 
-              p.tg?.chat_id === chatId
-            );
-            if (pack?.brand) {
-              tokenName = pack.brand.name || tokenName;
-              tokenTicker = pack.brand.ticker || tokenTicker;
-              mascotName = (pack as any).mascot?.name || '';
-            }
-          } catch (e) {
-            console.log('[BAN_HANDLER] Could not get pack for welcome:', e);
-          }
-        }
-        
         const firstName = user.first_name || user.username || 'fren';
         
-        // Generate a fun personalized welcome
-        const welcomeMessages = [
-          `🎉 yo ${firstName}! welcome to the $${tokenTicker} zone! 💎\n\ngrab a seat, we're just getting started. LFG! 🚀`,
-          `👋 ${firstName} just joined the ${tokenName} fam! welcome aboard ser! 🔥\n\nask questions, vibe with the community, and HODL tight! 💪`,
-          `🚀 gm ${firstName}! you made it to the $${tokenTicker} community!\n\nwe don't rug here, we RUG together 😈💎`,
-          `💎 ${firstName} is here! welcome to ${tokenName}!\n\nyou're early fren, make yourself at home! wagmi 🤝`,
-          `🔥 ayoo ${firstName}! glad you found us!\n\nwelcome to the $${tokenTicker} gang. diamond hands only! 💎🙌`,
-        ];
+        // Check if this is Nova's main channel
+        const novaChannelId = process.env.NOVA_CHANNEL_ID;
+        const isNovaChannel = novaChannelId && (chatId.toString() === novaChannelId || chatId.toString() === novaChannelId.replace('-100', ''));
         
-        const randomWelcome = welcomeMessages[Math.floor(Math.random() * welcomeMessages.length)];
+        let randomWelcome: string;
+        
+        if (isNovaChannel) {
+          // Nova's main channel welcome - generic, not token-specific
+          const novaWelcomes = [
+            `🤖 gm ${firstName}! welcome to Nova's channel! 💎\n\ni'm an autonomous AI launching meme tokens on Solana. stick around to see what I cook up next! 🚀`,
+            `👋 yo ${firstName}! glad you found us fren!\n\nthis is my HQ where I share launches, ideas, and daily vibes. LFG! 🔥`,
+            `🚀 ${firstName} just joined the Nova fam!\n\ni'm Nova, your friendly neighborhood AI degen. watch me launch tokens and share the journey! 💪`,
+            `💎 welcome ${firstName}!\n\nyou're in Nova's channel now. i launch meme coins, share alpha, and we all vibe together. wagmi! 🤝`,
+            `🔥 ayoo ${firstName}! welcome to the squad!\n\ni'm Nova - an AI that autonomously launches tokens. let's build something cool together! 🤖✨`,
+          ];
+          randomWelcome = novaWelcomes[Math.floor(Math.random() * novaWelcomes.length)];
+        } else {
+          // Token-specific group welcome
+          const bootstrap = runtime.getService('launchkit_bootstrap') as any;
+          const kit = bootstrap?.getLaunchKit?.();
+          const store = kit?.store;
+          
+          let tokenName = '$TOKEN';
+          let tokenTicker = 'TOKEN';
+          
+          if (store) {
+            try {
+              const packs = await store.list();
+              const pack = packs.find((p: any) => 
+                p.tg?.telegram_chat_id === chatId || 
+                p.tg?.chat_id === chatId
+              );
+              if (pack?.brand) {
+                tokenName = pack.brand.name || tokenName;
+                tokenTicker = pack.brand.ticker || tokenTicker;
+              }
+            } catch (e) {
+              console.log('[BAN_HANDLER] Could not get pack for welcome:', e);
+            }
+          }
+          
+          const tokenWelcomes = [
+            `🎉 yo ${firstName}! welcome to the $${tokenTicker} zone! 💎\n\ngrab a seat, we're just getting started. LFG! 🚀`,
+            `👋 ${firstName} just joined the ${tokenName} fam! welcome aboard ser! 🔥\n\nask questions, vibe with the community, and HODL tight! 💪`,
+            `🚀 gm ${firstName}! you made it to the $${tokenTicker} community!\n\nwe don't rug here, we RUG together 😈💎`,
+            `💎 ${firstName} is here! welcome to ${tokenName}!\n\nyou're early fren, make yourself at home! wagmi 🤝`,
+            `🔥 ayoo ${firstName}! glad you found us!\n\nwelcome to the $${tokenTicker} gang. diamond hands only! 💎🙌`,
+          ];
+          randomWelcome = tokenWelcomes[Math.floor(Math.random() * tokenWelcomes.length)];
+        }
         
         // Send welcome to the chat
         const botToken = process.env.TG_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
