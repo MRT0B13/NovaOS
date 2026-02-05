@@ -240,19 +240,30 @@ class StandaloneTwitterClient {
       const result = await this.client.v2.tweet(text, options);
       return { id: result.data.id };
     } catch (error: any) {
+      // Log full error for debugging
+      logger.error('[StandaloneTwitter] Tweet error:', {
+        code: error?.code,
+        status: error?.data?.status,
+        detail: error?.data?.detail,
+        title: error?.data?.title,
+        errors: error?.data?.errors,
+        message: error?.message,
+      });
+      
       // Parse Twitter API errors into cleaner messages
       const code = error?.code || error?.data?.status || 0;
-      const detail = error?.data?.detail || error?.message || 'Unknown error';
+      const detail = error?.data?.detail || error?.data?.title || error?.message || 'Unknown error';
       
       // Common Twitter error codes
       if (code === 403) {
         if (detail.includes('duplicate') || detail.includes('already posted')) {
           throw errorWithCode('X_DUPLICATE', 'Duplicate tweet - already posted similar content');
         }
-        if (detail.includes('not permitted')) {
-          throw errorWithCode('X_FORBIDDEN', 'Twitter API permission denied - try regenerating access tokens');
-        }
-        throw errorWithCode('X_FORBIDDEN', `Twitter 403: ${detail}`);
+        // Include full detail in error message for debugging
+        throw errorWithCode('X_FORBIDDEN', `Twitter 403 Forbidden: ${detail}`, { 
+          errors: error?.data?.errors,
+          rawMessage: error?.message 
+        });
       }
       if (code === 429) {
         throw errorWithCode('X_RATE_LIMIT', 'Twitter rate limit exceeded');

@@ -51,6 +51,9 @@ export const VOTE_REACTIONS = ['👍', '👎', '🔥', '💀'];
 // Reaction emojis for scheduled idea feedback (different from voting)
 export const FEEDBACK_REACTIONS = ['🔥', '🤔', '❌', '💡'];
 
+// All trackable reactions for personal brand posts
+export const BRAND_REACTIONS = ['🔥', '🤔', '❌', '💡', '🤑', '❤️', '👍', '👎', '🎉', '😂', '🚀'];
+
 export interface PendingVote {
   id: string;
   idea: TokenIdea;
@@ -551,6 +554,64 @@ export async function postScheduledIdeaForFeedback(
 }
 
 /**
+ * Register a personal brand post for reaction tracking
+ * This allows us to track reactions on GM posts, recaps, etc.
+ */
+export async function registerBrandPostForFeedback(
+  messageId: number,
+  chatId: string,
+  postType: string,
+  content: string,
+  feedbackMinutes: number = 1440 // Default 24h
+): Promise<PendingVote | null> {
+  const env = getEnv();
+  const usePostgres = env.USE_CENTRAL_POSTGRES;
+  const feedbackEndsAt = new Date(Date.now() + feedbackMinutes * 60 * 1000);
+  
+  // Create a dummy "idea" for tracking purposes
+  const dummyIdea: TokenIdea = {
+    ticker: postType.toUpperCase(),
+    name: `Nova ${postType} Post`,
+    description: content.substring(0, 100),
+    theme: 'nova_brand',
+    generatedAt: new Date().toISOString(),
+    status: 'pending',
+    confidence: 1,
+    hooks: [],
+    backstory: '',
+    source: 'nova_personal_brand',
+    reasoning: `Personal brand ${postType} post`,
+  };
+  
+  const vote: PendingVote = {
+    id: `brand_${Date.now()}_${postType}`,
+    idea: dummyIdea,
+    messageId,
+    chatId,
+    postedAt: new Date().toISOString(),
+    votingEndsAt: feedbackEndsAt.toISOString(),
+    agentReasoning: `Nova personal brand ${postType} post`,
+    status: 'pending',
+    type: 'feedback',
+  };
+  
+  state.pendingVotes.set(vote.id, vote);
+  
+  // Save to PostgreSQL if available
+  if (usePostgres && pgRepo) {
+    await pgRepo.insertPendingVote(vote as PGPendingVote).catch((err: Error) => {
+      logger.warn(`[CommunityVoting] Failed to save brand post to PostgreSQL: ${err.message}`);
+    });
+  }
+  
+  saveState();
+  
+  logger.info(`[CommunityVoting] Registered brand post ${postType} for feedback (messageId: ${messageId})`);
+  
+  return vote;
+}
+
+/**
  * Tally votes on a message
  */
 export async function tallyVotes(vote: PendingVote): Promise<VoteTally> {
@@ -745,7 +806,8 @@ function processChannelReactionCount(reactionCount: any): void {
   }
   
   if (!found) {
-    logger.warn(`[CommunityVoting] ❌ No pending vote found for message ${messageId} in chat ${chatId}`);
+    // Debug level since most reactions won't be on tracked posts
+    logger.debug(`[CommunityVoting] No pending vote found for message ${messageId} in chat ${chatId}`);
   }
 }
 
@@ -1120,6 +1182,7 @@ export function getRecentFeedback(limit: number = 10): IdeaFeedback[] {
 export default {
   postIdeaForVoting,
   postScheduledIdeaForFeedback,
+  registerBrandPostForFeedback,
   processReactionUpdate,
   checkPendingVotes,
   announceVoteResult,
@@ -1130,4 +1193,5 @@ export default {
   getRecentFeedback,
   VOTE_REACTIONS,
   FEEDBACK_REACTIONS,
+  BRAND_REACTIONS,
 };

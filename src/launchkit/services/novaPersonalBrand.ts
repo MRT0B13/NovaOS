@@ -19,6 +19,7 @@ import { getEnv } from '../env.ts';
 import { getPumpWalletBalance } from './fundingWallet.ts';
 import { getMetrics, recordTGPostSent } from './systemReporter.ts';
 import { recordMessageSent } from './telegramHealthMonitor.ts';
+import { registerBrandPostForFeedback } from './communityVoting.ts';
 import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
 
 // ============================================================================
@@ -530,6 +531,17 @@ export async function postToTelegram(
     // Track in metrics and health
     recordTGPostSent();
     recordMessageSent(); // For TG health monitor
+    
+    // Register for reaction tracking
+    if (messageId) {
+      await registerBrandPostForFeedback(
+        messageId,
+        channelId,
+        type,
+        content,
+        1440 // Track reactions for 24 hours
+      );
+    }
     
     // Record the post
     const post: NovaPost = {
