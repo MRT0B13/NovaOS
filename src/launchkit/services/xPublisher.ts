@@ -320,6 +320,9 @@ export class XPublisherService {
       throw errorWithCode('X_RATE_LIMIT', advice.reason);
     }
 
+    // Debug: Log exact tweet content being sent
+    logger.info(`[XPublisher] Attempting tweet (${text.length} chars): ${text.substring(0, 100)}...`);
+
     const result = await twitterClient.sendTweet(text);
     await recordWrite(text);
     recordTweetSent();

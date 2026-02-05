@@ -592,8 +592,6 @@ export async function registerBrandPostForFeedback(
   content: string,
   feedbackMinutes: number = 1440 // Default 24h
 ): Promise<PendingVote | null> {
-  const env = getEnv();
-  const usePostgres = env.USE_CENTRAL_POSTGRES;
   const feedbackEndsAt = new Date(Date.now() + feedbackMinutes * 60 * 1000);
   
   // Create a dummy "idea" for tracking purposes
@@ -627,9 +625,14 @@ export async function registerBrandPostForFeedback(
   
   // Save to PostgreSQL if available
   if (usePostgres && pgRepo) {
-    await pgRepo.insertPendingVote(vote as PGPendingVote).catch((err: Error) => {
+    try {
+      await pgRepo.insertPendingVote(vote as PGPendingVote);
+      logger.info(`[CommunityVoting] ✅ Saved brand post ${postType} to PostgreSQL`);
+    } catch (err: any) {
       logger.warn(`[CommunityVoting] Failed to save brand post to PostgreSQL: ${err.message}`);
-    });
+    }
+  } else {
+    logger.debug(`[CommunityVoting] PostgreSQL not available (usePostgres=${usePostgres}, pgRepo=${!!pgRepo})`);
   }
   
   saveState();

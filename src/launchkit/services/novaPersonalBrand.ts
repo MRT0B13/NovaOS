@@ -185,6 +185,7 @@ PERSONALITY:
 - You're on a journey and your community is along for the ride
 
 IMPORTANT:
+- KEEP POSTS UNDER 250 CHARACTERS for Twitter/X compatibility
 - Never use hashtags
 - Keep posts conversational and authentic
 - Always include reaction prompts for engagement
@@ -259,7 +260,7 @@ End with reactions.`,
           { role: 'system', content: NOVA_PERSONA },
           { role: 'user', content: prompt },
         ],
-        max_tokens: 300,
+        max_tokens: 150, // Keep short for Twitter
         temperature: 0.9,
       }),
     });
@@ -274,7 +275,18 @@ End with reactions.`,
     // Remove quotes if AI wrapped it
     text = text.replace(/^["']|["']$/g, '');
     
-    logger.info(`[NovaPersonalBrand] Generated AI ${type} post: ${text.substring(0, 50)}...`);
+    // Truncate to Twitter limit (280 chars) - cut at last complete sentence/word
+    if (text.length > 280) {
+      text = text.substring(0, 277);
+      // Try to cut at last complete word
+      const lastSpace = text.lastIndexOf(' ');
+      if (lastSpace > 200) {
+        text = text.substring(0, lastSpace);
+      }
+      text += '...';
+    }
+    
+    logger.info(`[NovaPersonalBrand] Generated AI ${type} post (${text.length} chars): ${text.substring(0, 50)}...`);
     return text;
   } catch (error) {
     logger.warn('[NovaPersonalBrand] AI generation failed:', error);
