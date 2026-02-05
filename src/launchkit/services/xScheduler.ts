@@ -492,11 +492,18 @@ async function buildTokenContext(launchPack: LaunchPack): Promise<TokenContext> 
  * Process scheduled tweets (run periodically)
  */
 export async function processScheduledTweets(
-  tweetFn: (text: string) => Promise<string | null>
+  tweetFn: (text: string) => Promise<string | null>,
+  options?: { onlyChannelPromos?: boolean }
 ): Promise<{ posted: number; skipped: number; failed: number }> {
   const results = { posted: 0, skipped: 0, failed: 0 };
   
-  const dueTweets = getDueTweets();
+  let dueTweets = getDueTweets();
+  
+  // Filter to only channel promos if specified
+  if (options?.onlyChannelPromos) {
+    dueTweets = dueTweets.filter(t => t.type === 'nova_channel_promo');
+  }
+  
   if (dueTweets.length === 0) return results;
   
   logger.info(`[XScheduler] Processing ${dueTweets.length} due tweets...`);
@@ -830,12 +837,6 @@ async function scheduleChannelPromos(): Promise<number> {
 async function autoRefillXMarketing(): Promise<void> {
   const env = getEnv();
   
-  // Check if token X marketing is disabled
-  if (env.TOKEN_X_MARKETING_ENABLE === 'false') {
-    logger.debug('[XScheduler] Token X marketing disabled, skipping auto-refill');
-    return;
-  }
-  
   if (!xStore) {
     logger.warn('[XScheduler] Store not initialized, skipping auto-refill');
     return;
@@ -848,11 +849,17 @@ async function autoRefillXMarketing(): Promise<void> {
     return;
   }
 
-  // Schedule channel promos (independent of tokens)
+  // Schedule channel promos (ALWAYS - independent of token marketing flag)
   try {
     await scheduleChannelPromos();
   } catch (err) {
     logger.warn('[XScheduler] Failed to schedule channel promos:', err);
+  }
+  
+  // Check if token X marketing is disabled - skip token-specific tweets but keep channel promos
+  if (env.TOKEN_X_MARKETING_ENABLE === 'false') {
+    logger.debug('[XScheduler] Token X marketing disabled, skipping token auto-refill (channel promos still active)');
+    return;
   }
   
   try {
@@ -925,32 +932,39 @@ export async function startXScheduler(
   xSchedulerInterval = setInterval(async () => {
     try {
       const env = getEnv();
-      
-      // Skip if token marketing is disabled
-      if (env.TOKEN_X_MARKETING_ENABLE === 'false') {
-        return; // Silent skip - no need to log every 5 min
-      }
+      const tokenMarketingEnabled = env.TOKEN_X_MARKETING_ENABLE !== 'false';
       
       const pending = getPendingTweets();
       const due = getDueTweets();
+      
+      // Filter to only channel promos if token marketing is disabled
+      const relevantDue = tokenMarketingEnabled 
+        ? due 
+        : due.filter(t => t.type === 'nova_channel_promo');
       
       if (pending.length === 0) {
         logger.info('[XScheduler] No pending tweets in queue');
         return;
       }
       
-      if (due.length === 0) {
+      if (relevantDue.length === 0) {
         // Log next scheduled tweet time for visibility
-        const nextTweet = pending[0];
+        const relevantPending = tokenMarketingEnabled
+          ? pending
+          : pending.filter(t => t.type === 'nova_channel_promo');
+        const nextTweet = relevantPending[0];
         if (nextTweet) {
           const nextTime = new Date(nextTweet.scheduledFor);
           const minsUntil = Math.round((nextTime.getTime() - Date.now()) / 60000);
-          logger.info(`[XScheduler] ${pending.length} pending, next tweet in ${minsUntil} min ($${nextTweet.tokenTicker})`);
+          logger.info(`[XScheduler] ${relevantPending.length} pending, next tweet in ${minsUntil} min ($${nextTweet.tokenTicker})`);
         }
         return;
       }
       
-      const results = await processScheduledTweets(tweetFn);
+      // Process only relevant tweets (channel promos only if token marketing disabled)
+      const results = tokenMarketingEnabled
+        ? await processScheduledTweets(tweetFn)
+        : await processScheduledTweets(tweetFn, { onlyChannelPromos: true });
       if (results.posted > 0 || results.failed > 0) {
         logger.info(`[XScheduler] Processed: ${results.posted} posted, ${results.skipped} skipped, ${results.failed} failed`);
       }
@@ -983,14 +997,21 @@ export async function startXScheduler(
   // Initial refill after 30 seconds, then immediately process due tweets
   setTimeout(async () => {
     try {
+      const env = getEnv();
+      const tokenMarketingEnabled = env.TOKEN_X_MARKETING_ENABLE !== 'false';
+      
       logger.info('[XScheduler] Running initial auto-refill...');
       await autoRefillXMarketing();
       
       // Immediately process any due tweets after refill
       const dueTweets = getDueTweets();
-      if (dueTweets.length > 0) {
-        logger.info(`[XScheduler] Processing ${dueTweets.length} due tweets after startup...`);
-        await processScheduledTweets(tweetFn);
+      const relevantDue = tokenMarketingEnabled 
+        ? dueTweets 
+        : dueTweets.filter(t => t.type === 'nova_channel_promo');
+        
+      if (relevantDue.length > 0) {
+        logger.info(`[XScheduler] Processing ${relevantDue.length} due tweets after startup...`);
+        await processScheduledTweets(tweetFn, { onlyChannelPromos: !tokenMarketingEnabled });
       } else {
         logger.info('[XScheduler] No due tweets to process on startup');
       }
