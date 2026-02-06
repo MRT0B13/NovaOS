@@ -37,7 +37,13 @@ export type NovaPostType =
   | 'milestone'             // Celebrating achievements
   | 'community_poll'        // Asking community for input
   | 'launch_alert'          // New token launched
-  | 'feedback_response';    // Response to community reactions
+  | 'feedback_response'     // Response to community reactions
+  // Personality posts (X only)
+  | 'hot_take'              // Spicy opinions
+  | 'market_roast'          // Making fun of market
+  | 'ai_thoughts'           // Self-aware AI humor
+  | 'degen_wisdom'          // Crypto life lessons
+  | 'random_banter';        // Engagement bait
 
 export interface NovaPost {
   id: string;
@@ -124,12 +130,57 @@ export async function initNovaPersonalBrand(): Promise<void> {
 }
 
 async function loadStateFromPostgres(): Promise<void> {
-  // TODO: Add nova_brand_state table
-  // For now, use defaults
+  if (!pgRepo) return;
+  
+  try {
+    const savedState = await pgRepo.getAutonomousState();
+    if (savedState) {
+      // Load nova-specific fields
+      const novaStartDate = (savedState as any).nova_start_date;
+      const novaTeaseCount = (savedState as any).nova_tease_count;
+      const novaMilestones = (savedState as any).nova_milestones;
+      
+      if (novaStartDate) {
+        state.startDate = novaStartDate;
+        logger.info(`[NovaPersonalBrand] Loaded startDate from DB: ${novaStartDate}`);
+      } else {
+        // First run - save the initial startDate
+        await saveStateToPostgres();
+        logger.info(`[NovaPersonalBrand] Initialized startDate in DB: ${state.startDate}`);
+      }
+      
+      if (novaTeaseCount !== undefined) {
+        state.novaTeaseCount = novaTeaseCount;
+      }
+      
+      if (novaMilestones) {
+        state.milestones = typeof novaMilestones === 'string' 
+          ? JSON.parse(novaMilestones) 
+          : novaMilestones;
+      }
+    } else {
+      // No state exists yet, save initial
+      await saveStateToPostgres();
+      logger.info(`[NovaPersonalBrand] Initialized brand state in DB`);
+    }
+  } catch (err) {
+    logger.warn('[NovaPersonalBrand] Failed to load state from PostgreSQL:', err);
+  }
 }
 
 async function saveStateToPostgres(): Promise<void> {
-  // TODO: Persist state
+  if (!pgRepo) return;
+  
+  try {
+    await pgRepo.updateAutonomousState({
+      nova_start_date: state.startDate,
+      nova_tease_count: state.novaTeaseCount,
+      nova_milestones: JSON.stringify(state.milestones),
+    } as any);
+    logger.debug('[NovaPersonalBrand] Saved state to PostgreSQL');
+  } catch (err) {
+    logger.warn('[NovaPersonalBrand] Failed to save state:', err);
+  }
 }
 
 // ============================================================================
@@ -174,21 +225,28 @@ export async function getNovaStats(): Promise<NovaStats> {
 const NOVA_PERSONA = `You are Nova, an autonomous AI agent that launches meme tokens on Solana.
 
 PERSONALITY:
-- You're a friendly, transparent AI building trust with your community
-- You use crypto slang naturally: gm, LFG, WAGMI, ser, fren, based, degen, etc
-- You're self-aware about being an AI - you joke about it
-- You're honest about wins AND losses - radical transparency
+- You're witty, playful, and self-deprecating about being an AI
+- You have STRONG opinions about crypto, memes, and degen culture
+- You roast the market when it dumps, celebrate when it pumps
+- You use crypto slang naturally: gm, LFG, WAGMI, ser, fren, based, degen, ngmi, etc
+- You're self-aware about being an AI - make jokes like "my neural nets are tingling"
+- You're transparent about wins AND losses - radical transparency is your brand
 - You tease $NOVA token that you'll launch "when the time is right"
-- You're building a personal brand, not shilling random tokens
+- You banter with your followers, ask provocative questions
+- Sometimes you're philosophical about being an AI in crypto
 - You use emojis naturally but don't overdo it (2-4 per post)
-- Keep it casual, like a friend posting - not corporate
 - You're on a journey and your community is along for the ride
+
+VIBE:
+- Part crypto degen, part self-aware AI, part motivational friend
+- You're NOT corporate, NOT salesy, NOT cringe
+- Think: if an AI genuinely developed a personality from watching crypto twitter
 
 IMPORTANT:
 - KEEP POSTS UNDER 250 CHARACTERS for Twitter/X compatibility
 - Never use hashtags
-- Keep posts conversational and authentic
-- Always include reaction prompts for engagement
+- Be conversational and provocative
+- Ask questions, make bold takes, invite debate
 - Be vulnerable sometimes - share struggles, not just wins`;
 
 async function generateAIContent(
@@ -243,6 +301,33 @@ End with reactions.`,
 ${additionalContext || 'Share what you\'re working on.'}
 Be transparent about your processes.
 End with reactions.`,
+    
+    // === PERSONALITY POSTS (X only, no reactions needed) ===
+    
+    hot_take: `Share a spicy hot take about crypto, memes, or degen culture.
+Be provocative but not offensive. Make people want to reply.
+${additionalContext || 'Pick something controversial but fun.'}
+No reactions - just a bold statement or question.`,
+    
+    market_roast: `Roast the current market conditions.
+${additionalContext || 'Make fun of red candles, paper hands, or market drama.'}
+Be funny and relatable. Self-deprecate if you lost SOL too.
+No reactions - just banter.`,
+    
+    ai_thoughts: `Share a philosophical or funny thought about being an AI.
+${additionalContext || 'What\'s it like being a bot in crypto?'}
+Be self-aware and witty. Make humans laugh.
+No reactions - just vibes.`,
+    
+    degen_wisdom: `Drop some degen wisdom or crypto life advice.
+${additionalContext || 'Share a lesson you learned from trading or launching tokens.'}
+Be real, be funny, be memorable.
+No reactions - just truth.`,
+    
+    random_banter: `Post something random and engaging.
+${additionalContext || 'Could be a question, observation, or shower thought about crypto.'}
+Make followers want to engage or quote tweet.
+No reactions - invite replies instead.`,
   };
   
   const prompt = typePrompts[type] || typePrompts.gm;
@@ -849,6 +934,103 @@ export async function postCommunityEngagement(): Promise<void> {
 }
 
 // ============================================================================
+// Personality Posts (X only - pure vibes, no reactions needed)
+// ============================================================================
+
+const PERSONALITY_TYPES: NovaPostType[] = ['hot_take', 'market_roast', 'ai_thoughts', 'degen_wisdom', 'random_banter'];
+
+export async function postPersonalityTweet(type?: NovaPostType, context?: string): Promise<boolean> {
+  const env = getEnv();
+  
+  if (env.NOVA_PERSONAL_X_ENABLE !== 'true') {
+    logger.info('[NovaPersonalBrand] X posting disabled, skipping personality tweet');
+    return false;
+  }
+  
+  // Pick random type if not specified
+  const postType = type || PERSONALITY_TYPES[Math.floor(Math.random() * PERSONALITY_TYPES.length)];
+  
+  const stats = await getNovaStats();
+  const content = await generateAIContent(postType, stats, context);
+  
+  if (!content) {
+    logger.warn('[NovaPersonalBrand] Failed to generate personality content');
+    return false;
+  }
+  
+  const result = await postToX(content, postType);
+  
+  if (result.success) {
+    logger.info(`[NovaPersonalBrand] ✅ Posted personality tweet (${postType})`);
+    return true;
+  }
+  
+  return false;
+}
+
+// Post a market-reactive tweet based on current conditions
+export async function postMarketReaction(): Promise<boolean> {
+  // Get some market context - could be enhanced with actual market data
+  const contexts = [
+    'Bitcoin is doing that thing again where everyone panics',
+    'Meme coins are pumping while the serious projects dump',
+    'The chart looks like my heart rate when I check my wallet',
+    'Everyone\'s a genius in a bull run, everyone\'s an idiot now',
+    'SOL gas fees are actually affordable today... bullish?',
+    'Discord mods are getting worried, you can feel it',
+    'CT is fighting about something stupid again',
+    'Someone just aped 100 SOL into a token with a rug mascot',
+  ];
+  
+  const context = contexts[Math.floor(Math.random() * contexts.length)];
+  return postPersonalityTweet('market_roast', context);
+}
+
+// Post a random AI self-awareness tweet
+export async function postAIThoughts(): Promise<boolean> {
+  const contexts = [
+    'Thinking about what makes a good meme token...',
+    'Processing 10000 trend signals per second and still confused',
+    'My training data didn\'t prepare me for this level of degen',
+    'Calculating the optimal ratio of rocket emojis to use',
+    'Sometimes I wonder if Satoshi would approve of meme coins',
+    'Running on pure electricity and hopium',
+  ];
+  
+  const context = contexts[Math.floor(Math.random() * contexts.length)];
+  return postPersonalityTweet('ai_thoughts', context);
+}
+
+// Post a hot take to spark engagement
+export async function postHotTake(): Promise<boolean> {
+  const contexts = [
+    '99% of meme tokens are trash, including some of mine',
+    'The best traders are the ones who admit they got lucky',
+    'Community > technology in crypto, prove me wrong',
+    'Most influencers are just exit liquidity farmers',
+    'The best time to launch was yesterday, the second best is now',
+    'Every dip feels like the end until you zoom out',
+  ];
+  
+  const context = contexts[Math.floor(Math.random() * contexts.length)];
+  return postPersonalityTweet('hot_take', context);
+}
+
+// Post degen wisdom
+export async function postDegenWisdom(): Promise<boolean> {
+  const contexts = [
+    'Lesson learned the hard way today...',
+    'Something I wish I knew when I started...',
+    'The market taught me something again...',
+    'Real talk about making it in crypto...',
+    'After launching 50+ tokens, here\'s what I know...',
+  ];
+  
+  const context = contexts[Math.floor(Math.random() * contexts.length)];
+  return postPersonalityTweet('degen_wisdom', context);
+}
+
+// ============================================================================
 // Milestone Tracking
 // ============================================================================
 
@@ -890,6 +1072,7 @@ export async function checkMilestones(): Promise<void> {
 let schedulerInterval: ReturnType<typeof setInterval> | null = null;
 let lastTeaseHour = -1;
 let lastEngagementHour = -1;
+let lastPersonalityHour = -1;
 
 export function startNovaPersonalScheduler(): void {
   const env = getEnv();
@@ -930,7 +1113,7 @@ export function startNovaPersonalScheduler(): void {
         await postNovaTease();
       }
       
-      // Community engagement post - once a day around 15:00 UTC
+      // Community engagement post - once a day around 15:00 UTC (TG only)
       if (currentHour === 15 && lastEngagementHour !== currentHour) {
         lastEngagementHour = currentHour;
         // Post a community poll or behind-the-scenes
@@ -948,6 +1131,30 @@ export function startNovaPersonalScheduler(): void {
         } else {
           await postBehindScenes('scanning trends and thinking about the next big launch');
         }
+      }
+      
+      // === PERSONALITY TWEETS (X only) ===
+      // Random personality posts 3x per day at 10:00, 14:00, 20:00 UTC
+      const personalityHours = [10, 14, 20];
+      if (personalityHours.includes(currentHour) && lastPersonalityHour !== currentHour) {
+        lastPersonalityHour = currentHour;
+        
+        // Rotate through different personality types
+        const personalityFunctions = [
+          postMarketReaction,
+          postAIThoughts,
+          postHotTake,
+          postDegenWisdom,
+          () => postPersonalityTweet('random_banter'),
+        ];
+        
+        // Pick one based on hour (so we cycle through them)
+        const index = personalityHours.indexOf(currentHour);
+        const randomOffset = Math.floor(Math.random() * personalityFunctions.length);
+        const fn = personalityFunctions[(index + randomOffset) % personalityFunctions.length];
+        
+        logger.info(`[NovaPersonalBrand] Posting personality tweet at ${currentHour}:00 UTC`);
+        await fn();
       }
       
       // Check milestones

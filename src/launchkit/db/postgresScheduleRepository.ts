@@ -348,9 +348,26 @@ export class PostgresScheduleRepository {
         next_scheduled_time BIGINT,
         pending_idea JSONB,
         pending_vote_id TEXT,
+        nova_start_date TEXT,
+        nova_tease_count INTEGER DEFAULT 0,
+        nova_milestones JSONB DEFAULT '[]',
         last_updated TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+    
+    // Add nova_start_date column if missing (migration)
+    await this.pool.query(`
+      ALTER TABLE sched_autonomous_state
+      ADD COLUMN IF NOT EXISTS nova_start_date TEXT;
+    `).catch(() => {});
+    await this.pool.query(`
+      ALTER TABLE sched_autonomous_state
+      ADD COLUMN IF NOT EXISTS nova_tease_count INTEGER DEFAULT 0;
+    `).catch(() => {});
+    await this.pool.query(`
+      ALTER TABLE sched_autonomous_state
+      ADD COLUMN IF NOT EXISTS nova_milestones JSONB DEFAULT '[]';
+    `).catch(() => {});
 
     // Create indexes
     await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_tg_posts_status ON sched_tg_posts (status);`);
@@ -1099,6 +1116,9 @@ export class PostgresScheduleRepository {
     nextScheduledTime?: number | null;
     pendingIdea?: any | null;
     pendingVoteId?: string | null;
+    nova_start_date?: string;
+    nova_tease_count?: number;
+    nova_milestones?: string;
   }): Promise<void> {
     const sets: string[] = ['last_updated = NOW()'];
     const values: any[] = [];
@@ -1111,6 +1131,9 @@ export class PostgresScheduleRepository {
       nextScheduledTime: 'next_scheduled_time',
       pendingIdea: 'pending_idea',
       pendingVoteId: 'pending_vote_id',
+      nova_start_date: 'nova_start_date',
+      nova_tease_count: 'nova_tease_count',
+      nova_milestones: 'nova_milestones',
     };
 
     for (const [key, value] of Object.entries(updates)) {
