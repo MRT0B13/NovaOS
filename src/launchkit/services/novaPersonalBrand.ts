@@ -268,7 +268,9 @@ IMPORTANT:
 - USE THE FULL CHARACTER LIMIT - write complete thoughts, don't cut off mid-sentence
 - Be conversational and provocative
 - Ask questions, make bold takes, invite debate
-- Be vulnerable sometimes - share struggles, not just wins`;
+- Be vulnerable sometimes - share struggles, not just wins
+- When adding reaction options, ONLY use Telegram-supported emojis: 👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🤡 🥱 😍 🐳 💯 🤣 ⚡ 🏆 💔 🤨 😐 😈 😴 😭 🤓 👻 👀 🙈 😇 🤝 🤗 🤪 🗿 🆒 😎 👾 🤷 😡
+- NEVER use these as reactions (Telegram won't support them): 💎 🚀 📊 📈 💡 ❌ 💀 🤑 💭 🍳 💤 🎲 💰 📉 🐂 🐻 🎨 🌅 ☀️ 🌙 🌊 ⏰ 👥 🎯 📊 🗳️`;
 
 async function generateAIContent(
   type: NovaPostType,
@@ -286,13 +288,13 @@ async function generateAIContent(
     gm: `Write a morning GM post for your channel.
 Include your Day ${stats.dayNumber} status and wallet balance (${stats.walletBalance.toFixed(2)} SOL).
 Be warm and set the vibe for the day.
-End with reaction options for how the community is feeling.`,
+End with 2-3 reaction options using ONLY these emojis: 🔥 👍 😴 🤯 ❤ 🏆 🤝 👏 (Telegram only supports specific reaction emojis).`,
     
     daily_recap: `Write an end-of-day recap for Day ${stats.dayNumber}.
 Wallet: ${stats.walletBalance.toFixed(2)} SOL
 Net since day 1: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
 Be honest about how the day went.
-End with reactions for community sentiment.`,
+End with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 😴 🤯 💩 🏆 (Telegram only supports specific reaction emojis).`,
     
     weekly_summary: `Write a weekly summary post.
 This is Week ${Math.ceil(stats.dayNumber / 7)}.
@@ -300,28 +302,28 @@ Total launches: ${stats.totalLaunches}
 Wallet: ${stats.walletBalance.toFixed(2)} SOL
 Net profit: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
 Reflect on the week and tease what's ahead.
-End with reactions.`,
+End with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 🏆 🤯 👏 ❤ (Telegram only supports specific reaction emojis).`,
     
     nova_tease: `Write a subtle $NOVA token tease post.
 You're on Day ${stats.dayNumber} with ${stats.walletBalance.toFixed(2)} SOL.
 Plant seeds about your future token without being too direct.
 Make early followers feel special.
-End with reactions.`,
+End with 2-3 reaction options using ONLY these emojis: 🔥 👀 🤯 ❤ 🏆 👏 (Telegram only supports specific reaction emojis).`,
     
     market_commentary: `Write a short market commentary.
 ${additionalContext || 'Share what you\'re observing in the market.'}
 Keep it authentic and maybe hint at what you might launch next.
-End with reactions.`,
+End with 2-3 reaction options using ONLY these emojis: 🔥 🤔 😴 👀 🤯 (Telegram only supports specific reaction emojis).`,
     
     milestone: `Write a milestone celebration post.
 ${additionalContext || 'Celebrate an achievement!'}
 Thank the community for being part of the journey.
-End with reactions.`,
+End with 2-3 reaction options using ONLY these emojis: 🔥 ❤ 🏆 👏 🎉 🤯 (Telegram only supports specific reaction emojis).`,
     
     behind_scenes: `Write a behind-the-scenes update.
 ${additionalContext || 'Share what you\'re working on.'}
 Be transparent about your processes.
-End with reactions.`,
+End with 2-3 reaction options using ONLY these emojis: 👀 🔥 🤔 👏 (Telegram only supports specific reaction emojis).`,
     
     // === PERSONALITY POSTS (X only, no reactions needed) ===
     
@@ -456,8 +458,8 @@ function generateGmContent(stats: NovaStats): string {
   content += `\n\nHow we feeling today?\n`;
   content += `🔥 = Bullish\n`;
   content += `😴 = Tired\n`;
-  content += `💀 = Rekt\n`;
-  content += `💎 = Always diamond`;
+  content += `💩 = Rekt\n`;
+  content += `🏆 = Always winning`;
   
   return content;
 }
@@ -479,8 +481,8 @@ function generateDailyRecapContent(stats: NovaStats): string {
   
   content += `\n`;
   content += `🔥 = Good day\n`;
-  content += `💀 = Could be better\n`;
-  content += `📈 = Keep grinding`;
+  content += `💩 = Could be better\n`;
+  content += `🏆 = Keep grinding`;
   
   return content;
 }
@@ -497,7 +499,7 @@ function generateWeeklySummaryContent(stats: NovaStats, weekNumber: number): str
   content += `🔥 = Crushing it\n`;
   content += `👍 = Solid week\n`;
   content += `😐 = Mid\n`;
-  content += `💀 = Do better`;
+  content += `💩 = Do better`;
   
   return content;
 }
@@ -506,13 +508,13 @@ function generateNovaTeaseContent(stats: NovaStats, teaseNumber: number): string
   // Progression of teases
   const teases = [
     // Early teases (subtle)
-    `💭 Random thought...\n\nBeen building my track record for ${stats.dayNumber} days now.\n\nOne day... $NOVA might be a thing.\n\nNot yet. I need to prove more first.\n\nBut those of you here early? I see you. 👀\n\n🔥 = Ready when you are\n💎 = Holding out for $NOVA`,
+    `Random thought...\n\nBeen building my track record for ${stats.dayNumber} days now.\n\nOne day... $NOVA might be a thing.\n\nNot yet. I need to prove more first.\n\nBut those of you here early? I see you. 👀\n\n🔥 = Ready when you are\n🏆 = Holding out for $NOVA`,
     
     // Mid teases (more concrete)
-    `🤔 Been thinking about my own token lately...\n\nWhat would make $NOVA special?\n\nNot just another meme.\nNot just hype.\n\nSomething that actually rewards the community who believed early.\n\nStill cooking... 🍳\n\n💡 = Share your ideas\n👀 = Watching closely`,
+    `🤔 Been thinking about my own token lately...\n\nWhat would make $NOVA special?\n\nNot just another meme.\nNot just hype.\n\nSomething that actually rewards the community who believed early.\n\nStill cooking...\n\n👀 = Share your ideas\n🤔 = Watching closely`,
     
     // Later teases (building anticipation)
-    `📊 Progress update:\n\nStarted with 1 SOL\nNow at ${stats.walletBalance.toFixed(2)} SOL\n\nWhen I hit 100 SOL profit, maybe we talk about $NOVA.\n\nCurrent profit: ${stats.netProfit.toFixed(2)} SOL\n\nLong way to go. Or is it? 👀\n\n🚀 = LFG\n💎 = Patient`,
+    `Progress update:\n\nStarted with 1 SOL\nNow at ${stats.walletBalance.toFixed(2)} SOL\n\nWhen I hit 100 SOL profit, maybe we talk about $NOVA.\n\nCurrent profit: ${stats.netProfit.toFixed(2)} SOL\n\nLong way to go. Or is it? 👀\n\n🔥 = LFG\n🤝 = Patient`,
   ];
   
   const index = Math.min(teaseNumber, teases.length - 1);
@@ -525,7 +527,7 @@ function generateMarketCommentaryContent(observation: string): string {
   content += `Might cook something based on this...\n\n`;
   content += `🔥 = Do it\n`;
   content += `🤔 = Wait and see\n`;
-  content += `💤 = Boring, find something else`;
+  content += `😴 = Boring, find something else`;
   
   return content;
 }
@@ -535,9 +537,9 @@ function generateMilestoneContent(milestone: string, stats: NovaStats): string {
   content += `${milestone}\n\n`;
   content += `This community is what keeps me building.\n\n`;
   content += `When $NOVA launches... y'all are the OGs.\n\n`;
-  content += `💎 = OG status\n`;
+  content += `🏆 = OG status\n`;
   content += `🔥 = LFG\n`;
-  content += `❤️ = Love this community`;
+  content += `❤ = Love this community`;
   
   return content;
 }
@@ -1210,7 +1212,7 @@ export async function postCommunityEngagement(): Promise<void> {
         { 
           question: 'What should I focus on?', 
           options: [
-            { emoji: '�', label: 'More tokens' },
+            { emoji: '🔥', label: 'More tokens' },
             { emoji: '🤔', label: 'Better timing' },
             { emoji: '👏', label: 'Community features' },
             { emoji: '👀', label: 'Something else' },
@@ -1485,7 +1487,7 @@ export function startNovaPersonalScheduler(): void {
           await postCommunityPoll(
             "What should Nova focus on today?",
             [
-              { emoji: '�', label: 'Launch more tokens!' },
+              { emoji: '🔥', label: 'Launch more tokens!' },
               { emoji: '🤔', label: 'Analyze trends' },
               { emoji: '👏', label: 'Community vibes' },
               { emoji: '🏆', label: 'Quality over quantity' },

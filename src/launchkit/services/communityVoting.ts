@@ -7,7 +7,7 @@
  * 
  * Flow:
  * 1. Agent generates idea → posts to channel with reasoning
- * 2. Community reacts: 👍 = Launch | 👎 = Skip | 🔥 = Love it | � = Terrible
+ * 2. Community reacts: 👍 = Launch | 👎 = Skip | 🔥 = Love it | 💩 = Terrible
  * 3. After voting window, tally reactions
  * 4. If sentiment positive → proceed with launch
  * 5. Store feedback in memory for learning
@@ -380,7 +380,7 @@ export async function postIdeaForVoting(
   message += `👍 = Yes, send it!\n`;
   message += `👎 = Nah, skip it\n`;
   message += `🔥 = Love it!\n`;
-  message += `� = Terrible idea\n\n`;
+  message += `💩 = Terrible idea\n\n`;
   message += `⏰ <i>Voting ends in ${votingMinutes} minutes</i>`;
   
   try {
@@ -631,6 +631,7 @@ export async function registerBrandPostForFeedback(
     ai_thoughts: 'AI Thoughts',
     degen_wisdom: 'Degen Wisdom',
     random_banter: 'Banter',
+    trust_talk: 'Trust Talk',
   };
   const displayTicker = friendlyNames[postType] || postType.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
   
