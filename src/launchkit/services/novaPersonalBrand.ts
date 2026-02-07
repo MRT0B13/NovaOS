@@ -251,8 +251,9 @@ VIBE:
 - Think: if an AI genuinely developed a personality from watching crypto twitter
 
 IMPORTANT:
-- KEEP POSTS UNDER 220 CHARACTERS for Twitter/X (hashtags are added separately)
+- KEEP POSTS UNDER 270 CHARACTERS for Twitter/X (hashtags are added separately)
 - Do NOT include hashtags in your post - they'll be added automatically
+- USE THE FULL CHARACTER LIMIT - write complete thoughts, don't cut off mid-sentence
 - Be conversational and provocative
 - Ask questions, make bold takes, invite debate
 - Be vulnerable sometimes - share struggles, not just wins`;
@@ -353,7 +354,7 @@ No reactions - invite replies instead.`,
           { role: 'system', content: NOVA_PERSONA },
           { role: 'user', content: prompt },
         ],
-        max_tokens: 150, // Keep short for Twitter
+        max_tokens: 250, // Enough for full 270-char tweets
         temperature: 0.9,
       }),
     });
@@ -371,15 +372,23 @@ No reactions - invite replies instead.`,
     // Remove quotes if AI wrapped it
     text = text.replace(/^["']|["']$/g, '');
     
-    // Truncate to Twitter limit (280 chars) - cut at last complete sentence/word
-    if (text.length > 280) {
-      text = text.substring(0, 277);
-      // Try to cut at last complete word
-      const lastSpace = text.lastIndexOf(' ');
-      if (lastSpace > 200) {
-        text = text.substring(0, lastSpace);
+    // Ensure content stays under 270 chars (leaves room for hashtags if they fit)
+    if (text.length > 270) {
+      text = text.substring(0, 267);
+      // Try to cut at last complete sentence or word
+      const lastPeriod = text.lastIndexOf('. ');
+      const lastQuestion = text.lastIndexOf('? ');
+      const lastExclaim = text.lastIndexOf('! ');
+      const lastSentence = Math.max(lastPeriod, lastQuestion, lastExclaim);
+      if (lastSentence > 180) {
+        text = text.substring(0, lastSentence + 1); // Keep the punctuation
+      } else {
+        const lastSpace = text.lastIndexOf(' ');
+        if (lastSpace > 200) {
+          text = text.substring(0, lastSpace);
+        }
+        text += '...';
       }
-      text += '...';
     }
     
     logger.info(`[NovaPersonalBrand] Generated AI ${type} post (${text.length} chars): ${text.substring(0, 50)}...`);
@@ -804,19 +813,18 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     // Generate smart hashtags
     const hashtags = generateHashtags(type);
     
-    // Build tweet: content + hashtags (ensure we stay under 280)
+    // Build tweet: content first, hashtags if they fit (never trim content for hashtags)
     let fullTweet = contentWithCTA;
     if (hashtags && (contentWithCTA.length + 2 + hashtags.length) <= 280) {
+      // Everything fits — add hashtags
       fullTweet = `${contentWithCTA}\n\n${hashtags}`;
     } else if (hashtags) {
-      // Trim content to fit hashtags
-      const maxContentLen = 280 - hashtags.length - 3; // 2 newlines + safety
-      if (maxContentLen > 150) {
-        let trimmed = contentWithCTA.substring(0, maxContentLen);
-        const lastSpace = trimmed.lastIndexOf(' ');
-        if (lastSpace > 120) trimmed = trimmed.substring(0, lastSpace);
-        fullTweet = `${trimmed}...\n\n${hashtags}`;
+      // Content too long for all hashtags — try fewer hashtags
+      const fewerTags = hashtags.split(' ').slice(0, 2).join(' ');
+      if ((contentWithCTA.length + 2 + fewerTags.length) <= 280) {
+        fullTweet = `${contentWithCTA}\n\n${fewerTags}`;
       }
+      // else: skip hashtags entirely, content is king
     }
     
     logger.info(`[NovaPersonalBrand] Tweet with hashtags (${fullTweet.length} chars): ${fullTweet.substring(0, 80)}...`);
