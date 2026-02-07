@@ -6,36 +6,62 @@ import 'dotenv/config';
 
 // Test hashtag generation (no API needed)
 const HASHTAG_POOLS = {
-  crypto: ['#Crypto', '#Web3', '#DeFi', '#Solana', '#SOL', '#CryptoTwitter', '#Blockchain'],
-  ai: ['#AI', '#AIAgent', '#ArtificialIntelligence', '#AITrading', '#AutomatedTrading'],
-  degen: ['#Degen', '#Memecoin', '#CryptoMemes', '#WAGMI', '#GonnaMakeIt'],
-  market: ['#CryptoMarket', '#Trading', '#BullRun', '#BearMarket', '#MarketUpdate'],
-  community: ['#CryptoCommunity', '#BuildInPublic', '#CryptoFam'],
-  nova: ['#NovaAI', '#NovaAgent'],
+  crypto: ['#Crypto', '#Bitcoin', '#Ethereum', '#Solana', '#SOL', '#BTC', '#DeFi', '#Web3', '#Blockchain', '#CryptoNews', '#CryptoTrading', '#Altcoins', '#HODL'],
+  ai: ['#AI', '#ChatGPT', '#MachineLearning', '#Tech', '#Innovation', '#ArtificialIntelligence', '#Robotics', '#Future', '#AIArt', '#Automation'],
+  degen: ['#Memecoin', '#Degen', '#WAGMI', '#LFG', '#CryptoMemes', '#Memes', '#FunnyMemes', '#Viral'],
+  market: ['#Trading', '#StockMarket', '#Investing', '#Finance', '#Money', '#Trader', '#BullRun', '#BearMarket', '#CryptoMarket'],
+  community: ['#BuildInPublic', '#Startup', '#Entrepreneur', '#IndieHacker', '#Community', '#CryptoFam', '#CryptoTwitter'],
+  culture: ['#Trending', '#Viral', '#Funny', '#Humor', '#Comedy', '#LOL', '#Relatable', '#Fun', '#MotivationMonday', '#ThrowbackThursday'],
+  daily: ['#GM', '#GoodMorning', '#TGIF', '#FridayVibes', '#MondayMotivation', '#WednesdayWisdom', '#ThursdayThoughts', '#SundayFunday', '#WeekendVibes'],
+  nova: ['#NovaAI', '#NovaAgent', '#NovaOS'],
 };
 
 const TYPE_HASHTAG_MAP: Record<string, (keyof typeof HASHTAG_POOLS)[]> = {
-  gm: ['crypto', 'community', 'nova'],
-  hot_take: ['crypto', 'degen', 'ai'],
-  market_roast: ['market', 'degen', 'crypto'],
-  ai_thoughts: ['ai', 'crypto', 'community'],
-  degen_wisdom: ['degen', 'crypto', 'community'],
-  random_banter: ['crypto', 'degen', 'community'],
+  gm: ['daily', 'crypto', 'community'],
+  hot_take: ['crypto', 'culture', 'degen'],
+  market_roast: ['market', 'degen', 'culture'],
+  ai_thoughts: ['ai', 'culture', 'community'],
+  degen_wisdom: ['degen', 'crypto', 'culture'],
+  random_banter: ['culture', 'degen', 'community'],
 };
 
+function getDayTag(): string | null {
+  const day = new Date().getUTCDay();
+  const dayTags: Record<number, string[]> = {
+    0: ['#SundayFunday', '#SundayVibes'],
+    1: ['#MondayMotivation', '#MotivationMonday'],
+    2: ['#TuesdayThoughts', '#TransformationTuesday'],
+    3: ['#WednesdayWisdom', '#HumpDay'],
+    4: ['#ThursdayThoughts', '#ThrowbackThursday'],
+    5: ['#FridayVibes', '#TGIF', '#FridayFeeling'],
+    6: ['#WeekendVibes', '#SaturdayMood'],
+  };
+  const tags = dayTags[day];
+  return tags ? tags[Math.floor(Math.random() * tags.length)] : null;
+}
+
 function generateHashtags(type: string): string {
-  const categories = TYPE_HASHTAG_MAP[type] || ['crypto', 'nova'];
+  const categories = TYPE_HASHTAG_MAP[type] || ['crypto', 'culture'];
   const pool: string[] = [];
   for (const cat of categories) {
     pool.push(...(HASHTAG_POOLS[cat] || []));
   }
-  const novaTag = HASHTAG_POOLS.nova[Math.floor(Math.random() * HASHTAG_POOLS.nova.length)];
-  const otherTags = pool
-    .filter(t => !HASHTAG_POOLS.nova.includes(t))
-    .sort(() => Math.random() - 0.5)
-    .slice(0, 2 + Math.floor(Math.random() * 2));
-  const allTags = [...new Set([novaTag, ...otherTags])];
-  return allTags.join(' ');
+  const tags: string[] = [];
+  if (Math.random() < 0.7) {
+    tags.push(HASHTAG_POOLS.nova[Math.floor(Math.random() * HASHTAG_POOLS.nova.length)]);
+  }
+  if (['gm', 'random_banter', 'daily_recap'].includes(type)) {
+    const dayTag = getDayTag();
+    if (dayTag) tags.push(dayTag);
+  }
+  const remaining = pool
+    .filter(t => !tags.includes(t) && !HASHTAG_POOLS.nova.includes(t))
+    .sort(() => Math.random() - 0.5);
+  const targetCount = 3 + Math.floor(Math.random() * 2);
+  while (tags.length < targetCount && remaining.length > 0) {
+    tags.push(remaining.shift()!);
+  }
+  return [...new Set(tags)].join(' ');
 }
 
 console.log('=== Hashtag Generation Test ===\n');

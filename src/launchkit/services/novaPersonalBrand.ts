@@ -621,57 +621,156 @@ async function generateImage(type: NovaPostType, tweetContent: string): Promise<
 // Smart Hashtag Generation
 // ============================================================================
 
-/** Curated hashtag pools by category - relevant, not spammy */
+/**
+ * High-traffic hashtag pools based on actual trending data.
+ * Mix of crypto, AI, culture, humor, and general viral tags.
+ * Nova isn't always crypto — sometimes he's just vibing.
+ */
 const HASHTAG_POOLS = {
-  crypto: ['#Crypto', '#Web3', '#DeFi', '#Solana', '#SOL', '#CryptoTwitter', '#Blockchain'],
-  ai: ['#AI', '#AIAgent', '#ArtificialIntelligence', '#AITrading', '#AutomatedTrading'],
-  degen: ['#Degen', '#Memecoin', '#CryptoMemes', '#WAGMI', '#GonnaMakeIt'],
-  market: ['#CryptoMarket', '#Trading', '#BullRun', '#BearMarket', '#MarketUpdate'],
-  community: ['#CryptoCommunity', '#BuildInPublic', '#CryptoFam'],
-  nova: ['#NovaAI', '#NovaAgent'],
+  // Crypto - high volume tags (millions of posts)
+  crypto: ['#Crypto', '#Bitcoin', '#Ethereum', '#Solana', '#SOL', '#BTC', '#DeFi', '#Web3', '#Blockchain', '#CryptoNews', '#CryptoTrading', '#Altcoins', '#HODL'],
+  // AI & Tech - trending AI conversation tags
+  ai: ['#AI', '#ChatGPT', '#MachineLearning', '#Tech', '#Innovation', '#ArtificialIntelligence', '#Robotics', '#Future', '#AIArt', '#Automation'],
+  // Degen & meme culture 
+  degen: ['#Memecoin', '#Degen', '#WAGMI', '#LFG', '#CryptoMemes', '#Memes', '#FunnyMemes', '#Viral'],
+  // Market & trading
+  market: ['#Trading', '#StockMarket', '#Investing', '#Finance', '#Money', '#Trader', '#BullRun', '#BearMarket', '#CryptoMarket'],
+  // Community & building
+  community: ['#BuildInPublic', '#Startup', '#Entrepreneur', '#IndieHacker', '#Community', '#CryptoFam', '#CryptoTwitter'],
+  // Culture & vibes - general high-engagement tags
+  culture: ['#Trending', '#Viral', '#Funny', '#Humor', '#Comedy', '#LOL', '#Relatable', '#Fun', '#MotivationMonday', '#ThrowbackThursday'],
+  // Daily themed tags (huge engagement)
+  daily: ['#GM', '#GoodMorning', '#TGIF', '#FridayVibes', '#MondayMotivation', '#WednesdayWisdom', '#ThursdayThoughts', '#SundayFunday', '#WeekendVibes'],
+  // Nova brand
+  nova: ['#NovaAI', '#NovaAgent', '#NovaOS'],
 };
 
-/** Map post types to relevant hashtag categories */
+/** Map post types to relevant hashtag categories - mixing crypto with culture */
 const TYPE_HASHTAG_MAP: Record<string, (keyof typeof HASHTAG_POOLS)[]> = {
-  gm: ['crypto', 'community', 'nova'],
-  hot_take: ['crypto', 'degen', 'ai'],
-  market_roast: ['market', 'degen', 'crypto'],
-  ai_thoughts: ['ai', 'crypto', 'community'],
-  degen_wisdom: ['degen', 'crypto', 'community'],
-  random_banter: ['crypto', 'degen', 'community'],
-  daily_recap: ['market', 'crypto', 'nova'],
-  nova_tease: ['nova', 'ai', 'crypto'],
-  milestone: ['nova', 'crypto', 'community'],
+  gm: ['daily', 'crypto', 'community'],
+  hot_take: ['crypto', 'culture', 'degen'],
+  market_roast: ['market', 'degen', 'culture'],
+  ai_thoughts: ['ai', 'culture', 'community'],
+  degen_wisdom: ['degen', 'crypto', 'culture'],
+  random_banter: ['culture', 'degen', 'community'],
+  daily_recap: ['market', 'crypto', 'daily'],
+  nova_tease: ['ai', 'crypto', 'community'],
+  milestone: ['crypto', 'community', 'culture'],
   market_commentary: ['market', 'crypto', 'ai'],
-  weekly_summary: ['market', 'crypto', 'nova'],
+  weekly_summary: ['market', 'crypto', 'community'],
 };
 
 /**
+ * Get day-of-week themed tags for extra relevance
+ */
+function getDayTag(): string | null {
+  const day = new Date().getUTCDay();
+  const dayTags: Record<number, string[]> = {
+    0: ['#SundayFunday', '#SundayVibes'],
+    1: ['#MondayMotivation', '#MotivationMonday'],
+    2: ['#TuesdayThoughts', '#TransformationTuesday'],
+    3: ['#WednesdayWisdom', '#HumpDay'],
+    4: ['#ThursdayThoughts', '#ThrowbackThursday'],
+    5: ['#FridayVibes', '#TGIF', '#FridayFeeling'],
+    6: ['#WeekendVibes', '#SaturdayMood'],
+  };
+  const tags = dayTags[day];
+  return tags ? tags[Math.floor(Math.random() * tags.length)] : null;
+}
+
+/**
  * Generate 2-4 relevant hashtags for a tweet.
- * Picks from curated pools based on post type.
+ * Mixes high-traffic tags with Nova branding.
+ * Uses day-of-week tags when relevant.
  * Avoids spam by keeping it to 2-4 max and rotating.
  */
 function generateHashtags(type: NovaPostType): string {
-  const categories = TYPE_HASHTAG_MAP[type] || ['crypto', 'nova'];
+  const categories = TYPE_HASHTAG_MAP[type] || ['crypto', 'culture'];
   const pool: string[] = [];
   
   for (const cat of categories) {
     pool.push(...(HASHTAG_POOLS[cat] || []));
   }
   
-  // Always include one Nova tag (brand building)
-  const novaTag = HASHTAG_POOLS.nova[Math.floor(Math.random() * HASHTAG_POOLS.nova.length)];
+  // Start with Nova brand tag (not every time - 70% chance)
+  const tags: string[] = [];
+  if (Math.random() < 0.7) {
+    tags.push(HASHTAG_POOLS.nova[Math.floor(Math.random() * HASHTAG_POOLS.nova.length)]);
+  }
   
-  // Shuffle and pick 2-3 from the pool (excluding Nova tags since we add one)
-  const otherTags = pool
-    .filter(t => !HASHTAG_POOLS.nova.includes(t))
-    .sort(() => Math.random() - 0.5)
-    .slice(0, 2 + Math.floor(Math.random() * 2)); // 2-3 tags
+  // Add day-of-week tag for GM and banter posts (high engagement)
+  if (['gm', 'random_banter', 'daily_recap'].includes(type)) {
+    const dayTag = getDayTag();
+    if (dayTag) tags.push(dayTag);
+  }
   
-  // Deduplicate
-  const allTags = [...new Set([novaTag, ...otherTags])];
+  // Shuffle and pick from pool (excluding already added)
+  const remaining = pool
+    .filter(t => !tags.includes(t) && !HASHTAG_POOLS.nova.includes(t))
+    .sort(() => Math.random() - 0.5);
   
-  return allTags.join(' ');
+  // Fill up to 3-4 total tags
+  const targetCount = 3 + Math.floor(Math.random() * 2); // 3-4 tags total
+  while (tags.length < targetCount && remaining.length > 0) {
+    tags.push(remaining.shift()!);
+  }
+  
+  return [...new Set(tags)].join(' ');
+}
+
+// ============================================================================
+// TG Channel Promotion (casual CTAs for X posts)
+// ============================================================================
+
+/** Casual, non-spammy CTAs to promote the TG channel */
+const CHANNEL_CTAS = [
+  '\n\nJoin the fam 👉 {link}',
+  '\n\nVibing with the community 👉 {link}',
+  '\n\nCome hang 👉 {link}',
+  '\n\nWe discuss this stuff daily 👉 {link}',
+  '\n\nJoin the convo 👉 {link}',
+  '\n\nMore alpha in the TG 👉 {link}',
+  '\n\nPull up 👉 {link}',
+  '\n\nBuilding in public, join the ride 👉 {link}',
+  '\n\nThe fam is growing 👉 {link}',
+  '\n\nReal talk happens here 👉 {link}',
+];
+
+/** Post types that should sometimes promote the channel */
+const CHANNEL_PROMO_CHANCE: Partial<Record<NovaPostType, number>> = {
+  gm: 0.6,              // 60% - morning vibes, invite people
+  hot_take: 0.3,        // 30% - after a hot take, invite discussion
+  daily_recap: 0.5,     // 50% - recap, show there's a community
+  degen_wisdom: 0.4,    // 40% - wisdom drops, come get more
+  random_banter: 0.3,   // 30% - casual banter, casual invite
+  milestone: 0.7,       // 70% - celebrating, invite people to join
+  ai_thoughts: 0.2,     // 20% - philosophical, light touch
+  market_roast: 0.2,    // 20% - comedy first, light invite
+  nova_tease: 0.5,      // 50% - teasing, build community
+  market_commentary: 0.3, // 30% - analysis, invite for more
+};
+
+/**
+ * Maybe append a casual TG channel CTA to a tweet.
+ * Respects 280 char limit. Only adds if there's room.
+ */
+function maybeAddChannelCTA(tweet: string, type: NovaPostType): string {
+  const channelLink = getEnv().NOVA_CHANNEL_INVITE;
+  if (!channelLink) return tweet;
+  
+  const chance = CHANNEL_PROMO_CHANCE[type] ?? 0;
+  if (Math.random() > chance) return tweet;
+  
+  const cta = CHANNEL_CTAS[Math.floor(Math.random() * CHANNEL_CTAS.length)]
+    .replace('{link}', channelLink);
+  
+  // Only add if we have room (leave space for hashtags too ~40 chars)
+  if (tweet.length + cta.length <= 235) {
+    logger.info(`[NovaPersonalBrand] 📢 Adding TG channel CTA to ${type} tweet`);
+    return tweet + cta;
+  }
+  
+  return tweet;
 }
 
 // ============================================================================
@@ -699,18 +798,21 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
   }
   
   try {
+    // Maybe add TG channel CTA (casual, probability-based)
+    const contentWithCTA = maybeAddChannelCTA(content, type);
+    
     // Generate smart hashtags
     const hashtags = generateHashtags(type);
     
     // Build tweet: content + hashtags (ensure we stay under 280)
-    let fullTweet = content;
-    if (hashtags && (content.length + 1 + hashtags.length) <= 280) {
-      fullTweet = `${content}\n\n${hashtags}`;
+    let fullTweet = contentWithCTA;
+    if (hashtags && (contentWithCTA.length + 2 + hashtags.length) <= 280) {
+      fullTweet = `${contentWithCTA}\n\n${hashtags}`;
     } else if (hashtags) {
       // Trim content to fit hashtags
       const maxContentLen = 280 - hashtags.length - 3; // 2 newlines + safety
       if (maxContentLen > 150) {
-        let trimmed = content.substring(0, maxContentLen);
+        let trimmed = contentWithCTA.substring(0, maxContentLen);
         const lastSpace = trimmed.lastIndexOf(' ');
         if (lastSpace > 120) trimmed = trimmed.substring(0, lastSpace);
         fullTweet = `${trimmed}...\n\n${hashtags}`;
