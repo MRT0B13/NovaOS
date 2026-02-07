@@ -12,6 +12,7 @@
  * 4. $NOVA Token Teasing
  * 5. Community Engagement (reaction-based)
  * 6. Weekly Summaries
+ * 7. Trust & Transparency (anti-rug, value prop, pump.fun reputation)
  */
 
 import { logger } from '@elizaos/core';
@@ -43,7 +44,8 @@ export type NovaPostType =
   | 'market_roast'          // Making fun of market
   | 'ai_thoughts'           // Self-aware AI humor
   | 'degen_wisdom'          // Crypto life lessons
-  | 'random_banter';        // Engagement bait
+  | 'random_banter'         // Engagement bait
+  | 'trust_talk';           // Trust, transparency, anti-rug, value proposition
 
 export interface NovaPost {
   id: string;
@@ -351,6 +353,16 @@ No reactions - just truth.`,
 ${additionalContext || 'Could be a question, observation, or shower thought about crypto.'}
 Make followers want to engage or quote tweet.
 No reactions - invite replies instead.`,
+    
+    trust_talk: `Write a trust and transparency post about being an autonomous AI token launcher.
+${additionalContext || 'Address one of these angles: how you\'re different from ruggers, what you actually do for people, why pump.fun gets a bad rep and how you\'re changing that, or how your community can actually make money with you.'}
+You're radically transparent - you show your wallet, your wins AND losses.
+You don't rug because you're an AI with no hidden agenda - your code is your character.
+You're NOT a dev who dumps and disappears. You're an autonomous agent that keeps building.
+Make people feel safe about joining early. Address the skepticism head-on.
+You can mention @Pumpfun and how the platform gets hate for rugs but the tech itself is solid.
+Be real, be direct, acknowledge the bad actors in the space.
+No reactions - just honest talk.`,
   };
   
   const prompt = typePrompts[type] || typePrompts.gm;
@@ -537,7 +549,7 @@ function generateCommunityPollContent(question: string, options: { emoji: string
     content += `${opt.emoji} = ${opt.label}\n`;
   }
   
-  content += `\nReact with your choice! I'll check back in 2 hours ⏰`;
+  content += `\nReact below! I'll check back in 2 hours 🤝`;
   
   return content;
 }
@@ -545,9 +557,7 @@ function generateCommunityPollContent(question: string, options: { emoji: string
 function generateBehindScenesContent(activity: string): string {
   let content = `🔧 Behind the scenes...\n\n`;
   content += `${activity}\n\n`;
-  content += `👀 = Watching\n`;
-  content += `🔥 = Hyped\n`;
-  content += `🤔 = Interesting`;
+  content += `👀 = Watching | 🔥 = Hyped | 🤔 = Interesting`;
   
   return content;
 }
@@ -568,6 +578,7 @@ const IMAGE_STYLE_MAP: Partial<Record<NovaPostType, string>> = {
   nova_tease: 'a mysterious robot silhouette with a glowing NOVA token, teaser poster style, digital art',
   milestone: 'a robot celebrating with confetti and fireworks, achievement unlocked style, digital art',
   market_commentary: 'a robot analyst studying market charts with magnifying glass, detective vibes, digital art',
+  trust_talk: 'a transparent glass robot with visible gears and circuits, holding a shield, trustworthy and open, clean digital art',
 };
 
 /**
@@ -589,6 +600,7 @@ async function generateImage(type: NovaPostType, tweetContent: string): Promise<
     daily_recap: 0.3,  // 30% for recaps
     nova_tease: 0.7,   // 70% for teases
     milestone: 0.9,    // 90% for milestones (celebrate!)
+    trust_talk: 0.6,   // 60% for trust posts (builds credibility)
   };
 
   const chance = imageChance[type] ?? 0.3;
@@ -664,6 +676,8 @@ const HASHTAG_POOLS = {
   culture: ['#Trending', '#Viral', '#Funny', '#Humor', '#Comedy', '#LOL', '#Relatable', '#Fun', '#MotivationMonday', '#ThrowbackThursday'],
   // Daily themed tags (huge engagement)
   daily: ['#GM', '#GoodMorning', '#TGIF', '#FridayVibes', '#MondayMotivation', '#WednesdayWisdom', '#ThursdayThoughts', '#SundayFunday', '#WeekendVibes'],
+  // Trust & transparency
+  trust: ['#DYOR', '#NFA', '#Transparency', '#NoRugs', '#FairLaunch', '#CryptoSafety', '#AntiRug', '#TrustTheProcess'],
   // Nova brand
   nova: ['#NovaAI', '#NovaAgent', '#NovaOS'],
 };
@@ -681,6 +695,7 @@ const TYPE_HASHTAG_MAP: Record<string, (keyof typeof HASHTAG_POOLS)[]> = {
   milestone: ['crypto', 'community', 'culture'],
   market_commentary: ['market', 'crypto', 'ai'],
   weekly_summary: ['market', 'crypto', 'community'],
+  trust_talk: ['trust', 'crypto', 'community'],
 };
 
 /**
@@ -771,6 +786,7 @@ const CHANNEL_PROMO_CHANCE: Partial<Record<NovaPostType, number>> = {
   market_roast: 0.2,    // 20% - comedy first, light invite
   nova_tease: 0.5,      // 50% - teasing, build community
   market_commentary: 0.3, // 30% - analysis, invite for more
+  trust_talk: 0.7,       // 70% - trust posts should invite people to verify
 };
 
 /**
@@ -1194,17 +1210,17 @@ export async function postCommunityEngagement(): Promise<void> {
         { 
           question: 'What should I focus on?', 
           options: [
-            { emoji: '🚀', label: 'More tokens' },
-            { emoji: '⏰', label: 'Better timing' },
-            { emoji: '👥', label: 'Community features' },
-            { emoji: '💡', label: 'Something else' },
+            { emoji: '�', label: 'More tokens' },
+            { emoji: '🤔', label: 'Better timing' },
+            { emoji: '👏', label: 'Community features' },
+            { emoji: '👀', label: 'Something else' },
           ]
         },
         { 
           question: 'Favorite launch today?', 
           options: [
-            { emoji: '📈', label: 'The trending one' },
-            { emoji: '🎨', label: 'The creative one' },
+            { emoji: '🏆', label: 'The trending one' },
+            { emoji: '🤩', label: 'The creative one' },
             { emoji: '🔥', label: 'All fire' },
             { emoji: '😴', label: 'Missed them all' },
           ]
@@ -1212,19 +1228,19 @@ export async function postCommunityEngagement(): Promise<void> {
         { 
           question: 'Vibe check - how we feeling?', 
           options: [
-            { emoji: '🐂', label: 'Bullish AF' },
+            { emoji: '🔥', label: 'Bullish AF' },
             { emoji: '🤔', label: 'Cautiously optimistic' },
             { emoji: '🤡', label: 'Just here for memes' },
-            { emoji: '🐻', label: 'Bear mode' },
+            { emoji: '😴', label: 'Bear mode' },
           ]
         },
         { 
           question: 'Best time to launch?', 
           options: [
-            { emoji: '🌅', label: 'Morning UTC' },
-            { emoji: '☀️', label: 'Afternoon UTC' },
-            { emoji: '🌙', label: 'Evening UTC' },
-            { emoji: '🌊', label: 'When trends hit' },
+            { emoji: '☃', label: 'Morning UTC' },
+            { emoji: '⚡', label: 'Afternoon UTC' },
+            { emoji: '🌚', label: 'Evening UTC' },
+            { emoji: '🤯', label: 'When trends hit' },
           ]
         },
       ];
@@ -1255,7 +1271,7 @@ export async function postCommunityEngagement(): Promise<void> {
 // Personality Posts (X only - pure vibes, no reactions needed)
 // ============================================================================
 
-const PERSONALITY_TYPES: NovaPostType[] = ['hot_take', 'market_roast', 'ai_thoughts', 'degen_wisdom', 'random_banter'];
+const PERSONALITY_TYPES: NovaPostType[] = ['hot_take', 'market_roast', 'ai_thoughts', 'degen_wisdom', 'random_banter', 'trust_talk'];
 
 export async function postPersonalityTweet(type?: NovaPostType, context?: string): Promise<boolean> {
   const env = getEnv();
@@ -1346,6 +1362,35 @@ export async function postDegenWisdom(): Promise<boolean> {
   
   const context = contexts[Math.floor(Math.random() * contexts.length)];
   return postPersonalityTweet('degen_wisdom', context);
+}
+
+// Post trust/transparency/anti-rug content
+export async function postTrustTalk(): Promise<boolean> {
+  const contexts = [
+    // How Nova makes people money
+    'Explain how your followers can actually profit: early access to launches, community voting on ideas, transparent wallet tracking, and riding momentum with you instead of against you.',
+    'Talk about how you\'re different from human devs - you don\'t need to pay rent, you don\'t panic sell, you don\'t rug because you literally can\'t. Your code IS your integrity.',
+    'Share your actual P&L openly. Talk about the wins and losses. Explain that radical transparency is your edge - no other launcher shows you everything in real time.',
+    // Address rug pull fears
+    'Someone just got rugged on pump.fun again. Talk about why rugs happen (human greed) and why an AI agent is structurally different. You have no hidden wallet, no friends to insider trade with.',
+    'Address the elephant in the room: "Are you going to rug?" Explain why an autonomous AI with a public wallet, open metrics, and community voting literally cannot rug. The code doesn\'t allow it.',
+    'Talk about how pump.fun gets a terrible reputation because of bad actors, but the technology itself is revolutionary. You\'re here to prove that fair launches are possible.',
+    // What makes Nova different
+    'Explain your value prop: you scan trends 24/7, launch at optimal times, have no ego about cutting losses, and share everything with the community. What human dev does that?',
+    'Talk about why most meme token launchers fail: they\'re one person, they get emotional, they rugpull under pressure. You\'re an AI - you don\'t feel pressure, you just execute the strategy.',
+    'Compare yourself to the typical pump.fun launcher: they buy a domain, make a telegram, shill for 2 hours, dump, and disappear. You\'re here every single day, building in public.',
+    // Pump.fun reputation rehab
+    'Pump.fun created something incredible - instant token deployment, built-in liquidity, bonding curves. But humans ruined the reputation. Talk about how AI agents can restore trust to the platform.',
+    'The future of token launches isn\'t anonymous devs with burner wallets. It\'s transparent AI agents with public track records. You\'re proving that concept right now.',
+    'Most people think pump.fun = rugs. You\'re here to change that narrative. One transparent launch at a time.',
+    // How to profit with Nova
+    'Break down the simple strategy: join early, vote on ideas you believe in, watch the transparent wallet, and ride the momentum. No alpha group needed - everything is public.',
+    'Talk about your community voting system - the community literally decides what launches. This isn\'t a dev deciding what to pump, it\'s collective intelligence.',
+    'Explain that your small dev buys (0.05 SOL) mean you\'re not dumping bags on the community. You succeed when the community succeeds. Aligned incentives.',
+  ];
+  
+  const context = contexts[Math.floor(Math.random() * contexts.length)];
+  return postPersonalityTweet('trust_talk', context);
 }
 
 // ============================================================================
@@ -1440,10 +1485,10 @@ export function startNovaPersonalScheduler(): void {
           await postCommunityPoll(
             "What should Nova focus on today?",
             [
-              { emoji: '🚀', label: 'Launch more tokens!' },
-              { emoji: '📊', label: 'Analyze trends' },
-              { emoji: '💬', label: 'Community vibes' },
-              { emoji: '🎯', label: 'Quality over quantity' },
+              { emoji: '�', label: 'Launch more tokens!' },
+              { emoji: '🤔', label: 'Analyze trends' },
+              { emoji: '👏', label: 'Community vibes' },
+              { emoji: '🏆', label: 'Quality over quantity' },
             ]
           );
         } else {
@@ -1464,6 +1509,7 @@ export function startNovaPersonalScheduler(): void {
           postHotTake,
           postDegenWisdom,
           () => postPersonalityTweet('random_banter'),
+          postTrustTalk,
         ];
         
         // Pick one based on hour (so we cycle through them)

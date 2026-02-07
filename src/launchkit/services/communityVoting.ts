@@ -7,7 +7,7 @@
  * 
  * Flow:
  * 1. Agent generates idea → posts to channel with reasoning
- * 2. Community reacts: 👍 = Launch | 👎 = Skip | 🔥 = Love it | 💀 = Terrible
+ * 2. Community reacts: 👍 = Launch | 👎 = Skip | 🔥 = Love it | � = Terrible
  * 3. After voting window, tally reactions
  * 4. If sentiment positive → proceed with launch
  * 5. Store feedback in memory for learning
@@ -31,29 +31,38 @@ let pgRepo: PostgresScheduleRepository | null = null;
 let usePostgres = false;
 
 // Reaction weights for sentiment calculation
+// IMPORTANT: Only use emojis from Telegram's supported reaction set!
+// Supported: ❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡
 const REACTION_WEIGHTS: Record<string, number> = {
   '👍': 1,      // Positive
   '🔥': 2,      // Strong positive
-  '🚀': 2,      // Strong positive
-  '💎': 1.5,    // Positive (diamond hands)
-  '❤️': 1,      // Positive
+  '🏆': 2,      // Strong positive (trophy)
+  '❤': 1,      // Positive
+  '❤️': 1,      // Positive (variant)
+  '🎉': 1.5,    // Positive (party)
   '👎': -1,     // Negative
-  '💀': -2,     // Strong negative
-  '🗑️': -2,     // Strong negative (trash)
+  '💩': -2,     // Strong negative
   '😴': -0.5,   // Mild negative (boring)
   '🤔': 0.5,    // Interested (thinking) - slightly positive for feedback
-  '💡': 0.5,    // Has ideas - slightly positive
-  '❌': -1,     // Skip this
+  '👀': 0.5,    // Eyes - interested/watching
+  '🤮': -1.5,   // Negative
+  '👏': 1,      // Positive (clapping)
+  '🤯': 1.5,    // Mind blown - strong positive
+  '🤡': -1,     // Clown - negative
+  '🥱': -0.5,   // Yawning - mild negative
 };
 
 // Reaction emojis to prompt users with for voting
-export const VOTE_REACTIONS = ['👍', '👎', '🔥', '💀'];
+// Must be from Telegram's supported reaction emoji set!
+export const VOTE_REACTIONS = ['👍', '👎', '🔥', '💩'];
 
 // Reaction emojis for scheduled idea feedback (different from voting)
-export const FEEDBACK_REACTIONS = ['🔥', '🤔', '❌', '💡'];
+// Must be from Telegram's supported reaction emoji set!
+export const FEEDBACK_REACTIONS = ['🔥', '🤔', '👎', '👀'];
 
 // All trackable reactions for personal brand posts
-export const BRAND_REACTIONS = ['🔥', '🤔', '❌', '💡', '🤑', '❤️', '👍', '👎', '🎉', '😂', '🚀'];
+// Must be from Telegram's supported reaction emoji set!
+export const BRAND_REACTIONS = ['🔥', '🤔', '👀', '❤', '👍', '👎', '🎉', '🤣', '🏆', '👏', '🤯', '😴', '💩'];
 
 export interface PendingVote {
   id: string;
@@ -371,7 +380,7 @@ export async function postIdeaForVoting(
   message += `👍 = Yes, send it!\n`;
   message += `👎 = Nah, skip it\n`;
   message += `🔥 = Love it!\n`;
-  message += `💀 = Terrible idea\n\n`;
+  message += `� = Terrible idea\n\n`;
   message += `⏰ <i>Voting ends in ${votingMinutes} minutes</i>`;
   
   try {
@@ -506,9 +515,9 @@ export async function postScheduledIdeaForFeedback(
   message += `<b>What do you think frens?</b>\n\n`;
   message += `🔥 = LFG, I love it!\n`;
   message += `🤔 = Interesting, tell me more\n`;
-  message += `❌ = Nah, skip this one\n`;
-  message += `💡 = I have suggestions\n\n`;
-  message += `<i>Drop your reactions! I'll check back in ${feedbackMinutes} mins and share what I learned 👀</i>`;
+  message += `👎 = Nah, skip this one\n`;
+  message += `👀 = I have suggestions\n\n`;
+  message += `<i>Drop your reactions! I'll check back in ${feedbackMinutes} mins and share what I learned 🤝</i>`;
   
   try {
     // Send message

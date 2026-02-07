@@ -5,7 +5,7 @@ import type { PumpLauncherService } from './pumpLauncher.ts';
 import { generateBestIdea, validateIdea, type TokenIdea } from './ideaGenerator.ts';
 import { generateMemeLogo } from './logoGenerator.ts';
 import { getPumpWalletBalance, getFundingWalletBalance, depositToPumpWallet } from './fundingWallet.ts';
-import { announceLaunch, announceSystem } from './novaChannel.ts';
+import { announceSystem } from './novaChannel.ts';
 import { notifyAutonomous, notifyError } from './adminNotify.ts';
 import { startTrendMonitor, stopTrendMonitor, syncTriggeredCount, type TrendSignal } from './trendMonitor.ts';
 import { recordLaunchCompleted } from './systemReporter.ts';
@@ -545,8 +545,8 @@ async function executeAutonomousLaunch(): Promise<void> {
     // Record all-time cumulative launch count
     recordLaunchCompleted();
     
-    // Announce to Nova channel
-    await announceLaunch(launched);
+    // NOTE: announceLaunch is already called inside pumpLauncher.launch()
+    // so we do NOT call it again here to avoid duplicate notifications
     
     // Notify admin of successful launch
     await notifyAutonomous({
@@ -710,8 +710,8 @@ async function executeAutonomousLaunchWithIdea(idea: TokenIdea, launchType: 'sch
     // Record all-time cumulative launch count
     recordLaunchCompleted();
     
-    // Announce to Nova channel
-    await announceLaunch(launched);
+    // NOTE: announceLaunch is already called inside pumpLauncher.launch()
+    // so we do NOT call it again here to avoid duplicate notifications
     
     // Notify admin of successful launch
     const launchCount = launchType === 'reactive' ? state.reactiveLaunchesToday : state.launchesToday;
@@ -1144,8 +1144,8 @@ async function executeReactiveLaunch(trend: TrendSignal): Promise<void> {
       details: `🔥 Reactive launch successful!\nTrend: ${trend.topic}`,
     });
     
-    // Announce to Nova channel
-    await announceLaunch(launched);
+    // NOTE: announceLaunch is already called inside pumpLauncher.launch()
+    // so we do NOT call it again here to avoid duplicate notifications
     
   } catch (err: any) {
     logger.error(`[Autonomous] Reactive launch failed: ${err.message}`);
