@@ -185,6 +185,11 @@ export class PostgresScheduleRepository {
     await this.pool.end();
   }
 
+  /** Public query proxy for ad-hoc SQL queries */
+  async query(sql: string, params?: any[]): Promise<any> {
+    return this.pool.query(sql, params);
+  }
+
   // ==========================================================================
   // Schema Setup
   // ==========================================================================
@@ -367,6 +372,10 @@ export class PostgresScheduleRepository {
     await this.pool.query(`
       ALTER TABLE sched_autonomous_state
       ADD COLUMN IF NOT EXISTS nova_milestones JSONB DEFAULT '[]';
+    `).catch(() => {});
+    await this.pool.query(`
+      ALTER TABLE sched_autonomous_state
+      ADD COLUMN IF NOT EXISTS initial_balance NUMERIC DEFAULT NULL;
     `).catch(() => {});
 
     // Create indexes
@@ -1108,6 +1117,7 @@ export class PostgresScheduleRepository {
     nova_start_date?: string | null;
     nova_tease_count?: number;
     nova_milestones?: any;
+    initial_balance?: number | null;
   }> {
     const result = await this.pool.query(`SELECT * FROM sched_autonomous_state WHERE id = 'main'`);
     const row = result.rows[0];
@@ -1131,6 +1141,7 @@ export class PostgresScheduleRepository {
       nova_start_date: row.nova_start_date || null,
       nova_tease_count: row.nova_tease_count || 0,
       nova_milestones: row.nova_milestones || null,
+      initial_balance: row.initial_balance != null ? Number(row.initial_balance) : null,
     };
   }
 
@@ -1144,6 +1155,7 @@ export class PostgresScheduleRepository {
     nova_start_date?: string;
     nova_tease_count?: number;
     nova_milestones?: string;
+    initial_balance?: number;
   }): Promise<void> {
     const sets: string[] = ['last_updated = NOW()'];
     const values: any[] = [];
@@ -1159,6 +1171,7 @@ export class PostgresScheduleRepository {
       nova_start_date: 'nova_start_date',
       nova_tease_count: 'nova_tease_count',
       nova_milestones: 'nova_milestones',
+      initial_balance: 'initial_balance',
     };
 
     for (const [key, value] of Object.entries(updates)) {

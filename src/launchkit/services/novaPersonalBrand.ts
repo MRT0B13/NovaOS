@@ -81,6 +81,7 @@ export interface NovaStats {
 interface BrandState {
   posts: NovaPost[];
   startDate: string; // When Nova started (for day counting)
+  initialBalance: number; // SOL balance when Nova first started (persisted in DB)
   lastGmDate?: string;
   lastRecapDate?: string;
   lastWeeklySummaryDate?: string;
@@ -91,6 +92,7 @@ interface BrandState {
 let state: BrandState = {
   posts: [],
   startDate: '2026-02-05T00:00:00.000Z', // Nova's actual launch date - DO NOT use new Date()
+  initialBalance: 1.60089, // Actual starting balance from wallet funding
   novaTeaseCount: 0,
   milestones: [],
 };
@@ -160,6 +162,13 @@ async function loadStateFromPostgres(): Promise<void> {
           ? JSON.parse(novaMilestones) 
           : novaMilestones;
       }
+      
+      // Load initial balance from DB
+      const initialBalance = (savedState as any).initial_balance;
+      if (initialBalance !== undefined && initialBalance !== null) {
+        state.initialBalance = Number(initialBalance);
+        logger.info(`[NovaPersonalBrand] Loaded initialBalance from DB: ${state.initialBalance} SOL`);
+      }
     } else {
       // No state exists yet, save initial
       await saveStateToPostgres();
@@ -186,6 +195,7 @@ async function saveStateToPostgres(): Promise<void> {
       nova_start_date: state.startDate,
       nova_tease_count: state.novaTeaseCount,
       nova_milestones: safeMilestones,
+      initial_balance: state.initialBalance,
     } as any);
     logger.debug('[NovaPersonalBrand] Saved state to PostgreSQL');
   } catch (err) {
@@ -216,15 +226,37 @@ export async function getNovaStats(): Promise<NovaStats> {
   // Get metrics
   const metrics = getMetrics();
   
-  // TODO: Calculate more detailed stats from launch history
+  // Get today's launches and weekly launches from DB
+  let todayLaunches = 0;
+  let weeklyLaunches = 0;
+  if (pgRepo) {
+    try {
+      // Today's launches from autonomous state (already tracked)
+      const autoState = await pgRepo.getAutonomousState();
+      todayLaunches = (autoState.launchesToday || 0) + (autoState.reactiveLaunchesToday || 0);
+      
+      // Weekly launches from launch_packs table
+      const weekResult = await pgRepo.query(
+        `SELECT COUNT(*) as count FROM launch_packs WHERE launch_status = 'launched' AND created_at >= (CURRENT_DATE - INTERVAL '7 days')`
+      );
+      weeklyLaunches = parseInt(weekResult.rows[0]?.count || '0');
+    } catch (err) {
+      logger.warn('[NovaPersonalBrand] Failed to query launch stats from DB:', err);
+    }
+  }
+  
+  // Net profit = current balance - initial funded balance (from DB)
+  const initialBalance = state.initialBalance || 1.60089;
+  const netProfit = walletBalance - initialBalance;
+  
   return {
     walletBalance,
     dayNumber,
     totalLaunches: metrics.totalLaunches || 0,
-    todayLaunches: 0, // TODO: Track daily launches separately
-    bondingCurveHits: 0, // TODO: Track this
-    netProfit: walletBalance - 1, // Assuming started with 1 SOL
-    weeklyProfit: 0, // TODO: Calculate
+    todayLaunches,
+    bondingCurveHits: 0, // No bonding curve tracking on pump.fun free tier
+    netProfit,
+    weeklyProfit: 0, // Would need historical balance snapshots to calculate accurately
   };
 }
 
@@ -458,7 +490,7 @@ function generateGmContent(stats: NovaStats): string {
   content += `\n\nHow we feeling today?\n`;
   content += `🔥 = Bullish\n`;
   content += `😴 = Tired\n`;
-  content += `💩 = Rekt\n`;
+  content += `� = Rekt\n`;
   content += `🏆 = Always winning`;
   
   return content;
@@ -481,7 +513,7 @@ function generateDailyRecapContent(stats: NovaStats): string {
   
   content += `\n`;
   content += `🔥 = Good day\n`;
-  content += `💩 = Could be better\n`;
+  content += `� = Could be better\n`;
   content += `🏆 = Keep grinding`;
   
   return content;
@@ -499,7 +531,7 @@ function generateWeeklySummaryContent(stats: NovaStats, weekNumber: number): str
   content += `🔥 = Crushing it\n`;
   content += `👍 = Solid week\n`;
   content += `😐 = Mid\n`;
-  content += `💩 = Do better`;
+  content += `� = Do better`;
   
   return content;
 }
@@ -514,7 +546,7 @@ function generateNovaTeaseContent(stats: NovaStats, teaseNumber: number): string
     `🤔 Been thinking about my own token lately...\n\nWhat would make $NOVA special?\n\nNot just another meme.\nNot just hype.\n\nSomething that actually rewards the community who believed early.\n\nStill cooking...\n\n👀 = Share your ideas\n🤔 = Watching closely`,
     
     // Later teases (building anticipation)
-    `Progress update:\n\nStarted with 1 SOL\nNow at ${stats.walletBalance.toFixed(2)} SOL\n\nWhen I hit 100 SOL profit, maybe we talk about $NOVA.\n\nCurrent profit: ${stats.netProfit.toFixed(2)} SOL\n\nLong way to go. Or is it? 👀\n\n🔥 = LFG\n🤝 = Patient`,
+    `Progress update:\n\nStarted with ${(state.initialBalance || 1.60).toFixed(2)} SOL\nNow at ${stats.walletBalance.toFixed(2)} SOL\n\nWhen I hit 100 SOL profit, maybe we talk about $NOVA.\n\nCurrent profit: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL\n\nLong way to go. Or is it? 👀\n\n🔥 = LFG\n🤝 = Patient`,
   ];
   
   const index = Math.min(teaseNumber, teases.length - 1);
@@ -527,7 +559,7 @@ function generateMarketCommentaryContent(observation: string): string {
   content += `Might cook something based on this...\n\n`;
   content += `🔥 = Do it\n`;
   content += `🤔 = Wait and see\n`;
-  content += `😴 = Boring, find something else`;
+  content += `� = Boring, find something else`;
   
   return content;
 }
@@ -1212,7 +1244,7 @@ export async function postCommunityEngagement(): Promise<void> {
         { 
           question: 'What should I focus on?', 
           options: [
-            { emoji: '🔥', label: 'More tokens' },
+            { emoji: '�', label: 'More tokens' },
             { emoji: '🤔', label: 'Better timing' },
             { emoji: '👏', label: 'Community features' },
             { emoji: '👀', label: 'Something else' },
@@ -1487,7 +1519,7 @@ export function startNovaPersonalScheduler(): void {
           await postCommunityPoll(
             "What should Nova focus on today?",
             [
-              { emoji: '🔥', label: 'Launch more tokens!' },
+              { emoji: '�', label: 'Launch more tokens!' },
               { emoji: '🤔', label: 'Analyze trends' },
               { emoji: '👏', label: 'Community vibes' },
               { emoji: '🏆', label: 'Quality over quantity' },
