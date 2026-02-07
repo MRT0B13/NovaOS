@@ -7,8 +7,8 @@ import { getEnv } from '../env.ts';
 import { recordTweetSent } from './systemReporter.ts';
 import { 
   PostgresScheduleRepository, 
-  type ScheduledXTweet as PGScheduledXTweet,
-  type XMarketingSchedule as PGXMarketingSchedule
+  type ScheduledTweet as PGScheduledXTweet,
+  type MarketingSchedule as PGXMarketingSchedule
 } from '../db/postgresScheduleRepository.ts';
 
 // PostgreSQL support

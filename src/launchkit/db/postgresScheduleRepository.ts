@@ -1086,6 +1086,9 @@ export class PostgresScheduleRepository {
     nextScheduledTime: number | null;
     pendingIdea: any | null;
     pendingVoteId: string | null;
+    nova_start_date?: string | null;
+    nova_tease_count?: number;
+    nova_milestones?: any;
   }> {
     const result = await this.pool.query(`SELECT * FROM sched_autonomous_state WHERE id = 'main'`);
     const row = result.rows[0];
@@ -1106,6 +1109,9 @@ export class PostgresScheduleRepository {
       nextScheduledTime: row.next_scheduled_time ? Number(row.next_scheduled_time) : null,
       pendingIdea: row.pending_idea || null,
       pendingVoteId: row.pending_vote_id || null,
+      nova_start_date: row.nova_start_date || null,
+      nova_tease_count: row.nova_tease_count || 0,
+      nova_milestones: row.nova_milestones || null,
     };
   }
 

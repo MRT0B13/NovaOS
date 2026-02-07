@@ -190,6 +190,15 @@ async function saveStateToPostgres(): Promise<void> {
   } catch (err) {
     logger.warn('[CommunityVoting] Failed to save preferences to PostgreSQL:', err);
   }
+  
+  // Also persist all pending votes with their current reaction data
+  for (const vote of state.pendingVotes.values()) {
+    try {
+      await pgRepo.insertPendingVote(vote as PGPendingVote);
+    } catch (err) {
+      logger.warn(`[CommunityVoting] Failed to update pending vote ${vote.id} in PostgreSQL:`, err);
+    }
+  }
 }
 
 /**
@@ -594,10 +603,32 @@ export async function registerBrandPostForFeedback(
 ): Promise<PendingVote | null> {
   const feedbackEndsAt = new Date(Date.now() + feedbackMinutes * 60 * 1000);
   
+  // Map internal post types to friendly display names
+  const friendlyNames: Record<string, string> = {
+    gm: 'GM',
+    nova_tease: 'Nova',
+    daily_recap: 'Recap',
+    weekly_summary: 'Weekly',
+    idea_share: 'Idea',
+    market_commentary: 'Market',
+    behind_scenes: 'BTS',
+    milestone: 'Milestone',
+    community_poll: 'Poll',
+    launch_alert: 'Launch',
+    feedback_response: 'Feedback',
+    engagement: 'Update',
+    hot_take: 'Hot Take',
+    market_roast: 'Market Roast',
+    ai_thoughts: 'AI Thoughts',
+    degen_wisdom: 'Degen Wisdom',
+    random_banter: 'Banter',
+  };
+  const displayTicker = friendlyNames[postType] || postType.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  
   // Create a dummy "idea" for tracking purposes
   const dummyIdea: TokenIdea = {
-    ticker: postType.toUpperCase(),
-    name: `Nova ${postType} Post`,
+    ticker: displayTicker,
+    name: `Nova ${displayTicker} Post`,
     description: content.substring(0, 100),
     theme: 'nova_brand',
     generatedAt: new Date().toISOString(),
@@ -829,6 +860,16 @@ function processChannelReactionCount(reactionCount: any): void {
       }
       
       saveState();
+      
+      // Explicitly persist the updated vote to PostgreSQL right away
+      if (usePostgres && pgRepo) {
+        pgRepo.insertPendingVote(vote as PGPendingVote).then(() => {
+          logger.info(`[CommunityVoting] ✅ Persisted reaction data for $${vote.idea.ticker} to PostgreSQL`);
+        }).catch((err: Error) => {
+          logger.warn(`[CommunityVoting] Failed to persist reaction data: ${err.message}`);
+        });
+      }
+      
       logger.info(`[CommunityVoting] 📊 Channel votes for $${vote.idea.ticker}: +${vote.votes.positive}/-${vote.votes.negative} (sentiment: ${vote.votes.sentiment.toFixed(2)})`);
       logger.info(`[CommunityVoting]    Reactions: ${JSON.stringify(vote.votes.reactions)}`);
       
@@ -936,10 +977,14 @@ async function postFeedbackResponse(vote: PendingVote, votes: VoteTally): Promis
   if (!botToken || !channelId) return;
   
   const ticker = vote.idea.ticker;
+  const isBrandPost = vote.idea.source === 'nova_personal_brand';
+  const displayName = isBrandPost ? ticker : `$${ticker}`;
   const totalReactions = Object.values(votes.reactions).reduce((a, b) => a + (b as number), 0);
   
   // Build response based on sentiment
-  let message = `📊 <b>Thanks for the feedback on $${ticker} frens!</b>\n\n`;
+  let message = isBrandPost
+    ? `📊 <b>Thanks for vibing with my ${ticker.toLowerCase()} post frens!</b>\n\n`
+    : `📊 <b>Thanks for the feedback on $${ticker} frens!</b>\n\n`;
   
   if (totalReactions === 0) {
     message += `Looks like y'all are busy today - no reactions came in. That's cool, I'll keep cooking and share more ideas soon! 🍳\n`;

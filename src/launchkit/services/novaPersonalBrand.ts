@@ -88,7 +88,7 @@ interface BrandState {
 
 let state: BrandState = {
   posts: [],
-  startDate: new Date().toISOString(),
+  startDate: '2026-02-05T00:00:00.000Z', // Nova's actual launch date - DO NOT use new Date()
   novaTeaseCount: 0,
   milestones: [],
 };
@@ -168,14 +168,22 @@ async function loadStateFromPostgres(): Promise<void> {
   }
 }
 
+/** Strip broken Unicode surrogate pairs that crash PostgreSQL JSON parsing */
+function sanitizeUnicode(str: string): string {
+  // Remove lone surrogates (high without low, low without high)
+  return str.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
+            .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+}
+
 async function saveStateToPostgres(): Promise<void> {
   if (!pgRepo) return;
   
   try {
+    const safeMilestones = sanitizeUnicode(JSON.stringify(state.milestones));
     await pgRepo.updateAutonomousState({
       nova_start_date: state.startDate,
       nova_tease_count: state.novaTeaseCount,
-      nova_milestones: JSON.stringify(state.milestones),
+      nova_milestones: safeMilestones,
     } as any);
     logger.debug('[NovaPersonalBrand] Saved state to PostgreSQL');
   } catch (err) {
@@ -356,6 +364,9 @@ No reactions - invite replies instead.`,
     
     const data = await response.json();
     let text = data.choices?.[0]?.message?.content?.trim() || '';
+    
+    // Remove broken Unicode surrogates (crashes PostgreSQL JSON)
+    text = sanitizeUnicode(text);
     
     // Remove quotes if AI wrapped it
     text = text.replace(/^["']|["']$/g, '');
