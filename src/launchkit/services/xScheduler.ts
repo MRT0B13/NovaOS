@@ -727,7 +727,16 @@ export async function regeneratePendingTweets(
     }
   }
   
-  await saveScheduledTweetsToFile();
+  // Persist all changes
+  if (usePostgres && pgRepo) {
+    for (const tweet of pendingTweets) {
+      try {
+        await pgRepo.updateXTweetStatus(tweet.id, tweet.status, tweet.tweetId, tweet.error);
+      } catch {}
+    }
+  } else {
+    await saveScheduledTweetsToFile();
+  }
   logger.info(`[XScheduler] Regeneration complete: ${results.regenerated} regenerated, ${results.failed} failed`);
   return results;
 }
@@ -817,6 +826,7 @@ async function scheduleChannelPromos(): Promise<number> {
     };
 
     scheduledTweets.push(tweet);
+    await saveTweet(tweet);
     scheduled++;
     lastPromoDate = scheduleDate;
 
@@ -824,8 +834,7 @@ async function scheduleChannelPromos(): Promise<number> {
   }
 
   if (scheduled > 0) {
-    await saveScheduledTweetsToFile();
-    logger.info(`[XScheduler] ✅ Scheduled ${scheduled} channel promo tweets`);
+    logger.info(`[XScheduler] ✅ Scheduled ${scheduled} channel promo tweets (saved to ${usePostgres ? 'PostgreSQL' : 'file'})`);
   }
 
   return scheduled;

@@ -593,6 +593,20 @@ async function executeAutonomousLaunchWithIdea(idea: TokenIdea, launchType: 'sch
   logger.info('[Autonomous] 🚀 Continuing launch with pre-generated idea...');
   logger.info(`[Autonomous] ✨ Idea: $${idea.ticker} - ${idea.name}`);
   
+  // Post to channel for community feedback (before launching)
+  try {
+    const reasoning = await generateIdeaReasoning(idea);
+    logger.info('[Autonomous] 📢 Posting idea for community feedback...');
+    const feedbackPost = await postScheduledIdeaForFeedback(idea, reasoning);
+    if (feedbackPost) {
+      logger.info(`[Autonomous] ✅ Posted idea to channel for feedback`);
+    } else {
+      logger.warn(`[Autonomous] ⚠️ Failed to post idea to channel`);
+    }
+  } catch (feedbackErr) {
+    logger.warn('[Autonomous] Failed to post feedback (continuing with launch):', feedbackErr);
+  }
+  
   // DRY RUN: Stop here and just log
   if (state.dryRun) {
     logger.info('[Autonomous] 🧪 DRY RUN - Would launch this token (set AUTONOMOUS_DRY_RUN=false to enable real launches)');

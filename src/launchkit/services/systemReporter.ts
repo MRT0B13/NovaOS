@@ -859,9 +859,12 @@ export async function startSystemReporter(): Promise<void> {
       try {
         const recovery = await pgRepo.recoverMetricsFromPosts();
         if (recovery.recovered) {
-          logger.info(`[SystemReporter] 🔧 Self-healed metrics from post tables (X: ${recovery.tweets}, TG: ${recovery.tgPosts})`);
+          logger.info(`[SystemReporter] 🔧 Self-healed metrics from post tables (X: ${recovery.tweets}, TG: ${recovery.tgPosts}${recovery.totalLaunches ? `, Launches: ${recovery.totalLaunches}` : ''})`);
           metrics.tweetsSentToday = recovery.tweets;
           metrics.tgPostsSentToday = recovery.tgPosts;
+          if (recovery.totalLaunches) {
+            metrics.totalLaunches = recovery.totalLaunches;
+          }
         }
       } catch (recoveryErr) {
         logger.warn('[SystemReporter] Metrics recovery check failed:', recoveryErr);

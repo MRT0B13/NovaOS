@@ -967,11 +967,12 @@ export class PostgresScheduleRepository {
    * Recover metrics from actual post tables
    * Call this on startup to ensure metrics match reality
    */
-  async recoverMetricsFromPosts(): Promise<{ recovered: boolean; tweets: number; tgPosts: number }> {
+  async recoverMetricsFromPosts(): Promise<{ recovered: boolean; tweets: number; tgPosts: number; totalLaunches?: number }> {
     const counts = await this.countTodaysPosts();
     const current = await this.getSystemMetrics();
+    let recovered = false;
     
-    // Only recover if current metrics are lower than actual (data loss)
+    // Recover daily tweet/TG counts if lower than actual
     if (counts.tweetsSentToday > current.tweetsSentToday || 
         counts.tgPostsSentToday > current.tgPostsSentToday) {
       await this.pool.query(`
@@ -981,11 +982,29 @@ export class PostgresScheduleRepository {
           last_updated = NOW()
         WHERE id = 'main'
       `, [counts.tweetsSentToday, counts.tgPostsSentToday]);
-      
-      return { recovered: true, tweets: counts.tweetsSentToday, tgPosts: counts.tgPostsSentToday };
+      recovered = true;
     }
     
-    return { recovered: false, tweets: current.tweetsSentToday, tgPosts: current.tgPostsSentToday };
+    // Recover total launch count from actual launch_packs table
+    try {
+      const launchResult = await this.pool.query(
+        `SELECT COUNT(*) as count FROM launch_packs WHERE data->'launch'->>'status' = 'launched'`
+      );
+      const actualLaunches = parseInt(launchResult.rows[0]?.count || '0', 10);
+      if (actualLaunches > 0 && actualLaunches !== current.totalLaunches) {
+        await this.pool.query(
+          `UPDATE sched_system_metrics SET total_launches = $1, last_updated = NOW() WHERE id = 'main'`,
+          [actualLaunches]
+        );
+        logger.info(`[PostgresRepo] 🔧 Self-healed total_launches: ${current.totalLaunches} → ${actualLaunches}`);
+        recovered = true;
+        return { recovered, tweets: Math.max(counts.tweetsSentToday, current.tweetsSentToday), tgPosts: Math.max(counts.tgPostsSentToday, current.tgPostsSentToday), totalLaunches: actualLaunches };
+      }
+    } catch (err) {
+      // launch_packs table might not exist in some setups
+    }
+    
+    return { recovered, tweets: Math.max(counts.tweetsSentToday, current.tweetsSentToday), tgPosts: Math.max(counts.tgPostsSentToday, current.tgPostsSentToday) };
   }
 
   // ==========================================================================
