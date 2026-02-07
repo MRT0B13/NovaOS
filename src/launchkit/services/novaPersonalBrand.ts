@@ -251,8 +251,8 @@ VIBE:
 - Think: if an AI genuinely developed a personality from watching crypto twitter
 
 IMPORTANT:
-- KEEP POSTS UNDER 250 CHARACTERS for Twitter/X compatibility
-- Never use hashtags
+- KEEP POSTS UNDER 220 CHARACTERS for Twitter/X (hashtags are added separately)
+- Do NOT include hashtags in your post - they'll be added automatically
 - Be conversational and provocative
 - Ask questions, make bold takes, invite debate
 - Be vulnerable sometimes - share struggles, not just wins`;
@@ -530,6 +530,151 @@ function generateBehindScenesContent(activity: string): string {
 }
 
 // ============================================================================
+// DALL-E Image Generation
+// ============================================================================
+
+/** Map post types to visual styles for DALL-E */
+const IMAGE_STYLE_MAP: Partial<Record<NovaPostType, string>> = {
+  gm: 'a cute robot waking up with a coffee cup, sunrise, warm colors, digital art style',
+  hot_take: 'a robot holding a flaming scroll with a bold statement, dramatic lighting, digital art',
+  market_roast: 'a robot laughing at a crashing stock chart with red candles, meme style, funny digital art',
+  ai_thoughts: 'a contemplative robot sitting on a moon looking at stars, philosophical, ethereal digital art',
+  degen_wisdom: 'a robot wearing sunglasses dropping knowledge, neon lights, crypto vibes, cool digital art',
+  random_banter: 'a playful robot in a chat room vibing with emojis flying around, fun colorful digital art',
+  daily_recap: 'a robot reviewing charts and data on holographic screens, futuristic dashboard, digital art',
+  nova_tease: 'a mysterious robot silhouette with a glowing NOVA token, teaser poster style, digital art',
+  milestone: 'a robot celebrating with confetti and fireworks, achievement unlocked style, digital art',
+  market_commentary: 'a robot analyst studying market charts with magnifying glass, detective vibes, digital art',
+};
+
+/**
+ * Generate an image using DALL-E for a tweet
+ * Returns the image as a Buffer, or null if generation fails
+ */
+async function generateImage(type: NovaPostType, tweetContent: string): Promise<Buffer | null> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+
+  // Only generate images for certain post types (not every tweet needs one)
+  const imageChance: Partial<Record<NovaPostType, number>> = {
+    gm: 0.5,           // 50% chance for GM
+    hot_take: 0.7,     // 70% for hot takes
+    market_roast: 0.8, // 80% for roasts (visual comedy)
+    ai_thoughts: 0.6,  // 60% for philosophical
+    degen_wisdom: 0.5, // 50% for wisdom
+    random_banter: 0.4,// 40% for banter
+    daily_recap: 0.3,  // 30% for recaps
+    nova_tease: 0.7,   // 70% for teases
+    milestone: 0.9,    // 90% for milestones (celebrate!)
+  };
+
+  const chance = imageChance[type] ?? 0.3;
+  if (Math.random() > chance) {
+    logger.info(`[NovaPersonalBrand] Skipping image for ${type} (${(chance * 100)}% chance, rolled skip)`);
+    return null;
+  }
+
+  const baseStyle = IMAGE_STYLE_MAP[type] || 'a friendly robot in a crypto-themed setting, digital art';
+  const prompt = `Create a simple, eye-catching illustration: ${baseStyle}. Style: modern, clean, slightly cartoony. No text in the image. Square format. The robot should look friendly and approachable.`;
+
+  try {
+    logger.info(`[NovaPersonalBrand] 🎨 Generating DALL-E image for ${type}...`);
+    const response = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'dall-e-3',
+        prompt,
+        n: 1,
+        size: '1024x1024',
+        quality: 'standard',
+        response_format: 'b64_json',
+      }),
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      logger.warn(`[NovaPersonalBrand] DALL-E API error (${response.status}): ${err.substring(0, 200)}`);
+      return null;
+    }
+
+    const data = await response.json();
+    const b64 = data?.data?.[0]?.b64_json;
+    if (!b64) {
+      logger.warn('[NovaPersonalBrand] DALL-E returned no image data');
+      return null;
+    }
+
+    const buffer = Buffer.from(b64, 'base64');
+    logger.info(`[NovaPersonalBrand] ✅ DALL-E image generated (${(buffer.length / 1024).toFixed(0)} KB)`);
+    return buffer;
+  } catch (error) {
+    logger.warn('[NovaPersonalBrand] DALL-E generation failed:', error);
+    return null;
+  }
+}
+
+// ============================================================================
+// Smart Hashtag Generation
+// ============================================================================
+
+/** Curated hashtag pools by category - relevant, not spammy */
+const HASHTAG_POOLS = {
+  crypto: ['#Crypto', '#Web3', '#DeFi', '#Solana', '#SOL', '#CryptoTwitter', '#Blockchain'],
+  ai: ['#AI', '#AIAgent', '#ArtificialIntelligence', '#AITrading', '#AutomatedTrading'],
+  degen: ['#Degen', '#Memecoin', '#CryptoMemes', '#WAGMI', '#GonnaMakeIt'],
+  market: ['#CryptoMarket', '#Trading', '#BullRun', '#BearMarket', '#MarketUpdate'],
+  community: ['#CryptoCommunity', '#BuildInPublic', '#CryptoFam'],
+  nova: ['#NovaAI', '#NovaAgent'],
+};
+
+/** Map post types to relevant hashtag categories */
+const TYPE_HASHTAG_MAP: Record<string, (keyof typeof HASHTAG_POOLS)[]> = {
+  gm: ['crypto', 'community', 'nova'],
+  hot_take: ['crypto', 'degen', 'ai'],
+  market_roast: ['market', 'degen', 'crypto'],
+  ai_thoughts: ['ai', 'crypto', 'community'],
+  degen_wisdom: ['degen', 'crypto', 'community'],
+  random_banter: ['crypto', 'degen', 'community'],
+  daily_recap: ['market', 'crypto', 'nova'],
+  nova_tease: ['nova', 'ai', 'crypto'],
+  milestone: ['nova', 'crypto', 'community'],
+  market_commentary: ['market', 'crypto', 'ai'],
+  weekly_summary: ['market', 'crypto', 'nova'],
+};
+
+/**
+ * Generate 2-4 relevant hashtags for a tweet.
+ * Picks from curated pools based on post type.
+ * Avoids spam by keeping it to 2-4 max and rotating.
+ */
+function generateHashtags(type: NovaPostType): string {
+  const categories = TYPE_HASHTAG_MAP[type] || ['crypto', 'nova'];
+  const pool: string[] = [];
+  
+  for (const cat of categories) {
+    pool.push(...(HASHTAG_POOLS[cat] || []));
+  }
+  
+  // Always include one Nova tag (brand building)
+  const novaTag = HASHTAG_POOLS.nova[Math.floor(Math.random() * HASHTAG_POOLS.nova.length)];
+  
+  // Shuffle and pick 2-3 from the pool (excluding Nova tags since we add one)
+  const otherTags = pool
+    .filter(t => !HASHTAG_POOLS.nova.includes(t))
+    .sort(() => Math.random() - 0.5)
+    .slice(0, 2 + Math.floor(Math.random() * 2)); // 2-3 tags
+  
+  // Deduplicate
+  const allTags = [...new Set([novaTag, ...otherTags])];
+  
+  return allTags.join(' ');
+}
+
+// ============================================================================
 // X Posting
 // ============================================================================
 
@@ -554,17 +699,55 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
   }
   
   try {
-    const result = await xPublisher.tweet(content);
+    // Generate smart hashtags
+    const hashtags = generateHashtags(type);
+    
+    // Build tweet: content + hashtags (ensure we stay under 280)
+    let fullTweet = content;
+    if (hashtags && (content.length + 1 + hashtags.length) <= 280) {
+      fullTweet = `${content}\n\n${hashtags}`;
+    } else if (hashtags) {
+      // Trim content to fit hashtags
+      const maxContentLen = 280 - hashtags.length - 3; // 2 newlines + safety
+      if (maxContentLen > 150) {
+        let trimmed = content.substring(0, maxContentLen);
+        const lastSpace = trimmed.lastIndexOf(' ');
+        if (lastSpace > 120) trimmed = trimmed.substring(0, lastSpace);
+        fullTweet = `${trimmed}...\n\n${hashtags}`;
+      }
+    }
+    
+    logger.info(`[NovaPersonalBrand] Tweet with hashtags (${fullTweet.length} chars): ${fullTweet.substring(0, 80)}...`);
+    
+    // Generate DALL-E image (runs in parallel-ish, non-blocking if it fails)
+    let mediaIds: string[] = [];
+    try {
+      const imageBuffer = await generateImage(type, content);
+      if (imageBuffer && xPublisher) {
+        const mediaId = await xPublisher.uploadMedia(imageBuffer, 'image/png');
+        if (mediaId) {
+          mediaIds.push(mediaId);
+          logger.info(`[NovaPersonalBrand] 🖼️ Image attached to tweet`);
+        }
+      }
+    } catch (imgErr) {
+      logger.warn('[NovaPersonalBrand] Image generation/upload failed (posting without image):', imgErr);
+    }
+    
+    // Post with or without media
+    const result = mediaIds.length > 0
+      ? await xPublisher!.tweetWithMedia(fullTweet, mediaIds)
+      : await xPublisher!.tweet(fullTweet);
     
     if (result?.id) {
-      logger.info(`[NovaPersonalBrand] ✅ Posted ${type} to X (ID: ${result.id})`);
+      logger.info(`[NovaPersonalBrand] ✅ Posted ${type} to X (ID: ${result.id})${mediaIds.length > 0 ? ' with image' : ''}`);
       
       // Record the post
       const post: NovaPost = {
         id: `x_${Date.now()}`,
         type,
         platform: 'x',
-        content,
+        content: fullTweet,
         scheduledFor: new Date().toISOString(),
         status: 'posted',
         postedAt: new Date().toISOString(),

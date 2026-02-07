@@ -226,7 +226,7 @@ class StandaloneTwitterClient {
     }
   }
 
-  async sendTweet(text: string, replyToTweetId?: string): Promise<{ id: string }> {
+  async sendTweet(text: string, replyToTweetId?: string, mediaIds?: string[]): Promise<{ id: string }> {
     if (!this.client) {
       throw errorWithCode('X_CLIENT_NOT_INITIALIZED', 'Twitter client not initialized');
     }
@@ -234,6 +234,9 @@ class StandaloneTwitterClient {
     const options: any = {};
     if (replyToTweetId) {
       options.reply = { in_reply_to_tweet_id: replyToTweetId };
+    }
+    if (mediaIds && mediaIds.length > 0) {
+      options.media = { media_ids: mediaIds };
     }
 
     try {
@@ -274,6 +277,24 @@ class StandaloneTwitterClient {
       
       // Re-throw with cleaner message
       throw errorWithCode('X_API_ERROR', `Twitter API error (${code}): ${detail}`);
+    }
+  }
+
+  /**
+   * Upload media (image) to Twitter and return the media ID
+   */
+  async uploadMedia(imageBuffer: Buffer, mimeType: string = 'image/png'): Promise<string | null> {
+    if (!this.client) {
+      logger.warn('[StandaloneTwitter] Client not initialized for media upload');
+      return null;
+    }
+    try {
+      const mediaId = await this.client.v1.uploadMedia(imageBuffer, { mimeType });
+      logger.info(`[StandaloneTwitter] ✅ Media uploaded (ID: ${mediaId})`);
+      return mediaId;
+    } catch (error: any) {
+      logger.error('[StandaloneTwitter] Media upload failed:', error?.message || error);
+      return null;
     }
   }
 }
@@ -329,6 +350,51 @@ export class XPublisherService {
     
     const quota = getQuota();
     logger.info(`[XPublisher] ✅ Tweet posted. ${quota.writes.remaining} remaining this month.`);
+    
+    return { id: result.id, remaining: quota.writes.remaining };
+  }
+
+  /**
+   * Upload media to Twitter
+   */
+  async uploadMedia(imageBuffer: Buffer, mimeType: string = 'image/png'): Promise<string | null> {
+    if (!twitterClient.isReady()) {
+      if (!twitterClient.initialize()) {
+        logger.warn('[XPublisher] Twitter client not initialized for media upload');
+        return null;
+      }
+    }
+    return twitterClient.uploadMedia(imageBuffer, mimeType);
+  }
+
+  /**
+   * Send a tweet with media attached
+   */
+  async tweetWithMedia(text: string, mediaIds: string[]): Promise<{ id: string; remaining: number }> {
+    const env = getEnv();
+    if (env.X_ENABLE !== 'true') {
+      throw errorWithCode('X_DISABLED', 'X publishing disabled');
+    }
+
+    if (!twitterClient.isReady()) {
+      if (!twitterClient.initialize()) {
+        throw errorWithCode('X_CLIENT_MISSING', 'Twitter client not initialized - check credentials');
+      }
+    }
+
+    const advice = getPostingAdvice();
+    if (!advice.canPost) {
+      throw errorWithCode('X_RATE_LIMIT', advice.reason);
+    }
+
+    logger.info(`[XPublisher] Attempting tweet with ${mediaIds.length} media (${text.length} chars): ${text.substring(0, 100)}...`);
+
+    const result = await twitterClient.sendTweet(text, undefined, mediaIds);
+    await recordWrite(text);
+    recordTweetSent();
+    
+    const quota = getQuota();
+    logger.info(`[XPublisher] ✅ Tweet with media posted. ${quota.writes.remaining} remaining this month.`);
     
     return { id: result.id, remaining: quota.writes.remaining };
   }
