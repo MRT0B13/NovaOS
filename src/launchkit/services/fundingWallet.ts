@@ -490,12 +490,26 @@ export async function getPumpWalletTokens(): Promise<Array<{
   
   logger.info(`[GetTokens] Fetching tokens for: ${pumpKeypair.publicKey.toBase58()}`);
   
-  const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
-    pumpKeypair.publicKey,
-    { programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') }
-  );
+  // Check BOTH Token programs:
+  // - Legacy SPL Token: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+  // - Token-2022: TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb (used by PumpFun)
+  const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+  const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
   
-  const tokens = tokenAccounts.value
+  const [legacyAccounts, token2022Accounts] = await Promise.all([
+    connection.getParsedTokenAccountsByOwner(
+      pumpKeypair.publicKey,
+      { programId: TOKEN_PROGRAM_ID }
+    ),
+    connection.getParsedTokenAccountsByOwner(
+      pumpKeypair.publicKey,
+      { programId: TOKEN_2022_PROGRAM_ID }
+    ),
+  ]);
+  
+  const allAccounts = [...legacyAccounts.value, ...token2022Accounts.value];
+  
+  const tokens = allAccounts
     .map(account => {
       const info = account.account.data.parsed.info;
       const balance = parseFloat(info.tokenAmount?.uiAmount || '0');
@@ -506,7 +520,7 @@ export async function getPumpWalletTokens(): Promise<Array<{
     })
     .filter(t => t.balance > 0);
   
-  logger.info(`[GetTokens] Found ${tokens.length} tokens with balance > 0`);
+  logger.info(`[GetTokens] Found ${tokens.length} tokens with balance > 0 (legacy: ${legacyAccounts.value.length}, token-2022: ${token2022Accounts.value.length})`);
   
   return tokens;
 }

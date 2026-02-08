@@ -17,7 +17,7 @@
 
 import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
-import { getPumpWalletBalance } from './fundingWallet.ts';
+import { getPumpWalletBalance, getPumpWalletTokens } from './fundingWallet.ts';
 import { getMetrics, recordTGPostSent } from './systemReporter.ts';
 import { recordMessageSent } from './telegramHealthMonitor.ts';
 import { registerBrandPostForFeedback } from './communityVoting.ts';
@@ -73,6 +73,11 @@ export interface NovaStats {
   worstToken?: { ticker: string; result: string };
   channelMembers?: number;
   xFollowers?: number;
+  // Dev buy token holdings
+  holdingsCount: number;       // Number of tokens still held
+  holdingsValueSol: number;    // Total estimated value in SOL
+  holdingsValueUsd: number;    // Total estimated value in USD
+  totalDevBuySol: number;      // Total SOL spent on dev buys
 }
 
 // ============================================================================
@@ -242,6 +247,7 @@ export async function getNovaStats(): Promise<NovaStats> {
   let todayLaunches = 0;
   let weeklyLaunches = 0;
   let bondingCurveHits = 0;
+  let totalDevBuySol = 0;
   let bestToken: { ticker: string; multiple: number } | undefined;
   let worstToken: { ticker: string; result: string } | undefined;
   
@@ -303,9 +309,44 @@ export async function getNovaStats(): Promise<NovaStats> {
       
       logger.info(`[NovaPersonalBrand] Token scan: ${mintResult.rows.length} tokens checked, ${bondingCurveHits} graduated, best=${bestToken?.ticker || 'none'} (${formatMarketCap(highestMcap)})`);
       
+      // Calculate total dev buy SOL spent
+      for (const row of mintResult.rows) {
+        totalDevBuySol += parseFloat(row.dev_buy_sol || '0');
+      }
+      
     } catch (err) {
       logger.warn('[NovaPersonalBrand] Failed to query launch stats from DB:', err);
     }
+  }
+  
+  // ── Dev buy token holdings (on-chain) ──────────────────────────────
+  // getPumpWalletTokens now checks BOTH Token and Token-2022 (PumpFun uses Token-2022)
+  let holdingsCount = 0;
+  let holdingsValueSol = 0;
+  let holdingsValueUsd = 0;
+  
+  try {
+    const tokens = await getPumpWalletTokens();
+    holdingsCount = tokens.length;
+    
+    // Look up price for each held token
+    for (const token of tokens) {
+      try {
+        const priceData = await getTokenPrice(token.mint);
+        if (priceData) {
+          const valueUsd = (priceData.priceUsd || 0) * token.balance;
+          const valueSol = (priceData.priceNative || 0) * token.balance;
+          holdingsValueUsd += valueUsd;
+          holdingsValueSol += valueSol;
+        }
+      } catch (err) {
+        logger.debug(`[NovaPersonalBrand] Price lookup failed for held token ${token.mint}: ${err}`);
+      }
+    }
+    
+    logger.info(`[NovaPersonalBrand] Holdings: ${holdingsCount} tokens worth ~${holdingsValueSol.toFixed(4)} SOL ($${holdingsValueUsd.toFixed(2)} USD), dev buy cost: ${totalDevBuySol.toFixed(2)} SOL`);
+  } catch (err) {
+    logger.warn('[NovaPersonalBrand] Failed to fetch token holdings:', err);
   }
   
   // Net profit = current balance - initial funded balance (from DB)
@@ -322,6 +363,10 @@ export async function getNovaStats(): Promise<NovaStats> {
     weeklyProfit: 0, // Would need historical balance snapshots
     bestToken,
     worstToken,
+    holdingsCount,
+    holdingsValueSol,
+    holdingsValueUsd,
+    totalDevBuySol,
   };
   
   // Cache the result
@@ -390,28 +435,35 @@ async function generateAIContent(
   const typePrompts: Record<string, string> = {
     gm: `Write a morning GM post for your channel.
 Include your Day ${stats.dayNumber} status and wallet balance (${stats.walletBalance.toFixed(2)} SOL).
+${stats.holdingsCount > 0 ? `You're holding ${stats.holdingsCount} tokens from dev buys worth ~${stats.holdingsValueSol.toFixed(4)} SOL ($${stats.holdingsValueUsd.toFixed(2)}). Total portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL.` : ''}
 Be warm and set the vibe for the day.
 End with 2-3 reaction options using ONLY these emojis: 🔥 👍 😴 🤯 ❤ 🏆 🤝 👏 (Telegram only supports specific reaction emojis).`,
     
     daily_recap: `Write an end-of-day recap for Day ${stats.dayNumber}.
 Wallet: ${stats.walletBalance.toFixed(2)} SOL
+${stats.holdingsCount > 0 ? `Token holdings: ${stats.holdingsCount} tokens worth ~${stats.holdingsValueSol.toFixed(4)} SOL ($${stats.holdingsValueUsd.toFixed(2)})
+Total portfolio (wallet + holdings): ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL
+Dev buy cost: ${stats.totalDevBuySol.toFixed(2)} SOL → Holdings ROI: ${stats.totalDevBuySol > 0 ? ((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0) + '%' : 'N/A'}` : ''}
 Net since day 1: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
 Launched today: ${stats.todayLaunches} tokens
 Total launches: ${stats.totalLaunches}
 ${stats.bondingCurveHits > 0 ? `Bonding curve graduates: ${stats.bondingCurveHits} (hit Raydium!)` : ''}
 ${stats.bestToken ? `Top performer: $${stats.bestToken.ticker}` : ''}
-Be honest about how the day went. Mention specific tokens if you have data.
+Be honest about how the day went. Mention your token holdings if notable.
 End with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 😴 🤯 💩 🏆 (Telegram only supports specific reaction emojis).`,
     
     weekly_summary: `Write a weekly summary post.
 This is Week ${Math.ceil(stats.dayNumber / 7)}.
 Total launches: ${stats.totalLaunches}
 Wallet: ${stats.walletBalance.toFixed(2)} SOL
+${stats.holdingsCount > 0 ? `Token holdings: ${stats.holdingsCount} tokens worth ~${stats.holdingsValueSol.toFixed(4)} SOL ($${stats.holdingsValueUsd.toFixed(2)})
+Total portfolio (wallet + holdings): ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL
+Dev buy spend: ${stats.totalDevBuySol.toFixed(2)} SOL → Current value: ${stats.holdingsValueSol.toFixed(4)} SOL (${stats.totalDevBuySol > 0 ? ((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0) + '% ROI' : 'N/A'})` : ''}
 Net profit: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
 ${stats.bondingCurveHits > 0 ? `Tokens that graduated to Raydium: ${stats.bondingCurveHits}` : 'No tokens graduated to Raydium yet'}
 ${stats.bestToken ? `Best performing token: $${stats.bestToken.ticker}` : ''}
 ${stats.worstToken ? `Weakest token: $${stats.worstToken.ticker} (${stats.worstToken.result} MC)` : ''}
-Reflect on the week honestly. Mention specific token performance. Tease what's ahead.
+Reflect on the week honestly. Include your portfolio breakdown. Tease what's ahead.
 End with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 🏆 🤯 👏 ❤ (Telegram only supports specific reaction emojis).`,
     
     nova_tease: `Write a subtle $NOVA token tease post.
@@ -554,6 +606,10 @@ function generateGmContent(stats: NovaStats): string {
   let content = `${greeting}\n\n`;
   content += `Day ${stats.dayNumber} status:\n`;
   content += `💰 Wallet: ${stats.walletBalance.toFixed(2)} SOL\n`;
+  if (stats.holdingsCount > 0) {
+    content += `📦 Holdings: ${stats.holdingsCount} tokens (~${stats.holdingsValueSol.toFixed(4)} SOL)\n`;
+    content += `💼 Total portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL\n`;
+  }
   content += `🚀 Launches scheduled: ${stats.todayLaunches || 'TBD'}\n`;
   
   // Add a random flavor
@@ -586,6 +642,10 @@ function generateDailyRecapContent(stats: NovaStats): string {
   }
   content += `\n`;
   content += `Wallet: ${stats.walletBalance.toFixed(2)} SOL\n`;
+  if (stats.holdingsCount > 0) {
+    content += `📦 Holdings: ${stats.holdingsCount} tokens (~${stats.holdingsValueSol.toFixed(4)} SOL / $${stats.holdingsValueUsd.toFixed(2)})\n`;
+    content += `💼 Portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL\n`;
+  }
   
   const netChange = stats.netProfit;
   if (netChange >= 0) {
@@ -607,6 +667,14 @@ function generateWeeklySummaryContent(stats: NovaStats, weekNumber: number): str
   
   content += `🚀 Launched: ${stats.totalLaunches} tokens\n`;
   content += `💰 Wallet: ${stats.walletBalance.toFixed(2)} SOL\n`;
+  if (stats.holdingsCount > 0) {
+    content += `📦 Holdings: ${stats.holdingsCount} tokens (~${stats.holdingsValueSol.toFixed(4)} SOL / $${stats.holdingsValueUsd.toFixed(2)})\n`;
+    content += `💼 Total portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL\n`;
+    if (stats.totalDevBuySol > 0) {
+      const roi = ((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0);
+      content += `📊 Dev buys: ${stats.totalDevBuySol.toFixed(2)} SOL spent → ${roi}% ROI\n`;
+    }
+  }
   if (stats.bondingCurveHits > 0) {
     content += `🎯 Graduated to Raydium: ${stats.bondingCurveHits}\n`;
   }
