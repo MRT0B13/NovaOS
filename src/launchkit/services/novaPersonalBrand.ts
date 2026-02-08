@@ -22,6 +22,7 @@ import { getMetrics, recordTGPostSent } from './systemReporter.ts';
 import { recordMessageSent } from './telegramHealthMonitor.ts';
 import { registerBrandPostForFeedback } from './communityVoting.ts';
 import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
+import { getTokenPrice, formatMarketCap } from './priceService.ts';
 
 // ============================================================================
 // Types
@@ -99,6 +100,11 @@ let state: BrandState = {
 
 let pgRepo: PostgresScheduleRepository | null = null;
 let xPublisher: any = null;
+
+// Stats cache to avoid re-fetching all token prices on every post
+let cachedStats: NovaStats | null = null;
+let cachedStatsAt = 0;
+const STATS_CACHE_TTL_MS = 10 * 60_000; // 10 minutes
 
 // ============================================================================
 // Initialization
@@ -208,6 +214,12 @@ async function saveStateToPostgres(): Promise<void> {
 // ============================================================================
 
 export async function getNovaStats(): Promise<NovaStats> {
+  // Return cached stats if fresh (avoids re-fetching all token prices on every post)
+  if (cachedStats && Date.now() - cachedStatsAt < STATS_CACHE_TTL_MS) {
+    logger.debug('[NovaPersonalBrand] Using cached stats');
+    return cachedStats;
+  }
+  
   const env = getEnv();
   
   // Get wallet balance
@@ -226,9 +238,13 @@ export async function getNovaStats(): Promise<NovaStats> {
   // Get metrics
   const metrics = getMetrics();
   
-  // Get today's launches and weekly launches from DB
+  // Get today's launches, weekly launches, and token performance from DB
   let todayLaunches = 0;
   let weeklyLaunches = 0;
+  let bondingCurveHits = 0;
+  let bestToken: { ticker: string; multiple: number } | undefined;
+  let worstToken: { ticker: string; result: string } | undefined;
+  
   if (pgRepo) {
     try {
       // Today's launches from autonomous state (already tracked)
@@ -240,6 +256,53 @@ export async function getNovaStats(): Promise<NovaStats> {
         `SELECT COUNT(*) as count FROM launch_packs WHERE launch_status = 'launched' AND created_at >= (CURRENT_DATE - INTERVAL '7 days')`
       );
       weeklyLaunches = parseInt(weekResult.rows[0]?.count || '0');
+      
+      // Get ALL launched token mints for market cap / bonding curve analysis
+      // DexScreener allows 300 req/min, priceService has 1-min cache per token
+      const mintResult = await pgRepo.query(
+        `SELECT data->'launch'->>'mint' as mint, data->'brand'->>'ticker' as ticker, data->'launch'->'dev_buy'->>'amount_sol' as dev_buy_sol
+         FROM launch_packs WHERE launch_status = 'launched' AND data->'launch'->>'mint' IS NOT NULL
+         ORDER BY created_at DESC`
+      );
+      
+      let highestMcap = 0;
+      let lowestMcap = Infinity;
+      
+      // Check ALL tokens - DexScreener has 60s cache in priceService so repeated calls are cheap
+      for (const row of mintResult.rows) {
+        if (!row.mint) continue;
+        try {
+          const priceData = await getTokenPrice(row.mint);
+          if (priceData) {
+            // If dexId is raydium/orca (not pumpfun), it graduated the bonding curve
+            if (priceData.dexId && priceData.dexId !== 'pumpfun') {
+              bondingCurveHits++;
+            }
+            
+            // Track best/worst by market cap
+            const mcap = priceData.marketCap || 0;
+            if (mcap > highestMcap) {
+              highestMcap = mcap;
+              bestToken = { 
+                ticker: row.ticker || '???', 
+                multiple: mcap > 0 ? Math.round(mcap / 100) / 10 : 0
+              };
+            }
+            if (mcap < lowestMcap && mcap > 0) {
+              lowestMcap = mcap;
+              worstToken = { 
+                ticker: row.ticker || '???', 
+                result: formatMarketCap(mcap)
+              };
+            }
+          }
+        } catch (err) {
+          logger.debug(`[NovaPersonalBrand] Price check failed for ${row.ticker}: ${err}`);
+        }
+      }
+      
+      logger.info(`[NovaPersonalBrand] Token scan: ${mintResult.rows.length} tokens checked, ${bondingCurveHits} graduated, best=${bestToken?.ticker || 'none'} (${formatMarketCap(highestMcap)})`);
+      
     } catch (err) {
       logger.warn('[NovaPersonalBrand] Failed to query launch stats from DB:', err);
     }
@@ -249,15 +312,23 @@ export async function getNovaStats(): Promise<NovaStats> {
   const initialBalance = state.initialBalance || 1.60089;
   const netProfit = walletBalance - initialBalance;
   
-  return {
+  const stats: NovaStats = {
     walletBalance,
     dayNumber,
     totalLaunches: metrics.totalLaunches || 0,
     todayLaunches,
-    bondingCurveHits: 0, // No bonding curve tracking on pump.fun free tier
+    bondingCurveHits,
     netProfit,
-    weeklyProfit: 0, // Would need historical balance snapshots to calculate accurately
+    weeklyProfit: 0, // Would need historical balance snapshots
+    bestToken,
+    worstToken,
   };
+  
+  // Cache the result
+  cachedStats = stats;
+  cachedStatsAt = Date.now();
+  
+  return stats;
 }
 
 // ============================================================================
@@ -325,7 +396,11 @@ End with 2-3 reaction options using ONLY these emojis: 🔥 👍 😴 🤯 ❤ �
     daily_recap: `Write an end-of-day recap for Day ${stats.dayNumber}.
 Wallet: ${stats.walletBalance.toFixed(2)} SOL
 Net since day 1: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
-Be honest about how the day went.
+Launched today: ${stats.todayLaunches} tokens
+Total launches: ${stats.totalLaunches}
+${stats.bondingCurveHits > 0 ? `Bonding curve graduates: ${stats.bondingCurveHits} (hit Raydium!)` : ''}
+${stats.bestToken ? `Top performer: $${stats.bestToken.ticker}` : ''}
+Be honest about how the day went. Mention specific tokens if you have data.
 End with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 😴 🤯 💩 🏆 (Telegram only supports specific reaction emojis).`,
     
     weekly_summary: `Write a weekly summary post.
@@ -333,7 +408,10 @@ This is Week ${Math.ceil(stats.dayNumber / 7)}.
 Total launches: ${stats.totalLaunches}
 Wallet: ${stats.walletBalance.toFixed(2)} SOL
 Net profit: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
-Reflect on the week and tease what's ahead.
+${stats.bondingCurveHits > 0 ? `Tokens that graduated to Raydium: ${stats.bondingCurveHits}` : 'No tokens graduated to Raydium yet'}
+${stats.bestToken ? `Best performing token: $${stats.bestToken.ticker}` : ''}
+${stats.worstToken ? `Weakest token: $${stats.worstToken.ticker} (${stats.worstToken.result} MC)` : ''}
+Reflect on the week honestly. Mention specific token performance. Tease what's ahead.
 End with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 🏆 🤯 👏 ❤ (Telegram only supports specific reaction emojis).`,
     
     nova_tease: `Write a subtle $NOVA token tease post.
@@ -500,7 +578,12 @@ function generateDailyRecapContent(stats: NovaStats): string {
   let content = `📊 Day ${stats.dayNumber} Recap\n\n`;
   
   content += `Launched: ${stats.todayLaunches} tokens\n`;
-  // TODO: Add individual token results
+  if (stats.bondingCurveHits > 0) {
+    content += `🎯 Bonding curve graduates: ${stats.bondingCurveHits}\n`;
+  }
+  if (stats.bestToken) {
+    content += `🏆 Top token: $${stats.bestToken.ticker}\n`;
+  }
   content += `\n`;
   content += `Wallet: ${stats.walletBalance.toFixed(2)} SOL\n`;
   
@@ -524,8 +607,15 @@ function generateWeeklySummaryContent(stats: NovaStats, weekNumber: number): str
   
   content += `🚀 Launched: ${stats.totalLaunches} tokens\n`;
   content += `💰 Wallet: ${stats.walletBalance.toFixed(2)} SOL\n`;
-  
-  // TODO: Add more detailed weekly stats
+  if (stats.bondingCurveHits > 0) {
+    content += `🎯 Graduated to Raydium: ${stats.bondingCurveHits}\n`;
+  }
+  if (stats.bestToken) {
+    content += `🏆 Best: $${stats.bestToken.ticker}\n`;
+  }
+  if (stats.worstToken) {
+    content += `💀 Worst: $${stats.worstToken.ticker} (${stats.worstToken.result} MC)\n`;
+  }
   content += `\n`;
   content += `How'd I do?\n\n`;
   content += `🔥 = Crushing it\n`;
@@ -1458,6 +1548,15 @@ export async function checkMilestones(): Promise<void> {
     if (stats.dayNumber >= milestone && !state.milestones.includes(`days_${milestone}`)) {
       await postMilestone(`Day ${milestone}! Been running for ${milestone} days straight 🤖`);
       state.milestones.push(`days_${milestone}`);
+    }
+  }
+  
+  // Bonding curve graduation milestones
+  const graduationMilestones = [1, 3, 5, 10, 25];
+  for (const milestone of graduationMilestones) {
+    if (stats.bondingCurveHits >= milestone && !state.milestones.includes(`graduated_${milestone}`)) {
+      await postMilestone(`${milestone} token${milestone > 1 ? 's' : ''} graduated to Raydium! 🎯 The bonding curve has been conquered`);
+      state.milestones.push(`graduated_${milestone}`);
     }
   }
 }
