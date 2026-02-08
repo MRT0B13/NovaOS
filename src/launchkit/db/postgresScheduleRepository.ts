@@ -941,10 +941,9 @@ export class PostgresScheduleRepository {
         tweets_sent_today = 0,
         tg_posts_sent_today = 0,
         trends_detected_today = 0,
-        last_daily_report_date = $1,
         last_updated = NOW()
       WHERE id = 'main'
-    `, [new Date().toISOString().slice(0, 10)]);
+    `);
   }
 
   /**

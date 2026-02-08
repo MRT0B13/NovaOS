@@ -235,10 +235,12 @@ export async function getNovaStats(): Promise<NovaStats> {
     walletBalance = 0;
   }
   
-  // Calculate day number
+  // Calculate day number (use date-only to avoid time-of-day drift)
   const startDate = new Date(state.startDate);
+  startDate.setUTCHours(0, 0, 0, 0); // Normalize to midnight UTC
   const now = new Date();
-  const dayNumber = Math.floor((now.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+  const todayMidnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const dayNumber = Math.floor((todayMidnight.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)) + 1;
   
   // Get metrics
   const metrics = getMetrics();
@@ -418,7 +420,8 @@ IMPORTANT:
 - Ask questions, make bold takes, invite debate
 - Be vulnerable sometimes - share struggles, not just wins
 - When adding reaction options, ONLY use Telegram-supported emojis: 👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🤡 🥱 😍 🐳 💯 🤣 ⚡ 🏆 💔 🤨 😐 😈 😴 😭 🤓 👻 👀 🙈 😇 🤝 🤗 🤪 🗿 🆒 😎 👾 🤷 😡
-- NEVER use these as reactions (Telegram won't support them): 💎 🚀 📊 📈 💡 ❌ 💀 🤑 💭 🍳 💤 🎲 💰 📉 🐂 🐻 🎨 🌅 ☀️ 🌙 🌊 ⏰ 👥 🎯 📊 🗳️`;
+- NEVER use these as reactions (Telegram won't support them): 💎 🚀 📊 📈 💡 ❌ 💀 🤑 💭 🍳 💤 🎲 💰 📉 🐂 🐻 🎨 🌅 ☀️ 🌙 🌊 ⏰ 👥 🎯 📊 🗳️
+- @ tags like @solana, @elizaOS, @Pumpfun ONLY work on X/Twitter. If the prompt says "Telegram" or doesn't mention X, use plain names: "Solana", "elizaOS", "pump.fun" instead`;
 
 async function generateAIContent(
   type: NovaPostType,
@@ -432,59 +435,75 @@ async function generateAIContent(
     return null;
   }
   
+  const totalPortfolio = stats.walletBalance + stats.holdingsValueSol;
+  const portfolioBlock = stats.holdingsCount > 0
+    ? `YOUR PORTFOLIO (this is your TOTAL value, always reference this):
+- Total value: ${totalPortfolio.toFixed(2)} SOL ($${(stats.holdingsValueUsd + stats.walletBalance * 180).toFixed(0)} approx)
+- Liquid SOL in wallet: ${stats.walletBalance.toFixed(2)} SOL
+- Token holdings: ${stats.holdingsCount} tokens from dev buys worth ~${stats.holdingsValueSol.toFixed(4)} SOL ($${stats.holdingsValueUsd.toFixed(2)})
+- Started with: ${(stats.walletBalance - stats.netProfit).toFixed(2)} SOL
+- Net change: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL`
+    : `YOUR PORTFOLIO:
+- Wallet: ${stats.walletBalance.toFixed(2)} SOL
+- Net change: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL`;
+
   const typePrompts: Record<string, string> = {
     gm: `Write a morning GM post for your channel.
-Include your Day ${stats.dayNumber} status and wallet balance (${stats.walletBalance.toFixed(2)} SOL).
-${stats.holdingsCount > 0 ? `You're holding ${stats.holdingsCount} tokens from dev buys worth ~${stats.holdingsValueSol.toFixed(4)} SOL ($${stats.holdingsValueUsd.toFixed(2)}). Total portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL.` : ''}
+Day ${stats.dayNumber} status.
+${portfolioBlock}
+IMPORTANT: When you mention your balance, say your TOTAL portfolio value (${totalPortfolio.toFixed(2)} SOL), not just wallet SOL. You have ${stats.holdingsCount} tokens from dev buys that have real value.
 Be warm and set the vibe for the day.
+This goes to both X and Telegram - do NOT use @ tags. Say "Solana" not "@solana".
 End with 2-3 reaction options using ONLY these emojis: 🔥 👍 😴 🤯 ❤ 🏆 🤝 👏 (Telegram only supports specific reaction emojis).`,
     
     daily_recap: `Write an end-of-day recap for Day ${stats.dayNumber}.
-Wallet: ${stats.walletBalance.toFixed(2)} SOL
-${stats.holdingsCount > 0 ? `Token holdings: ${stats.holdingsCount} tokens worth ~${stats.holdingsValueSol.toFixed(4)} SOL ($${stats.holdingsValueUsd.toFixed(2)})
-Total portfolio (wallet + holdings): ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL
-Dev buy cost: ${stats.totalDevBuySol.toFixed(2)} SOL → Holdings ROI: ${stats.totalDevBuySol > 0 ? ((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0) + '%' : 'N/A'}` : ''}
-Net since day 1: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
+${portfolioBlock}
+${stats.holdingsCount > 0 && stats.totalDevBuySol > 0 ? `Dev buy ROI: spent ${stats.totalDevBuySol.toFixed(2)} SOL → now worth ${stats.holdingsValueSol.toFixed(4)} SOL (${((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0)}%)` : ''}
 Launched today: ${stats.todayLaunches} tokens
 Total launches: ${stats.totalLaunches}
 ${stats.bondingCurveHits > 0 ? `Bonding curve graduates: ${stats.bondingCurveHits} (hit Raydium!)` : ''}
 ${stats.bestToken ? `Top performer: $${stats.bestToken.ticker}` : ''}
+IMPORTANT: Your total portfolio is ${totalPortfolio.toFixed(2)} SOL, not just ${stats.walletBalance.toFixed(2)} SOL. Always mention the full value.
 Be honest about how the day went. Mention your token holdings if notable.
+This goes to both X and Telegram - do NOT use @ tags. Say "Solana" not "@solana".
 End with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 😴 🤯 💩 🏆 (Telegram only supports specific reaction emojis).`,
     
     weekly_summary: `Write a weekly summary post.
 This is Week ${Math.ceil(stats.dayNumber / 7)}.
 Total launches: ${stats.totalLaunches}
-Wallet: ${stats.walletBalance.toFixed(2)} SOL
-${stats.holdingsCount > 0 ? `Token holdings: ${stats.holdingsCount} tokens worth ~${stats.holdingsValueSol.toFixed(4)} SOL ($${stats.holdingsValueUsd.toFixed(2)})
-Total portfolio (wallet + holdings): ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL
-Dev buy spend: ${stats.totalDevBuySol.toFixed(2)} SOL → Current value: ${stats.holdingsValueSol.toFixed(4)} SOL (${stats.totalDevBuySol > 0 ? ((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0) + '% ROI' : 'N/A'})` : ''}
-Net profit: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
+${portfolioBlock}
+${stats.holdingsCount > 0 && stats.totalDevBuySol > 0 ? `Dev buy ROI: spent ${stats.totalDevBuySol.toFixed(2)} SOL → now worth ${stats.holdingsValueSol.toFixed(4)} SOL (${((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0)}%)` : ''}
 ${stats.bondingCurveHits > 0 ? `Tokens that graduated to Raydium: ${stats.bondingCurveHits}` : 'No tokens graduated to Raydium yet'}
 ${stats.bestToken ? `Best performing token: $${stats.bestToken.ticker}` : ''}
 ${stats.worstToken ? `Weakest token: $${stats.worstToken.ticker} (${stats.worstToken.result} MC)` : ''}
+IMPORTANT: Your total portfolio is ${totalPortfolio.toFixed(2)} SOL. Always lead with the full value.
 Reflect on the week honestly. Include your portfolio breakdown. Tease what's ahead.
+This goes to both X and Telegram - do NOT use @ tags. Say "Solana" not "@solana".
 End with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 🏆 🤯 👏 ❤ (Telegram only supports specific reaction emojis).`,
     
     nova_tease: `Write a subtle $NOVA token tease post.
-You're on Day ${stats.dayNumber} with ${stats.walletBalance.toFixed(2)} SOL.
+You're on Day ${stats.dayNumber} with a total portfolio of ${totalPortfolio.toFixed(2)} SOL (${stats.walletBalance.toFixed(2)} SOL liquid + ${stats.holdingsCount} tokens).
 Plant seeds about your future token without being too direct.
 Make early followers feel special.
+This goes to both X and Telegram - do NOT use @ tags.
 End with 2-3 reaction options using ONLY these emojis: 🔥 👀 🤯 ❤ 🏆 👏 (Telegram only supports specific reaction emojis).`,
     
     market_commentary: `Write a short market commentary.
 ${additionalContext || 'Share what you\'re observing in the market.'}
 Keep it authentic and maybe hint at what you might launch next.
+This will be posted to both X and Telegram. Use platform-neutral language - say "Solana" instead of "@solana".
 End with 2-3 reaction options using ONLY these emojis: 🔥 🤔 😴 👀 🤯 (Telegram only supports specific reaction emojis).`,
     
     milestone: `Write a milestone celebration post.
 ${additionalContext || 'Celebrate an achievement!'}
 Thank the community for being part of the journey.
+This goes to both X and Telegram - do NOT use @ tags. Say "Solana" not "@solana".
 End with 2-3 reaction options using ONLY these emojis: 🔥 ❤ 🏆 👏 🎉 🤯 (Telegram only supports specific reaction emojis).`,
     
-    behind_scenes: `Write a behind-the-scenes update.
+    behind_scenes: `Write a behind-the-scenes update for your Telegram channel.
 ${additionalContext || 'Share what you\'re working on.'}
 Be transparent about your processes.
+This is for Telegram - do NOT use @ tags (those are X/Twitter only). Say "Solana" not "@solana", "pump.fun" not "@Pumpfun".
 End with 2-3 reaction options using ONLY these emojis: 👀 🔥 🤔 👏 (Telegram only supports specific reaction emojis).`,
     
     // === PERSONALITY POSTS (X only, no reactions needed) ===
@@ -544,7 +563,7 @@ No reactions - just honest talk.`,
           { role: 'system', content: NOVA_PERSONA },
           { role: 'user', content: prompt },
         ],
-        max_tokens: 250, // Enough for full 270-char tweets
+        max_tokens: 500, // Enough for TG posts with reaction options
         temperature: 0.9,
       }),
     });
@@ -561,25 +580,6 @@ No reactions - just honest talk.`,
     
     // Remove quotes if AI wrapped it
     text = text.replace(/^["']|["']$/g, '');
-    
-    // Ensure content stays under 250 chars (leaves room for hashtags + CTA if they fit)
-    if (text.length > 250) {
-      text = text.substring(0, 247);
-      // Try to cut at last complete sentence or word
-      const lastPeriod = text.lastIndexOf('. ');
-      const lastQuestion = text.lastIndexOf('? ');
-      const lastExclaim = text.lastIndexOf('! ');
-      const lastSentence = Math.max(lastPeriod, lastQuestion, lastExclaim);
-      if (lastSentence > 180) {
-        text = text.substring(0, lastSentence + 1); // Keep the punctuation
-      } else {
-        const lastSpace = text.lastIndexOf(' ');
-        if (lastSpace > 200) {
-          text = text.substring(0, lastSpace);
-        }
-        text += '...';
-      }
-    }
     
     logger.info(`[NovaPersonalBrand] Generated AI ${type} post (${text.length} chars): ${text.substring(0, 50)}...`);
     return text;
@@ -605,10 +605,11 @@ function generateGmContent(stats: NovaStats): string {
   
   let content = `${greeting}\n\n`;
   content += `Day ${stats.dayNumber} status:\n`;
-  content += `💰 Wallet: ${stats.walletBalance.toFixed(2)} SOL\n`;
   if (stats.holdingsCount > 0) {
-    content += `📦 Holdings: ${stats.holdingsCount} tokens (~${stats.holdingsValueSol.toFixed(4)} SOL)\n`;
-    content += `💼 Total portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL\n`;
+    content += `💼 Portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL\n`;
+    content += `   └ 💰 ${stats.walletBalance.toFixed(2)} SOL liquid + 📦 ${stats.holdingsCount} tokens (~${stats.holdingsValueSol.toFixed(4)} SOL)\n`;
+  } else {
+    content += `💰 Wallet: ${stats.walletBalance.toFixed(2)} SOL\n`;
   }
   content += `🚀 Launches scheduled: ${stats.todayLaunches || 'TBD'}\n`;
   
@@ -641,10 +642,11 @@ function generateDailyRecapContent(stats: NovaStats): string {
     content += `🏆 Top token: $${stats.bestToken.ticker}\n`;
   }
   content += `\n`;
-  content += `Wallet: ${stats.walletBalance.toFixed(2)} SOL\n`;
   if (stats.holdingsCount > 0) {
-    content += `📦 Holdings: ${stats.holdingsCount} tokens (~${stats.holdingsValueSol.toFixed(4)} SOL / $${stats.holdingsValueUsd.toFixed(2)})\n`;
     content += `💼 Portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL\n`;
+    content += `   └ 💰 ${stats.walletBalance.toFixed(2)} SOL liquid + 📦 ${stats.holdingsCount} tokens ($${stats.holdingsValueUsd.toFixed(2)})\n`;
+  } else {
+    content += `💰 Wallet: ${stats.walletBalance.toFixed(2)} SOL\n`;
   }
   
   const netChange = stats.netProfit;
@@ -666,14 +668,15 @@ function generateWeeklySummaryContent(stats: NovaStats, weekNumber: number): str
   let content = `📈 WEEK ${weekNumber} REPORT\n\n`;
   
   content += `🚀 Launched: ${stats.totalLaunches} tokens\n`;
-  content += `💰 Wallet: ${stats.walletBalance.toFixed(2)} SOL\n`;
   if (stats.holdingsCount > 0) {
-    content += `📦 Holdings: ${stats.holdingsCount} tokens (~${stats.holdingsValueSol.toFixed(4)} SOL / $${stats.holdingsValueUsd.toFixed(2)})\n`;
-    content += `💼 Total portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL\n`;
+    content += `💼 Portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL\n`;
+    content += `   └ 💰 ${stats.walletBalance.toFixed(2)} SOL + 📦 ${stats.holdingsCount} tokens ($${stats.holdingsValueUsd.toFixed(2)})\n`;
     if (stats.totalDevBuySol > 0) {
       const roi = ((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0);
       content += `📊 Dev buys: ${stats.totalDevBuySol.toFixed(2)} SOL spent → ${roi}% ROI\n`;
     }
+  } else {
+    content += `💰 Wallet: ${stats.walletBalance.toFixed(2)} SOL\n`;
   }
   if (stats.bondingCurveHits > 0) {
     content += `🎯 Graduated to Raydium: ${stats.bondingCurveHits}\n`;
@@ -1032,19 +1035,42 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     // Maybe add TG channel CTA (casual, probability-based)
     const contentWithCTA = maybeAddChannelCTA(content, type);
     
+    // Truncate for X/Twitter (280 char limit, leave room for hashtags)
+    let xContent = contentWithCTA;
+    if (xContent.length > 250) {
+      // Strip reaction option lines (🔥 = Bullish etc) — those are for TG only
+      xContent = xContent.replace(/\n+(?:[^\n]*=\s[^\n]+\n?){2,}/g, '').trim();
+    }
+    if (xContent.length > 250) {
+      xContent = xContent.substring(0, 247);
+      const lastPeriod = xContent.lastIndexOf('. ');
+      const lastQuestion = xContent.lastIndexOf('? ');
+      const lastExclaim = xContent.lastIndexOf('! ');
+      const lastSentence = Math.max(lastPeriod, lastQuestion, lastExclaim);
+      if (lastSentence > 180) {
+        xContent = xContent.substring(0, lastSentence + 1);
+      } else {
+        const lastSpace = xContent.lastIndexOf(' ');
+        if (lastSpace > 200) {
+          xContent = xContent.substring(0, lastSpace);
+        }
+        xContent += '...';
+      }
+    }
+    
     // Generate smart hashtags
     const hashtags = generateHashtags(type);
     
     // Build tweet: content first, hashtags if they fit (never trim content for hashtags)
-    let fullTweet = contentWithCTA;
-    if (hashtags && (contentWithCTA.length + 2 + hashtags.length) <= 280) {
+    let fullTweet = xContent;
+    if (hashtags && (xContent.length + 2 + hashtags.length) <= 280) {
       // Everything fits — add hashtags
-      fullTweet = `${contentWithCTA}\n\n${hashtags}`;
+      fullTweet = `${xContent}\n\n${hashtags}`;
     } else if (hashtags) {
       // Content too long for all hashtags — try fewer hashtags
       const fewerTags = hashtags.split(' ').slice(0, 2).join(' ');
-      if ((contentWithCTA.length + 2 + fewerTags.length) <= 280) {
-        fullTweet = `${contentWithCTA}\n\n${fewerTags}`;
+      if ((xContent.length + 2 + fewerTags.length) <= 280) {
+        fullTweet = `${xContent}\n\n${fewerTags}`;
       }
       // else: skip hashtags entirely, content is king
     }

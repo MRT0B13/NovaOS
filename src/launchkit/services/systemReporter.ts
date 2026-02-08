@@ -132,7 +132,10 @@ function loadMetricsFromFile(): PersistedMetrics {
         loaded.trendsDetectedToday = 0;
         loaded.errors24h = 0;
         loaded.warnings24h = 0;
-        loaded.lastDailyReportDate = today;
+        // NOTE: Do NOT set lastDailyReportDate here.
+        // That field tracks whether the daily *summary report* was sent,
+        // not whether counters were reset. Setting it here would prevent
+        // the daily summary from firing at the scheduled hour.
         // Also clear old failed attempts on new day
         if (loaded.failedAttempts) {
           const threshold = Date.now() - 24 * 60 * 60 * 1000;
@@ -208,7 +211,10 @@ async function loadMetricsFromPostgres(): Promise<PersistedMetrics | null> {
       data.trendsDetectedToday = 0;
       data.errors24h = 0;
       data.warnings24h = 0;
-      data.lastDailyReportDate = today;
+      // NOTE: Do NOT set lastDailyReportDate here.
+      // That field tracks whether the daily *summary report* was sent,
+      // not whether counters were reset. Setting it here would prevent
+      // the daily summary from firing at the scheduled hour.
     } else {
       // Same day - preserve counters
       logger.info(`[SystemReporter] Same day (${today}), preserving counters`);

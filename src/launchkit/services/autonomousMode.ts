@@ -593,33 +593,13 @@ async function executeAutonomousLaunchWithIdea(idea: TokenIdea, launchType: 'sch
   logger.info('[Autonomous] 🚀 Continuing launch with pre-generated idea...');
   logger.info(`[Autonomous] ✨ Idea: $${idea.ticker} - ${idea.name}`);
   
-  // Post to channel for community feedback (before launching)
-  try {
-    const reasoning = await generateIdeaReasoning(idea);
-    logger.info('[Autonomous] 📢 Posting idea for community feedback...');
-    const feedbackPost = await postScheduledIdeaForFeedback(idea, reasoning);
-    if (feedbackPost) {
-      logger.info(`[Autonomous] ✅ Posted idea to channel for feedback`);
-    } else {
-      logger.warn(`[Autonomous] ⚠️ Failed to post idea to channel`);
-    }
-  } catch (feedbackErr) {
-    logger.warn('[Autonomous] Failed to post feedback (continuing with launch):', feedbackErr);
-  }
+  // NOTE: Feedback post (🧠 "yo frens") is already posted by the caller
+  // (executeScheduledLaunch or handleReactiveLaunch). Do NOT post again here.
   
   // DRY RUN: Stop here and just log
   if (state.dryRun) {
     logger.info('[Autonomous] 🧪 DRY RUN - Would launch this token (set AUTONOMOUS_DRY_RUN=false to enable real launches)');
     state.pendingIdea = idea;
-    
-    // Post for community voting with reactions (scheduled launch type)
-    const vote = await postIdeaForVoting(idea, undefined, { launchType: 'scheduled' });
-    if (vote) {
-      state.pendingVoteId = vote.id;
-      logger.info(`[Autonomous] Posted scheduled idea for community voting`);
-    } else {
-      logger.warn(`[Autonomous] Failed to post for voting - check COMMUNITY_VOTING_ENABLED and channel config`);
-    }
     return;
   }
   
