@@ -1,6 +1,6 @@
 import { logger } from '@elizaos/core';
 import bs58 from 'bs58';
-import { Keypair } from '@solana/web3.js';
+import { Keypair, Connection, PublicKey } from '@solana/web3.js';
 import { nowIso } from './time.ts';
 import { appendAudit } from './audit.ts';
 import { LaunchPack, LaunchPackUpdateInput } from '../model/launchPack.ts';
@@ -12,6 +12,51 @@ import { getPumpWalletBalance, getFundingWalletBalance, depositToPumpWallet } fr
 import { schedulePostLaunchMarketing, createMarketingSchedule, getDueTweets, processScheduledTweets } from './xScheduler.ts';
 import { announceLaunch } from './novaChannel.ts';
 import { recordBuy } from './pnlTracker.ts';
+
+/**
+ * Query on-chain token balance for the pump wallet after a dev buy.
+ * Returns the UI amount (human-readable, accounting for decimals).
+ */
+async function getOnChainTokenBalance(mintAddress: string): Promise<number> {
+  const env = getEnv();
+  const rpcUrl = env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const walletAddress = env.PUMP_PORTAL_WALLET_ADDRESS;
+  
+  if (!walletAddress) {
+    logger.warn('[Launch] No PUMP_PORTAL_WALLET_ADDRESS set, cannot query token balance');
+    return 0;
+  }
+  
+  const connection = new Connection(rpcUrl, 'confirmed');
+  const walletPubkey = new PublicKey(walletAddress);
+  const mintPubkey = new PublicKey(mintAddress);
+  
+  const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+    walletPubkey,
+    { mint: mintPubkey }
+  );
+  
+  if (!tokenAccounts.value.length) {
+    return 0;
+  }
+  
+  const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount;
+  return parseFloat(balance.uiAmount || balance.uiAmountString || '0');
+}
+
+/**
+ * Estimate tokens received from a pump.fun dev buy.
+ * Pump.fun tokens have 1B total supply. At launch, the bonding curve
+ * starts at ~$0.0000065/token. For small dev buys (0.01-0.1 SOL),
+ * the amount is roughly: SOL_spent / initial_price_in_sol.
+ * This is a rough estimate — on-chain query is preferred.
+ */
+function estimateTokensFromDevBuy(solSpent: number): number {
+  // Pump.fun initial price is approximately 0.000000030 SOL per token
+  // (based on initial market cap ~$6.5k with 1B supply at ~$200 SOL)
+  const estimatedPricePerToken = 0.000000030;
+  return Math.floor(solSpent / estimatedPricePerToken);
+}
 
 interface PumpLauncherOptions {
   maxDevBuy: number;
@@ -931,17 +976,51 @@ export class PumpLauncherService {
       // Track the dev buy as a cost basis for this token
       if (launched.launch?.dev_buy?.enabled && launched.launch?.dev_buy?.amount_sol && launched.launch?.mint) {
         try {
+          let tokensReceived = launched.launch.dev_buy.tokens_received || 0;
+          
+          // If tokens_received wasn't set, query on-chain after a brief delay
+          if (tokensReceived <= 0) {
+            logger.info(`[Launch] Querying on-chain token balance for $${saved.brand?.ticker}...`);
+            // Wait 3s for transaction to confirm
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            
+            try {
+              tokensReceived = await getOnChainTokenBalance(launched.launch.mint);
+              if (tokensReceived > 0) {
+                logger.info(`[Launch] On-chain token balance: ${tokensReceived.toLocaleString()} $${saved.brand?.ticker}`);
+                // Update the stored launch pack with actual tokens received
+                await this.store.update(id, {
+                  launch: {
+                    ...saved.launch,
+                    dev_buy: {
+                      ...saved.launch?.dev_buy,
+                      tokens_received: tokensReceived,
+                    },
+                  },
+                });
+              }
+            } catch (chainErr) {
+              logger.warn(`[Launch] On-chain balance query failed: ${chainErr}`);
+            }
+          }
+          
+          // If still no token count, use estimation
+          if (tokensReceived <= 0) {
+            tokensReceived = estimateTokensFromDevBuy(launched.launch.dev_buy.amount_sol);
+            logger.info(`[Launch] Using estimated token amount: ${tokensReceived.toLocaleString()} (based on ${launched.launch.dev_buy.amount_sol} SOL)`);
+          }
+          
           await recordBuy({
             tokenMint: launched.launch.mint,
             tokenTicker: saved.brand?.ticker,
             tokenName: saved.brand?.name,
-            tokenAmount: launched.launch.dev_buy.tokens_received || 0, // Will be 0 if not tracked
+            tokenAmount: tokensReceived,
             solSpent: launched.launch.dev_buy.amount_sol,
             isLaunchBuy: true,
             signature: launched.launch.tx_signature,
             launchPackId: id,
           });
-          logger.info(`[Launch] PnL tracker: Recorded dev buy of ${launched.launch.dev_buy.amount_sol} SOL for $${saved.brand?.ticker}`);
+          logger.info(`[Launch] PnL tracker: Recorded dev buy of ${launched.launch.dev_buy.amount_sol} SOL for ${tokensReceived.toLocaleString()} $${saved.brand?.ticker}`);
         } catch (pnlErr) {
           logger.warn(`[Launch] Failed to record dev buy in PnL tracker: ${pnlErr}`);
         }

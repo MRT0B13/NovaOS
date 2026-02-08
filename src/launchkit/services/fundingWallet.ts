@@ -418,6 +418,15 @@ export async function sellToken(
   
   logger.info(`[SellToken] Calling PumpPortal sell API...`);
   
+  // Snapshot SOL balance before sell so we can calc actual SOL received
+  let solBalanceBefore = 0;
+  try {
+    solBalanceBefore = await connection.getBalance(pumpKeypair.publicKey) / 1e9;
+    logger.info(`[SellToken] SOL balance before sell: ${solBalanceBefore.toFixed(6)} SOL`);
+  } catch (err) {
+    logger.warn(`[SellToken] Failed to get pre-sell SOL balance: ${err}`);
+  }
+  
   const res = await fetch(`https://pumpportal.fun/api/trade?api-key=${apiKey}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -442,8 +451,27 @@ export async function sellToken(
     throw new Error('No transaction signature returned from PumpPortal');
   }
   
-  // Get SOL received (approximate from response or calculate)
-  const solReceived = resJson?.solReceived || resJson?.sol || 0;
+  // Get SOL received: prefer API response, fall back to on-chain balance diff
+  let solReceived = resJson?.solReceived || resJson?.sol || 0;
+  
+  if (solReceived <= 0 && solBalanceBefore > 0) {
+    try {
+      // Wait for transaction to confirm
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      const solBalanceAfter = await connection.getBalance(pumpKeypair.publicKey) / 1e9;
+      const diff = solBalanceAfter - solBalanceBefore;
+      if (diff > 0) {
+        solReceived = diff;
+        logger.info(`[SellToken] Calculated SOL received from balance diff: ${solReceived.toFixed(6)} SOL`);
+      } else {
+        logger.warn(`[SellToken] Balance diff was ${diff.toFixed(6)} SOL (may include tx fees). Using absolute diff.`);
+        // Even if slightly negative due to fees, the sell did happen
+        // Estimate from current pump.fun pricing would be complex, just use 0 
+      }
+    } catch (err) {
+      logger.warn(`[SellToken] Failed to get post-sell SOL balance: ${err}`);
+    }
+  }
   
   logger.info(`[SellToken] ✅ Successfully sold ${sellAmount} tokens`);
   logger.info(`[SellToken] Transaction: ${signature}`);
