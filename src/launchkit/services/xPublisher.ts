@@ -355,6 +355,70 @@ export class XPublisherService {
   }
 
   /**
+   * Reply to a tweet (for threads and engagement)
+   */
+  async reply(text: string, replyToTweetId: string): Promise<{ id: string; remaining: number }> {
+    const env = getEnv();
+    if (env.X_ENABLE !== 'true') {
+      throw errorWithCode('X_DISABLED', 'X publishing disabled');
+    }
+
+    if (!twitterClient.isReady()) {
+      if (!twitterClient.initialize()) {
+        throw errorWithCode('X_CLIENT_MISSING', 'Twitter client not initialized - check credentials');
+      }
+    }
+
+    const advice = getPostingAdvice();
+    if (!advice.canPost) {
+      throw errorWithCode('X_RATE_LIMIT', advice.reason);
+    }
+
+    logger.info(`[XPublisher] Replying to ${replyToTweetId} (${text.length} chars): ${text.substring(0, 100)}...`);
+
+    const result = await twitterClient.sendTweet(text, replyToTweetId);
+    await recordWrite(text);
+    recordTweetSent();
+    
+    const quota = getQuota();
+    logger.info(`[XPublisher] ✅ Reply posted. ${quota.writes.remaining} remaining this month.`);
+    
+    return { id: result.id, remaining: quota.writes.remaining };
+  }
+
+  /**
+   * Reply to a tweet with media attached
+   */
+  async replyWithMedia(text: string, replyToTweetId: string, mediaIds: string[]): Promise<{ id: string; remaining: number }> {
+    const env = getEnv();
+    if (env.X_ENABLE !== 'true') {
+      throw errorWithCode('X_DISABLED', 'X publishing disabled');
+    }
+
+    if (!twitterClient.isReady()) {
+      if (!twitterClient.initialize()) {
+        throw errorWithCode('X_CLIENT_MISSING', 'Twitter client not initialized - check credentials');
+      }
+    }
+
+    const advice = getPostingAdvice();
+    if (!advice.canPost) {
+      throw errorWithCode('X_RATE_LIMIT', advice.reason);
+    }
+
+    logger.info(`[XPublisher] Replying with ${mediaIds.length} media to ${replyToTweetId} (${text.length} chars)`);
+
+    const result = await twitterClient.sendTweet(text, replyToTweetId, mediaIds);
+    await recordWrite(text);
+    recordTweetSent();
+    
+    const quota = getQuota();
+    logger.info(`[XPublisher] ✅ Reply with media posted. ${quota.writes.remaining} remaining this month.`);
+    
+    return { id: result.id, remaining: quota.writes.remaining };
+  }
+
+  /**
    * Upload media to Twitter
    */
   async uploadMedia(imageBuffer: Buffer, mimeType: string = 'image/png'): Promise<string | null> {

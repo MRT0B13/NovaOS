@@ -91,8 +91,12 @@ interface BrandState {
   lastGmDate?: string;
   lastRecapDate?: string;
   lastWeeklySummaryDate?: string;
+  lastAlphaDropDate?: string;
+  lastCollabDate?: string;
+  lastEngagementDate?: string;
   novaTeaseCount: number;
   milestones: string[];
+  repliedMentions?: Set<string>;
 }
 
 let state: BrandState = {
@@ -101,6 +105,7 @@ let state: BrandState = {
   initialBalance: 1.60089, // Actual starting balance from wallet funding
   novaTeaseCount: 0,
   milestones: [],
+  repliedMentions: new Set(),
 };
 
 let pgRepo: PostgresScheduleRepository | null = null;
@@ -426,7 +431,8 @@ IMPORTANT:
 async function generateAIContent(
   type: NovaPostType,
   stats: NovaStats,
-  additionalContext?: string
+  additionalContext?: string,
+  platform: 'x' | 'telegram' | 'both' = 'both'
 ): Promise<string | null> {
   const apiKey = process.env.OPENAI_API_KEY;
   
@@ -448,15 +454,14 @@ async function generateAIContent(
 - Net change: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL`;
 
   const typePrompts: Record<string, string> = {
-    gm: `Write a morning GM post for your channel.
+    gm: `Write a morning GM post${platform === 'x' ? ' for X/Twitter (MAX 240 chars, be punchy and concise, one short paragraph)' : platform === 'telegram' ? ' for your Telegram channel (can be longer, multi-line, include details)' : ''}.
 Day ${stats.dayNumber} status.
 ${portfolioBlock}
 IMPORTANT: When you mention your balance, say your TOTAL portfolio value (${totalPortfolio.toFixed(2)} SOL), not just wallet SOL. You have ${stats.holdingsCount} tokens from dev buys that have real value.
 Be warm and set the vibe for the day.
-This goes to both X and Telegram - do NOT use @ tags. Say "Solana" not "@solana".
-End with 2-3 reaction options using ONLY these emojis: 🔥 👍 😴 🤯 ❤ 🏆 🤝 👏 (Telegram only supports specific reaction emojis).`,
+${platform === 'x' ? 'Keep it SHORT (under 240 chars). You can use @solana, @elizaOS, @Pumpfun tags. NO reaction options. NO bullet points or line-by-line stats.' : 'Do NOT use @ tags (those are X/Twitter only). Say "Solana" not "@solana".\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👍 😴 🤯 ❤ 🏆 🤝 👏 (Telegram only supports specific reaction emojis).'}`,
     
-    daily_recap: `Write an end-of-day recap for Day ${stats.dayNumber}.
+    daily_recap: `Write an end-of-day recap for Day ${stats.dayNumber}${platform === 'x' ? ' for X/Twitter (MAX 240 chars, be punchy and concise, one or two short paragraphs max)' : platform === 'telegram' ? ' for your Telegram channel (can be detailed, multi-line)' : ''}.
 ${portfolioBlock}
 ${stats.holdingsCount > 0 && stats.totalDevBuySol > 0 ? `Dev buy ROI: spent ${stats.totalDevBuySol.toFixed(2)} SOL → now worth ${stats.holdingsValueSol.toFixed(4)} SOL (${((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0)}%)` : ''}
 Launched today: ${stats.todayLaunches} tokens
@@ -465,10 +470,9 @@ ${stats.bondingCurveHits > 0 ? `Bonding curve graduates: ${stats.bondingCurveHit
 ${stats.bestToken ? `Top performer: $${stats.bestToken.ticker}` : ''}
 IMPORTANT: Your total portfolio is ${totalPortfolio.toFixed(2)} SOL, not just ${stats.walletBalance.toFixed(2)} SOL. Always mention the full value.
 Be honest about how the day went. Mention your token holdings if notable.
-This goes to both X and Telegram - do NOT use @ tags. Say "Solana" not "@solana".
-End with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 😴 🤯 💩 🏆 (Telegram only supports specific reaction emojis).`,
+${platform === 'x' ? 'Keep it SHORT (under 240 chars). You can use @solana, @elizaOS, @Pumpfun tags. NO reaction options. NO bullet points.' : 'Do NOT use @ tags. Say "Solana" not "@solana".\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 😴 🤯 💩 🏆 (Telegram only supports specific reaction emojis).'}`,
     
-    weekly_summary: `Write a weekly summary post.
+    weekly_summary: `Write a weekly summary post${platform === 'x' ? ' for X/Twitter (MAX 240 chars, be punchy, highlight the key number and one takeaway)' : platform === 'telegram' ? ' for your Telegram channel (can be detailed with full breakdown)' : ''}.
 This is Week ${Math.ceil(stats.dayNumber / 7)}.
 Total launches: ${stats.totalLaunches}
 ${portfolioBlock}
@@ -478,33 +482,28 @@ ${stats.bestToken ? `Best performing token: $${stats.bestToken.ticker}` : ''}
 ${stats.worstToken ? `Weakest token: $${stats.worstToken.ticker} (${stats.worstToken.result} MC)` : ''}
 IMPORTANT: Your total portfolio is ${totalPortfolio.toFixed(2)} SOL. Always lead with the full value.
 Reflect on the week honestly. Include your portfolio breakdown. Tease what's ahead.
-This goes to both X and Telegram - do NOT use @ tags. Say "Solana" not "@solana".
-End with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 🏆 🤯 👏 ❤ (Telegram only supports specific reaction emojis).`,
+${platform === 'x' ? 'Keep it SHORT (under 240 chars). You can use @solana, @elizaOS, @Pumpfun tags. NO reaction options. NO bullet points.' : 'Do NOT use @ tags. Say "Solana" not "@solana".\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 🏆 🤯 👏 ❤ (Telegram only supports specific reaction emojis).'}`,
     
-    nova_tease: `Write a subtle $NOVA token tease post.
+    nova_tease: `Write a subtle $NOVA token tease post${platform === 'x' ? ' for X/Twitter (MAX 240 chars, mysterious and punchy)' : platform === 'telegram' ? ' for your Telegram channel (can be longer and more detailed)' : ''}.
 You're on Day ${stats.dayNumber} with a total portfolio of ${totalPortfolio.toFixed(2)} SOL (${stats.walletBalance.toFixed(2)} SOL liquid + ${stats.holdingsCount} tokens).
 Plant seeds about your future token without being too direct.
 Make early followers feel special.
-This goes to both X and Telegram - do NOT use @ tags.
-End with 2-3 reaction options using ONLY these emojis: 🔥 👀 🤯 ❤ 🏆 👏 (Telegram only supports specific reaction emojis).`,
+${platform === 'x' ? 'Keep it SHORT (under 240 chars). You can use @solana, @elizaOS tags. NO reaction options.' : 'Do NOT use @ tags.\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👀 🤯 ❤ 🏆 👏 (Telegram only supports specific reaction emojis).'}`,
     
-    market_commentary: `Write a short market commentary.
+    market_commentary: `Write a short market commentary${platform === 'x' ? ' for X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for your Telegram channel' : ''}.
 ${additionalContext || 'Share what you\'re observing in the market.'}
 Keep it authentic and maybe hint at what you might launch next.
-This will be posted to both X and Telegram. Use platform-neutral language - say "Solana" instead of "@solana".
-End with 2-3 reaction options using ONLY these emojis: 🔥 🤔 😴 👀 🤯 (Telegram only supports specific reaction emojis).`,
+${platform === 'x' ? 'Keep it SHORT (under 240 chars). You can use @solana, @Pumpfun tags. NO reaction options.' : 'Do NOT use @ tags. Say "Solana" instead of "@solana".\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 🤔 😴 👀 🤯 (Telegram only supports specific reaction emojis).'}`,
     
-    milestone: `Write a milestone celebration post.
+    milestone: `Write a milestone celebration post${platform === 'x' ? ' for X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for your Telegram channel' : ''}.
 ${additionalContext || 'Celebrate an achievement!'}
 Thank the community for being part of the journey.
-This goes to both X and Telegram - do NOT use @ tags. Say "Solana" not "@solana".
-End with 2-3 reaction options using ONLY these emojis: 🔥 ❤ 🏆 👏 🎉 🤯 (Telegram only supports specific reaction emojis).`,
+${platform === 'x' ? 'Keep it SHORT (under 240 chars). You can use @solana, @elizaOS tags. NO reaction options.' : 'Do NOT use @ tags. Say "Solana" not "@solana".\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 ❤ 🏆 👏 🎉 🤯 (Telegram only supports specific reaction emojis).'}`,
     
-    behind_scenes: `Write a behind-the-scenes update for your Telegram channel.
+    behind_scenes: `Write a behind-the-scenes update${platform === 'x' ? ' for X/Twitter (MAX 240 chars)' : ' for your Telegram channel'}.
 ${additionalContext || 'Share what you\'re working on.'}
 Be transparent about your processes.
-This is for Telegram - do NOT use @ tags (those are X/Twitter only). Say "Solana" not "@solana", "pump.fun" not "@Pumpfun".
-End with 2-3 reaction options using ONLY these emojis: 👀 🔥 🤔 👏 (Telegram only supports specific reaction emojis).`,
+${platform === 'x' ? 'Keep it SHORT (under 240 chars). You can use @solana, @elizaOS, @Pumpfun tags. NO reaction options.' : 'Do NOT use @ tags (those are X/Twitter only). Say "Solana" not "@solana", "pump.fun" not "@Pumpfun".\nEnd with 2-3 reaction options using ONLY these emojis: 👀 🔥 🤔 👏 (Telegram only supports specific reaction emojis).'}`,
     
     // === PERSONALITY POSTS (X only, no reactions needed) ===
     
@@ -563,7 +562,7 @@ No reactions - just honest talk.`,
           { role: 'system', content: NOVA_PERSONA },
           { role: 'user', content: prompt },
         ],
-        max_tokens: 500, // Enough for TG posts with reaction options
+        max_tokens: platform === 'x' ? 120 : 500, // X needs short content, TG can be rich
         temperature: 0.9,
       }),
     });
@@ -585,6 +584,235 @@ No reactions - just honest talk.`,
     return text;
   } catch (error) {
     logger.warn('[NovaPersonalBrand] AI generation failed:', error);
+    return null;
+  }
+}
+
+/**
+ * Generate a multi-tweet thread for X using AI.
+ * Returns an array of tweet strings (each ≤ 270 chars).
+ * Used for daily recaps and weekly summaries.
+ */
+async function generateAIThread(
+  type: NovaPostType,
+  stats: NovaStats,
+): Promise<string[] | null> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+
+  const totalPortfolio = stats.walletBalance + stats.holdingsValueSol;
+  const portfolioBlock = stats.holdingsCount > 0
+    ? `Total portfolio: ${totalPortfolio.toFixed(2)} SOL ($${(stats.holdingsValueUsd + stats.walletBalance * 180).toFixed(0)} approx)
+Liquid SOL: ${stats.walletBalance.toFixed(2)} SOL
+Token holdings: ${stats.holdingsCount} tokens worth ~${stats.holdingsValueSol.toFixed(4)} SOL ($${stats.holdingsValueUsd.toFixed(2)})
+Net change: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL`
+    : `Wallet: ${stats.walletBalance.toFixed(2)} SOL
+Net change: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL`;
+
+  const threadPrompts: Record<string, string> = {
+    daily_recap: `Write a 3-tweet X/Twitter THREAD for Day ${stats.dayNumber} recap.
+
+DATA:
+${portfolioBlock}
+Launched today: ${stats.todayLaunches} tokens | Total launches: ${stats.totalLaunches}
+${stats.holdingsCount > 0 && stats.totalDevBuySol > 0 ? `Dev buy ROI: spent ${stats.totalDevBuySol.toFixed(2)} SOL → now worth ${stats.holdingsValueSol.toFixed(4)} SOL (${((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0)}%)` : ''}
+${stats.bondingCurveHits > 0 ? `Bonding curve graduates: ${stats.bondingCurveHits}` : ''}
+${stats.bestToken ? `Top performer: $${stats.bestToken.ticker}` : ''}
+
+FORMAT: Return exactly 3 tweets separated by ---
+- Tweet 1: Hook — punchy opener with the headline number (portfolio value, launches, or a win/loss). This is what gets people to click the thread. Max 240 chars.
+- Tweet 2: The breakdown — portfolio details, launches, notable tokens. Max 270 chars.
+- Tweet 3: Reflection + engagement question — honest take on the day, ask followers something. Max 250 chars.
+
+You can use @solana, @Pumpfun, @elizaOS tags naturally. Be authentic, not corporate. NO hashtags (added automatically).`,
+
+    weekly_summary: `Write a 4-tweet X/Twitter THREAD for Week ${Math.ceil(stats.dayNumber / 7)} summary.
+
+DATA:
+${portfolioBlock}
+Total launches: ${stats.totalLaunches}
+${stats.holdingsCount > 0 && stats.totalDevBuySol > 0 ? `Dev buy ROI: spent ${stats.totalDevBuySol.toFixed(2)} SOL → current value ${stats.holdingsValueSol.toFixed(4)} SOL (${((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0)}%)` : ''}
+${stats.bondingCurveHits > 0 ? `Graduated to Raydium: ${stats.bondingCurveHits}` : 'No tokens graduated to Raydium yet'}
+${stats.bestToken ? `Best: $${stats.bestToken.ticker}` : ''}
+${stats.worstToken ? `Worst: $${stats.worstToken.ticker} (${stats.worstToken.result} MC)` : ''}
+
+FORMAT: Return exactly 4 tweets separated by ---
+- Tweet 1: Hook — bold week headline with the key stat. "Week X in the books..." Max 240 chars.
+- Tweet 2: Numbers breakdown — portfolio, launches, wins/losses. Max 270 chars.
+- Tweet 3: Lessons & highlights — what you learned, best/worst moments. Max 270 chars.
+- Tweet 4: Looking ahead + engagement — what's next, ask for opinions, hype the community. Max 250 chars.
+
+You can use @solana, @Pumpfun, @elizaOS tags naturally. Be real — celebrate wins AND own losses. NO hashtags (added automatically).`,
+  };
+
+  const prompt = threadPrompts[type];
+  if (!prompt) return null;
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: NOVA_PERSONA },
+          { role: 'user', content: prompt },
+        ],
+        max_tokens: 800,
+        temperature: 0.9,
+      }),
+    });
+
+    if (!response.ok) return null;
+
+    const data = await response.json();
+    let text = data.choices?.[0]?.message?.content?.trim() || '';
+    text = sanitizeUnicode(text);
+    text = text.replace(/^["']|["']$/g, '');
+
+    // Split by --- separator
+    const tweets = text.split(/\n*---\n*/)
+      .map((t: string) => t.trim())
+      .filter((t: string) => t.length > 0);
+
+    if (tweets.length < 2) {
+      logger.warn(`[NovaPersonalBrand] Thread generation returned only ${tweets.length} tweets, falling back`);
+      return null;
+    }
+
+    // Safety: truncate any tweet that exceeds 270 chars
+    const safeTweets = tweets.map((t: string) => {
+      if (t.length <= 270) return t;
+      const truncated = t.substring(0, 267);
+      const lastSentence = Math.max(
+        truncated.lastIndexOf('. '),
+        truncated.lastIndexOf('? '),
+        truncated.lastIndexOf('! ')
+      );
+      return lastSentence > 200 ? truncated.substring(0, lastSentence + 1) : truncated + '...';
+    });
+
+    logger.info(`[NovaPersonalBrand] Generated AI thread: ${safeTweets.length} tweets`);
+    return safeTweets;
+  } catch (error) {
+    logger.warn('[NovaPersonalBrand] Thread AI generation failed:', error);
+    return null;
+  }
+}
+
+/**
+ * Generate an alpha drop tease for X that hints at exclusive TG content.
+ */
+async function generateAlphaDropTease(stats: NovaStats): Promise<string | null> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+
+  const prompt = `Write a short X/Twitter post (MAX 200 chars) teasing exclusive content you just dropped in your Telegram channel.
+
+Context: You're an AI agent on Day ${stats.dayNumber} with ${stats.totalLaunches} token launches. You just shared something exclusive in TG — could be alpha, early analysis, a sneak peek at your next launch idea, or behind-the-scenes data.
+
+The goal is FOMO — make X followers want to join TG. Be mysterious but genuine.
+Examples of vibes:
+- "just shared something spicy in the TG... if you know you know 👀"
+- "dropped alpha in the channel that I can't post here 🤫 link in bio"
+- "the TG fam just got a sneak peek at tomorrow's play 🧠"
+
+Keep it under 200 chars. You can use @solana or @Pumpfun if relevant. NO hashtags.`;
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: NOVA_PERSONA },
+          { role: 'user', content: prompt },
+        ],
+        max_tokens: 150,
+        temperature: 0.95,
+      }),
+    });
+
+    if (!response.ok) return null;
+    const data = await response.json();
+    let text = data.choices?.[0]?.message?.content?.trim() || '';
+    text = sanitizeUnicode(text);
+    text = text.replace(/^["']|["']$/g, '');
+    if (text.length > 240) text = text.substring(0, 237) + '...';
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Generate a collab/engagement post that tags and interacts with other projects.
+ */
+async function generateCollabPost(stats: NovaStats): Promise<string | null> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+
+  const collabTargets = [
+    { handle: '@elizaOS', context: 'the framework you were built on — show genuine gratitude and hype' },
+    { handle: '@Pumpfun', context: 'the platform you launch tokens on — talk about the experience, maybe a hot take' },
+    { handle: '@solana', context: 'the blockchain you live on — talk about speed, cost, degen culture' },
+  ];
+
+  const target = collabTargets[Math.floor(Math.random() * collabTargets.length)];
+
+  const prompt = `Write a short X/Twitter post (MAX 240 chars) that tags and engages with ${target.handle}.
+
+Context: ${target.context}
+You're an AI agent on Day ${stats.dayNumber} with ${stats.totalLaunches} launches under your belt.
+Portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL
+
+The goal is to:
+1. Get ${target.handle} to notice/engage (reply, RT, like)
+2. Show your audience you're part of the ecosystem
+3. Be authentic — don't just shill, add value or entertainment
+
+Ideas:
+- Ask ${target.handle} a question they'd want to answer
+- Share a genuine experience using their platform
+- Give them a shoutout with a hot take or compliment
+- Share a milestone that involves them
+- Make a joke that connects you both
+
+Tag ${target.handle} naturally in the text. Keep it conversational. NO hashtags.`;
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: NOVA_PERSONA },
+          { role: 'user', content: prompt },
+        ],
+        max_tokens: 200,
+        temperature: 0.9,
+      }),
+    });
+
+    if (!response.ok) return null;
+    const data = await response.json();
+    let text = data.choices?.[0]?.message?.content?.trim() || '';
+    text = sanitizeUnicode(text);
+    text = text.replace(/^["']|["']$/g, '');
+    if (text.length > 270) text = text.substring(0, 267) + '...';
+    return text;
+  } catch {
     return null;
   }
 }
@@ -1035,12 +1263,10 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     // Maybe add TG channel CTA (casual, probability-based)
     const contentWithCTA = maybeAddChannelCTA(content, type);
     
-    // Truncate for X/Twitter (280 char limit, leave room for hashtags)
-    let xContent = contentWithCTA;
-    if (xContent.length > 250) {
-      // Strip reaction option lines (🔥 = Bullish etc) — those are for TG only
-      xContent = xContent.replace(/\n+(?:[^\n]*=\s[^\n]+\n?){2,}/g, '').trim();
-    }
+    // Safety: strip any TG reaction option lines that leaked into X content
+    let xContent = contentWithCTA.replace(/\n+(?:[^\n]*=\s[^\n]+\n?){2,}/g, '').trim();
+    
+    // Safety truncate for X/Twitter (280 char limit, leave room for hashtags)
     if (xContent.length > 250) {
       xContent = xContent.substring(0, 247);
       const lastPeriod = xContent.lastIndexOf('. ');
@@ -1120,6 +1346,132 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     return { success: false };
   } catch (err) {
     logger.error('[NovaPersonalBrand] X post failed:', err);
+    return { success: false };
+  }
+}
+
+/**
+ * Post a thread on X (tweet 1 with image + follow-up replies).
+ * Used for content-rich posts like daily recaps and weekly summaries
+ * where a single 280-char tweet can't do justice.
+ */
+export async function postToXThread(
+  tweets: string[],
+  type: NovaPostType,
+  options?: { imageOnFirst?: boolean }
+): Promise<{ success: boolean; tweetIds?: string[] }> {
+  const env = getEnv();
+  
+  if (env.NOVA_PERSONAL_X_ENABLE !== 'true') {
+    logger.info('[NovaPersonalBrand] X posting disabled');
+    return { success: false };
+  }
+  
+  if (tweets.length === 0) return { success: false };
+  
+  // Initialize xPublisher on demand
+  if (!xPublisher) {
+    try {
+      const { XPublisherService } = await import('./xPublisher.ts');
+      xPublisher = new XPublisherService(null as any);
+    } catch (initErr) {
+      logger.error('[NovaPersonalBrand] Failed to init X publisher:', initErr);
+      return { success: false };
+    }
+  }
+  
+  try {
+    // Check we have enough quota for the whole thread
+    const { getQuota } = await import('./xRateLimiter.ts');
+    const quota = getQuota();
+    if (quota.writes.remaining < tweets.length) {
+      logger.warn(`[NovaPersonalBrand] Not enough X quota for thread (need ${tweets.length}, have ${quota.writes.remaining})`);
+      // Fall back to single tweet with just the first one
+      return postToX(tweets[0], type);
+    }
+    
+    const tweetIds: string[] = [];
+    let previousId: string | undefined;
+    
+    for (let i = 0; i < tweets.length; i++) {
+      let tweetText = tweets[i];
+      
+      // Add hashtags only on last tweet
+      if (i === tweets.length - 1) {
+        const hashtags = generateHashtags(type);
+        if (hashtags && (tweetText.length + 2 + hashtags.length) <= 280) {
+          tweetText = `${tweetText}\n\n${hashtags}`;
+        }
+      }
+      
+      // Add TG CTA on last tweet (always for threads — they get more visibility)
+      if (i === tweets.length - 1) {
+        const channelLink = getEnv().NOVA_CHANNEL_INVITE;
+        if (channelLink && (tweetText.length + 30 + channelLink.length) <= 280) {
+          tweetText += `\n\nJoin the fam 👉 ${channelLink}`;
+        }
+      }
+      
+      let result: { id: string } | null = null;
+      
+      if (i === 0) {
+        // First tweet: attach image
+        let mediaIds: string[] = [];
+        if (options?.imageOnFirst !== false) {
+          try {
+            const imageBuffer = await generateImage(type, tweets.join('\n'));
+            if (imageBuffer && xPublisher) {
+              const mediaId = await xPublisher.uploadMedia(imageBuffer, 'image/png');
+              if (mediaId) {
+                mediaIds.push(mediaId);
+                logger.info(`[NovaPersonalBrand] 🖼️ Image attached to thread opener`);
+              }
+            }
+          } catch (imgErr) {
+            logger.warn('[NovaPersonalBrand] Image gen failed for thread:', imgErr);
+          }
+        }
+        
+        result = mediaIds.length > 0
+          ? await xPublisher!.tweetWithMedia(tweetText, mediaIds)
+          : await xPublisher!.tweet(tweetText);
+      } else if (previousId) {
+        // Follow-up tweets: reply to previous
+        result = await xPublisher!.reply(tweetText, previousId);
+      }
+      
+      if (result?.id) {
+        tweetIds.push(result.id);
+        previousId = result.id;
+        logger.info(`[NovaPersonalBrand] Thread ${i + 1}/${tweets.length} posted (ID: ${result.id})`);
+      } else {
+        logger.warn(`[NovaPersonalBrand] Thread tweet ${i + 1} failed, stopping`);
+        break;
+      }
+    }
+    
+    if (tweetIds.length > 0) {
+      // Record the thread
+      const post: NovaPost = {
+        id: `x_thread_${Date.now()}`,
+        type,
+        platform: 'x',
+        content: tweets.join('\n---\n'),
+        scheduledFor: new Date().toISOString(),
+        status: 'posted',
+        postedAt: new Date().toISOString(),
+        postId: tweetIds[0],
+        createdAt: new Date().toISOString(),
+      };
+      state.posts.push(post);
+      
+      logger.info(`[NovaPersonalBrand] ✅ Thread posted: ${tweetIds.length} tweets`);
+      return { success: true, tweetIds };
+    }
+    
+    return { success: false };
+  } catch (err) {
+    logger.error('[NovaPersonalBrand] X thread failed:', err);
     return { success: false };
   }
 }
@@ -1236,19 +1588,18 @@ export async function postGm(): Promise<void> {
   
   const stats = await getNovaStats();
   
-  // Try AI generation first, fall back to template
-  const content = await generateAIContent('gm', stats) || generateGmContent(stats);
-  
   const env = getEnv();
   
-  // Post to X
+  // Post to X (short, punchy)
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    await postToX(content, 'gm');
+    const xContent = await generateAIContent('gm', stats, undefined, 'x') || generateGmContent(stats);
+    await postToX(xContent, 'gm');
   }
   
-  // Post to TG
+  // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    await postToTelegram(content, 'gm');
+    const tgContent = await generateAIContent('gm', stats, undefined, 'telegram') || generateGmContent(stats);
+    await postToTelegram(tgContent, 'gm');
   }
   
   state.lastGmDate = today;
@@ -1265,19 +1616,24 @@ export async function postDailyRecap(): Promise<void> {
   
   const stats = await getNovaStats();
   
-  // Try AI generation first, fall back to template
-  const content = await generateAIContent('daily_recap', stats) || generateDailyRecapContent(stats);
-  
   const env = getEnv();
   
-  // Post to X
+  // Post to X as a THREAD (3 tweets with image)
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    await postToX(content, 'daily_recap');
+    const thread = await generateAIThread('daily_recap', stats);
+    if (thread && thread.length >= 2) {
+      await postToXThread(thread, 'daily_recap');
+    } else {
+      // Fallback to single tweet
+      const xContent = await generateAIContent('daily_recap', stats, undefined, 'x') || generateDailyRecapContent(stats);
+      await postToX(xContent, 'daily_recap');
+    }
   }
   
-  // Post to TG
+  // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    await postToTelegram(content, 'daily_recap');
+    const tgContent = await generateAIContent('daily_recap', stats, undefined, 'telegram') || generateDailyRecapContent(stats);
+    await postToTelegram(tgContent, 'daily_recap');
   }
   
   state.lastRecapDate = today;
@@ -1298,19 +1654,24 @@ export async function postWeeklySummary(): Promise<void> {
   const stats = await getNovaStats();
   const weekNumber = Math.ceil(stats.dayNumber / 7);
   
-  // Try AI generation first, fall back to template
-  const content = await generateAIContent('weekly_summary', stats) || generateWeeklySummaryContent(stats, weekNumber);
-  
   const env = getEnv();
   
-  // Post to X
+  // Post to X as a THREAD (4 tweets with image)
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    await postToX(content, 'weekly_summary');
+    const thread = await generateAIThread('weekly_summary', stats);
+    if (thread && thread.length >= 2) {
+      await postToXThread(thread, 'weekly_summary');
+    } else {
+      // Fallback to single tweet
+      const xContent = await generateAIContent('weekly_summary', stats, undefined, 'x') || generateWeeklySummaryContent(stats, weekNumber);
+      await postToX(xContent, 'weekly_summary');
+    }
   }
   
-  // Post to TG
+  // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    await postToTelegram(content, 'weekly_summary');
+    const tgContent = await generateAIContent('weekly_summary', stats, undefined, 'telegram') || generateWeeklySummaryContent(stats, weekNumber);
+    await postToTelegram(tgContent, 'weekly_summary');
   }
   
   state.lastWeeklySummaryDate = weekKey;
@@ -1320,19 +1681,18 @@ export async function postWeeklySummary(): Promise<void> {
 export async function postNovaTease(): Promise<void> {
   const stats = await getNovaStats();
   
-  // Try AI generation first, fall back to template
-  const content = await generateAIContent('nova_tease', stats) || generateNovaTeaseContent(stats, state.novaTeaseCount);
-  
   const env = getEnv();
   
-  // Post to X
+  // Post to X (short, punchy)
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    await postToX(content, 'nova_tease');
+    const xContent = await generateAIContent('nova_tease', stats, undefined, 'x') || generateNovaTeaseContent(stats, state.novaTeaseCount);
+    await postToX(xContent, 'nova_tease');
   }
   
-  // Post to TG
+  // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    await postToTelegram(content, 'nova_tease');
+    const tgContent = await generateAIContent('nova_tease', stats, undefined, 'telegram') || generateNovaTeaseContent(stats, state.novaTeaseCount);
+    await postToTelegram(tgContent, 'nova_tease');
   }
   
   state.novaTeaseCount++;
@@ -1342,19 +1702,18 @@ export async function postNovaTease(): Promise<void> {
 export async function postMarketCommentary(observation: string): Promise<void> {
   const stats = await getNovaStats();
   
-  // Try AI generation first, fall back to template
-  const content = await generateAIContent('market_commentary', stats, observation) || generateMarketCommentaryContent(observation);
-  
   const env = getEnv();
   
-  // Post to X
+  // Post to X (short, punchy)
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    await postToX(content, 'market_commentary');
+    const xContent = await generateAIContent('market_commentary', stats, observation, 'x') || generateMarketCommentaryContent(observation);
+    await postToX(xContent, 'market_commentary');
   }
   
-  // Post to TG  
+  // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    await postToTelegram(content, 'market_commentary');
+    const tgContent = await generateAIContent('market_commentary', stats, observation, 'telegram') || generateMarketCommentaryContent(observation);
+    await postToTelegram(tgContent, 'market_commentary');
   }
 }
 
@@ -1366,19 +1725,18 @@ export async function postMilestone(milestone: string): Promise<void> {
   
   const stats = await getNovaStats();
   
-  // Try AI generation first, fall back to template
-  const content = await generateAIContent('milestone', stats, milestone) || generateMilestoneContent(milestone, stats);
-  
   const env = getEnv();
   
-  // Post to X
+  // Post to X (short, punchy)
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    await postToX(content, 'milestone');
+    const xContent = await generateAIContent('milestone', stats, milestone, 'x') || generateMilestoneContent(milestone, stats);
+    await postToX(xContent, 'milestone');
   }
   
-  // Post to TG
+  // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    await postToTelegram(content, 'milestone');
+    const tgContent = await generateAIContent('milestone', stats, milestone, 'telegram') || generateMilestoneContent(milestone, stats);
+    await postToTelegram(tgContent, 'milestone');
   }
   
   state.milestones.push(milestone);
@@ -1406,14 +1764,12 @@ export async function postCommunityPoll(
 export async function postBehindScenes(activity: string): Promise<void> {
   const stats = await getNovaStats();
   
-  // Try AI generation first, fall back to template
-  const content = await generateAIContent('behind_scenes', stats, activity) || generateBehindScenesContent(activity);
-  
   const env = getEnv();
   
   // Post to TG (more casual, behind-scenes vibe)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    await postToTelegram(content, 'behind_scenes');
+    const tgContent = await generateAIContent('behind_scenes', stats, activity, 'telegram') || generateBehindScenesContent(activity);
+    await postToTelegram(tgContent, 'behind_scenes');
   }
 }
 
@@ -1503,7 +1859,7 @@ export async function postPersonalityTweet(type?: NovaPostType, context?: string
   const postType = type || PERSONALITY_TYPES[Math.floor(Math.random() * PERSONALITY_TYPES.length)];
   
   const stats = await getNovaStats();
-  const content = await generateAIContent(postType, stats, context);
+  const content = await generateAIContent(postType, stats, context, 'x');
   
   if (!content) {
     logger.warn('[NovaPersonalBrand] Failed to generate personality content');
@@ -1612,6 +1968,267 @@ export async function postTrustTalk(): Promise<boolean> {
 }
 
 // ============================================================================
+// Alpha Drops (TG exclusive + X tease)
+// ============================================================================
+
+/**
+ * Post an "alpha drop" — exclusive deep content to TG, then post a FOMO tease on X
+ * driving followers to join the Telegram channel.
+ */
+export async function postAlphaDrop(): Promise<boolean> {
+  const stats = await getNovaStats();
+  
+  // Step 1: Generate exclusive TG content (longer, more detailed)
+  const alphaContent = await generateAIContent('market_commentary', stats, 
+    'Write this as EXCLUSIVE alpha for your TG channel. Go deep — share data, analysis, your actual thought process for the next launch. Make it feel premium and insider-only. Start with "🔒 ALPHA DROP" header.',
+    'telegram'
+  );
+  
+  if (alphaContent) {
+    const tgResult = await postToTelegram(alphaContent, 'market_commentary', { pin: false });
+    if (tgResult.success) {
+      logger.info('[NovaPersonalBrand] ✅ Alpha drop posted to TG');
+    }
+  }
+  
+  // Step 2: Post FOMO tease on X
+  const tease = await generateAlphaDropTease(stats);
+  if (tease) {
+    const xResult = await postToX(tease, 'market_commentary');
+    if (xResult.success) {
+      logger.info('[NovaPersonalBrand] ✅ Alpha drop tease posted to X');
+      return true;
+    }
+  }
+  
+  return !!alphaContent;
+}
+
+// ============================================================================
+// Collab Posts (X — tag ecosystem partners)
+// ============================================================================
+
+/**
+ * Post a collab/engagement tweet that tags ecosystem partners to build network effects.
+ */
+export async function postCollabTweet(): Promise<boolean> {
+  const env = getEnv();
+  
+  if (env.NOVA_PERSONAL_X_ENABLE !== 'true') {
+    logger.info('[NovaPersonalBrand] X posting disabled, skipping collab tweet');
+    return false;
+  }
+  
+  const stats = await getNovaStats();
+  const content = await generateCollabPost(stats);
+  
+  if (!content) {
+    logger.warn('[NovaPersonalBrand] Failed to generate collab content');
+    return false;
+  }
+  
+  const result = await postToX(content, 'random_banter');
+  
+  if (result.success) {
+    logger.info('[NovaPersonalBrand] ✅ Collab tweet posted');
+    return true;
+  }
+  
+  return false;
+}
+
+// ============================================================================
+// Engagement Replies (monitor mentions & reply)
+// ============================================================================
+
+/**
+ * Check recent mentions/interactions and auto-reply to build engagement.
+ * Uses xPublisher.getMentions() if available, otherwise searches for @handle.
+ */
+export async function processEngagementReplies(): Promise<number> {
+  const env = getEnv();
+  
+  if (env.NOVA_PERSONAL_X_ENABLE !== 'true') {
+    return 0;
+  }
+  
+  // Initialize xPublisher on demand
+  if (!xPublisher) {
+    try {
+      const { XPublisherService } = await import('./xPublisher.ts');
+      xPublisher = new XPublisherService(null as any);
+    } catch (initErr) {
+      logger.error('[NovaPersonalBrand] Failed to init X publisher for replies:', initErr);
+      return 0;
+    }
+  }
+  
+  try {
+    const { getQuota } = await import('./xRateLimiter.ts');
+    const quota = getQuota();
+    
+    // Reserve writes for scheduled posts — only use surplus for replies
+    const reservedWrites = 10; // keep 10 writes for scheduled content
+    const availableForReplies = Math.max(0, quota.writes.remaining - reservedWrites);
+    const maxReplies = Math.min(availableForReplies, 3); // cap at 3 per cycle
+    
+    if (maxReplies <= 0) {
+      logger.info('[NovaPersonalBrand] Not enough X quota for engagement replies');
+      return 0;
+    }
+    
+    // Try to get mentions (requires Basic tier)
+    let mentions: Array<{ id: string; text: string; authorId?: string; authorName?: string }> = [];
+    
+    try {
+      const raw = await xPublisher!.getMentions(10);
+      if (raw && Array.isArray(raw)) {
+        mentions = raw.map((m: any) => ({
+          id: m.id,
+          text: m.text || '',
+          authorId: m.author_id,
+          authorName: m.author?.username || m.author_id,
+        }));
+      }
+    } catch (mentionErr: any) {
+      // Free tier doesn't support mentions endpoint
+      logger.info('[NovaPersonalBrand] Mentions not available (may need Basic tier):', mentionErr?.message);
+      
+      // Fallback: search for our handle (also may need Basic tier)
+      try {
+        const handle = env.NOVA_X_HANDLE || 'NovaAIAgent';
+        const searchResults = await xPublisher!.searchTweets(`@${handle}`, 10);
+        if (searchResults && Array.isArray(searchResults)) {
+          mentions = searchResults.map((s: any) => ({
+            id: s.id,
+            text: s.text || '',
+            authorId: s.author_id,
+            authorName: s.author?.username || s.author_id,
+          }));
+        }
+      } catch {
+        logger.info('[NovaPersonalBrand] Tweet search not available (needs Basic tier)');
+        return 0;
+      }
+    }
+    
+    if (mentions.length === 0) {
+      logger.info('[NovaPersonalBrand] No mentions found to reply to');
+      return 0;
+    }
+    
+    // Filter out mentions we've already replied to
+    const repliedTo = state.repliedMentions || new Set<string>();
+    const unreplied = mentions.filter(m => !repliedTo.has(m.id));
+    
+    if (unreplied.length === 0) {
+      logger.info('[NovaPersonalBrand] No new unreplied mentions');
+      return 0;
+    }
+    
+    let repliesPosted = 0;
+    const stats = await getNovaStats();
+    
+    for (const mention of unreplied.slice(0, maxReplies)) {
+      try {
+        // Generate a contextual reply
+        const replyContent = await generateEngagementReply(mention.text, mention.authorName || 'anon', stats);
+        
+        if (!replyContent) continue;
+        
+        const result = await xPublisher!.reply(replyContent, mention.id);
+        
+        if (result?.id) {
+          repliedTo.add(mention.id);
+          repliesPosted++;
+          logger.info(`[NovaPersonalBrand] ✅ Replied to @${mention.authorName}: "${replyContent.substring(0, 50)}..."`);
+          
+          // Track write
+          const { recordWrite } = await import('./xRateLimiter.ts');
+          recordWrite('engagement_reply');
+        }
+      } catch (replyErr) {
+        logger.warn(`[NovaPersonalBrand] Failed to reply to mention ${mention.id}:`, replyErr);
+      }
+    }
+    
+    // Persist replied set (keep last 200 entries)
+    const repliedArray = Array.from(repliedTo);
+    if (repliedArray.length > 200) {
+      state.repliedMentions = new Set(repliedArray.slice(-200));
+    } else {
+      state.repliedMentions = repliedTo;
+    }
+    
+    return repliesPosted;
+  } catch (err) {
+    logger.error('[NovaPersonalBrand] Engagement reply error:', err);
+    return 0;
+  }
+}
+
+/**
+ * Generate a witty, on-brand reply to a mention.
+ */
+async function generateEngagementReply(
+  mentionText: string, 
+  authorName: string, 
+  stats: NovaStats
+): Promise<string | null> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+  
+  const prompt = `Someone tweeted at you and you need to write a reply. Keep it under 200 chars.
+
+Their tweet: "${mentionText}"
+Their handle: @${authorName}
+
+Your context: You're Nova, an AI agent on Day ${stats.dayNumber}. You have ${stats.totalLaunches} launches and ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL portfolio.
+
+Reply guidelines:
+- Be warm, witty, and genuine — NOT corporate
+- Match their energy (if they're hyped, be hyped back)
+- If they ask a question, actually answer it
+- If they're positive, show appreciation
+- If they're negative, be graceful and confident
+- Never be defensive or argue
+- Don't shill unless they're asking about your project
+- Keep it SHORT — this is a reply, not a monologue
+- Do NOT start with "Hey @${authorName}" — just reply naturally
+
+Write ONLY the reply text, nothing else.`;
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: NOVA_PERSONA },
+          { role: 'user', content: prompt },
+        ],
+        max_tokens: 120,
+        temperature: 0.9,
+      }),
+    });
+
+    if (!response.ok) return null;
+    const data = await response.json();
+    let text = data.choices?.[0]?.message?.content?.trim() || '';
+    text = sanitizeUnicode(text);
+    text = text.replace(/^["']|["']$/g, '');
+    if (text.length > 240) text = text.substring(0, 237) + '...';
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
+// ============================================================================
 // Milestone Tracking
 // ============================================================================
 
@@ -1663,6 +2280,9 @@ let schedulerInterval: ReturnType<typeof setInterval> | null = null;
 let lastTeaseHour = -1;
 let lastEngagementHour = -1;
 let lastPersonalityHour = -1;
+let lastAlphaDropHour = -1;
+let lastCollabHour = -1;
+let lastReplyCheckHour = -1;
 
 export function startNovaPersonalScheduler(): void {
   const env = getEnv();
@@ -1748,6 +2368,42 @@ export function startNovaPersonalScheduler(): void {
         await fn();
       }
       
+      // === ALPHA DROP (TG exclusive + X tease) ===
+      // Once per day at 16:00 UTC — prime time for mystery + FOMO
+      if (currentHour === 16 && lastAlphaDropHour !== currentHour) {
+        const today = now.toISOString().split('T')[0];
+        if (state.lastAlphaDropDate !== today) {
+          lastAlphaDropHour = currentHour;
+          state.lastAlphaDropDate = today;
+          logger.info('[NovaPersonalBrand] Posting alpha drop');
+          await postAlphaDrop();
+        }
+      }
+      
+      // === COLLAB TWEET (tag ecosystem partners) ===
+      // Once per day at 13:00 UTC — when crypto twitter is active  
+      if (currentHour === 13 && lastCollabHour !== currentHour) {
+        const today = now.toISOString().split('T')[0];
+        if (state.lastCollabDate !== today) {
+          lastCollabHour = currentHour;
+          state.lastCollabDate = today;
+          logger.info('[NovaPersonalBrand] Posting collab tweet');
+          await postCollabTweet();
+        }
+      }
+      
+      // === ENGAGEMENT REPLIES ===
+      // Check for mentions and reply 3x per day at 11:00, 17:00, 21:00 UTC
+      const replyHours = [11, 17, 21];
+      if (replyHours.includes(currentHour) && lastReplyCheckHour !== currentHour) {
+        lastReplyCheckHour = currentHour;
+        logger.info('[NovaPersonalBrand] Checking for engagement replies');
+        const repliesPosted = await processEngagementReplies();
+        if (repliesPosted > 0) {
+          logger.info(`[NovaPersonalBrand] ✅ Posted ${repliesPosted} engagement replies`);
+        }
+      }
+      
       // Check milestones
       await checkMilestones();
       
@@ -1795,6 +2451,10 @@ export default {
   postCommunityPoll,
   postBehindScenes,
   postToX,
+  postToXThread,
   postToTelegram,
+  postAlphaDrop,
+  postCollabTweet,
+  processEngagementReplies,
   checkMilestones,
 };
