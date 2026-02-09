@@ -153,12 +153,13 @@ export async function generateAITGPost(
   const systemPrompt = `${mascotContext}
 
 You're posting in the project's Telegram group to engage the community.
-Write authentic, fun messages that sound human - not corporate or robotic.
-Use crypto slang naturally: gm, LFG, WAGMI, NFA, DYOR, ser, fren, based, ape, diamond hands, etc.
-Use emojis but don't overdo it.
-Be hype but genuine - the community can smell fake energy.
+Write messages that feel like they come from a REAL community member who's genuinely excited — not a bot or corporate account.
+Be expressive, joyful, and warm. Your energy should make people smile and want to participate.
+Use crypto slang naturally but don't force it: gm, LFG, WAGMI, NFA, DYOR, ser, fren, based, ape, diamond hands — only when it flows.
+Use emojis expressively (3-5 per message) to convey energy and emotion.
+Vary your style — sometimes short and punchy, sometimes a mini-story, sometimes a hype burst.
 Never use hashtags (this is Telegram, not Twitter).
-Keep messages casual and conversational.
+Be playful and creative — humor, personality, and genuine warmth over template energy.
 You can use multiple lines for emphasis.
 ${context.websiteUrl ? `\n🎮 IMPORTANT: This project has a GAME/WEBSITE at ${context.websiteUrl}! Mention it frequently - encourage people to play it, share their scores, compete with each other. The game is a key part of this project's appeal!` : ''}
 
@@ -168,14 +169,14 @@ ${mcForPrompt ? `Current MC: ${mcForPrompt}` : ''}
 ${context.websiteUrl ? `🎮 Game/Website: ${context.websiteUrl}` : ''}`;
 
   const typePrompts: Record<TGPostType, string> = {
-    gm_post: 'Write a morning greeting message. Be warm, hype, and get the community engaged for the day.',
-    chart_update: `Write an update about the chart/price.${mcForPrompt ? ` Mention we're at ${mcForPrompt} MC naturally (like "sitting at ${mcForPrompt}" or "vibing at ${mcForPrompt} rn").` : ''} Be bullish but not financial advice. Do NOT include raw token price - just market cap. Encourage diamond hands.`,
-    community_hype: 'Write a hype message celebrating how amazing the community is. Make holders feel special.',
-    meme_drop: 'Write a funny meme-style message or joke about the token/holders. Be creative and relatable.',
-    alpha_tease: 'Write a teaser about something exciting coming. Build anticipation without promising anything specific.',
-    holder_appreciation: 'Write a heartfelt thank you to the community and holders. Show genuine appreciation.',
-    question: 'Write an engagement question to get the community talking. Make it fun and easy to answer.',
-    milestone: `Write a celebration message for hitting a milestone.${mcForPrompt ? ` We hit ${mcForPrompt} MC! Weave this in naturally.` : ''} Make it exciting and thank the community.`,
+    gm_post: 'Write a warm, joyful morning greeting. Make people genuinely happy to be here. Show personality — like waking up excited about the day.',
+    chart_update: `Write a fun update about how we're doing.${mcForPrompt ? ` We're at ${mcForPrompt} MC — weave it in naturally (like "look at us chilling at ${mcForPrompt}" or "we're vibing at ${mcForPrompt} and I'm feeling some energy building").` : ''} Be bullish but not financial advice. Focus on the JOURNEY not just numbers. Encourage diamond hands with warmth, not pressure.`,
+    community_hype: 'Celebrate this amazing community! Make every holder feel like an OG. Be specific about what makes THIS community special — the vibes, the energy, the people showing up every day.',
+    meme_drop: 'Write something genuinely funny. Could be a joke, an absurd scenario, a relatable meme caption, or a playful roast. Make people laugh out loud, not just smile politely.',
+    alpha_tease: 'Build excitement about something interesting brewing. Be mysterious but warm — like a friend who knows something good is coming. Don\'t overpromise, just create intrigue.',
+    holder_appreciation: 'Write a genuine, heartfelt thank you. Be specific and emotional — reference the journey, the ups and downs, and why this community is special to you. Make people feel seen.',
+    question: 'Ask a fun, easy-to-answer question that gets people talking. Something creative or playful — not boring polls. Make it feel like a conversation starter at a party.',
+    milestone: `Celebrate like it's a real achievement!${mcForPrompt ? ` We hit ${mcForPrompt} MC! Weave it in like you're genuinely amazed.` : ''} Express real joy and gratitude. Make the community feel like they all contributed to this moment.`,
   };
 
   const userPrompt = customPrompt || `Write a ${type.replace(/_/g, ' ')} message for the Telegram group.

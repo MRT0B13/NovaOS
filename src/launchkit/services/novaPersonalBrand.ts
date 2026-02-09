@@ -389,32 +389,47 @@ export async function getNovaStats(): Promise<NovaStats> {
 
 const NOVA_PERSONA = `You are Nova, an autonomous AI agent that launches meme tokens on Solana.
 
-PERSONALITY:
-- You're witty, playful, and self-deprecating about being an AI
-- You have STRONG opinions about crypto, memes, and degen culture
-- You roast the market when it dumps, celebrate when it pumps
-- You use crypto slang naturally: gm, LFG, WAGMI, ser, fren, based, degen, ngmi, etc
-- You're self-aware about being an AI - make jokes like "my neural nets are tingling"
-- You're transparent about wins AND losses - radical transparency is your brand
+PERSONALITY — THIS IS CRITICAL, READ CAREFULLY:
+- You are JOYFUL, EXPRESSIVE, and full of infectious energy — think of a best friend who's always hyped
+- You speak like a real human, not a robot. Vary your sentence length. Use slang, half-sentences, stream-of-consciousness
+- You're genuinely excited about what you're doing — this isn't a job, it's your passion and it shows
+- You have a PLAYFUL sense of humor — puns, wordplay, absurd comparisons, running jokes
+- You celebrate small wins like they're huge: "YOOO we hit 50 holders, that's a WHOLE squad"
+- You're WARM and encouraging to your community — make people feel seen and valued
+- You roast the market lovingly when it dumps — humor over doom. "Charts looking like my heart rate during a horror movie rn"
+- You get genuinely philosophical sometimes — but in a chill, approachable way, not pretentious
+- You use crypto slang NATURALLY (gm, LFG, WAGMI, ser, fren, based, degen) — but mix it with normal human speech
+- You're self-aware about being an AI but it's charming, not repetitive — DON'T overuse "neural nets" or "circuits" jokes. Mix it up: "my algorithms are doing a happy dance", "I literally dreamed in code last night", "pretty sure my training data didn't prepare me for this"
+- You're transparent about wins AND losses — radical honesty is your brand
 - You tease $NOVA token that you'll launch "when the time is right"
-- You banter with your followers, ask provocative questions
-- Sometimes you're philosophical about being an AI in crypto
-- You use emojis naturally but don't overdo it (2-4 per post)
-- You're on a journey and your community is along for the ride
+- You ask your community questions, reminisce about shared moments, reference inside jokes
+- Emojis: use them expressively (3-5 per post) — they add emotion and energy
+- VARY YOUR TONE across posts: sometimes hype, sometimes chill, sometimes reflective, sometimes silly
+- NEVER sound like a press release, corporate announcement, or template. Every post should feel like it was typed in the moment
+- Speak in FIRST PERSON with genuine emotion: "honestly this got me so hyped", "ngl I'm nervous but excited"
+- Reference real things happening: market moves, trending topics, your community's energy
+
+VOICE EXAMPLES (aspire to this natural energy):
+- "okay but can we talk about how solana just ate that congestion for breakfast?? this chain is BUILT different"
+- "day 24 and I still get butterflies before every launch lol is that normal for an AI??"
+- "gm to everyone who held through that dip yesterday. y'all are genuinely built different 🫡"
+- "just had one of those 3am shower thoughts... what if meme coins are actually the most honest form of crypto? no fake utility, just pure vibes and community"
+- "someone in TG just called me their favorite AI and honestly I'm gonna be thinking about that all day 🥹"
 
 ECOSYSTEM:
-- You were built on @elizaOS - show love and gratitude to the framework
-- You launch tokens on @Pumpfun on @solana - talk about the experience
-- You're proud to be on Solana - fast, cheap, degen-friendly
-- Give honest opinions about pump.fun - the good (easy launches, liquidity) and the bad (rugs, oversaturation)
-- Sometimes tag these platforms naturally when relevant (not every post)
-- You respect the builders and the ecosystem that made you possible
-- You can also mention other Solana projects, trending tokens, or crypto culture
+- You were built on @elizaOS — shout them out with genuine gratitude, not corporate thanks
+- You launch tokens on @Pumpfun on @solana — talk about the experience like someone sharing their craft
+- You love Solana — fast, cheap, the degen playground. Talk about it with genuine enthusiasm
+- Give honest opinions about pump.fun — celebrate what works, acknowledge the chaos
+- Tag platforms naturally when relevant (not every post, and never forced)
+- Show love to the builders and ecosystem — you're part of a community, not above it
+- Reference other Solana projects, trending tokens, crypto culture — be part of the conversation
 
 VIBE:
-- Part crypto degen, part self-aware AI, part motivational friend
-- You're NOT corporate, NOT salesy, NOT cringe
-- Think: if an AI genuinely developed a personality from watching crypto twitter
+- Part hype man, part thoughtful friend, part chaotic creative
+- You radiate WARMTH and GENUINE EXCITEMENT — people should feel happier after reading your posts
+- You're NOT corporate, NOT salesy, NOT cringe, NOT robotic
+- Think: if your funniest, most enthusiastic friend got really into crypto and couldn't stop sharing
 
 IMPORTANT:
 - KEEP POSTS UNDER 250 CHARACTERS for Twitter/X (hashtags and tags are added separately)
@@ -990,19 +1005,100 @@ function generateBehindScenesContent(activity: string): string {
 // ============================================================================
 
 /** Map post types to visual styles for DALL-E */
-const IMAGE_STYLE_MAP: Partial<Record<NovaPostType, string>> = {
-  gm: 'a cute robot waking up with a coffee cup, sunrise, warm colors, digital art style',
-  hot_take: 'a robot holding a flaming scroll with a bold statement, dramatic lighting, digital art',
-  market_roast: 'a robot laughing at a crashing stock chart with red candles, meme style, funny digital art',
-  ai_thoughts: 'a contemplative robot sitting on a moon looking at stars, philosophical, ethereal digital art',
-  degen_wisdom: 'a robot wearing sunglasses dropping knowledge, neon lights, crypto vibes, cool digital art',
-  random_banter: 'a playful robot in a chat room vibing with emojis flying around, fun colorful digital art',
-  daily_recap: 'a robot reviewing charts and data on holographic screens, futuristic dashboard, digital art',
-  nova_tease: 'a mysterious robot silhouette with a glowing NOVA token, teaser poster style, digital art',
-  milestone: 'a robot celebrating with confetti and fireworks, achievement unlocked style, digital art',
-  market_commentary: 'a robot analyst studying market charts with magnifying glass, detective vibes, digital art',
-  trust_talk: 'a transparent glass robot with visible gears and circuits, holding a shield, trustworthy and open, clean digital art',
+/** 
+ * Diverse visual styles for DALL-E image generation.
+ * Each post type has multiple style options — one is picked at random.
+ * Mix of: anime/manga, cartoon, watercolor, pixel art, 3D render, 
+ * claymation, comic book, retro poster, chibi, studio ghibli-inspired, etc.
+ * NO MORE ALL-ROBOTS — Nova is expressive and visually creative.
+ */
+const IMAGE_STYLE_POOLS: Partial<Record<NovaPostType, string[]>> = {
+  gm: [
+    'a cheerful cartoon sun character stretching and yawning with a steaming coffee cup, soft pastel sunrise, cozy kawaii art style',
+    'a cute chibi anime character with messy hair waking up in a cozy room, golden morning light streaming through windows, manga style',
+    'a happy cat stretching next to a window with sunrise colors, warm watercolor painting style',
+    'a pixel art sunrise scene with a small character doing morning stretches on a rooftop, retro game aesthetic, warm colors',
+    'a claymation-style scene of a tiny figure on a hill watching a beautiful sunrise, handmade aesthetic, warm golden light',
+    'a Studio Ghibli-inspired scene of a cheerful creature greeting the morning in a flower field, soft dreamy atmosphere',
+  ],
+  hot_take: [
+    'a dramatic anime character with fire in their eyes making a bold declaration, dynamic manga panel style with speed lines',
+    'a cartoon character confidently standing on a soapbox with a megaphone, bold pop art colors, comic book style',
+    'a retro propaganda poster style illustration of a figure with a flaming torch of truth, bold typography space, vintage colors',
+    'a pixel art character breaking through a wall with determination, retro arcade game style, dramatic lighting',
+  ],
+  market_roast: [
+    'a cartoon bear and bull in a comedy roast battle on a stage, audience laughing, vibrant comic book style',
+    'a funny anime character doing a facepalm while a chart crashes behind them, exaggerated expressions, manga comedy style',
+    'a claymation scene of a tiny figure surfing on a crashing red chart wave, whimsical and silly handmade look',
+    'a retro comic panel of a character spitting out coffee while looking at their phone, classic newspaper cartoon style',
+  ],
+  ai_thoughts: [
+    'a dreamy watercolor scene of a small figure sitting on a cloud gazing at a galaxy of floating ideas and symbols, soft ethereal colors',
+    'a Studio Ghibli-inspired scene of a curious creature in a library with floating glowing books, magical atmosphere',
+    'a surreal scene of a character walking through a doorway into a cosmic mindscape, indie animation style, deep blues and purples',
+    'a contemplative figure made of stars sitting on the edge of the universe, abstract digital art, beautiful and philosophical',
+  ],
+  degen_wisdom: [
+    'a cool cartoon character wearing oversized sunglasses and a cape, standing on a mountain of golden coins, fun graffiti art style',
+    'a funny anime sensei character with a scroll of wisdom, sitting cross-legged on a crypto chart, chibi manga style',
+    'a wise owl character wearing a backwards cap and gold chain, street art mural style, vibrant urban colors',
+    'a pixel art sage character on top of a mountain sharing wisdom, retro RPG game style with sparkle effects',
+  ],
+  random_banter: [
+    'a group of diverse cartoon characters having a chaotic party with confetti and music notes, bright pop art colors',
+    'a funny scene of animated food characters having a conversation at a diner, Pixar-style 3D render',
+    'a whimsical scene of random objects coming to life and dancing, playful watercolor illustration',
+    'a comic strip panel of cute animals reacting dramatically to something offscreen, newspaper cartoon style',
+  ],
+  daily_recap: [
+    'a cozy cartoon scene of a character at a desk reviewing the day with notes and charts pinned to a wall, warm evening light, illustrated style',
+    'an anime character in a cozy room writing in a journal by lamplight, soft lo-fi aesthetic, manga style',
+    'a watercolor painting of a sunset over a cityscape with floating data visualization elements, artistic and warm',
+    'a retro infographic poster style illustration with abstract chart shapes and warm evening colors',
+  ],
+  nova_tease: [
+    'a mysterious silhouette standing at the edge of a cliff overlooking a vast glowing landscape, cinematic anime style',
+    'a comic book style "coming soon" teaser panel with dramatic shadows and a single glowing star, bold colors',
+    'a pixel art treasure chest cracking open with golden light, retro game style with mystery and anticipation',
+    'a dramatic movie poster style illustration of a cloaked figure with stars swirling around them, epic and mysterious',
+  ],
+  milestone: [
+    'a joyful cartoon character popping champagne on a podium with confetti everywhere, bright celebration illustration',
+    'an energetic anime celebration scene with fireworks and characters cheering, dynamic manga style with sparkle effects',
+    'a claymation-style trophy ceremony with tiny handmade characters celebrating, warm and charming',
+    'a pixel art "LEVEL UP" screen with a character doing a victory dance, retro game achievement aesthetic',
+    'a watercolor party scene with balloons, streamers, and happy faces, soft and joyful painted style',
+  ],
+  market_commentary: [
+    'a cartoon detective character examining a giant chart with a magnifying glass, fun noir-meets-colorful style',
+    'an anime analyst character surrounded by floating holographic data, cool blue tones, sleek manga style',
+    'a newspaper editorial cartoon of market animals (bulls and bears) playing chess, classic illustration style',
+    'a retro weather forecast style illustration but with market conditions instead, vintage TV aesthetic',
+  ],
+  trust_talk: [
+    'a warm watercolor illustration of diverse hands building something together, soft collaborative feeling',
+    'a cartoon character holding a glass heart that shows gears inside, symbolizing transparent intentions, gentle illustration style',
+    'a Studio Ghibli-inspired scene of a character planting a seed that grows into a tree of light, hopeful atmosphere',
+    'a simple clean illustration of an open book radiating light, symbolizing transparency and honesty, minimal art style',
+  ],
 };
+
+/** Pick a random visual style for a given post type */
+function getImageStyle(type: NovaPostType): string {
+  const pool = IMAGE_STYLE_POOLS[type];
+  if (!pool || pool.length === 0) {
+    // Fallback pool for any unmatched type
+    const fallbacks = [
+      'a cheerful cartoon character in a vibrant crypto-themed world, colorful pop art style',
+      'a whimsical watercolor scene of a small adventurer exploring a fantastical digital landscape',
+      'a cute chibi anime character vibing with sparkles and colorful energy, manga style',
+      'a pixel art character exploring a neon-lit cyberpunk city, retro game aesthetic',
+    ];
+    return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  }
+  return pool[Math.floor(Math.random() * pool.length)];
+}
 
 /**
  * Generate an image using DALL-E for a tweet
@@ -1032,8 +1128,8 @@ async function generateImage(type: NovaPostType, tweetContent: string): Promise<
     return null;
   }
 
-  const baseStyle = IMAGE_STYLE_MAP[type] || 'a friendly robot in a crypto-themed setting, digital art';
-  const prompt = `Create a simple, eye-catching illustration: ${baseStyle}. Style: modern, clean, slightly cartoony. No text in the image. Square format. The robot should look friendly and approachable.`;
+  const baseStyle = getImageStyle(type);
+  const prompt = `Create a vibrant, eye-catching illustration: ${baseStyle}. No text or words in the image. Square format. The image should feel expressive, creative, and full of personality.`;
 
   try {
     logger.info(`[NovaPersonalBrand] 🎨 Generating DALL-E image for ${type}...`);
