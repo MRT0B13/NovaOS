@@ -155,6 +155,7 @@ export interface SystemMetrics {
   totalLaunches: number;
   totalTweetsSent: number;
   totalTgPostsSent: number;
+  counterDate: string;
   lastUpdated: string;
 }
 
@@ -329,6 +330,7 @@ export class PostgresScheduleRepository {
         total_launches INTEGER DEFAULT 0,
         total_tweets_sent INTEGER DEFAULT 0,
         total_tg_posts_sent INTEGER DEFAULT 0,
+        counter_date TEXT,
         last_updated TIMESTAMPTZ DEFAULT NOW(),
         banned_users JSONB DEFAULT '[]'::jsonb,
         failed_attempts JSONB DEFAULT '[]'::jsonb
@@ -340,7 +342,8 @@ export class PostgresScheduleRepository {
       ALTER TABLE sched_system_metrics 
       ADD COLUMN IF NOT EXISTS total_launches INTEGER DEFAULT 0,
       ADD COLUMN IF NOT EXISTS total_tweets_sent INTEGER DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS total_tg_posts_sent INTEGER DEFAULT 0;
+      ADD COLUMN IF NOT EXISTS total_tg_posts_sent INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS counter_date TEXT;
     `).catch(() => {/* columns may already exist */});
 
     // Autonomous Mode State (single row - persists launch counts across restarts)
@@ -850,6 +853,7 @@ export class PostgresScheduleRepository {
         totalLaunches: 0,
         totalTweetsSent: 0,
         totalTgPostsSent: 0,
+        counterDate: new Date().toISOString().split('T')[0],
         lastUpdated: new Date().toISOString(),
         bannedUsers: [],
         failedAttempts: [],
@@ -871,6 +875,7 @@ export class PostgresScheduleRepository {
       totalLaunches: row.total_launches || 0,
       totalTweetsSent: row.total_tweets_sent || 0,
       totalTgPostsSent: row.total_tg_posts_sent || 0,
+      counterDate: row.counter_date || '',
       lastUpdated: row.last_updated instanceof Date ? row.last_updated.toISOString() : row.last_updated,
       bannedUsers: row.banned_users || [],
       failedAttempts: row.failed_attempts || [],
@@ -935,15 +940,19 @@ export class PostgresScheduleRepository {
     }
   }
 
-  async resetDailyMetrics(): Promise<void> {
+  async resetDailyMetrics(counterDate?: string): Promise<void> {
+    const today = counterDate || new Date().toISOString().split('T')[0];
     await this.pool.query(`
       UPDATE sched_system_metrics SET 
         tweets_sent_today = 0,
         tg_posts_sent_today = 0,
         trends_detected_today = 0,
+        errors_24h = 0,
+        warnings_24h = 0,
+        counter_date = $1,
         last_updated = NOW()
       WHERE id = 'main'
-    `);
+    `, [today]);
   }
 
   /**

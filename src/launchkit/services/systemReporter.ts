@@ -6,7 +6,7 @@ import { getPumpWalletBalance, getFundingWalletBalance } from './fundingWallet.t
 import { getEnv } from '../env.ts';
 import { getFailedAttempts, isAdminSecurityEnabled, isWebhookSecurityEnabled } from './telegramSecurity.ts';
 import { getPnLSummary, getActivePositions, initPnLTracker, type PnLSummary } from './pnlTracker.ts';
-import { getTokenPrice } from './priceService.ts';
+import { getTokenPrice, getTokenPrices } from './priceService.ts';
 import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -106,6 +106,10 @@ interface PersistedMetrics {
   totalTweetsSent: number;
   totalTgPostsSent: number;
   
+  // Tracks which day the daily counters belong to (ISO date string like '2026-02-09')
+  // Only updated when counters are reset — NOT on every metric increment
+  counterDate: string;
+  
   lastReportTime: number;
   lastDailyReportDate: string;
   totalMessagesReceived: number;
@@ -121,18 +125,20 @@ function loadMetricsFromFile(): PersistedMetrics {
       const loaded = JSON.parse(data) as PersistedMetrics;
       
       // Check if we need to reset daily counters (new day)
-      // IMPORTANT: Use lastUpdated to determine if counters are stale, not lastDailyReportDate
+      // Use counterDate (which day the counters belong to), NOT lastUpdated
+      // lastUpdated gets bumped by every incrementMetric() call so it's unreliable
       const today = new Date().toISOString().split('T')[0];
-      const lastUpdateDate = loaded.lastUpdated ? loaded.lastUpdated.split('T')[0] : '';
+      const counterDay = loaded.counterDate || (loaded.lastUpdated ? loaded.lastUpdated.split('T')[0] : '');
       
-      if (lastUpdateDate && lastUpdateDate !== today) {
+      if (counterDay && counterDay !== today) {
         // Counters are from a previous day - reset them
-        logger.info(`[SystemReporter] File metrics from previous day (${lastUpdateDate}), resetting daily counters`);
+        logger.info(`[SystemReporter] File metrics from previous day (${counterDay}), resetting daily counters`);
         loaded.tweetsSentToday = 0;
         loaded.tgPostsSentToday = 0;
         loaded.trendsDetectedToday = 0;
         loaded.errors24h = 0;
         loaded.warnings24h = 0;
+        loaded.counterDate = today;
         // NOTE: Do NOT set lastDailyReportDate here.
         // That field tracks whether the daily *summary report* was sent,
         // not whether counters were reset. Setting it here would prevent
@@ -145,6 +151,9 @@ function loadMetricsFromFile(): PersistedMetrics {
       } else {
         logger.info(`[SystemReporter] Same day (${today}), preserving file metrics`);
       }
+      
+      // Ensure counterDate is set (migration from older versions)
+      if (!loaded.counterDate) loaded.counterDate = today;
       
       // Initialize missing fields (migration from older versions)
       if (!loaded.bannedUsers) loaded.bannedUsers = [];
@@ -178,6 +187,7 @@ function loadMetricsFromFile(): PersistedMetrics {
     totalLaunches: 0,
     totalTweetsSent: 0,
     totalTgPostsSent: 0,
+    counterDate: new Date().toISOString().split('T')[0],
     lastReportTime: 0,
     lastDailyReportDate: '',
     totalMessagesReceived: 0,
@@ -198,26 +208,27 @@ async function loadMetricsFromPostgres(): Promise<PersistedMetrics | null> {
     const today = new Date().toISOString().split('T')[0];
     
     // Check if we need to reset daily counters
-    // IMPORTANT: Use lastUpdated to determine if counters are stale, not lastDailyReportDate
-    // lastDailyReportDate only updates when the daily summary runs (9 AM UTC)
-    // but counters represent today's activity regardless
-    const lastUpdateDate = data.lastUpdated ? data.lastUpdated.split('T')[0] : '';
+    // Use counterDate (which day the counters belong to), NOT lastUpdated
+    // lastUpdated gets bumped by every incrementMetric() call so it's unreliable
+    const counterDay = data.counterDate || (data.lastUpdated ? data.lastUpdated.split('T')[0] : '');
     
-    if (lastUpdateDate && lastUpdateDate !== today) {
+    if (counterDay && counterDay !== today) {
       // Counters are from a previous day - reset them
-      logger.info(`[SystemReporter] New day detected (last update: ${lastUpdateDate}, now: ${today}), resetting daily counters`);
-      await pgRepo.resetDailyMetrics();
+      logger.info(`[SystemReporter] New day detected (counter_date: ${counterDay}, now: ${today}), resetting daily counters`);
+      await pgRepo.resetDailyMetrics(today);
       data.tweetsSentToday = 0;
       data.tgPostsSentToday = 0;
       data.trendsDetectedToday = 0;
       data.errors24h = 0;
       data.warnings24h = 0;
+      data.counterDate = today;
       // NOTE: Do NOT set lastDailyReportDate here.
       // That field tracks whether the daily *summary report* was sent,
       // not whether counters were reset. Setting it here would prevent
       // the daily summary from firing at the scheduled hour.
     } else {
       // Same day - preserve counters
+      if (!data.counterDate) data.counterDate = today; // migration
       logger.info(`[SystemReporter] Same day (${today}), preserving counters`);
     }
     
@@ -277,9 +288,33 @@ export function getTotalMessagesReceived(): number {
 }
 
 /**
+ * Lightweight day-change guard: if we've crossed midnight since the last check,
+ * reset daily counters immediately. This prevents stale counter accumulation
+ * when the hourly checkMidnightReset() hasn't fired yet.
+ */
+function ensureDayIsCurrent(): void {
+  const today = new Date().toISOString().split('T')[0];
+  if (metrics.counterDate && metrics.counterDate !== today) {
+    logger.info(`[SystemReporter] 🌅 Day change detected in counter guard (was ${metrics.counterDate}, now ${today}), resetting`);
+    resetDailyCounters();
+    metrics.errors24h = 0;
+    metrics.warnings24h = 0;
+    lastCheckedDate = today;
+    saveMetrics();
+    // Fire-and-forget DB reset
+    if (usePostgres && pgRepo) {
+      pgRepo.resetDailyMetrics(today).catch(err => {
+        logger.warn('[SystemReporter] Failed to reset PostgreSQL metrics in guard:', err);
+      });
+    }
+  }
+}
+
+/**
  * Record a tweet was sent (call from XScheduler)
  */
 export function recordTweetSent(): void {
+  ensureDayIsCurrent();
   metrics.tweetsSentToday++;
   metrics.totalTweetsSent++;  // All-time cumulative
   saveMetrics();
@@ -295,6 +330,7 @@ export function recordTweetSent(): void {
  * Record a TG post was sent (call from TGScheduler)
  */
 export function recordTGPostSent(): void {
+  ensureDayIsCurrent();
   metrics.tgPostsSentToday++;
   metrics.totalTgPostsSent++;  // All-time cumulative
   saveMetrics();
@@ -314,6 +350,7 @@ export function recordTGPostSent(): void {
  * Record a trend was detected (call from TrendMonitor)
  */
 export function recordTrendDetected(): void {
+  ensureDayIsCurrent();
   metrics.trendsDetectedToday++;
   saveMetrics();
   if (usePostgres && pgRepo) {
@@ -470,12 +507,14 @@ export function getPersistedFailedAttempts(): FailedAttemptRecord[] {
 let lastCheckedDate: string = new Date().toISOString().split('T')[0];
 
 /**
- * Reset daily counters (call at midnight)
+ * Reset daily counters (call at midnight or on day change)
  */
 function resetDailyCounters(): void {
+  const today = new Date().toISOString().split('T')[0];
   metrics.tweetsSentToday = 0;
   metrics.tgPostsSentToday = 0;
   metrics.trendsDetectedToday = 0;
+  metrics.counterDate = today;
   // Also clear old failed attempts (older than 24h)
   if (metrics.failedAttempts) {
     const threshold = Date.now() - 24 * 60 * 60 * 1000;
@@ -507,7 +546,7 @@ async function checkMidnightReset(): Promise<void> {
     // Reset in PostgreSQL
     if (usePostgres && pgRepo) {
       try {
-        await pgRepo.resetDailyMetrics();
+        await pgRepo.resetDailyMetrics(today);
         logger.info('[SystemReporter] Reset daily metrics in PostgreSQL');
       } catch (err) {
         logger.warn('[SystemReporter] Failed to reset PostgreSQL metrics:', err);
@@ -555,15 +594,19 @@ async function collectStats(): Promise<SystemStats> {
   // Get PnL summary with current market prices for unrealized PnL
   let pnl: PnLSummary | null = null;
   try {
-    // Fetch current prices for all active positions
+    // Fetch current prices for all active positions (batch call)
     const currentPrices: Record<string, number> = {};
     try {
       const positions = await getActivePositions();
-      for (const pos of positions) {
-        if (pos.currentBalance > 0 && pos.mint) {
-          const priceData = await getTokenPrice(pos.mint);
+      const mintsToPrice = positions
+        .filter(pos => pos.currentBalance > 0 && pos.mint)
+        .map(pos => pos.mint);
+      
+      if (mintsToPrice.length > 0) {
+        const priceMap = await getTokenPrices(mintsToPrice);
+        for (const [mint, priceData] of priceMap) {
           if (priceData?.priceNative && priceData.priceNative > 0) {
-            currentPrices[pos.mint] = priceData.priceNative;
+            currentPrices[mint] = priceData.priceNative;
           }
         }
       }

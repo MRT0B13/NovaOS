@@ -57,7 +57,29 @@ interface DexScreenerPair {
 
 // Simple in-memory cache to avoid hammering the API
 const priceCache = new Map<string, { data: TokenPriceData; fetchedAt: number }>();
-const CACHE_TTL_MS = 60_000; // 1 minute cache
+const CACHE_TTL_MS = 5 * 60_000; // 5 minute cache (bonding curve tokens barely move)
+
+// Cache the @solana/web3.js import and Connection so we don't re-import + re-create every call
+let _solanaWeb3: typeof import('@solana/web3.js') | null = null;
+let _rpcConnection: InstanceType<typeof import('@solana/web3.js').Connection> | null = null;
+let _rpcUrl: string | null = null;
+
+async function getSolanaWeb3() {
+  if (!_solanaWeb3) {
+    _solanaWeb3 = await import('@solana/web3.js');
+  }
+  return _solanaWeb3;
+}
+
+async function getRpcConnection() {
+  const rpcUrl = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  if (!_rpcConnection || _rpcUrl !== rpcUrl) {
+    const { Connection } = await getSolanaWeb3();
+    _rpcConnection = new Connection(rpcUrl, 'confirmed');
+    _rpcUrl = rpcUrl;
+  }
+  return _rpcConnection;
+}
 
 /**
  * Fetch token price data from DexScreener
@@ -77,7 +99,7 @@ export async function getTokenPrice(mintAddress: string): Promise<TokenPriceData
 
   try {
     const url = `https://api.dexscreener.com/tokens/v1/solana/${mintAddress}`;
-    logger.info(`[PriceService] Fetching price for ${mintAddress}`);
+    logger.debug(`[PriceService] Fetching price for ${mintAddress.slice(0,8)}...`);
 
     const response = await fetch(url, {
       headers: {
@@ -87,14 +109,14 @@ export async function getTokenPrice(mintAddress: string): Promise<TokenPriceData
     });
 
     if (!response.ok) {
-      logger.warn(`[PriceService] DexScreener returned ${response.status} for ${mintAddress}`);
+      logger.warn(`[PriceService] DexScreener returned ${response.status} for ${mintAddress.slice(0,8)}...`);
       return null;
     }
 
     const pairs: DexScreenerPair[] = await response.json();
 
     if (!pairs || pairs.length === 0) {
-      logger.info(`[PriceService] No DexScreener pairs for ${mintAddress}, trying bonding curve...`);
+      logger.debug(`[PriceService] No DexScreener pairs for ${mintAddress.slice(0,8)}..., trying bonding curve...`);
       // Fallback to bonding curve price
       return await getBondingCurvePrice(mintAddress);
     }
@@ -168,35 +190,25 @@ const PUMP_PROGRAM_ID = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
  * regardless of trade activity
  */
 async function getBondingCurveFromRPC(mintAddress: string): Promise<TokenPriceData | null> {
-  logger.info(`[PriceService] Attempting RPC bonding curve fetch for ${mintAddress.slice(0,8)}...`);
+  logger.debug(`[PriceService] RPC bonding curve fetch for ${mintAddress.slice(0,8)}...`);
   try {
-    logger.info('[PriceService] Importing @solana/web3.js...');
-    const { Connection, PublicKey } = await import('@solana/web3.js');
-    logger.info('[PriceService] Import successful');
-    
-    // Use public RPC endpoint (could be configurable)
-    const rpcUrl = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-    logger.info(`[PriceService] Using RPC: ${rpcUrl}`);
-    const connection = new Connection(rpcUrl, 'confirmed');
+    const { PublicKey } = await getSolanaWeb3();
+    const connection = await getRpcConnection();
     
     const mint = new PublicKey(mintAddress);
     const programId = new PublicKey(PUMP_PROGRAM_ID);
-    logger.info(`[PriceService] Deriving PDA for mint ${mint.toString().slice(0,8)}... with program ${PUMP_PROGRAM_ID.slice(0,8)}...`);
     
     // Derive bonding curve PDA
     const [bondingCurvePda] = PublicKey.findProgramAddressSync(
       [Buffer.from('bonding-curve'), mint.toBuffer()],
       programId
     );
-    logger.info(`[PriceService] Bonding curve PDA: ${bondingCurvePda.toString().slice(0,12)}...`);
     
     // Fetch account data
-    logger.info('[PriceService] Fetching account info from RPC...');
     const accountInfo = await connection.getAccountInfo(bondingCurvePda);
-    logger.info(`[PriceService] Account info received: ${accountInfo ? 'yes' : 'no'}, data length: ${accountInfo?.data?.length || 0}`);
     
     if (!accountInfo || !accountInfo.data) {
-      logger.debug(`[PriceService] No bonding curve found for ${mintAddress.slice(0,8)}...`);
+      logger.debug(`[PriceService] No bonding curve account for ${mintAddress.slice(0,8)}...`);
       return null;
     }
     
@@ -249,11 +261,11 @@ async function getBondingCurveFromRPC(mintAddress: string): Promise<TokenPriceDa
     // Cache the result
     priceCache.set(mintAddress, { data: priceData, fetchedAt: Date.now() });
     
-    logger.info(`[PriceService] Bonding curve ${mintAddress.slice(0,8)}...: $${priceUsd.toFixed(10)} | MC: $${formatNumber(marketCapUsd)} | ${vSol.toFixed(2)} SOL`);
+    logger.debug(`[PriceService] BC ${mintAddress.slice(0,8)}...: $${priceUsd.toFixed(10)} | MC: $${formatNumber(marketCapUsd)} | ${vSol.toFixed(2)} SOL`);
     
     return priceData;
   } catch (error) {
-    logger.warn(`[PriceService] RPC bonding curve fetch failed for ${mintAddress.slice(0,8)}...: ${error instanceof Error ? error.message : String(error)}`);
+    logger.warn(`[PriceService] RPC bonding curve failed for ${mintAddress.slice(0,8)}...: ${error instanceof Error ? error.message : String(error)}`);
     return null;
   }
 }
@@ -448,6 +460,113 @@ export function getPriceSummary(data: TokenPriceData): string {
   }
   
   return parts.join(' | ');
+}
+
+/**
+ * Batch fetch prices for multiple mints in one go.
+ * Uses DexScreener's multi-token endpoint (up to 30 addresses per call)
+ * then falls back to bonding curve RPC for tokens not found on DexScreener.
+ * 
+ * Much more efficient than calling getTokenPrice() in a loop.
+ */
+export async function getTokenPrices(mintAddresses: string[]): Promise<Map<string, TokenPriceData>> {
+  const results = new Map<string, TokenPriceData>();
+  const uncached: string[] = [];
+
+  // 1. Check cache first
+  for (const mint of mintAddresses) {
+    if (!mint || mint === 'N/A') continue;
+    const cached = priceCache.get(mint);
+    if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
+      results.set(mint, cached.data);
+    } else {
+      uncached.push(mint);
+    }
+  }
+
+  if (uncached.length === 0) {
+    logger.debug(`[PriceService] Batch: all ${mintAddresses.length} prices from cache`);
+    return results;
+  }
+
+  logger.info(`[PriceService] Batch: ${results.size} cached, ${uncached.length} to fetch`);
+
+  // 2. Batch DexScreener call (max 30 addresses comma-separated)
+  const needBondingCurve: string[] = [];
+  const BATCH_SIZE = 30;
+
+  for (let i = 0; i < uncached.length; i += BATCH_SIZE) {
+    const batch = uncached.slice(i, i + BATCH_SIZE);
+    try {
+      const url = `https://api.dexscreener.com/tokens/v1/solana/${batch.join(',')}`;
+      const response = await fetch(url, {
+        headers: { 'Accept': 'application/json', 'User-Agent': 'LaunchKit/1.0' }
+      });
+
+      if (response.ok) {
+        const pairs: DexScreenerPair[] = await response.json();
+        const foundMints = new Set<string>();
+
+        for (const pair of (pairs || [])) {
+          const mint = pair.baseToken?.address;
+          if (!mint || foundMints.has(mint)) continue;
+          foundMints.add(mint);
+
+          const priceData: TokenPriceData = {
+            priceUsd: pair.priceUsd ? parseFloat(pair.priceUsd) : null,
+            priceNative: pair.priceNative ? parseFloat(pair.priceNative) : null,
+            marketCap: pair.marketCap ?? null,
+            fdv: pair.fdv ?? null,
+            volume24h: pair.volume?.h24 ?? null,
+            priceChange5m: pair.priceChange?.m5 ?? null,
+            priceChange1h: pair.priceChange?.h1 ?? null,
+            priceChange24h: pair.priceChange?.h24 ?? null,
+            liquidity: pair.liquidity?.usd ?? null,
+            buys24h: pair.txns?.h24?.buys ?? null,
+            sells24h: pair.txns?.h24?.sells ?? null,
+            dexId: pair.dexId,
+            pairAddress: pair.pairAddress,
+            lastUpdated: new Date().toISOString(),
+          };
+
+          results.set(mint, priceData);
+          priceCache.set(mint, { data: priceData, fetchedAt: Date.now() });
+        }
+
+        // Tokens NOT found on DexScreener need bonding curve lookup
+        for (const mint of batch) {
+          if (!foundMints.has(mint)) {
+            needBondingCurve.push(mint);
+          }
+        }
+      } else {
+        // DexScreener failed — all go to bonding curve
+        needBondingCurve.push(...batch);
+      }
+    } catch (error) {
+      logger.warn(`[PriceService] Batch DexScreener failed: ${error instanceof Error ? error.message : String(error)}`);
+      needBondingCurve.push(...batch);
+    }
+  }
+
+  // 3. Bonding curve fallback for tokens not on DexScreener
+  if (needBondingCurve.length > 0) {
+    logger.debug(`[PriceService] Batch: ${needBondingCurve.length} tokens need bonding curve lookup`);
+    // Fetch bonding curve prices in parallel (they're independent RPC calls)
+    const bcResults = await Promise.allSettled(
+      needBondingCurve.map(mint => getBondingCurveFromRPC(mint))
+    );
+
+    for (let i = 0; i < needBondingCurve.length; i++) {
+      const result = bcResults[i];
+      if (result.status === 'fulfilled' && result.value) {
+        results.set(needBondingCurve[i], result.value);
+      }
+    }
+  }
+
+  logger.info(`[PriceService] Batch complete: ${results.size}/${mintAddresses.length} prices fetched`);
+  return results;
 }
 
 /**

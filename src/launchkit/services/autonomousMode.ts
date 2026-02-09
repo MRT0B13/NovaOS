@@ -425,15 +425,20 @@ async function executeAutonomousLaunch(): Promise<void> {
   
   // ALWAYS post scheduled ideas to the channel for community feedback
   // This is different from voting - just collects reactions, Nova responds later
-  logger.info('[Autonomous] 📢 Posting scheduled idea for community feedback...');
-  const feedbackPost = await postScheduledIdeaForFeedback(idea, reasoning);
-  
-  if (feedbackPost) {
-    state.pendingIdea = idea;
-    state.pendingVoteId = feedbackPost.id;
-    logger.info(`[Autonomous] ✅ Posted scheduled idea to channel (feedback tracking enabled)`);
-  } else {
-    logger.warn(`[Autonomous] Failed to post idea to channel - check NOVA_CHANNEL_ID config`);
+  // Wrapped in its own try/catch so a posting failure doesn't abort the launch
+  try {
+    logger.info('[Autonomous] 📢 Posting scheduled idea for community feedback...');
+    const feedbackPost = await postScheduledIdeaForFeedback(idea, reasoning);
+    
+    if (feedbackPost) {
+      state.pendingIdea = idea;
+      state.pendingVoteId = feedbackPost.id;
+      logger.info(`[Autonomous] ✅ Posted scheduled idea to channel (feedback tracking enabled)`);
+    } else {
+      logger.warn(`[Autonomous] ⚠️ Failed to post idea to channel - check NOVA_CHANNEL_ID config. Launch continues.`);
+    }
+  } catch (postErr) {
+    logger.error('[Autonomous] Channel feedback post error (launch continues):', postErr);
   }
   
   // DRY RUN: Stop here and just log
@@ -788,6 +793,25 @@ async function schedulerTick(): Promise<void> {
       name: idea.name,
       details: `${idea.description}\n\nMascot: ${idea.mascot}\nConfidence: ${(idea.confidence * 100).toFixed(0)}%\nDry run: ${state.dryRun ? 'Yes' : 'No'}`,
     });
+    
+    // Post scheduled idea to channel for community feedback (🧠 "yo frens" post)
+    // Post scheduled idea to channel for community feedback
+    // Wrapped in its own try/catch so a posting failure doesn't abort the launch
+    try {
+      const reasoning = await generateIdeaReasoning(idea);
+      logger.info('[Autonomous] 📢 Posting scheduled idea for community feedback...');
+      const feedbackPost = await postScheduledIdeaForFeedback(idea, reasoning);
+      
+      if (feedbackPost) {
+        state.pendingIdea = idea;
+        state.pendingVoteId = feedbackPost.id;
+        logger.info(`[Autonomous] ✅ Posted scheduled idea to channel (feedback tracking enabled)`);
+      } else {
+        logger.warn(`[Autonomous] ⚠️ Failed to post idea to channel - check NOVA_CHANNEL_ID config. Launch will continue.`);
+      }
+    } catch (postErr) {
+      logger.error('[Autonomous] Channel feedback post error (launch continues):', postErr);
+    }
   } catch (err) {
     logger.error('[Autonomous] Idea generation failed:', err);
     state.lastCheckTime = state.nextScheduledTime.getTime();

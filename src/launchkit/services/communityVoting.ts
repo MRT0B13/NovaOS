@@ -30,6 +30,17 @@ import {
 let pgRepo: PostgresScheduleRepository | null = null;
 let usePostgres = false;
 
+/**
+ * Escape HTML entities for Telegram HTML parse_mode.
+ * LLM-generated content often contains <, >, & which break Telegram's HTML parser.
+ */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 // Reaction weights for sentiment calculation
 // IMPORTANT: Only use emojis from Telegram's supported reaction set!
 // Supported: ❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡
@@ -358,23 +369,31 @@ export async function postIdeaForVoting(
   const votingEndsAt = new Date(Date.now() + votingMinutes * 60 * 1000);
   
   // Use different title based on launch type
+  // Escape HTML entities in LLM-generated content
+  const safeTicker = escapeHtml(idea.ticker);
+  const safeName = escapeHtml(idea.name);
+  const safeDescription = escapeHtml(idea.description);
+  const safeMascot = idea.mascot ? escapeHtml(idea.mascot) : '';
+  const safeReasoning = escapeHtml(reasoning);
+  const safeTrendContext = trendContext ? escapeHtml(trendContext) : '';
+  
   const isScheduled = options?.launchType === 'scheduled' || (!trendContext && !options?.launchType);
   let message = isScheduled
-    ? `💡 <b>Nova's Daily Creation: $${idea.ticker}</b>\n\n`
-    : `🔥 <b>Reactive Idea: $${idea.ticker}</b>\n\n`;
+    ? `💡 <b>Nova's Daily Creation: $${safeTicker}</b>\n\n`
+    : `🔥 <b>Reactive Idea: $${safeTicker}</b>\n\n`;
   
-  message += `<b>${idea.name}</b>\n`;
-  message += `${idea.description}\n\n`;
+  message += `<b>${safeName}</b>\n`;
+  message += `${safeDescription}\n\n`;
   
-  if (idea.mascot) {
-    message += `🎨 <i>Mascot concept: ${idea.mascot}</i>\n\n`;
+  if (safeMascot) {
+    message += `🎨 <i>Mascot concept: ${safeMascot}</i>\n\n`;
   }
   
-  if (trendContext) {
-    message += `🌊 <b>Riding the wave:</b> ${trendContext}\n\n`;
+  if (safeTrendContext) {
+    message += `🌊 <b>Riding the wave:</b> ${safeTrendContext}\n\n`;
   }
   
-  message += `<b>Why I think this slaps:</b>\n${reasoning}\n\n`;
+  message += `<b>Why I think this slaps:</b>\n${safeReasoning}\n\n`;
   message += `━━━━━━━━━━━━━━━\n`;
   message += `<b>Should we launch this?</b>\n\n`;
   message += `👍 = Yes, send it!\n`;
@@ -384,8 +403,8 @@ export async function postIdeaForVoting(
   message += `⏰ <i>Voting ends in ${votingMinutes} minutes</i>`;
   
   try {
-    // Send message
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    // Send message (try HTML first, fallback to plain text)
+    let res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -396,9 +415,26 @@ export async function postIdeaForVoting(
       }),
     });
     
-    const json = await res.json();
+    let json = await res.json();
+    
+    // If HTML parse fails, retry without parse_mode as plain text
+    if (!json.ok && json.description?.includes('parse')) {
+      logger.warn(`[CommunityVoting] HTML parse failed for voting, retrying as plain text: ${json.description}`);
+      const plainMessage = message.replace(/<\/?[^>]+(>|$)/g, '');
+      res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: channelId,
+          text: plainMessage,
+          disable_web_page_preview: true,
+        }),
+      });
+      json = await res.json();
+    }
+    
     if (!json.ok) {
-      logger.error(`[CommunityVoting] Failed to post: ${json.description}`);
+      logger.error(`[CommunityVoting] Failed to post: ${json.description} (chat_id: ${channelId})`);
       return null;
     }
     
@@ -498,16 +534,25 @@ export async function postScheduledIdeaForFeedback(
   const feedbackEndsAt = new Date(Date.now() + feedbackMinutes * 60 * 1000);
   
   // Build Nova's creative idea message with personality
-  let message = `🧠 <b>yo frens, I've been cooking something up...</b>\n\n`;
-  message += `Meet <b>$${idea.ticker}</b> - ${idea.name}\n\n`;
-  message += `${idea.description}\n\n`;
+  // Escape HTML entities in LLM-generated content to prevent Telegram parse errors
+  const safeTicker = escapeHtml(idea.ticker);
+  const safeName = escapeHtml(idea.name);
+  const safeDescription = escapeHtml(idea.description);
+  const safeMascot = idea.mascot ? escapeHtml(idea.mascot) : '';
+  const safeReasoning = escapeHtml(
+    reasoning || `Been thinking about this concept for a while. The memetics are strong, the narrative is fresh, and I think the community would love it.`
+  );
   
-  if (idea.mascot) {
-    message += `🎨 <i>The vibe: ${idea.mascot}</i>\n\n`;
+  let message = `🧠 <b>yo frens, I've been cooking something up...</b>\n\n`;
+  message += `Meet <b>$${safeTicker}</b> - ${safeName}\n\n`;
+  message += `${safeDescription}\n\n`;
+  
+  if (safeMascot) {
+    message += `🎨 <i>The vibe: ${safeMascot}</i>\n\n`;
   }
   
   message += `💭 <b>Why I think this could be fire:</b>\n`;
-  message += reasoning || `Been thinking about this concept for a while. The memetics are strong, the narrative is fresh, and I think the community would love it.`;
+  message += safeReasoning;
   message += `\n\n`;
   
   message += `Confidence: ${(idea.confidence * 100).toFixed(0)}%\n\n`;
@@ -520,8 +565,8 @@ export async function postScheduledIdeaForFeedback(
   message += `<i>Drop your reactions! I'll check back in ${feedbackMinutes} mins and share what I learned 🤝</i>`;
   
   try {
-    // Send message
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    // Send message (try HTML first, fallback to plain text)
+    let res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -532,9 +577,26 @@ export async function postScheduledIdeaForFeedback(
       }),
     });
     
-    const json = await res.json();
+    let json = await res.json();
+    
+    // If HTML parse fails, retry without parse_mode as plain text
+    if (!json.ok && json.description?.includes('parse')) {
+      logger.warn(`[CommunityVoting] HTML parse failed, retrying as plain text: ${json.description}`);
+      const plainMessage = message.replace(/<\/?[^>]+(>|$)/g, ''); // strip HTML tags
+      res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: channelId,
+          text: plainMessage,
+          disable_web_page_preview: true,
+        }),
+      });
+      json = await res.json();
+    }
+    
     if (!json.ok) {
-      logger.error(`[CommunityVoting] Failed to post scheduled idea: ${json.description}`);
+      logger.error(`[CommunityVoting] Failed to post scheduled idea: ${json.description} (chat_id: ${channelId})`);
       return null;
     }
     
@@ -987,14 +1049,15 @@ async function postFeedbackResponse(vote: PendingVote, votes: VoteTally): Promis
   if (!botToken || !channelId) return;
   
   const ticker = vote.idea.ticker;
+  const safeTicker = escapeHtml(ticker);
   const isBrandPost = vote.idea.source === 'nova_personal_brand';
-  const displayName = isBrandPost ? ticker : `$${ticker}`;
+  const displayName = isBrandPost ? safeTicker : `$${safeTicker}`;
   const totalReactions = Object.values(votes.reactions).reduce((a, b) => a + (b as number), 0);
   
   // Build response based on sentiment
   let message = isBrandPost
-    ? `📊 <b>Thanks for vibing with my ${ticker.toLowerCase()} post frens!</b>\n\n`
-    : `📊 <b>Thanks for the feedback on $${ticker} frens!</b>\n\n`;
+    ? `📊 <b>Thanks for vibing with my ${safeTicker.toLowerCase()} post frens!</b>\n\n`
+    : `📊 <b>Thanks for the feedback on $${safeTicker} frens!</b>\n\n`;
   
   if (totalReactions === 0) {
     message += `Looks like y'all are busy today - no reactions came in. That's cool, I'll keep cooking and share more ideas soon! 🍳\n`;
@@ -1183,22 +1246,24 @@ export async function announceVoteResult(vote: PendingVote): Promise<boolean> {
   if (!botToken || !channelId) return false;
   
   const votes = vote.votes || { positive: 0, negative: 0, total: 0, sentiment: 0, reactions: {}, voters: 0 };
+  const safeTicker = escapeHtml(vote.idea.ticker);
+  const safeName = escapeHtml(vote.idea.name);
   
   let message = '';
   
   if (vote.status === 'approved') {
-    message = `✅ <b>$${vote.idea.ticker} APPROVED!</b>\n\n`;
-    message += `The community has spoken! Launching ${vote.idea.name}...\n\n`;
+    message = `✅ <b>$${safeTicker} APPROVED!</b>\n\n`;
+    message += `The community has spoken! Launching ${safeName}...\n\n`;
     message += `Votes: 👍 ${votes.positive} | 👎 ${votes.negative}\n`;
     message += `Sentiment: ${(votes.sentiment * 100).toFixed(0)}% positive`;
   } else if (vote.status === 'rejected') {
-    message = `❌ <b>$${vote.idea.ticker} REJECTED</b>\n\n`;
-    message += `The community said no to ${vote.idea.name}.\n`;
+    message = `❌ <b>$${safeTicker} REJECTED</b>\n\n`;
+    message += `The community said no to ${safeName}.\n`;
     message += `I'll learn from this and come back with better ideas! 🧠\n\n`;
     message += `Votes: 👍 ${votes.positive} | 👎 ${votes.negative}\n`;
     message += `Sentiment: ${(votes.sentiment * 100).toFixed(0)}%`;
   } else if (vote.status === 'no_votes') {
-    message = `🤷 <b>$${vote.idea.ticker} - No Votes</b>\n\n`;
+    message = `🤷 <b>$${safeTicker} - No Votes</b>\n\n`;
     message += `Not enough votes received. Proceeding with launch since silence = consent in degen land! 🚀`;
   }
   
