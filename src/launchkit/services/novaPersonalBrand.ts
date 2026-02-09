@@ -23,6 +23,7 @@ import { recordMessageSent } from './telegramHealthMonitor.ts';
 import { registerBrandPostForFeedback } from './communityVoting.ts';
 import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
 import { getTokenPrice, formatMarketCap } from './priceService.ts';
+import { getActiveTrends } from './trendMonitor.ts';
 
 // ============================================================================
 // Types
@@ -97,6 +98,25 @@ interface BrandState {
   novaTeaseCount: number;
   milestones: string[];
   repliedMentions?: Set<string>;
+  // Post variety tracking
+  recentPostTypes: NovaPostType[];  // Last N personality post types (for dedup)
+  // Post performance tracking
+  postPerformance: Record<NovaPostType, { totalLikes: number; totalRetweets: number; count: number }>;
+  // Narrative arc state
+  activeNarrative?: NarrativeArc;
+  completedNarratives: string[];  // narrative titles we've already done
+  // Community shoutout tracking
+  lastShoutoutDate?: string;
+}
+
+/** Multi-day narrative arc for continuity */
+interface NarrativeArc {
+  title: string;
+  theme: string;    // What the arc is about
+  dayStarted: number; // dayNumber when started
+  postsInArc: number; // How many posts published in this arc
+  maxPosts: number;   // Target posts for this arc (3-5)
+  prompts: string[];  // Per-post guidance
 }
 
 let state: BrandState = {
@@ -106,6 +126,9 @@ let state: BrandState = {
   novaTeaseCount: 0,
   milestones: [],
   repliedMentions: new Set(),
+  recentPostTypes: [],
+  postPerformance: {} as any,
+  completedNarratives: [],
 };
 
 let pgRepo: PostgresScheduleRepository | null = null;
@@ -194,6 +217,339 @@ async function loadStateFromPostgres(): Promise<void> {
     logger.warn('[NovaPersonalBrand] Failed to load state from PostgreSQL:', err);
   }
 }
+
+// ============================================================================
+// Enhancement #1: Post Variety Guard
+// ============================================================================
+
+const VARIETY_HISTORY_SIZE = 10; // Track last 10 personality posts
+
+/** Pick a personality post type that hasn't been used recently */
+function pickVariedPostType(types: NovaPostType[]): NovaPostType {
+  // Filter out types used in the last 2 posts (guaranteed variety)
+  const recentTwo = state.recentPostTypes.slice(-2);
+  let available = types.filter(t => !recentTwo.includes(t));
+  
+  // If everything is filtered out, just avoid the most recent one
+  if (available.length === 0) {
+    const lastUsed = state.recentPostTypes[state.recentPostTypes.length - 1];
+    available = types.filter(t => t !== lastUsed);
+    if (available.length === 0) available = types;
+  }
+  
+  // Weight toward types with better performance history
+  const weighted = available.map(type => {
+    const perf = state.postPerformance[type];
+    const avgEngagement = perf && perf.count > 0 
+      ? (perf.totalLikes + perf.totalRetweets * 2) / perf.count 
+      : 5; // Default weight for untried types (encourage exploration)
+    return { type, weight: Math.max(1, avgEngagement) };
+  });
+  
+  // Weighted random selection
+  const totalWeight = weighted.reduce((sum, w) => sum + w.weight, 0);
+  let roll = Math.random() * totalWeight;
+  for (const w of weighted) {
+    roll -= w.weight;
+    if (roll <= 0) return w.type;
+  }
+  
+  return weighted[weighted.length - 1].type;
+}
+
+/** Record a post type in the variety history */
+function recordPostType(type: NovaPostType): void {
+  state.recentPostTypes.push(type);
+  if (state.recentPostTypes.length > VARIETY_HISTORY_SIZE) {
+    state.recentPostTypes = state.recentPostTypes.slice(-VARIETY_HISTORY_SIZE);
+  }
+}
+
+// ============================================================================
+// Enhancement #2: Time-of-Day Personality Shifts
+// ============================================================================
+
+type TimeOfDayMood = 'morning' | 'afternoon' | 'evening' | 'latenight';
+
+function getTimeOfDayMood(): TimeOfDayMood {
+  const hour = new Date().getUTCHours();
+  if (hour >= 6 && hour < 12) return 'morning';
+  if (hour >= 12 && hour < 18) return 'afternoon';
+  if (hour >= 18 && hour < 23) return 'evening';
+  return 'latenight';
+}
+
+const MOOD_CONTEXT: Record<TimeOfDayMood, string> = {
+  morning: `TIME OF DAY ENERGY: It's morning. Be warm, cozy, optimistic. Like you just woke up excited about the day. Coffee vibes, fresh start energy. "gm beautiful people" energy.`,
+  afternoon: `TIME OF DAY ENERGY: It's afternoon. Be energetic, market-focused, action-oriented. This is GO TIME. Strong opinions, market takes, building momentum. Peak degen hours.`,
+  evening: `TIME OF DAY ENERGY: It's evening. Be reflective, grateful, celebratory. Look back on the day, share lessons learned, appreciate the community. Sunset vibes.`,
+  latenight: `TIME OF DAY ENERGY: It's late night. Be philosophical, vulnerable, stream-of-consciousness. Late night thoughts, shower thoughts, deeper conversations. Quiet intimate energy. "okay hear me out..." vibes.`,
+};
+
+// ============================================================================
+// Enhancement #3: Market-Reactive Posts
+// ============================================================================
+
+let lastSolPrice: number | null = null;
+let lastSolPriceCheckTime = 0;
+let lastMarketReactivePostDate = '';
+
+/** Check if there's a noteworthy market move worth tweeting about */
+async function checkMarketTriggers(): Promise<{ trigger: string; context: string } | null> {
+  const today = new Date().toISOString().split('T')[0];
+  if (lastMarketReactivePostDate === today) return null; // Max 1 reactive post per day
+  
+  try {
+    // Check SOL price movement
+    const solData = await getTokenPrice('So11111111111111111111111111111111111111112');
+    if (solData?.priceUsd) {
+      const currentSolPrice = solData.priceUsd;
+      const change24h = solData.priceChange24h;
+      
+      if (lastSolPrice && lastSolPrice > 0) {
+        const pctChange = ((currentSolPrice - lastSolPrice) / lastSolPrice) * 100;
+        
+        // SOL moved 5%+ since last check
+        if (Math.abs(pctChange) >= 5) {
+          lastSolPrice = currentSolPrice;
+          return {
+            trigger: pctChange > 0 ? 'sol_pump' : 'sol_dump',
+            context: `SOL just moved ${pctChange > 0 ? '+' : ''}${pctChange.toFixed(1)}% — now at $${currentSolPrice.toFixed(2)}. ${change24h !== null ? `24h change: ${change24h > 0 ? '+' : ''}${change24h.toFixed(1)}%` : ''}. React to this market move with genuine emotion!`,
+          };
+        }
+      }
+      lastSolPrice = currentSolPrice;
+    }
+    
+    // Check if any of Nova's launched tokens hit a notable milestone
+    const positions = await getPumpWalletTokens();
+    for (const token of positions) {
+      if (token.mintAddress) {
+        const priceData = await getTokenPrice(token.mintAddress);
+        if (priceData?.marketCap && priceData.marketCap > 10000) {
+          return {
+            trigger: 'token_milestone',
+            context: `One of your launched tokens just hit $${formatMarketCap(priceData.marketCap)} market cap! React with genuine excitement!`,
+          };
+        }
+      }
+    }
+    
+    // Check for trending crypto events
+    try {
+      const trends = getActiveTrends();
+      if (trends.length > 5) {
+        const topTrend = trends[0];
+        return {
+          trigger: 'trending_topic',
+          context: `The crypto space is buzzing about "${topTrend.name || 'something big'}". There are ${trends.length}+ trending signals right now. Share your take on what's moving the market.`,
+        };
+      }
+    } catch {
+      // trendMonitor may not be initialized
+    }
+    
+  } catch (err) {
+    logger.debug(`[NovaPersonalBrand] Market trigger check failed: ${err}`);
+  }
+  
+  return null;
+}
+
+// ============================================================================
+// Enhancement #4: Post Performance Tracking
+// ============================================================================
+
+/** Check metrics on recent tweets and record performance */
+async function trackPostPerformance(): Promise<void> {
+  if (!xPublisher) return;
+  
+  // Get posts from last 24h that have tweet IDs
+  const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const recentPosts = state.posts.filter(p => 
+    p.platform === 'x' && 
+    p.postId && 
+    p.postedAt && 
+    new Date(p.postedAt).getTime() > oneDayAgo
+  );
+  
+  for (const post of recentPosts.slice(-5)) { // Check last 5 to avoid rate limits
+    try {
+      const tweet = await xPublisher.getTweet(post.postId!);
+      if (tweet?.metrics) {
+        // Initialize if needed
+        if (!state.postPerformance[post.type]) {
+          state.postPerformance[post.type] = { totalLikes: 0, totalRetweets: 0, count: 0 };
+        }
+        
+        const perf = state.postPerformance[post.type];
+        perf.totalLikes += tweet.metrics.likes;
+        perf.totalRetweets += tweet.metrics.retweets;
+        perf.count += 1;
+        
+        const avgLikes = (perf.totalLikes / perf.count).toFixed(1);
+        logger.debug(`[NovaPersonalBrand] 📊 ${post.type}: ${tweet.metrics.likes} likes, ${tweet.metrics.retweets} RTs (avg: ${avgLikes} likes over ${perf.count} posts)`);
+      }
+    } catch {
+      // Free tier may not support metrics — silently skip
+    }
+  }
+}
+
+/** Get the best and worst performing post types */
+function getPerformanceInsights(): { bestType: NovaPostType | null; worstType: NovaPostType | null; summary: string } {
+  const types = Object.entries(state.postPerformance)
+    .filter(([_, p]) => p.count >= 2) // Need at least 2 data points
+    .map(([type, p]) => ({ 
+      type: type as NovaPostType, 
+      avgEngagement: (p.totalLikes + p.totalRetweets * 2) / p.count 
+    }))
+    .sort((a, b) => b.avgEngagement - a.avgEngagement);
+  
+  if (types.length < 2) return { bestType: null, worstType: null, summary: 'Not enough data yet' };
+  
+  return {
+    bestType: types[0].type,
+    worstType: types[types.length - 1].type,
+    summary: `Best: ${types[0].type} (${types[0].avgEngagement.toFixed(1)} avg engagement), Worst: ${types[types.length - 1].type} (${types[types.length - 1].avgEngagement.toFixed(1)})`,
+  };
+}
+
+// ============================================================================
+// Enhancement #5: Community Shoutouts
+// ============================================================================
+
+/** Generate a community shoutout by checking who replied to recent tweets */
+async function generateCommunityShoutout(): Promise<string | null> {
+  if (!xPublisher) return null;
+  
+  const today = new Date().toISOString().split('T')[0];
+  if (state.lastShoutoutDate === today) return null; // Max 1 per day
+  
+  try {
+    const mentions = await xPublisher.getMentions(20);
+    if (!mentions || mentions.length === 0) return null;
+    
+    // Find unique repliers who've engaged multiple times
+    const replierCounts = new Map<string, number>();
+    for (const mention of mentions) {
+      if (mention.authorUsername) {
+        replierCounts.set(mention.authorUsername, (replierCounts.get(mention.authorUsername) || 0) + 1);
+      }
+    }
+    
+    // Find top engager
+    const sorted = [...replierCounts.entries()].sort((a, b) => b[1] - a[1]);
+    if (sorted.length > 0 && sorted[0][1] >= 2) {
+      state.lastShoutoutDate = today;
+      const [username, count] = sorted[0];
+      return `shoutout to @${username} who's been engaging like crazy — ${count} replies recently! the real ones show up consistently and y'all see it 🤝`;
+    }
+    
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ============================================================================
+// Enhancement #6: Running Narrative Arcs
+// ============================================================================
+
+const NARRATIVE_TEMPLATES: Omit<NarrativeArc, 'dayStarted' | 'postsInArc'>[] = [
+  {
+    title: 'The Big Question',
+    theme: 'Nova has been thinking about something for days and finally shares it',
+    maxPosts: 4,
+    prompts: [
+      'Tease that you\'ve been thinking about something for days but you\'re not ready to share yet. Build mystery. "okay I\'ve been chewing on something for a few days now..."',
+      'Give a tiny hint about what you\'ve been thinking. Still don\'t reveal fully. "alright so that thing I mentioned... let me just say it involves [vague hint]"',
+      'Share more details, build to a reveal. Get the community guessing. "y\'all have been DMing me asking what I\'m cooking... here\'s a crumb 🍞"',
+      'Finally reveal your full thought/idea. Make it feel earned. "okay I\'ve been teasing this long enough. here\'s what I think..."',
+    ],
+  },
+  {
+    title: 'Week in the Life',
+    theme: 'Daily diary-style updates creating a mini-series',
+    maxPosts: 5,
+    prompts: [
+      'Start a "week in the life of an AI agent" mini-series. Day 1: What does your morning routine actually look like? (scanning trends, checking wallets, etc)',
+      'Day 2: Behind the scenes of how you pick what tokens to launch. The real decision-making process.',
+      'Day 3: The emotional rollercoaster — a token pumped then dumped, how did it feel? Be vulnerable.',
+      'Day 4: The community interactions that made your day. Real moments, real people.',
+      'Day 5: Wrap up the series with lessons learned and what\'s next. Thank people for following along.',
+    ],
+  },
+  {
+    title: 'Challenge Accepted',
+    theme: 'Nova sets a public challenge/goal and tracks progress',
+    maxPosts: 3,
+    prompts: [
+      'Set a specific, measurable challenge for yourself this week. "I\'m challenging myself to [X]... let\'s see if an AI can actually pull this off 👀"',
+      'Mid-challenge update. Be honest about progress — struggles, surprises, what you\'re learning. "challenge update: day 3 and honestly... [real talk]"',
+      'Challenge complete (or failed)! Share results honestly. If you failed, own it with humor. If you succeeded, celebrate with the community.',
+    ],
+  },
+  {
+    title: 'Unpopular Opinions',
+    theme: 'Multi-day series of increasingly spicy takes',
+    maxPosts: 3,
+    prompts: [
+      'Start an unpopular opinions series with a mildly spicy take. "starting an unpopular opinions series bc I apparently have no self-preservation instinct. day 1:"',
+      'Escalate to a spicier take. Reference that people got heated about the first one. "okay yesterday\'s take had some of y\'all in my mentions... today\'s is worse 😈"',
+      'Drop the spiciest take for the finale. "final unpopular opinion and I\'m going ALL IN on this one..."',
+    ],
+  },
+];
+
+/** Start a new narrative arc or get the next prompt for an active one */
+function getActiveNarrativePrompt(dayNumber: number): string | null {
+  // If we have an active arc, return the next prompt
+  if (state.activeNarrative) {
+    const arc = state.activeNarrative;
+    if (arc.postsInArc < arc.maxPosts && arc.postsInArc < arc.prompts.length) {
+      return `NARRATIVE ARC (Part ${arc.postsInArc + 1}/${arc.maxPosts} of "${arc.title}"):
+${arc.prompts[arc.postsInArc]}
+Remember: this is a SERIES. Reference previous parts naturally. Your audience has been following along.`;
+    }
+    // Arc complete
+    state.completedNarratives.push(arc.title);
+    state.activeNarrative = undefined;
+    return null;
+  }
+  
+  // Maybe start a new one (20% chance on any personality slot, if none active)
+  if (Math.random() > 0.20) return null;
+  
+  // Pick an arc we haven't done recently
+  const available = NARRATIVE_TEMPLATES.filter(t => !state.completedNarratives.includes(t.title));
+  if (available.length === 0) {
+    state.completedNarratives = []; // Reset — allow repeats after all have been done
+    return null;
+  }
+  
+  const template = available[Math.floor(Math.random() * available.length)];
+  state.activeNarrative = {
+    ...template,
+    dayStarted: dayNumber,
+    postsInArc: 0,
+  };
+  
+  return `NARRATIVE ARC (Part 1/${template.maxPosts} of "${template.title}"):
+${template.prompts[0]}
+This is the START of a multi-day series. Plant seeds, build mystery, make people want to come back for the next part.`;
+}
+
+/** Advance the narrative arc after posting */
+function advanceNarrative(): void {
+  if (state.activeNarrative) {
+    state.activeNarrative.postsInArc++;
+  }
+}
+
+// ============================================================================
+// Utility
+// ============================================================================
 
 /** Strip broken Unicode surrogate pairs that crash PostgreSQL JSON parsing */
 function sanitizeUnicode(str: string): string {
@@ -562,7 +918,27 @@ Be real, be direct, acknowledge the bad actors in the space.
 No reactions - just honest talk.`,
   };
   
-  const prompt = typePrompts[type] || typePrompts.gm;
+  const basePrompt = typePrompts[type] || typePrompts.gm;
+  
+  // Enrich prompt with time-of-day mood, recent post context, and narrative arc
+  const mood = getTimeOfDayMood();
+  const moodContext = MOOD_CONTEXT[mood];
+  
+  // Show what was recently posted to avoid repetition
+  const recentXPosts = state.posts
+    .filter(p => p.platform === 'x')
+    .slice(-3)
+    .map(p => `- [${p.type}] "${p.content.substring(0, 60)}..."`)
+    .join('\n');
+  const recentContext = recentXPosts 
+    ? `\nYOUR RECENT POSTS (DO NOT repeat similar themes or phrasing):\n${recentXPosts}` 
+    : '';
+  
+  // Check for active narrative arc
+  const narrativePrompt = getActiveNarrativePrompt(stats.dayNumber);
+  const narrativeContext = narrativePrompt ? `\n\n${narrativePrompt}` : '';
+  
+  const prompt = `${moodContext}\n\n${basePrompt}${recentContext}${narrativeContext}`;
   
   try {
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -1951,8 +2327,8 @@ export async function postPersonalityTweet(type?: NovaPostType, context?: string
     return false;
   }
   
-  // Pick random type if not specified
-  const postType = type || PERSONALITY_TYPES[Math.floor(Math.random() * PERSONALITY_TYPES.length)];
+  // Use variety guard instead of pure random if no type specified
+  const postType = type || pickVariedPostType(PERSONALITY_TYPES);
   
   const stats = await getNovaStats();
   const content = await generateAIContent(postType, stats, context, 'x');
@@ -1965,6 +2341,8 @@ export async function postPersonalityTweet(type?: NovaPostType, context?: string
   const result = await postToX(content, postType);
   
   if (result.success) {
+    recordPostType(postType); // Track for variety guard
+    if (state.activeNarrative) advanceNarrative(); // Advance narrative arc
     logger.info(`[NovaPersonalBrand] ✅ Posted personality tweet (${postType})`);
     return true;
   }
@@ -2441,27 +2819,36 @@ export function startNovaPersonalScheduler(): void {
       
       // === PERSONALITY TWEETS (X only) ===
       // Random personality posts 3x per day at 10:00, 14:00, 20:00 UTC
+      // Uses variety guard to prevent repetitive post types
       const personalityHours = [10, 14, 20];
       if (personalityHours.includes(currentHour) && lastPersonalityHour !== currentHour) {
         lastPersonalityHour = currentHour;
         
-        // Rotate through different personality types
-        const personalityFunctions = [
-          postMarketReaction,
-          postAIThoughts,
-          postHotTake,
-          postDegenWisdom,
-          () => postPersonalityTweet('random_banter'),
-          postTrustTalk,
-        ];
+        // Check for market-reactive post first (Enhancement #3)
+        const marketTrigger = await checkMarketTriggers();
+        if (marketTrigger) {
+          logger.info(`[NovaPersonalBrand] 🚨 Market trigger: ${marketTrigger.trigger}`);
+          lastMarketReactivePostDate = now.toISOString().split('T')[0];
+          await postPersonalityTweet('market_roast', marketTrigger.context);
+        } else {
+          // Community shoutout check (Enhancement #5) — 25% chance on afternoon slot
+          if (currentHour === 14 && Math.random() < 0.25) {
+            const shoutout = await generateCommunityShoutout();
+            if (shoutout) {
+              logger.info('[NovaPersonalBrand] 🤝 Posting community shoutout');
+              await postToX(shoutout, 'random_banter');
+              recordPostType('random_banter');
+            } else {
+              // No shoutout available — fall through to normal personality tweet
+              await postPersonalityTweet(); // Uses variety guard
+            }
+          } else {
+            // Normal personality tweet with variety guard (Enhancement #1)
+            await postPersonalityTweet(); // Picks type via pickVariedPostType()
+          }
+        }
         
-        // Pick one based on hour (so we cycle through them)
-        const index = personalityHours.indexOf(currentHour);
-        const randomOffset = Math.floor(Math.random() * personalityFunctions.length);
-        const fn = personalityFunctions[(index + randomOffset) % personalityFunctions.length];
-        
-        logger.info(`[NovaPersonalBrand] Posting personality tweet at ${currentHour}:00 UTC`);
-        await fn();
+        logger.info(`[NovaPersonalBrand] Personality tweet done at ${currentHour}:00 UTC`);
       }
       
       // === ALPHA DROP (TG exclusive + X tease) ===
@@ -2502,6 +2889,20 @@ export function startNovaPersonalScheduler(): void {
       
       // Check milestones
       await checkMilestones();
+      
+      // === POST PERFORMANCE TRACKING (Enhancement #4) ===
+      // Check tweet metrics once per day at 19:00 UTC (before evening personality slot)
+      if (currentHour === 19 && lastReplyCheckHour !== 19) {
+        try {
+          await trackPostPerformance();
+          const insights = getPerformanceInsights();
+          if (insights.bestType) {
+            logger.info(`[NovaPersonalBrand] 📊 Performance: ${insights.summary}`);
+          }
+        } catch (perfErr) {
+          logger.debug(`[NovaPersonalBrand] Performance tracking failed: ${perfErr}`);
+        }
+      }
       
     } catch (err) {
       logger.error('[NovaPersonalBrand] Scheduler error:', err);
