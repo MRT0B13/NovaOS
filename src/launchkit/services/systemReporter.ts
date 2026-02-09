@@ -5,7 +5,8 @@ import { getAutonomousStatus } from './autonomousMode.ts';
 import { getPumpWalletBalance, getFundingWalletBalance } from './fundingWallet.ts';
 import { getEnv } from '../env.ts';
 import { getFailedAttempts, isAdminSecurityEnabled, isWebhookSecurityEnabled } from './telegramSecurity.ts';
-import { getPnLSummary, initPnLTracker, type PnLSummary } from './pnlTracker.ts';
+import { getPnLSummary, getActivePositions, initPnLTracker, type PnLSummary } from './pnlTracker.ts';
+import { getTokenPrice } from './priceService.ts';
 import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -551,10 +552,25 @@ async function collectStats(): Promise<SystemStats> {
   const uptimeMs = Date.now() - metrics.startTime;
   const uptimeHours = Math.round(uptimeMs / (60 * 60 * 1000) * 10) / 10;
   
-  // Get PnL summary
+  // Get PnL summary with current market prices for unrealized PnL
   let pnl: PnLSummary | null = null;
   try {
-    pnl = await getPnLSummary();
+    // Fetch current prices for all active positions
+    const currentPrices: Record<string, number> = {};
+    try {
+      const positions = await getActivePositions();
+      for (const pos of positions) {
+        if (pos.currentBalance > 0 && pos.mint) {
+          const priceData = await getTokenPrice(pos.mint);
+          if (priceData?.priceNative && priceData.priceNative > 0) {
+            currentPrices[pos.mint] = priceData.priceNative;
+          }
+        }
+      }
+    } catch (priceErr) {
+      logger.warn(`[SystemReporter] Failed to fetch token prices for PnL: ${priceErr}`);
+    }
+    pnl = await getPnLSummary(Object.keys(currentPrices).length > 0 ? currentPrices : undefined);
   } catch {
     // PnL tracker might not be initialized
   }
