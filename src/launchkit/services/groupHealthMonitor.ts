@@ -293,11 +293,17 @@ export class GroupHealthMonitor {
     const communityId = env.TELEGRAM_COMMUNITY_CHAT_ID;
     
     if (!communityId) {
+      console.log('[GROUP_HEALTH] No TELEGRAM_COMMUNITY_CHAT_ID set, skipping community group health');
       return null;
     }
     
     try {
-      return await this.getHealthReport(communityId);
+      console.log(`[GROUP_HEALTH] Fetching community group health for chat ${communityId}`);
+      const report = await this.getHealthReport(communityId);
+      if (!report) {
+        console.warn(`[GROUP_HEALTH] getHealthReport returned null for community group ${communityId}`);
+      }
+      return report;
     } catch (err) {
       console.warn('[GROUP_HEALTH] Failed to get community group health:', err);
       return null;

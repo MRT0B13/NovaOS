@@ -20,6 +20,7 @@ import { processUpdate as processBanUpdate } from '../services/telegramBanHandle
 import { recordMessageReceived } from '../services/telegramHealthMonitor.ts';
 import { verifyWebhookSignature, isWebhookSecurityEnabled, initTelegramSecurity } from '../services/telegramSecurity.ts';
 import { processReactionUpdate } from '../services/communityVoting.ts';
+import { trackMessage } from '../services/groupHealthMonitor.ts';
 import { getEnv } from '../env.ts';
 import { checkDatabaseReadiness, logDbReadinessSummary, type DbReadiness } from '../db/railwayReady.ts';
 
@@ -281,6 +282,12 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
             firstName: from.first_name,
             lastName: from.last_name,
           }, messageId);
+          
+          // Track message for active member count + sentiment analysis
+          const msgText = message?.text || message?.caption || '';
+          if (msgText) {
+            trackMessage(chatId, from.id, from.username, msgText);
+          }
           
           console.log(`[TG_WEBHOOK] Cached user ${from.id} (@${from.username || from.first_name}) for chat ${chatId}`);
         }
