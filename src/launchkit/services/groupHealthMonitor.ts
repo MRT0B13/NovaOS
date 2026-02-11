@@ -288,6 +288,22 @@ export class GroupHealthMonitor {
     }
   }
   
+  async getCommunityGroupHealth(): Promise<GroupHealth | null> {
+    const env = getEnv();
+    const communityId = env.TELEGRAM_COMMUNITY_CHAT_ID;
+    
+    if (!communityId) {
+      return null;
+    }
+    
+    try {
+      return await this.getHealthReport(communityId);
+    } catch (err) {
+      console.warn('[GROUP_HEALTH] Failed to get community group health:', err);
+      return null;
+    }
+  }
+  
   /**
    * Update health for all tokens
    */
@@ -373,8 +389,8 @@ export class GroupHealthMonitor {
       const env = getEnv();
       healthSummaries.unshift({
         ticker: 'NOVA',
-        name: 'Nova Community',
-        description: 'Main community channel',
+        name: 'Nova Channel',
+        description: 'Broadcast channel',
         members: novaChannelHealth.memberCount,
         active: novaChannelHealth.activeMembers24h,
         sentiment: novaChannelHealth.sentiment,
@@ -384,6 +400,25 @@ export class GroupHealthMonitor {
         memberChange24h: novaChannelHealth.memberChange24h,
       });
       console.log(`[GROUP_HEALTH] Nova channel health: ${novaChannelHealth.memberCount} members, ${novaChannelHealth.activeMembers24h} active, ${novaChannelHealth.sentiment}`);
+    }
+    
+    // Also track the community discussion group
+    const communityGroupHealth = await this.getCommunityGroupHealth();
+    if (communityGroupHealth) {
+      const env2 = getEnv();
+      healthSummaries.push({
+        ticker: 'NOVA',
+        name: 'Nova Community',
+        description: 'Discussion & voting group',
+        members: communityGroupHealth.memberCount,
+        active: communityGroupHealth.activeMembers24h,
+        sentiment: communityGroupHealth.sentiment,
+        trend: communityGroupHealth.trend,
+        tgInviteLink: env2.TELEGRAM_COMMUNITY_LINK,
+        messagesPerDay: communityGroupHealth.messagesPerDay,
+        memberChange24h: communityGroupHealth.memberChange24h,
+      });
+      console.log(`[GROUP_HEALTH] Community group health: ${communityGroupHealth.memberCount} members, ${communityGroupHealth.activeMembers24h} active, ${communityGroupHealth.sentiment}`);
     }
     
     // Post to Nova channel if we have health data
