@@ -157,7 +157,7 @@ export async function getTokenPrice(mintAddress: string): Promise<TokenPriceData
 /**
  * Fetch current SOL price in USD from DexScreener
  */
-async function getSolPriceUsd(): Promise<number> {
+export async function getSolPriceUsd(): Promise<number> {
   // Use cached value if fresh
   if (Date.now() - solPriceUpdatedAt < SOL_PRICE_TTL_MS) {
     return solPriceUsd;

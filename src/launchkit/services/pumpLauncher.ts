@@ -1046,15 +1046,40 @@ export class PumpLauncherService {
             const pumpLink = `https://pump.fun/coin/${mint}`;
             const channelLink = env.NOVA_CHANNEL_INVITE || '';
             
-            let tweetText = `🚀 Just launched $${ticker} (${name}) on @Pumpfun!\n\n`;
+            let tweetText = `🚀 New launch: $${ticker}\n\n`;
+            tweetText += `CA: ${mint}\n`;
             tweetText += `${pumpLink}\n\n`;
+            tweetText += `Dev buy: 0.05 SOL | Mint revoked ✅ | Freeze revoked ✅`;
             if (channelLink) {
-              tweetText += `Join my channel for more launches: ${channelLink}`;
+              tweetText += `\n\nVote on launches: ${channelLink}`;
             }
             
             const result = await xPublisher.tweet(tweetText);
             if (result?.id) {
               logger.info(`[Launch] 🐦 ✅ Posted autonomous launch announcement to X! Tweet ID: ${result.id}`);
+              
+              // RugCheck scan + reply (12s delay to let token index)
+              setTimeout(async () => {
+                try {
+                  const { scanToken, formatReportForTweet } = await import('./rugcheck.ts');
+                  const report = await scanToken(mint);
+                  if (report) {
+                    const replyText = formatReportForTweet(report, ticker);
+                    await xPublisher.reply(replyText, result.id);
+                    logger.info(`[Launch] 🔍 RugCheck reply posted for $${ticker} (score: ${report.score})`);
+                    
+                    // Also post RugCheck to TG channel
+                    try {
+                      const { formatReportForTelegram } = await import('./rugcheck.ts');
+                      const { sendToCommunity } = await import('./novaChannel.ts');
+                      const tgReport = formatReportForTelegram(report, ticker);
+                      await sendToCommunity(tgReport);
+                    } catch { /* non-fatal */ }
+                  }
+                } catch (rcErr) {
+                  logger.warn(`[Launch] RugCheck scan failed: ${(rcErr as Error).message}`);
+                }
+              }, 12_000);
             }
           } catch (tweetErr) {
             logger.warn(`[Launch] Could not post autonomous launch tweet: ${(tweetErr as Error).message}`);

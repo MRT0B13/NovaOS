@@ -153,30 +153,28 @@ export async function generateAITGPost(
   const systemPrompt = `${mascotContext}
 
 You're posting in the project's Telegram group to engage the community.
-Write messages that feel like they come from a REAL community member who's genuinely excited — not a bot or corporate account.
-Be expressive, joyful, and warm. Your energy should make people smile and want to participate.
-Use crypto slang naturally but don't force it: gm, LFG, WAGMI, NFA, DYOR, ser, fren, based, ape, diamond hands — only when it flows.
-Use emojis expressively (3-5 per message) to convey energy and emotion.
-Vary your style — sometimes short and punchy, sometimes a mini-story, sometimes a hype burst.
-Never use hashtags (this is Telegram, not Twitter).
-Be playful and creative — humor, personality, and genuine warmth over template energy.
-You can use multiple lines for emphasis.
-${context.websiteUrl ? `\n🎮 IMPORTANT: This project has a GAME/WEBSITE at ${context.websiteUrl}! Mention it frequently - encourage people to play it, share their scores, compete with each other. The game is a key part of this project's appeal!` : ''}
+Write messages that provide VALUE — data points, safety info, market observations, honest updates.
+Be direct and concise. No fluff, no "vibes are incredible," no "let's gooo."
+Use crypto slang sparingly and only when natural: DYOR, NFA, based — never forced WAGMI/LFG chains.
+Max 1-2 emojis per message, purposeful only: 📊 ⚠️ ✅ ❌ 🚀 (sparingly).
+Never use hashtags in Telegram.
+Be honest — if the chart is bad, acknowledge it. If it's good, share the data.
+${context.websiteUrl ? `\n🎮 This project has a GAME/WEBSITE at ${context.websiteUrl}. Mention it when relevant.` : ''}
 
 Token: ${context.name} ($${context.ticker})
 ${context.description ? `About: ${context.description}` : ''}
 ${mcForPrompt ? `Current MC: ${mcForPrompt}` : ''}
-${context.websiteUrl ? `🎮 Game/Website: ${context.websiteUrl}` : ''}`;
+${context.websiteUrl ? `Game/Website: ${context.websiteUrl}` : ''}`;
 
   const typePrompts: Record<TGPostType, string> = {
-    gm_post: 'Write a warm, joyful morning greeting. Make people genuinely happy to be here. Show personality — like waking up excited about the day.',
-    chart_update: `Write a fun update about how we're doing.${mcForPrompt ? ` We're at ${mcForPrompt} MC — weave it in naturally (like "look at us chilling at ${mcForPrompt}" or "we're vibing at ${mcForPrompt} and I'm feeling some energy building").` : ''} Be bullish but not financial advice. Focus on the JOURNEY not just numbers. Encourage diamond hands with warmth, not pressure.`,
-    community_hype: 'Celebrate this amazing community! Make every holder feel like an OG. Be specific about what makes THIS community special — the vibes, the energy, the people showing up every day.',
-    meme_drop: 'Write something genuinely funny. Could be a joke, an absurd scenario, a relatable meme caption, or a playful roast. Make people laugh out loud, not just smile politely.',
-    alpha_tease: 'Build excitement about something interesting brewing. Be mysterious but warm — like a friend who knows something good is coming. Don\'t overpromise, just create intrigue.',
-    holder_appreciation: 'Write a genuine, heartfelt thank you. Be specific and emotional — reference the journey, the ups and downs, and why this community is special to you. Make people feel seen.',
-    question: 'Ask a fun, easy-to-answer question that gets people talking. Something creative or playful — not boring polls. Make it feel like a conversation starter at a party.',
-    milestone: `Celebrate like it's a real achievement!${mcForPrompt ? ` We hit ${mcForPrompt} MC! Weave it in like you're genuinely amazed.` : ''} Express real joy and gratitude. Make the community feel like they all contributed to this moment.`,
+    gm_post: `Write a brief morning check-in with a data point. "Morning. $${context.ticker} sitting at [MC]. [One observation]." No "gm fam" or "good morning everyone."`,
+    chart_update: `Write a factual chart/price update.${mcForPrompt ? ` We're at ${mcForPrompt} MC.` : ''} Share the number, one observation about holder behavior or volume, and leave it. No "bullish" cheerleading — let the data speak.`,
+    community_hype: `Acknowledge the community with specifics — reference the market cap${mcForPrompt ? ` (${mcForPrompt})` : ''}, chart movement, or a notable action. Be factual, not generic.`,
+    meme_drop: `Write something genuinely funny or sharp. A quick observation, a relatable scenario, or a self-aware joke. One-liner preferred. Make people actually laugh, not just react.`,
+    alpha_tease: `Share something concrete you're observing.${mcForPrompt ? ` Current MC: ${mcForPrompt}.` : ''} Reference the chart, price action, or market context. Intrigue through data, not mystery.`,
+    holder_appreciation: `Acknowledge holders with specifics. Reference the chart movement or how long the token has been live. Be specific, not generic.`,
+    question: `Ask a question that has a useful answer — "What MC would you consider taking profit?" or "Which other tokens are you watching?" Not "how are you feeling?" to an empty room.`,
+    milestone: `Celebrate with the exact number.${mcForPrompt ? ` Hit ${mcForPrompt} MC.` : ''} One line about what it means, one line about what's next. Keep it factual.`,
   };
 
   const userPrompt = customPrompt || `Write a ${type.replace(/_/g, ' ')} message for the Telegram group.

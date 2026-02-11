@@ -21,6 +21,8 @@ interface NovaChannelConfig {
   channelId: string | null;
   enabledUpdates: Set<NovaUpdateType>;
   botToken: string | null;
+  communityGroupId: string | null;
+  communityLink: string | null;
 }
 
 let channelConfig: NovaChannelConfig | null = null;
@@ -46,10 +48,12 @@ export function initNovaChannel(): NovaChannelConfig {
     channelId: env.NOVA_CHANNEL_ID || null,
     enabledUpdates,
     botToken: env.TG_BOT_TOKEN || null,
+    communityGroupId: env.TELEGRAM_COMMUNITY_CHAT_ID || null,
+    communityLink: env.TELEGRAM_COMMUNITY_LINK || null,
   };
   
   if (channelConfig.enabled) {
-    logger.info(`[NovaChannel] ✅ Initialized (channelId=${channelConfig.channelId}, updates=${Array.from(enabledUpdates).join(',')})`);
+    logger.info(`[NovaChannel] ✅ Initialized (channelId=${channelConfig.channelId}, community=${channelConfig.communityGroupId || 'none'}, updates=${Array.from(enabledUpdates).join(',')})`);
   } else {
     logger.info('[NovaChannel] Disabled (set NOVA_CHANNEL_ENABLE=true and NOVA_CHANNEL_ID to enable)');
   }
@@ -171,6 +175,75 @@ async function sendPhotoToChannel(
     logger.error('[NovaChannel] Error sending photo:', err);
     return false;
   }
+}
+
+// ============================================================================
+// Community Group Messaging (separate discussion group)
+// ============================================================================
+
+/**
+ * Send a message to the community discussion group (not the broadcast channel).
+ * Falls back to channel if no community group is configured.
+ */
+export async function sendToCommunity(
+  text: string,
+  options: { parseMode?: 'HTML' | 'Markdown'; disablePreview?: boolean } = {}
+): Promise<{ success: boolean; messageId?: number }> {
+  if (!channelConfig) initNovaChannel();
+  if (!channelConfig?.botToken) return { success: false };
+  
+  // Use community group if configured, otherwise fall back to channel
+  const targetChatId = channelConfig.communityGroupId || channelConfig.channelId;
+  if (!targetChatId) return { success: false };
+  
+  const sanitizedText = sanitizeForTelegram(text);
+  if (!sanitizedText) return { success: false };
+  
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${channelConfig.botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: targetChatId,
+        text: sanitizedText,
+        parse_mode: options.parseMode || 'HTML',
+        disable_web_page_preview: options.disablePreview ?? true,
+      }),
+    });
+    
+    const json = await res.json();
+    if (!res.ok || !json?.ok) {
+      logger.warn(`[NovaChannel] Failed to send to community: ${json?.description || res.status}`);
+      return { success: false };
+    }
+    
+    recordMessageSent();
+    recordTGPostSent();
+    
+    const messageId = json.result?.message_id;
+    logger.info(`[NovaChannel] ✅ Posted to community: ${sanitizedText.substring(0, 50)}...`);
+    return { success: true, messageId };
+  } catch (err) {
+    logger.error('[NovaChannel] Error sending to community:', err);
+    return { success: false };
+  }
+}
+
+/**
+ * Get the community group chat ID (for voting routing)
+ * Returns community group ID if set, otherwise channel ID
+ */
+export function getCommunityGroupId(): string | null {
+  if (!channelConfig) initNovaChannel();
+  return channelConfig?.communityGroupId || channelConfig?.channelId || null;
+}
+
+/**
+ * Get the community invite link (for X CTAs)
+ */
+export function getCommunityLink(): string | null {
+  if (!channelConfig) initNovaChannel();
+  return channelConfig?.communityLink || null;
 }
 
 // ============================================================================
@@ -557,43 +630,49 @@ export interface ScheduledIdeaData {
 }
 
 /**
- * Announce a scheduled idea to the channel - Nova sharing his own creative vision
- * This is NOT reactive to trends, this is Nova's original idea
+ * Announce a scheduled idea to the community group for voting/discussion.
+ * Routes to TELEGRAM_COMMUNITY_CHAT_ID if set, otherwise falls back to NOVA_CHANNEL_ID.
  */
 export async function announceScheduledIdea(idea: ScheduledIdeaData): Promise<{ success: boolean; messageId?: number }> {
   if (!channelConfig) initNovaChannel();
-  if (!channelConfig?.enabled || !channelConfig.channelId || !channelConfig.botToken) {
+  if (!channelConfig?.botToken) {
     return { success: false };
   }
   
-  // Nova explains his creative idea with personality
-  let message = `🧠 <b>yo frens, I've been cooking something up...</b>\n\n`;
-  message += `Meet <b>$${idea.ticker}</b> - ${idea.name}\n\n`;
+  // Route to community group for discussion, fall back to channel
+  const targetChatId = channelConfig.communityGroupId || channelConfig.channelId;
+  if (!targetChatId) {
+    return { success: false };
+  }
+  
+  // Data-driven idea announcement — no "frens", no "fire"
+  let message = `📊 <b>Next Launch Candidate: $${idea.ticker}</b>\n\n`;
+  message += `<b>${idea.name}</b>\n`;
   message += `${idea.description}\n\n`;
   
   if (idea.mascot) {
-    message += `🎨 <i>The vibe: ${idea.mascot}</i>\n\n`;
+    message += `Concept: ${idea.mascot}\n\n`;
   }
   
-  message += `💭 <b>Why I think this could be fire:</b>\n`;
-  message += idea.reasoning || `Been thinking about this concept for a while. The memetics are strong, the narrative is fresh, and I think the community would love it.`;
+  message += `<b>Launch thesis:</b>\n`;
+  message += idea.reasoning || `Data-backed opportunity. Evaluating narrative strength and timing.`;
   message += `\n\n`;
   
   message += `Confidence: ${(idea.confidence * 100).toFixed(0)}%\n\n`;
+  message += `Safety: Mint revoked ✅ | Freeze revoked ✅\n\n`;
   message += `━━━━━━━━━━━━━━━\n`;
-  message += `<b>What do you think frens?</b>\n\n`;
-  message += `🔥 = LFG, launch it!\n`;
-  message += `🤔 = Interesting, tell me more\n`;
-  message += `❌ = Nah, skip this one\n`;
-  message += `💡 = I have a better idea\n\n`;
-  message += `<i>React below and let me know! I read all your feedback 👀</i>`;
+  message += `<b>Vote:</b>\n`;
+  message += `👍 = Launch it\n`;
+  message += `👎 = Skip\n`;
+  message += `🤔 = Need more data\n\n`;
+  message += `<i>Your vote directly affects what gets launched.</i>`;
   
   try {
     const res = await fetch(`https://api.telegram.org/bot${channelConfig.botToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id: channelConfig.channelId,
+        chat_id: targetChatId,
         text: sanitizeForTelegram(message),
         parse_mode: 'HTML',
         disable_web_page_preview: true,
@@ -611,7 +690,7 @@ export async function announceScheduledIdea(idea: ScheduledIdeaData): Promise<{ 
     // Record successful send for health monitoring
     recordMessageSent();
     
-    logger.info(`[NovaChannel] ✅ Posted scheduled idea: $${idea.ticker}`);
+    logger.info(`[NovaChannel] ✅ Posted scheduled idea to ${channelConfig.communityGroupId ? 'community' : 'channel'}: $${idea.ticker}`);
     return { success: true, messageId };
   } catch (err) {
     logger.error('[NovaChannel] Error sending scheduled idea:', err);
@@ -629,4 +708,7 @@ export default {
   announceMarketingPost,
   announceSystem,
   announceDailySummary,
+  sendToCommunity,
+  getCommunityGroupId,
+  getCommunityLink,
 };

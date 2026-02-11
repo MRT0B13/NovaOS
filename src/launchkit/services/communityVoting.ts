@@ -339,7 +339,7 @@ function generateFallbackReasoning(idea: TokenIdea, trendContext?: string): stri
 }
 
 /**
- * Post an idea to the channel for community voting
+ * Post an idea to the community group for voting (falls back to channel if no group configured)
  */
 export async function postIdeaForVoting(
   idea: TokenIdea,
@@ -348,10 +348,11 @@ export async function postIdeaForVoting(
 ): Promise<PendingVote | null> {
   const env = getEnv();
   const botToken = env.TG_BOT_TOKEN;
-  const channelId = env.NOVA_CHANNEL_ID;
+  // Route voting to community group if available, otherwise channel
+  const channelId = env.TELEGRAM_COMMUNITY_CHAT_ID || env.NOVA_CHANNEL_ID;
   
   if (!botToken || !channelId) {
-    logger.warn('[CommunityVoting] Missing TG_BOT_TOKEN or NOVA_CHANNEL_ID');
+    logger.warn('[CommunityVoting] Missing TG_BOT_TOKEN or TELEGRAM_COMMUNITY_CHAT_ID/NOVA_CHANNEL_ID');
     return null;
   }
   
@@ -379,28 +380,29 @@ export async function postIdeaForVoting(
   
   const isScheduled = options?.launchType === 'scheduled' || (!trendContext && !options?.launchType);
   let message = isScheduled
-    ? `💡 <b>Nova's Daily Creation: $${safeTicker}</b>\n\n`
-    : `🔥 <b>Reactive Idea: $${safeTicker}</b>\n\n`;
+    ? `� <b>Scheduled Launch Candidate: $${safeTicker}</b>\n\n`
+    : `⚡ <b>Reactive Launch Candidate: $${safeTicker}</b>\n\n`;
   
   message += `<b>${safeName}</b>\n`;
   message += `${safeDescription}\n\n`;
   
   if (safeMascot) {
-    message += `🎨 <i>Mascot concept: ${safeMascot}</i>\n\n`;
+    message += `Concept: ${safeMascot}\n\n`;
   }
   
   if (safeTrendContext) {
-    message += `🌊 <b>Riding the wave:</b> ${safeTrendContext}\n\n`;
+    message += `📈 <b>Trend context:</b> ${safeTrendContext}\n\n`;
   }
   
-  message += `<b>Why I think this slaps:</b>\n${safeReasoning}\n\n`;
+  message += `<b>Launch thesis:</b>\n${safeReasoning}\n\n`;
+  message += `Safety: Mint revoked ✅ | Freeze revoked ✅\n\n`;
   message += `━━━━━━━━━━━━━━━\n`;
-  message += `<b>Should we launch this?</b>\n\n`;
-  message += `👍 = Yes, send it!\n`;
-  message += `👎 = Nah, skip it\n`;
-  message += `🔥 = Love it!\n`;
-  message += `💩 = Terrible idea\n\n`;
-  message += `⏰ <i>Voting ends in ${votingMinutes} minutes</i>`;
+  message += `<b>Vote to launch:</b>\n\n`;
+  message += `👍 = Launch it\n`;
+  message += `👎 = Skip\n`;
+  message += `🔥 = Strong yes\n`;
+  message += `💩 = Hard no\n\n`;
+  message += `⏰ <i>Voting closes in ${votingMinutes} minutes. Results are binding.</i>`;
   
   try {
     // Send message (try HTML first, fallback to plain text)
@@ -519,13 +521,14 @@ export async function postScheduledIdeaForFeedback(
 ): Promise<PendingVote | null> {
   const env = getEnv();
   const botToken = env.TG_BOT_TOKEN;
-  const channelId = env.NOVA_CHANNEL_ID;
+  // Route feedback to community group if available, otherwise channel
+  const channelId = env.TELEGRAM_COMMUNITY_CHAT_ID || env.NOVA_CHANNEL_ID;
   
   logger.info(`[CommunityVoting] postScheduledIdeaForFeedback called for $${idea.ticker}`);
-  logger.info(`[CommunityVoting] Config: TG_BOT_TOKEN=${botToken ? 'SET' : 'MISSING'}, NOVA_CHANNEL_ID=${channelId || 'MISSING'}`);
+  logger.info(`[CommunityVoting] Config: TG_BOT_TOKEN=${botToken ? 'SET' : 'MISSING'}, target=${channelId || 'MISSING'}`);
   
   if (!botToken || !channelId) {
-    logger.error(`[CommunityVoting] ❌ Cannot post scheduled idea - Missing TG_BOT_TOKEN (${botToken ? 'set' : 'missing'}) or NOVA_CHANNEL_ID (${channelId || 'missing'})`);
+    logger.error(`[CommunityVoting] ❌ Cannot post scheduled idea - Missing TG_BOT_TOKEN (${botToken ? 'set' : 'missing'}) or chat ID (${channelId || 'missing'})`);
     return null;
   }
   
@@ -543,26 +546,27 @@ export async function postScheduledIdeaForFeedback(
     reasoning || `Been thinking about this concept for a while. The memetics are strong, the narrative is fresh, and I think the community would love it.`
   );
   
-  let message = `🧠 <b>yo frens, I've been cooking something up...</b>\n\n`;
-  message += `Meet <b>$${safeTicker}</b> - ${safeName}\n\n`;
+  let message = `📊 <b>Next Launch Candidate: $${safeTicker}</b>\n\n`;
+  message += `<b>${safeName}</b>\n`;
   message += `${safeDescription}\n\n`;
   
   if (safeMascot) {
-    message += `🎨 <i>The vibe: ${safeMascot}</i>\n\n`;
+    message += `Concept: ${safeMascot}\n\n`;
   }
   
-  message += `💭 <b>Why I think this could be fire:</b>\n`;
+  message += `<b>Launch thesis:</b>\n`;
   message += safeReasoning;
   message += `\n\n`;
   
-  message += `Confidence: ${(idea.confidence * 100).toFixed(0)}%\n\n`;
+  message += `Confidence: ${(idea.confidence * 100).toFixed(0)}%\n`;
+  message += `Safety: Mint revoked ✅ | Freeze revoked ✅\n\n`;
   message += `━━━━━━━━━━━━━━━\n`;
-  message += `<b>What do you think frens?</b>\n\n`;
-  message += `🔥 = LFG, I love it!\n`;
-  message += `🤔 = Interesting, tell me more\n`;
-  message += `👎 = Nah, skip this one\n`;
-  message += `👀 = I have suggestions\n\n`;
-  message += `<i>Drop your reactions! I'll check back in ${feedbackMinutes} mins and share what I learned 🤝</i>`;
+  message += `<b>Vote:</b>\n\n`;
+  message += `👍 = Launch it\n`;
+  message += `🤔 = Need more data\n`;
+  message += `👎 = Skip\n`;
+  message += `👀 = Have suggestions\n\n`;
+  message += `<i>Your vote directly affects what gets launched. Checking results in ${feedbackMinutes} mins.</i>`;
   
   try {
     // Send message (try HTML first, fallback to plain text)
@@ -1044,7 +1048,7 @@ export async function checkPendingVotes(): Promise<PendingVote[]> {
 async function postFeedbackResponse(vote: PendingVote, votes: VoteTally): Promise<void> {
   const env = getEnv();
   const botToken = env.TG_BOT_TOKEN;
-  const channelId = env.NOVA_CHANNEL_ID;
+  const channelId = env.TELEGRAM_COMMUNITY_CHAT_ID || env.NOVA_CHANNEL_ID;
   
   if (!botToken || !channelId) return;
   
@@ -1056,8 +1060,8 @@ async function postFeedbackResponse(vote: PendingVote, votes: VoteTally): Promis
   
   // Build response based on sentiment
   let message = isBrandPost
-    ? `📊 <b>Thanks for vibing with my ${safeTicker.toLowerCase()} post frens!</b>\n\n`
-    : `📊 <b>Thanks for the feedback on $${safeTicker} frens!</b>\n\n`;
+    ? `📊 <b>Feedback results: ${safeTicker.toLowerCase()}</b>\n\n`
+    : `📊 <b>Feedback results: $${safeTicker}</b>\n\n`;
   
   if (totalReactions === 0) {
     message += `Looks like y'all are busy today - no reactions came in. That's cool, I'll keep cooking and share more ideas soon! 🍳\n`;

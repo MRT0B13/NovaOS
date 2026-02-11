@@ -388,6 +388,75 @@ export class PostgresScheduleRepository {
     await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_x_tweets_scheduled ON sched_x_tweets (scheduled_for);`);
     await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_trend_pool_score ON sched_trend_pool (current_score DESC);`);
 
+    // RugCheck Reports
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS sched_rugcheck_reports (
+        id TEXT PRIMARY KEY,
+        mint TEXT NOT NULL,
+        ticker TEXT,
+        score INTEGER NOT NULL,
+        risk_level TEXT NOT NULL,
+        mint_authority BOOLEAN DEFAULT FALSE,
+        freeze_authority BOOLEAN DEFAULT FALSE,
+        top_holder_pct DOUBLE PRECISION DEFAULT 0,
+        top10_holder_pct DOUBLE PRECISION DEFAULT 0,
+        lp_locked BOOLEAN DEFAULT FALSE,
+        risks JSONB DEFAULT '[]'::jsonb,
+        raw_data JSONB,
+        scanned_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_rugcheck_mint ON sched_rugcheck_reports (mint);`);
+
+    // Reply Engine Tracking
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS sched_reply_tracking (
+        id TEXT PRIMARY KEY,
+        tweet_id TEXT NOT NULL,
+        reply_id TEXT NOT NULL,
+        reply_text TEXT NOT NULL,
+        source TEXT NOT NULL,
+        author_id TEXT,
+        original_text TEXT,
+        replied_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_reply_tweet ON sched_reply_tracking (tweet_id);`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_reply_date ON sched_reply_tracking (replied_at);`);
+
+    // Creator Fees Tracking (PumpSwap)
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS sched_creator_fees (
+        id TEXT PRIMARY KEY,
+        mint TEXT NOT NULL,
+        ticker TEXT,
+        fee_amount_sol DOUBLE PRECISION NOT NULL,
+        fee_amount_usd DOUBLE PRECISION,
+        pool_address TEXT,
+        tx_signature TEXT,
+        claimed_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_creator_fees_mint ON sched_creator_fees (mint);`);
+
+    // Fee Claims (actual on-chain claim transactions)
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS sched_fee_claims (
+        id TEXT PRIMARY KEY,
+        mint_address TEXT NOT NULL,
+        amount_sol DOUBLE PRECISION NOT NULL,
+        tx_signature TEXT NOT NULL,
+        destination_wallet TEXT NOT NULL,
+        claimed_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_fee_claims_mint ON sched_fee_claims (mint_address);`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_fee_claims_date ON sched_fee_claims (claimed_at);`);
+
     // Initialize default rows if needed
     await this.pool.query(`
       INSERT INTO sched_community_prefs (id) VALUES ('main')

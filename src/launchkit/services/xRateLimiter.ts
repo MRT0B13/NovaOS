@@ -3,13 +3,13 @@ import { getEnv } from '../env.ts';
 import { PostgresScheduleRepository, type XUsageData } from '../db/postgresScheduleRepository.ts';
 
 /**
- * X/Twitter Free Tier Rate Limiter
+ * X/Twitter Rate Limiter
  * 
- * Free Plan Limits (per month):
- * - 100 Post reads
- * - 500 Post writes (tweets)
+ * Writes: Free tier (500/month, no charge)
+ * Reads: Pay-per-use at $0.005/read. Set X_READ_BUDGET_USD to control monthly spend.
+ *        If X_READ_BUDGET_USD=0, falls back to X_MONTHLY_READ_LIMIT hard cap (default 100).
  * 
- * This service tracks usage and prevents exceeding limits
+ * Example: X_READ_BUDGET_USD=5 → ~1000 reads/month → ~33 reads/day
  */
 
 // PostgreSQL support
@@ -126,9 +126,33 @@ function getWriteLimit(): number {
   return (env as any).X_MONTHLY_WRITE_LIMIT || 500;
 }
 
+const X_READ_COST_USD = 0.005; // $0.005 per read (X pay-per-use)
+
 function getReadLimit(): number {
   const env = getEnv();
+  const budget = (env as any).X_READ_BUDGET_USD || 0;
+  if (budget > 0) {
+    // Budget mode: derive max reads from dollar budget
+    return Math.floor(budget / X_READ_COST_USD);
+  }
+  // Fallback: hard cap (old free-tier style)
   return (env as any).X_MONTHLY_READ_LIMIT || 100;
+}
+
+/**
+ * Get current read spend in USD this month
+ */
+export function getReadSpendUsd(): number {
+  resetIfNewMonth();
+  return usageData.reads * X_READ_COST_USD;
+}
+
+/**
+ * Check if reads are using the pay-per-use budget model
+ */
+export function isPayPerUseReads(): boolean {
+  const env = getEnv();
+  return ((env as any).X_READ_BUDGET_USD || 0) > 0;
 }
 
 /**
@@ -223,9 +247,13 @@ export function getUsageSummary(): string {
   if (quota.writes.remaining <= 10) status = '🚨';
   if (quota.writes.remaining <= 0) status = '❌';
   
+  const readLine = isPayPerUseReads()
+    ? `📖 Reads: ${quota.reads.used} ($${getReadSpendUsd().toFixed(2)} / $${((getEnv() as any).X_READ_BUDGET_USD || 0).toFixed(2)} budget)`
+    : `📖 Reads: ${quota.reads.used}/${quota.reads.limit} (${readPct}% used)`;
+  
   return `${status} X/Twitter Usage (${quota.month}):
-📝 Tweets: ${quota.writes.used}/${quota.writes.limit} (${writePct}% used, ${quota.writes.remaining} remaining)
-📖 Reads: ${quota.reads.used}/${quota.reads.limit} (${readPct}% used)
+📝 Tweets: ${quota.writes.used}/${quota.writes.limit} (${writePct}% used, ${quota.writes.remaining} remaining) [FREE]
+${readLine}
 ${quota.lastWrite ? `Last tweet: ${new Date(quota.lastWrite).toLocaleString()}` : 'No tweets this month'}`;
 }
 
@@ -324,4 +352,6 @@ export default {
   getUsageSummary,
   getPostingAdvice,
   safeTweet,
+  getReadSpendUsd,
+  isPayPerUseReads,
 };

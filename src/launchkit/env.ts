@@ -34,6 +34,11 @@ const EnvSchema = z.object({
   AGENT_FUNDING_WALLET_SECRET: z.string().optional(),
   SOLANA_RPC_URL: z.string().default('https://api.mainnet-beta.solana.com'),
   
+  // ==========================================
+  // RugCheck API (optional — GET endpoints work without auth)
+  // ==========================================
+  RUGCHECK_API_KEY: z.string().optional(),
+  
   TG_ENABLE: z.enum(['true', 'false']).optional(),
   TG_BOT_TOKEN: z.string().optional(),
   TG_CHAT_ID: z.string().optional(),
@@ -71,6 +76,14 @@ const EnvSchema = z.object({
   NOVA_X_HANDLE: z.string().optional(),
   
   // ==========================================
+  // Nova Community Group (separate discussion group)
+  // ==========================================
+  // Telegram community group ID (separate from channel — for voting, discussion, feedback)
+  TELEGRAM_COMMUNITY_CHAT_ID: z.string().optional(),
+  // Public invite link for the community group (used in X CTAs)
+  TELEGRAM_COMMUNITY_LINK: z.string().optional(),
+  
+  // ==========================================
   // Community Voting Configuration
   // ==========================================
   // Enable community voting on autonomous ideas before launch
@@ -105,7 +118,22 @@ const EnvSchema = z.object({
   TWITTER_ACCESS_TOKEN: z.string().optional(),
   TWITTER_ACCESS_TOKEN_SECRET: z.string().optional(),
   X_MONTHLY_WRITE_LIMIT: z.coerce.number().default(500),  // Free tier: 500 tweets/month
-  X_MONTHLY_READ_LIMIT: z.coerce.number().default(100),   // Free tier: 100 reads/month
+  X_MONTHLY_READ_LIMIT: z.coerce.number().default(100),   // Fallback hard cap (ignored if budget set)
+  X_READ_BUDGET_USD: z.coerce.number().default(0),        // Pay-per-use read budget in USD/month ($0.005/read). 0 = use hard cap instead.
+  
+  // ==========================================
+  // X Reply Engine Configuration
+  // ==========================================
+  // Enable the X reply engine (search + reply to relevant tweets)
+  X_REPLY_ENGINE_ENABLE: z.enum(['true', 'false']).default('false'),
+  // Max replies per day (capped by write quota)
+  X_REPLY_MAX_PER_DAY: z.coerce.number().default(10),
+  // Min interval between reply rounds (minutes) — 60m default keeps reads under ~30/mo
+  X_REPLY_INTERVAL_MINUTES: z.coerce.number().default(60),
+  // Reply engine target accounts (comma-separated handles without @)
+  X_REPLY_TARGETS: z.string().default('pumpdotfun,DexScreener,JupiterExchange,elizaOS,RugCheckXYZ,aixbt_agent'),
+  // Reply engine search queries (comma-separated)
+  X_REPLY_SEARCH_QUERIES: z.string().default('pump.fun launched,pump.fun graduated,solana meme token,rugcheck'),
   
   // X Scheduler Configuration
   X_AUTO_TWEETS_PER_DAY: z.coerce.number().default(2),       // Tweets per day per token

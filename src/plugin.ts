@@ -89,6 +89,7 @@ import { stopTGScheduler } from './launchkit/services/telegramScheduler.ts';
 import { redactEnvForLogging } from './launchkit/services/redact.ts';
 import { getEnv } from './launchkit/env.ts';
 import { initNovaChannel, announceSystem } from './launchkit/services/novaChannel.ts';
+import { startReplyEngine, stopReplyEngine } from './launchkit/services/xReplyEngine.ts';
 
 
 
@@ -125,7 +126,7 @@ class LaunchKitBootstrapService extends Service {
     try {
       const env = getEnv();
       const safeEnv = redactEnvForLogging(env);
-      logger.info('[LaunchKit] Environment configuration:', safeEnv);
+      logger.info({ env: safeEnv }, '[LaunchKit] Environment configuration');
     } catch (envError) {
       logger.error('[LaunchKit] Environment validation failed:', envError);
       throw envError;
@@ -167,6 +168,9 @@ class LaunchKitBootstrapService extends Service {
     // Start Telegram health monitor (alerts if bot stops receiving messages)
     startTelegramHealthMonitor(runtime);
     
+    // Start X reply engine (search + reply to ecosystem tweets)
+    startReplyEngine();
+    
     return service;
   }
 
@@ -187,6 +191,9 @@ class LaunchKitBootstrapService extends Service {
     
     // Stop Telegram health monitor
     stopTelegramHealthMonitor();
+    
+    // Stop X reply engine
+    stopReplyEngine();
     
     // Stop system reporter
     stopSystemReporter();

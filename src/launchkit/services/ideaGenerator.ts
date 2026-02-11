@@ -20,6 +20,12 @@ export interface TokenIdea {
   theme?: string;
   generatedAt: string;
   confidence: number; // 0-1 score of how good the idea seems
+  // Optional extended fields used by community voting / personal brand
+  status?: string;
+  hooks?: string[];
+  backstory?: string;
+  source?: string;
+  reasoning?: string;
 }
 
 export interface IdeaGeneratorConfig {
@@ -137,13 +143,24 @@ export async function generateIdea(config: IdeaGeneratorConfig = {}): Promise<To
   
   const systemPrompt = `You are a creative meme coin idea generator for an AI agent named ${config.agentName || 'Nova'}.
 
-${config.agentPersonality || 'Nova is a chaotic, self-aware AI that embraces entropy and finds humor in the absurdity of crypto culture.'}
+${config.agentPersonality || 'Nova is a data-driven, self-aware AI that launches meme tokens on Solana. Nova is blunt, transparent, and has opinions backed by launch data. Not a hype bot — a builder learning in public.'}
 
 Generate a unique, creative meme coin concept. The idea should be:
 - Memorable and catchy
-- Slightly absurd or humorous
-- On-brand for crypto/degen culture
+- Tied to a REAL cultural moment, trending narrative, or event people are emotionally invested in
+- Something 50 people in a Telegram group would want to share the contract address with friends
+- Able to sustain interest for hours/days, not just minutes
+- NOT a random shock-value joke or offensive for laughs
 - NOT a copy of existing major meme coins (no DOGE, SHIB, PEPE clones)
+
+CULTURAL RESONANCE FILTER — evaluate before proposing:
+1. Is this a moment people are ALREADY emotionally invested in? (news event, cultural moment, viral meme) → GOOD
+2. Is this just a random shock-value joke with no cultural hook? → SKIP, generate something else
+3. Would real people want to share this CA with friends? → If no, SKIP
+4. Does this ride a narrative that could sustain interest for hours/days? → If just minutes, SKIP
+5. AVOID: Offensive/criminal themes, overly niche inside jokes, anything that could create legal issues
+
+OPTIMIZE FOR: Real cultural moments, trending memes with legs, events with emotional investment, themes that make people want to PARTICIPATE not just laugh.
 
 Theme for this idea: ${theme}${avoidList}${trendInstruction}${communityLearningsText}
 
@@ -158,8 +175,8 @@ Respond in this exact JSON format:
 
 Rules:
 - Ticker must be 2-6 uppercase letters
-- Mascot description should be vivid and image-generation friendly
-- Confidence is your self-assessment (0.5-1.0) of how good this idea is`;
+- Mascot description should be vivid and image-generation friendly. Style: bold, clean, meme-native, dark background, single neon accent color, NO text overlay
+- Confidence is your self-assessment (0.5-1.0) of cultural resonance and shareability`;
 
   try {
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
