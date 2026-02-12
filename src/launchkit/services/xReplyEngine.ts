@@ -227,6 +227,9 @@ async function runReplyRound(): Promise<void> {
     const msg = err?.message || String(err);
     const code = err?.code || '';
 
+    // Always mark the tweet as "attempted" so we don't retry the same one
+    state.repliedTweetIds.add(candidate.tweetId);
+
     if (code === 'X_RATE_LIMIT' || msg.includes('429') || msg.includes('rate limit')) {
       // Signal shared backoff — pauses ALL X posting (replies, brand, marketing)
       reportRateLimit();
