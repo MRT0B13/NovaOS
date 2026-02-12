@@ -469,7 +469,9 @@ export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promi
     const rankEmoji = i === 0 && sorted.length > 1 ? '🥇 ' : i === 1 ? '🥈 ' : i === 2 ? '🥉 ' : '';
     
     // Header with name and trend
-    message += `${rankEmoji}<b>$${token.ticker}</b>`;
+    // Don't add $ prefix to Nova's own channels (they're not tokens)
+    const tickerDisplay = ['📢', '💬'].includes(token.ticker) ? token.ticker : `$${token.ticker}`;
+    message += `${rankEmoji}<b>${tickerDisplay}</b>`;
     if (token.name) message += ` - ${token.name}`;
     message += ` ${trendEmoji}\n`;
     
@@ -512,7 +514,11 @@ export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promi
   
   message += `<i>Updated ${new Date().toLocaleTimeString()}</i>`;
   
-  return sendToChannel(message);
+  // Post to channel for visibility
+  await sendToChannel(message);
+  // Also post to community group for discussion (if configured)
+  await sendToCommunity(message);
+  return true;
 }
 
 // ============================================================================

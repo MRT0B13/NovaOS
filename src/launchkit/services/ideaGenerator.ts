@@ -168,7 +168,7 @@ Respond in this exact JSON format:
 {
   "name": "Full Token Name",
   "ticker": "TICKER",
-  "description": "A compelling 1-2 sentence description that would make degens curious",
+  "description": "A clear 1-2 sentence description of the token concept. State what it is and what cultural moment it connects to. No hype, no exclamation marks.",
   "mascot": "Visual description of mascot/logo concept for DALL-E",
   "confidence": 0.8
 }

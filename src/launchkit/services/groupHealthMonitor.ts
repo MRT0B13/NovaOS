@@ -394,7 +394,7 @@ export class GroupHealthMonitor {
     if (novaChannelHealth) {
       const env = getEnv();
       healthSummaries.unshift({
-        ticker: 'NOVA',
+        ticker: '📢',
         name: 'Nova Channel',
         description: 'Broadcast channel',
         members: novaChannelHealth.memberCount,
@@ -413,7 +413,7 @@ export class GroupHealthMonitor {
     if (communityGroupHealth) {
       const env2 = getEnv();
       healthSummaries.push({
-        ticker: 'NOVA',
+        ticker: '💬',
         name: 'Nova Community',
         description: 'Discussion & voting group',
         members: communityGroupHealth.memberCount,

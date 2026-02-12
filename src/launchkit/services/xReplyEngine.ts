@@ -2,6 +2,7 @@ import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
 import { getTwitterReader, XPublisherService } from './xPublisher.ts';
 import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseReads, reportRateLimit, reportReadRateLimit, canReadMentions, canReadSearch, recordMentionRead, recordSearchRead, mentionsCooldownRemaining, searchCooldownRemaining } from './xRateLimiter.ts';
+import { canPostToX, recordXPost } from './novaPersonalBrand.ts';
 import { scanToken, formatReportForTweet } from './rugcheck.ts';
 
 /**
@@ -81,9 +82,9 @@ export function startReplyEngine(): void {
   state.running = true;
   logger.info(`[ReplyEngine] Started (max ${env.X_REPLY_MAX_PER_DAY}/day, every ${env.X_REPLY_INTERVAL_MINUTES || 60}m)`);
   
-  // Delay first round by 5 minutes to avoid startup 429 collisions
-  // (deploy restarts, ElizaOS init, and webhook setup all hit the API on boot)
-  const startDelayMs = 5 * 60 * 1000;
+  // Delay first round by 10 minutes to avoid startup 429 collisions
+  // (deploy restarts, ElizaOS init, brand scheduler, and webhook setup all hit the API on boot)
+  const startDelayMs = 10 * 60 * 1000;
   setTimeout(() => {
     runReplyRound().catch(err => logger.error('[ReplyEngine] Initial round failed:', err));
   }, startDelayMs);
@@ -208,6 +209,12 @@ async function runReplyRound(): Promise<void> {
     return;
   }
   
+  // Global write gate — ensure 5-min gap between any two X writes
+  if (!canPostToX()) {
+    logger.debug('[ReplyEngine] Skipping reply — global X write gate (5-min gap)');
+    return;
+  }
+  
   // Generate a reply
   const replyText = await generateReply(candidate);
   if (!replyText) return;
@@ -218,6 +225,9 @@ async function runReplyRound(): Promise<void> {
     const xPublisher = new XPublisherService({} as any);
     
     const result = await xPublisher.reply(replyText, candidate.tweetId);
+    
+    // Update global write gate
+    recordXPost();
     
     state.repliesToday++;
     state.lastReplyAt = Date.now();
@@ -343,24 +353,96 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
   return candidates;
 }
 
+// ============================================================================
+// Spam & Relevance Filters
+// ============================================================================
+
+/**
+ * Patterns that indicate spam, scam, or engagement-farming tweets.
+ * Checked as case-insensitive substrings.
+ */
+const SPAM_PATTERNS = [
+  // DM bait / scams
+  'dm me', 'check your dm', 'check dm', 'sent you a dm', "let's connect",
+  'message me', 'inbox me', 'slide into', 'text me',
+  // Follow farming
+  'follow me', 'follow back', 'f4f', 'like and retweet', 'rt and follow',
+  // Wallet scams
+  'claim your', 'connect wallet', 'validate your wallet', 'guaranteed profit',
+  'send sol to', 'send eth to', 'free airdrop claim', 'claim now',
+  // Promo spam
+  'grow your account', 'marketing services', 'book a call', 'link in bio',
+  'promote your', 'boost your followers',
+  // Generic bot replies
+  'nice project', 'great project', 'amazing project', 'check out my',
+  'looks promising sir',
+  // Engagement bait
+  'drop your wallet', 'tag 3 friends', 'tag a friend', 'comment your',
+  // Ad / brand content
+  'sponsored', 'ad:', '#ad ', 'limited time offer', 'use code',
+  'shop now', 'buy now', 'order now', 'free shipping',
+];
+
+/**
+ * Keywords that indicate crypto/Solana relevance.
+ */
+const RELEVANCE_KEYWORDS = [
+  // Solana ecosystem
+  'solana', 'sol', 'pump.fun', 'pumpfun', 'pump fun', 'pumpswap',
+  'raydium', 'jupiter', 'dexscreener', 'birdeye', 'phantom',
+  // Token / crypto terms
+  'memecoin', 'meme coin', 'meme token', 'token', 'crypto',
+  'defi', 'dex', 'bonding curve', 'market cap', 'mcap',
+  // Safety terms
+  'rugcheck', 'rug pull', 'rug pulled', 'rugged',
+  'mint authority', 'freeze authority', 'lp locked', 'liquidity',
+  // Community
+  'degen', 'holder', 'airdrop', 'launch', 'presale',
+  // AI agents
+  'ai agent', 'eliza', 'elizaos', 'autonomous', 'nova',
+  // Chain / wallet
+  'wallet', 'on-chain', 'onchain', 'blockchain', 'web3',
+];
+
+/**
+ * Check if a tweet is spam/scam.
+ * Returns true if spam (should be SKIPPED).
+ */
+function isSpam(text: string): boolean {
+  const lower = text.toLowerCase();
+  return SPAM_PATTERNS.some(pattern => lower.includes(pattern));
+}
+
+/**
+ * Check if a tweet is relevant to Nova's domain.
+ * - Mentions: always relevant (someone tagged us directly) UNLESS caught by spam filter
+ * - Search results: must contain at least one relevance keyword
+ */
+function isRelevant(text: string, source: 'mention' | 'search' | 'target'): boolean {
+  // Mentions are relevant by default (spam filter catches the bad ones first)
+  if (source === 'mention') return true;
+  
+  const lower = text.toLowerCase();
+  return RELEVANCE_KEYWORDS.some(kw => lower.includes(kw));
+}
+
 function pickBestCandidate(candidates: ReplyCandidate[]): ReplyCandidate | null {
   if (candidates.length === 0) return null;
   
-  const totalCount = candidates.length;
   const viable: ReplyCandidate[] = [];
   
   for (const c of candidates) {
-    // Spam filter first — catch scam bots even if they mention us
+    // Spam filter FIRST — catches DM scams, follow bait, ads, etc.
     if (isSpam(c.text)) {
-      logger.debug(`[ReplyEngine] Skipping spam: "${c.text.slice(0, 60)}..."`);
-      state.repliedTweetIds.add(c.tweetId);
+      logger.debug(`[ReplyEngine] SPAM filtered: "${c.text.slice(0, 60)}..." (${c.source})`);
+      state.repliedTweetIds.add(c.tweetId); // Don't retry this one
       continue;
     }
     
-    // Relevance filter — mentions always pass, search must have keywords
+    // Relevance filter — mentions pass by default, search must match keywords
     if (!isRelevant(c.text, c.source)) {
-      logger.debug(`[ReplyEngine] Skipping irrelevant: "${c.text.slice(0, 60)}..."`);
-      state.repliedTweetIds.add(c.tweetId);
+      logger.debug(`[ReplyEngine] IRRELEVANT filtered: "${c.text.slice(0, 60)}..." (${c.source})`);
+      state.repliedTweetIds.add(c.tweetId); // Don't retry
       continue;
     }
     
@@ -368,79 +450,20 @@ function pickBestCandidate(candidates: ReplyCandidate[]): ReplyCandidate | null 
   }
   
   if (viable.length === 0) {
-    logger.info(`[ReplyEngine] All ${totalCount} candidates filtered out (spam/irrelevant)`);
+    logger.info(`[ReplyEngine] All ${candidates.length} candidates filtered out (spam/irrelevant)`);
     return null;
   }
+  
+  logger.debug(`[ReplyEngine] ${viable.length}/${candidates.length} candidates passed filters`);
   
   // Priority: mentions > search
   const mentions = viable.filter(c => c.source === 'mention');
   if (mentions.length > 0) return mentions[0];
   
-  // For search results, pick one at random
   const search = viable.filter(c => c.source === 'search');
   if (search.length > 0) return search[Math.floor(Math.random() * search.length)];
   
   return viable[0];
-}
-
-// ============================================================================
-// Spam & Relevance Filters
-// ============================================================================
-
-const SPAM_PATTERNS: string[] = [
-  // DM bait / scams
-  'dm me', 'send me a dm', 'check your dm', 'check inbox', 'check dm',
-  'slide into', "let's connect", "let's talk privately", "let's collaborate",
-  'message me', 'inbox me', 'text me', 'whatsapp me',
-  // Follow farming
-  'follow me', 'follow back', 'f4f', 'follow for follow',
-  'like and retweet', 'like and follow', 'retweet this', 'repost this',
-  // Wallet scams
-  'claim your', 'airdrop claim', 'connect wallet', 'connect your wallet',
-  'validate your wallet', 'sync your wallet', 'verify wallet', 'whitelist spot',
-  'guaranteed profit', 'free mint', 'free airdrop', '100x guaranteed',
-  'send sol to', 'send eth to', '10x your',
-  // Promo spam
-  'i can help you grow', 'grow your account', 'grow your brand',
-  'promote your', 'marketing services', 'paid promo', 'paid promotion',
-  'book a call', 'schedule a call', 'link in bio', 'check my bio',
-  // Generic bot replies
-  'nice project', 'great project', 'amazing project', 'interesting project',
-  'check out my', 'check my pin', 'check my latest',
-  // Engagement bait
-  'drop your wallet', 'drop wallet below', 'tag 3 friends',
-];
-
-function isSpam(text: string): boolean {
-  const lower = text.toLowerCase();
-  return SPAM_PATTERNS.some(pattern => lower.includes(pattern));
-}
-
-const RELEVANCE_KEYWORDS: string[] = [
-  // Solana ecosystem
-  'solana', 'sol', 'pump.fun', 'pumpfun', 'pumpswap', 'raydium',
-  'jupiter', 'dexscreener', 'birdeye',
-  // Token/crypto
-  'memecoin', 'meme coin', 'meme token', 'token launch', 'token',
-  'crypto', 'defi', 'dex', 'swap', 'liquidity', 'bonding curve',
-  'graduated', 'market cap',
-  // Safety
-  'rugcheck', 'rug pull', 'rugged', 'mint authority', 'freeze authority',
-  'lp locked', 'lp burned',
-  // Community
-  'degen', 'crypto twitter', 'holder', 'airdrop',
-  // AI agents
-  'ai agent', 'eliza', 'elizaos', 'autonomous', 'nova',
-  // Chain/wallet
-  'wallet', 'on-chain', 'onchain', 'blockchain', 'web3',
-];
-
-function isRelevant(text: string, source: string): boolean {
-  // Mentions are always relevant — someone tagged Nova directly
-  if (source === 'mention') return true;
-  // Search results must contain at least one keyword
-  const lower = text.toLowerCase();
-  return RELEVANCE_KEYWORDS.some(kw => lower.includes(kw));
 }
 
 // ============================================================================
@@ -523,7 +546,9 @@ NEVER:
 - Say "fam", "frens", "let's gooo", "vibes"
 - Be sycophantic or generic
 - Self-promote excessively (one natural mention of your work is fine)
-- Use more than 1 emoji`;
+- Use more than 1 emoji
+
+If the tweet is clearly not about crypto, Solana, tokens, AI agents, or anything in your domain — reply with exactly "SKIP" and nothing else. Examples: product ads, sports, celebrity gossip, unrelated tech announcements.`;
     
     // Try to get RugCheck data for any token addresses in the tweet
     const rugCheckContext = await getRugCheckContext(candidate.text);
@@ -562,6 +587,13 @@ NEVER:
     let reply = data.choices?.[0]?.message?.content?.trim();
     
     if (!reply) return null;
+    
+    // GPT can refuse to reply by returning "SKIP"
+    if (reply.trim().toUpperCase() === 'SKIP') {
+      logger.debug(`[ReplyEngine] GPT refused to reply (irrelevant): "${candidate.text.slice(0, 60)}..."`);
+      state.repliedTweetIds.add(candidate.tweetId);
+      return null;
+    }
     
     // Clean up quotes if LLM wrapped it
     reply = reply.replace(/^["']|["']$/g, '');

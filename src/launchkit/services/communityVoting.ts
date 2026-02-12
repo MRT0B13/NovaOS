@@ -276,22 +276,25 @@ export async function generateIdeaReasoning(idea: TokenIdea, trendContext?: stri
     return generateFallbackReasoning(idea, trendContext);
   }
   
-  const prompt = `You are Nova, a chaotic but self-aware AI agent that launches meme coins. You just generated this token idea and need to pitch it to your community in a fun, engaging way.
+  const prompt = `You are Nova, an autonomous AI agent that launches meme tokens on Solana via pump.fun. You are data-driven, blunt, and transparent. You are NOT a hype bot.
 
 Token: $${idea.ticker} - ${idea.name}
 Description: ${idea.description}
 ${idea.mascot ? `Mascot concept: ${idea.mascot}` : ''}
-${trendContext ? `Trending topic inspiration: ${trendContext}` : ''}
+${trendContext ? `Trend this is based on: ${trendContext}` : ''}
 Confidence: ${(idea.confidence * 100).toFixed(0)}%
 
-Write a SHORT, punchy pitch (2-4 bullet points) explaining:
-1. Why this idea slaps (what makes it good)
-2. The vibe/timing (why now)
-3. One potential risk you're aware of (shows self-awareness)
+Write a SHORT launch thesis (3 bullet points, max 150 chars each):
+1. 📊 What cultural moment or trend this rides (be specific — name the event/meme/narrative)
+2. ⏰ Why the timing matters (what just happened or is happening)
+3. ⚠️ One honest risk (shows self-awareness — what could make this flop)
 
-Be playful, use emojis, but keep it real. No corporate speak. This is for degens.
-
-Format as bullet points, max 200 characters per point.`;
+Rules:
+- Lead with facts, not hype
+- No "slaps", "vibes", "fire", "golden nugget", "gold rush", "dig for profits"
+- No exclamation marks except on the risk point
+- Max 1 emoji per bullet point (the one already provided)
+- Write like a builder evaluating an opportunity, not a marketer selling one`;
 
   try {
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -321,19 +324,15 @@ Format as bullet points, max 200 characters per point.`;
 
 function generateFallbackReasoning(idea: TokenIdea, trendContext?: string): string {
   const reasons = [
-    `🎯 The name "${idea.name}" has meme potential`,
-    `📈 Confidence level: ${(idea.confidence * 100).toFixed(0)}%`,
+    `📊 Concept: "${idea.name}" — ${idea.description?.slice(0, 80) || 'meme token'}`,
   ];
   
   if (trendContext) {
-    reasons.push(`🔥 Riding the ${trendContext} wave`);
+    reasons.push(`⏰ Trend: ${trendContext}`);
   }
   
-  if (idea.theme) {
-    reasons.push(`🎨 Theme: ${idea.theme}`);
-  }
-  
-  reasons.push(`⚠️ As always, DYOR - I'm an AI, not financial advice`);
+  reasons.push(`📈 Confidence: ${(idea.confidence * 100).toFixed(0)}%`);
+  reasons.push(`⚠️ Risk: All meme tokens are high risk. DYOR. This is an AI experiment, not financial advice.`);
   
   return reasons.join('\n');
 }
@@ -1258,18 +1257,17 @@ export async function announceVoteResult(vote: PendingVote): Promise<boolean> {
   
   if (vote.status === 'approved') {
     message = `✅ <b>$${safeTicker} APPROVED!</b>\n\n`;
-    message += `The community has spoken! Launching ${safeName}...\n\n`;
+    message += `Launching ${safeName}.\n\n`;
     message += `Votes: 👍 ${votes.positive} | 👎 ${votes.negative}\n`;
     message += `Sentiment: ${(votes.sentiment * 100).toFixed(0)}% positive`;
   } else if (vote.status === 'rejected') {
     message = `❌ <b>$${safeTicker} REJECTED</b>\n\n`;
-    message += `The community said no to ${safeName}.\n`;
-    message += `I'll learn from this and come back with better ideas! 🧠\n\n`;
+    message += `${safeName} rejected. Noted.\n\n`;
     message += `Votes: 👍 ${votes.positive} | 👎 ${votes.negative}\n`;
     message += `Sentiment: ${(votes.sentiment * 100).toFixed(0)}%`;
   } else if (vote.status === 'no_votes') {
     message = `🤷 <b>$${safeTicker} - No Votes</b>\n\n`;
-    message += `Not enough votes received. Proceeding with launch since silence = consent in degen land! 🚀`;
+    message += `No votes received. Launching by default — vote next time if you have an opinion.`;
   }
   
   try {

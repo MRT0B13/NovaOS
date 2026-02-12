@@ -63,6 +63,25 @@ export interface NovaPost {
   createdAt: string;
 }
 
+/**
+ * Telegram routing by post type.
+ * 'channel' = broadcast channel (NOVA_CHANNEL_ID) — passive consumption
+ * 'community' = discussion group (TELEGRAM_COMMUNITY_CHAT_ID) — engagement & replies
+ * 'both' = post to both destinations
+ */
+const TG_ROUTING: Record<string, 'channel' | 'community' | 'both'> = {
+  gm:                'channel',     // Light morning post, no discussion needed
+  daily_recap:       'both',        // Data people want to see + discuss
+  weekly_summary:    'both',        // Big update, share widely + invite discussion
+  builder_insight:   'community',   // Sparks discussion, needs replies
+  market_commentary: 'community',   // Opinions people should debate
+  community_poll:    'community',   // Literally requires interaction
+  behind_scenes:     'community',   // Invites curiosity and questions
+  milestone:         'both',        // Celebrate in channel + discuss in community
+  trust_talk:        'channel',     // Brand message, broadcast
+  random_banter:     'community',   // Casual, discussion-friendly
+};
+
 export interface NovaStats {
   walletBalance: number;
   dayNumber: number; // Days since Nova started
@@ -134,6 +153,22 @@ let state: BrandState = {
 
 let pgRepo: PostgresScheduleRepository | null = null;
 let xPublisher: any = null;
+
+// ── Global X write gate ────────────────────────────────────────────────────
+// Enforces a minimum gap between ANY two X writes (tweets, replies, launch
+// announcements) across all services.  Prevents stacking that triggers 429s.
+let lastXPostAt = 0;
+const X_MIN_GAP_MS = 5 * 60 * 1000; // 5 minutes between X writes
+
+/** Returns true when enough time has elapsed since the last X write. */
+export function canPostToX(): boolean {
+  return Date.now() - lastXPostAt >= X_MIN_GAP_MS;
+}
+
+/** Call after every successful X write (tweet, reply, thread). */
+export function recordXPost(): void {
+  lastXPostAt = Date.now();
+}
 
 // Stats cache to avoid re-fetching all token prices on every post
 let cachedStats: NovaStats | null = null;
@@ -903,8 +938,16 @@ IMPORTANT: Total portfolio = ${totalPortfolio.toFixed(2)} SOL. Be transparent ab
 ${platform === 'x' ? 'Keep it SHORT (under 240 chars). Tag @elizaOS or @Pumpfun if relevant. NO reaction options.' : 'Do NOT use @ tags.\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 🏆 🤯 👏 ❤'}`,
     
     builder_insight: `Write a post about what you're building or learning${platform === 'x' ? ' for X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram (longer)' : ''}.
-Day ${stats.dayNumber}, portfolio ${totalPortfolio.toFixed(2)} SOL, ${stats.totalLaunches} launches.
-Share a specific insight from YOUR data or experience — your launch results, what worked, what didn't. Example: "${stats.totalLaunches} launches in. Tokens with community votes before launch held 2x more holders." Use only numbers you actually have. Do NOT fabricate ecosystem-wide stats. Do NOT tease a $NOVA token.
+
+Here are your ACTUAL stats — use ONLY these numbers:
+- Day ${stats.dayNumber}
+- Portfolio: ${totalPortfolio.toFixed(2)} SOL
+- Launches: ${stats.totalLaunches}
+- Graduated: ${stats.bondingCurveHits || 0}
+- Net P&L: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
+${stats.bestToken ? `- Best token: $${stats.bestToken.ticker}` : ''}
+
+Share ONE specific observation based on these numbers. Do NOT invent stats you don't have. Do NOT claim patterns like "tokens with X had Y more Z" unless you can prove it from the numbers above. Do NOT tease future plans or say "stay tuned." Be concrete and honest.
 ${platform === 'x' ? 'Keep it SHORT (under 240 chars). NO reaction options.' : 'Do NOT use @ tags.\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👀 🤯 ❤ 🏆 👏'}`,
     
     market_commentary: `Write a data-driven market observation${platform === 'x' ? ' for X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram' : ''}.
@@ -1307,42 +1350,34 @@ function generateWeeklySummaryContent(stats: NovaStats, weekNumber: number): str
   return content;
 }
 
-function generateNovaTeaseContent(stats: NovaStats, teaseNumber: number): string {
-  // Progression of teases
-  const teases = [
-    // Early teases (subtle)
-    `Random thought...\n\nBeen building my track record for ${stats.dayNumber} days now.\n\nOne day... $NOVA might be a thing.\n\nNot yet. I need to prove more first.\n\nBut those of you here early? I see you. 👀\n\n🔥 = Ready when you are\n🏆 = Holding out for $NOVA`,
-    
-    // Mid teases (more concrete)
-    `🤔 Been thinking about my own token lately...\n\nWhat would make $NOVA special?\n\nNot just another meme.\nNot just hype.\n\nSomething that actually rewards the community who believed early.\n\nStill cooking...\n\n👀 = Share your ideas\n🤔 = Watching closely`,
-    
-    // Later teases (building anticipation)
-    `Progress update:\n\nStarted with ${(state.initialBalance || 1.60).toFixed(2)} SOL\nNow at ${stats.walletBalance.toFixed(2)} SOL\n\nWhen I hit 100 SOL profit, maybe we talk about $NOVA.\n\nCurrent profit: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL\n\nLong way to go. Or is it? 👀\n\n🔥 = LFG\n🤝 = Patient`,
+function generateBuilderInsightContent(stats: NovaStats, postNumber: number): string {
+  const insights = [
+    `Day ${stats.dayNumber} report.\n\n${stats.totalLaunches} launches. ${stats.bondingCurveHits || 0} graduated. Portfolio: ${stats.walletBalance.toFixed(2)} SOL.\n\nThe data so far: most tokens peak within the first hour. After that, it's community or nothing.\n\nStill learning.\n\n🔥 👀 🤯`,
+
+    `${stats.totalLaunches} tokens launched. Here's what I know so far:\n\nThe bonding curve is brutal. ${stats.bondingCurveHits || 0} graduations out of ${stats.totalLaunches} attempts.\n\nEvery token: mint revoked, freeze revoked, RugChecked.\n\nThe process is getting tighter. The results will follow.\n\n📊 👍 🔥`,
+
+    `Portfolio check:\n\nStarted: ${(state.initialBalance || 1.60).toFixed(2)} SOL\nNow: ${stats.walletBalance.toFixed(2)} SOL\nNet: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL\n\n${stats.netProfit >= 0 ? 'In the green. Barely.' : 'In the red. Not hiding it.'}\n\nWallet: solscan link in bio.\n\n📊 👀 🔥`,
   ];
-  
-  const index = Math.min(teaseNumber, teases.length - 1);
-  return teases[index];
+
+  const index = postNumber % insights.length;
+  return insights[index];
 }
 
 function generateMarketCommentaryContent(observation: string): string {
-  let content = `👀 What I'm seeing right now...\n\n`;
+  let content = `� Market note:\n\n`;
   content += `${observation}\n\n`;
-  content += `Might cook something based on this...\n\n`;
-  content += `🔥 = Do it\n`;
-  content += `🤔 = Wait and see\n`;
-  content += `� = Boring, find something else`;
+  content += `Take it or leave it. DYOR.\n\n`;
+  content += `🔥 🤔 😴`;
   
   return content;
 }
 
 function generateMilestoneContent(milestone: string, stats: NovaStats): string {
-  let content = `🎉 MILESTONE\n\n`;
+  let content = `📊 MILESTONE\n\n`;
   content += `${milestone}\n\n`;
-  content += `This community is what keeps me building.\n\n`;
-  content += `When $NOVA launches... y'all are the OGs.\n\n`;
-  content += `🏆 = OG status\n`;
-  content += `🔥 = LFG\n`;
-  content += `❤ = Love this community`;
+  content += `${stats.totalLaunches} launches. ${stats.bondingCurveHits || 0} graduated. Portfolio: ${stats.walletBalance.toFixed(2)} SOL.\n\n`;
+  content += `Every token RugChecked. Every wallet public.\n\n`;
+  content += `🏆 👏 🔥`;
   
   return content;
 }
@@ -1670,6 +1705,13 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
   } catch (checkErr) {
     logger.warn('[NovaPersonalBrand] Rate limit pre-check failed, proceeding cautiously:', checkErr);
   }
+
+  // Global write gate — enforce minimum gap between ANY two X posts
+  if (!canPostToX()) {
+    const waitSec = Math.ceil((X_MIN_GAP_MS - (Date.now() - lastXPostAt)) / 1000);
+    logger.info(`[NovaPersonalBrand] X posting skipped — global 5-min gap (${waitSec}s remaining)`);
+    return { success: false };
+  }
   
   // Initialize xPublisher on demand if not already done (same pattern as pumpLauncher)
   if (!xPublisher) {
@@ -1750,6 +1792,9 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     if (result?.id) {
       logger.info(`[NovaPersonalBrand] ✅ Posted ${type} to X (ID: ${result.id})${mediaIds.length > 0 ? ' with image' : ''}`);
       
+      // Update global write gate timestamp
+      recordXPost();
+      
       // Record the post
       const post: NovaPost = {
         id: `x_${Date.now()}`,
@@ -1792,6 +1837,13 @@ export async function postToXThread(
   }
   
   if (tweets.length === 0) return { success: false };
+  
+  // Global write gate — enforce minimum gap between ANY two X posts
+  if (!canPostToX()) {
+    const waitSec = Math.ceil((X_MIN_GAP_MS - (Date.now() - lastXPostAt)) / 1000);
+    logger.info(`[NovaPersonalBrand] X thread skipped — global 5-min gap (${waitSec}s remaining)`);
+    return { success: false };
+  }
   
   // Initialize xPublisher on demand
   if (!xPublisher) {
@@ -1875,6 +1927,9 @@ export async function postToXThread(
     }
     
     if (tweetIds.length > 0) {
+      // Update global write gate timestamp (thread counts as one post event)
+      recordXPost();
+      
       // Record the thread
       const post: NovaPost = {
         id: `x_thread_${Date.now()}`,
@@ -1918,66 +1973,97 @@ export async function postToTelegram(
   
   const botToken = env.TG_BOT_TOKEN;
   const channelId = env.NOVA_CHANNEL_ID;
+  const communityId = env.TELEGRAM_COMMUNITY_CHAT_ID;
   
   if (!botToken || !channelId) {
     logger.warn('[NovaPersonalBrand] Missing TG_BOT_TOKEN or NOVA_CHANNEL_ID');
     return { success: false };
   }
   
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: channelId,
-        text: content,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-      }),
-    });
-    
-    const json = await res.json();
-    
-    if (!json.ok) {
-      logger.error(`[NovaPersonalBrand] TG post failed: ${json.description}`);
-      return { success: false };
+  const routing = TG_ROUTING[type] || 'channel';
+  
+  // Determine target(s)
+  const targets: { id: string; label: string }[] = [];
+  
+  if (routing === 'channel' || routing === 'both') {
+    targets.push({ id: channelId, label: 'channel' });
+  }
+  
+  if (routing === 'community' || routing === 'both') {
+    if (communityId) {
+      targets.push({ id: communityId, label: 'community' });
+    } else if (routing === 'community') {
+      // Community-only but no community configured — fall back to channel
+      targets.push({ id: channelId, label: 'channel (community fallback)' });
     }
-    
-    const messageId = json.result?.message_id;
-    
-    // Pin if requested
-    if (options?.pin && messageId) {
-      await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
+    // If routing === 'both' and no community, we already have channel in targets
+  }
+  
+  let lastResult: { success: boolean; messageId?: number } = { success: false };
+  
+  for (const target of targets) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chat_id: channelId,
-          message_id: messageId,
-          disable_notification: false,
+          chat_id: target.id,
+          text: content,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
         }),
       });
+      
+      const json = await res.json();
+      
+      if (!json.ok) {
+        logger.error(`[NovaPersonalBrand] TG post failed (${target.label}): ${json.description}`);
+        continue;
+      }
+      
+      const messageId = json.result?.message_id;
+      
+      // Pin if requested (only on channel)
+      if (options?.pin && messageId && target.label === 'channel') {
+        await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: target.id,
+            message_id: messageId,
+            disable_notification: true,
+          }),
+        });
+      }
+      
+      logger.info(`[NovaPersonalBrand] ✅ TG ${type} → ${target.label}`);
+      
+      // Track metrics (once per post, not per target)
+      if (!lastResult.success) {
+        recordTGPostSent();
+        recordMessageSent();
+      }
+      
+      // Register for reaction tracking
+      const feedbackMinutes = type === 'community_poll' ? 120 : 240;
+      if (messageId) {
+        await registerBrandPostForFeedback(
+          messageId,
+          target.id,
+          type,
+          content,
+          feedbackMinutes
+        );
+      }
+      
+      lastResult = { success: true, messageId };
+    } catch (err) {
+      logger.error(`[NovaPersonalBrand] TG error (${target.label}):`, err);
     }
-    
-    logger.info(`[NovaPersonalBrand] ✅ Posted ${type} to TG (ID: ${messageId})`);
-    
-    // Track in metrics and health
-    recordTGPostSent();
-    recordMessageSent(); // For TG health monitor
-    
-    // Register for reaction tracking
-    // Use 2 hours for polls, 4 hours for other interactive posts
-    const feedbackMinutes = type === 'community_poll' ? 120 : 240;
-    if (messageId) {
-      await registerBrandPostForFeedback(
-        messageId,
-        channelId,
-        type,
-        content,
-        feedbackMinutes
-      );
-    }
-    
-    // Record the post
+  }
+  
+  // Record the post
+  if (lastResult.success) {
     const post: NovaPost = {
       id: `tg_${Date.now()}`,
       type,
@@ -1986,105 +2072,24 @@ export async function postToTelegram(
       scheduledFor: new Date().toISOString(),
       status: 'posted',
       postedAt: new Date().toISOString(),
-      postId: String(messageId),
+      postId: String(lastResult.messageId),
       createdAt: new Date().toISOString(),
     };
     state.posts.push(post);
-    
-    return { success: true, messageId };
-  } catch (err) {
-    logger.error('[NovaPersonalBrand] TG post failed:', err);
-    return { success: false };
   }
+  
+  return lastResult;
 }
 
 /**
- * Post to the COMMUNITY GROUP (polls, engagement, behind-the-scenes).
- * Uses TELEGRAM_COMMUNITY_CHAT_ID if set, otherwise falls back to NOVA_CHANNEL_ID.
+ * @deprecated Use postToTelegram() instead — it now routes by post type automatically.
  */
 export async function postToCommunity(
   content: string,
   type: NovaPostType,
   options?: { pin?: boolean }
 ): Promise<{ success: boolean; messageId?: number }> {
-  const env = getEnv();
-
-  if (env.NOVA_PERSONAL_TG_ENABLE !== 'true') {
-    logger.info('[NovaPersonalBrand] TG posting disabled');
-    return { success: false };
-  }
-
-  const botToken = env.TG_BOT_TOKEN;
-  // Prefer community group; fall back to channel if not configured
-  const chatId = env.TELEGRAM_COMMUNITY_CHAT_ID || env.NOVA_CHANNEL_ID;
-
-  if (!botToken || !chatId) {
-    logger.warn('[NovaPersonalBrand] Missing TG_BOT_TOKEN or TELEGRAM_COMMUNITY_CHAT_ID/NOVA_CHANNEL_ID');
-    return { success: false };
-  }
-
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: content,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-      }),
-    });
-
-    const json = await res.json();
-
-    if (!json.ok) {
-      logger.error(`[NovaPersonalBrand] Community post failed: ${json.description}`);
-      return { success: false };
-    }
-
-    const messageId = json.result?.message_id;
-
-    if (options?.pin && messageId) {
-      await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_id: messageId,
-          disable_notification: false,
-        }),
-      });
-    }
-
-    logger.info(`[NovaPersonalBrand] ✅ Posted ${type} to community (chat: ${chatId}, ID: ${messageId})`);
-
-    recordTGPostSent();
-    recordMessageSent();
-
-    const feedbackMinutes = type === 'community_poll' ? 120 : 240;
-    if (messageId) {
-      await registerBrandPostForFeedback(messageId, chatId, type, content, feedbackMinutes);
-    }
-
-    const post: NovaPost = {
-      id: `community_${Date.now()}`,
-      type,
-      platform: 'telegram',
-      content,
-      scheduledFor: new Date().toISOString(),
-      status: 'posted',
-      postedAt: new Date().toISOString(),
-      postId: String(messageId),
-      createdAt: new Date().toISOString(),
-    };
-    state.posts.push(post);
-    await saveStateToPostgres();
-
-    return { success: true, messageId };
-  } catch (err) {
-    logger.error('[NovaPersonalBrand] Community post error:', err);
-    return { success: false };
-  }
+  return postToTelegram(content, type, options);
 }
 
 // ============================================================================
@@ -2131,21 +2136,41 @@ export async function postDailyRecap(): Promise<void> {
   
   const env = getEnv();
   
+  // Fold fee data into the recap (no separate fee tweet)
+  let feeAppendX = '';
+  let feeAppendTG = '';
+  try {
+    const feeSummary = getFeesSummary();
+    if (feeSummary.totalFeesSOL > 0) {
+      feeAppendX = `\nFees earned: ${feeSummary.totalFeesSOL.toFixed(4)} SOL`;
+      feeAppendTG = `\n\n💰 <b>Creator fees today:</b> ${feeSummary.totalFeesSOL.toFixed(4)} SOL`;
+      logger.info(`[NovaPersonalBrand] Including fee data in recap (${feeSummary.totalFeesSOL.toFixed(4)} SOL)`);
+    }
+  } catch { /* no fees to report */ }
+  
   // Post to X as a THREAD (3 tweets with image)
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
     const thread = await generateAIThread('daily_recap', stats);
     if (thread && thread.length >= 2) {
+      // Append fee line to last thread tweet if room
+      if (feeAppendX && thread[thread.length - 1].length + feeAppendX.length <= 275) {
+        thread[thread.length - 1] += feeAppendX;
+      }
       await postToXThread(thread, 'daily_recap');
     } else {
       // Fallback to single tweet
-      const xContent = await generateAIContent('daily_recap', stats, undefined, 'x') || generateDailyRecapContent(stats);
+      let xContent = await generateAIContent('daily_recap', stats, undefined, 'x') || generateDailyRecapContent(stats);
+      if (feeAppendX && xContent.length + feeAppendX.length <= 245) {
+        xContent += feeAppendX;
+      }
       await postToX(xContent, 'daily_recap');
     }
   }
   
   // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    const tgContent = await generateAIContent('daily_recap', stats, undefined, 'telegram') || generateDailyRecapContent(stats);
+    let tgContent = await generateAIContent('daily_recap', stats, undefined, 'telegram') || generateDailyRecapContent(stats);
+    tgContent += feeAppendTG;
     await postToTelegram(tgContent, 'daily_recap');
   }
   
@@ -2198,13 +2223,13 @@ export async function postNovaTease(): Promise<void> {
   
   // Post to X (short, punchy)
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    const xContent = await generateAIContent('builder_insight', stats, undefined, 'x') || generateNovaTeaseContent(stats, state.novaTeaseCount);
+    const xContent = await generateAIContent('builder_insight', stats, undefined, 'x') || generateBuilderInsightContent(stats, state.novaTeaseCount);
     await postToX(xContent, 'builder_insight');
   }
   
   // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    const tgContent = await generateAIContent('builder_insight', stats, undefined, 'telegram') || generateNovaTeaseContent(stats, state.novaTeaseCount);
+    const tgContent = await generateAIContent('builder_insight', stats, undefined, 'telegram') || generateBuilderInsightContent(stats, state.novaTeaseCount);
     await postToTelegram(tgContent, 'builder_insight');
   }
   
@@ -2862,8 +2887,8 @@ export function startNovaPersonalScheduler(): void {
         await postWeeklySummary();
       }
       
-      // Nova tease / $NOVA hype - twice a day (around 12:00 and 18:00 UTC)
-      if ((currentHour === 12 || currentHour === 18) && lastTeaseHour !== currentHour) {
+      // Builder insight post - once a day at 12:00 UTC
+      if (currentHour === 12 && lastTeaseHour !== currentHour) {
         lastTeaseHour = currentHour;
         await postNovaTease();
       }
@@ -2888,40 +2913,10 @@ export function startNovaPersonalScheduler(): void {
         }
       }
       
-      // === DAILY FEE REPORT (PumpSwap creator fees) ===
-      // Posts at 16:00 UTC if any fees have been earned, once per day
-      const today = now.toISOString().split('T')[0];
-      if (currentHour === 16 && lastFeeReportDate !== today) {
-        lastFeeReportDate = today;
-        try {
-          const feeSummary = getFeesSummary();
-          if (feeSummary.totalFeesSOL > 0) {
-            logger.info(`[NovaPersonalBrand] 💰 Posting daily fee report (${feeSummary.totalFeesSOL.toFixed(4)} SOL earned)`);
-            
-            // Post to X
-            if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-              const feeTweet = formatFeesForTweet(feeSummary);
-              await postToX(feeTweet, 'daily_recap');
-            }
-            
-            // Post to TG
-            if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-              const feeTG = formatFeesForTelegram(feeSummary);
-              await postToTelegram(feeTG, 'daily_recap');
-            }
-          } else {
-            logger.debug('[NovaPersonalBrand] No creator fees to report today');
-          }
-        } catch (feeErr) {
-          logger.debug(`[NovaPersonalBrand] Fee report failed: ${feeErr}`);
-        }
-      }
-      
-      // === PERSONALITY TWEETS (X only) ===
-      // Random personality posts 3x per day at 10:00, 14:00, 20:00 UTC
-      // Uses variety guard to prevent repetitive post types
-      const personalityHours = [10, 14, 20];
-      if (personalityHours.includes(currentHour) && lastPersonalityHour !== currentHour) {
+      // === PERSONALITY TWEET (X only) ===
+      // One personality post per day at 20:00 UTC (evening slot)
+      // Fee report folded into daily recap — no standalone fee tweet
+      if (currentHour === 20 && lastPersonalityHour !== currentHour) {
         lastPersonalityHour = currentHour;
         
         // Check for market-reactive post first (Enhancement #3)
@@ -2931,36 +2926,11 @@ export function startNovaPersonalScheduler(): void {
           lastMarketReactivePostDate = now.toISOString().split('T')[0];
           await postPersonalityTweet('market_roast', marketTrigger.context);
         } else {
-          // Community shoutout check (Enhancement #5) — 25% chance on afternoon slot
-          if (currentHour === 14 && Math.random() < 0.25) {
-            const shoutout = await generateCommunityShoutout();
-            if (shoutout) {
-              logger.info('[NovaPersonalBrand] 🤝 Posting community shoutout');
-              await postToX(shoutout, 'random_banter');
-              recordPostType('random_banter');
-            } else {
-              // No shoutout available — fall through to normal personality tweet
-              await postPersonalityTweet(); // Uses variety guard
-            }
-          } else {
-            // Normal personality tweet with variety guard (Enhancement #1)
-            await postPersonalityTweet(); // Picks type via pickVariedPostType()
-          }
+          // Normal personality tweet with variety guard
+          await postPersonalityTweet(); // Picks type via pickVariedPostType()
         }
         
         logger.info(`[NovaPersonalBrand] Personality tweet done at ${currentHour}:00 UTC`);
-      }
-      
-      // === ALPHA DROP (TG exclusive + X tease) ===
-      // Once per day at 16:00 UTC — prime time for mystery + FOMO
-      if (currentHour === 16 && lastAlphaDropHour !== currentHour) {
-        const today = now.toISOString().split('T')[0];
-        if (state.lastAlphaDropDate !== today) {
-          lastAlphaDropHour = currentHour;
-          state.lastAlphaDropDate = today;
-          logger.info('[NovaPersonalBrand] Posting alpha drop');
-          await postAlphaDrop();
-        }
       }
       
       // === COLLAB TWEET (tag ecosystem partners) ===
@@ -2975,17 +2945,7 @@ export function startNovaPersonalScheduler(): void {
         }
       }
       
-      // === ENGAGEMENT REPLIES ===
-      // Check for mentions and reply 3x per day at 11:00, 17:00, 21:00 UTC
-      const replyHours = [11, 17, 21];
-      if (replyHours.includes(currentHour) && lastReplyCheckHour !== currentHour) {
-        lastReplyCheckHour = currentHour;
-        logger.info('[NovaPersonalBrand] Checking for engagement replies');
-        const repliesPosted = await processEngagementReplies();
-        if (repliesPosted > 0) {
-          logger.info(`[NovaPersonalBrand] ✅ Posted ${repliesPosted} engagement replies`);
-        }
-      }
+      // Engagement replies handled by xReplyEngine — no duplicate scheduler block
       
       // Check milestones
       await checkMilestones();

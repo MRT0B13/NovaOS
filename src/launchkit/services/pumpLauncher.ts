@@ -11,6 +11,7 @@ import { redactSensitive } from './redact.ts';
 import { getPumpWalletBalance, getFundingWalletBalance, depositToPumpWallet } from './fundingWallet.ts';
 import { schedulePostLaunchMarketing, createMarketingSchedule, getDueTweets, processScheduledTweets } from './xScheduler.ts';
 import { announceLaunch } from './novaChannel.ts';
+import { canPostToX, recordXPost } from './novaPersonalBrand.ts';
 import { recordBuy } from './pnlTracker.ts';
 
 /**
@@ -1056,6 +1057,7 @@ export class PumpLauncherService {
             
             const result = await xPublisher.tweet(tweetText);
             if (result?.id) {
+              recordXPost(); // Update global write gate
               logger.info(`[Launch] 🐦 ✅ Posted autonomous launch announcement to X! Tweet ID: ${result.id}`);
               
               // RugCheck scan + reply (12s delay to let token index)
@@ -1116,7 +1118,12 @@ export class PumpLauncherService {
                 
                 const results = await processScheduledTweets(async (text: string) => {
                   try {
+                    if (!canPostToX()) {
+                      logger.info('[Launch] Skipping immediate tweet — global X write gate');
+                      return null;
+                    }
                     const result = await xPublisher.tweet(text);
+                    if (result?.id) recordXPost();
                     return result.id;
                   } catch (err: any) {
                     logger.error(`[Launch] Tweet failed: ${err.message}`);
