@@ -247,15 +247,16 @@ async function runReplyRound(): Promise<void> {
 /**
  * Find reply candidates.
  * Always alternates between mentions and search (1 read per round).
- * Twitter free tier only allows 1 search per 15-minute window — doing
- * both in one round guarantees a 429 on the second call.
+ * Even on paid tiers, alternating avoids burning through rate limits
+ * and keeps the engine sustainable long-term.
+ * 
+ * If a 429 hits, reportReadRateLimit() pauses all reads for 15 min.
  */
 async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Promise<ReplyCandidate[]> {
   const env = getEnv();
   const candidates: ReplyCandidate[] = [];
   
   // Always alternate: even rounds → mentions, odd rounds → search.
-  // This keeps us to 1 read per round regardless of budget mode.
   const doMentions = state.roundCount % 2 === 0;
   const doSearch   = state.roundCount % 2 !== 0;
   
