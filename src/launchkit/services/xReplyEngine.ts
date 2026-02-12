@@ -246,19 +246,18 @@ async function runReplyRound(): Promise<void> {
 
 /**
  * Find reply candidates.
- * - Pay-per-use mode: uses 2 reads/round (mentions + search) for better coverage.
- * - Hard-cap mode: uses 1 read/round, alternating mentions ↔ search.
+ * Always alternates between mentions and search (1 read per round).
+ * Twitter free tier only allows 1 search per 15-minute window — doing
+ * both in one round guarantees a 429 on the second call.
  */
 async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Promise<ReplyCandidate[]> {
   const env = getEnv();
   const candidates: ReplyCandidate[] = [];
   
-  const payPerUse = isPayPerUseReads();
-  
-  // In pay-per-use mode, do both mentions AND search each round for better coverage.
-  // In hard-cap mode, alternate: even rounds → mentions, odd rounds → search.
-  const doMentions = payPerUse || state.roundCount % 2 === 0;
-  const doSearch   = payPerUse || state.roundCount % 2 !== 0;
+  // Always alternate: even rounds → mentions, odd rounds → search.
+  // This keeps us to 1 read per round regardless of budget mode.
+  const doMentions = state.roundCount % 2 === 0;
+  const doSearch   = state.roundCount % 2 !== 0;
   
   // Mentions
   if (doMentions && canRead()) {
