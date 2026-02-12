@@ -323,7 +323,7 @@ describe('postToXThread', () => {
     // We can't easily drain quota in tests, but we can verify the function
     // handles the case by checking the quota check exists in the code path
     // For now, verify a single tweet thread works
-    const result = await mod.postToXThread(['solo tweet'], 'nova_tease', { imageOnFirst: false });
+    const result = await mod.postToXThread(['solo tweet'], 'builder_insight', { imageOnFirst: false });
     
     if (result.success) {
       expect(result.tweetIds).toBeDefined();

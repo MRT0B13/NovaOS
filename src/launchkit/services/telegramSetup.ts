@@ -369,6 +369,16 @@ export class TelegramSetupService {
     if (!this.botToken) {
       return [];
     }
+
+    // SAFETY: getUpdates silently disables any active webhook.
+    // If TG_WEBHOOK_URL is configured, never call getUpdates.
+    try {
+      const env = getEnv();
+      if (env.TG_WEBHOOK_URL) {
+        logger.debug('[TelegramSetup] Skipping getUpdates — webhook mode active');
+        return [];
+      }
+    } catch { /* env not available, proceed cautiously */ }
     
     try {
       // Get recent updates (messages, group joins, etc.)

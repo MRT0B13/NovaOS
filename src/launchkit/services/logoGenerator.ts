@@ -264,11 +264,11 @@ function buildLogoPrompt(
   style: string = 'meme'
 ): string {
   const styleGuides: Record<string, string> = {
-    meme: 'viral meme style, bold colors, funny and eye-catching, internet culture aesthetic, perfect for a crypto token',
-    cartoon: 'cartoon character style, vibrant colors, friendly and appealing, mascot-like design',
-    pixel: '8-bit pixel art style, retro gaming aesthetic, bright colors, nostalgic feel',
-    '3d': '3D rendered character, glossy and polished, modern CGI style, professional quality',
-    flat: 'flat design illustration, minimal and clean, modern vector art style, bold shapes',
+    meme: 'bold meme-native style, high contrast, single neon accent color on dark background, internet culture aesthetic, iconic and shareable',
+    cartoon: 'clean cartoon character, bold outlines, vibrant single accent color, dark or minimal background, mascot-like and memorable',
+    pixel: '8-bit pixel art, dark background with bright pixel accents, retro gaming aesthetic, crisp and iconic',
+    '3d': '3D rendered character, dark dramatic lighting, single bold accent color, modern and polished, cinematic feel',
+    flat: 'flat vector design, minimal composition, bold geometric shapes, dark background with single accent color, modern and clean',
   };
   
   const styleGuide = styleGuides[style] || styleGuides.meme;
@@ -288,13 +288,13 @@ function buildLogoPrompt(
     else if (themes.includes('ape') || themes.includes('monkey')) context = 'featuring an ape character, ';
   }
   
-  return `Create a logo for a cryptocurrency meme token called "${tokenName}" ($${ticker}). ` +
+  return `Create a token logo for "${tokenName}" ($${ticker}). ` +
     `${context}` +
     `Style: ${styleGuide}. ` +
-    `The logo should be a single iconic image suitable for a token profile picture. ` +
-    `No text or letters in the image. ` +
-    `Centered composition, simple background, highly memorable and shareable. ` +
-    `Think viral meme coin aesthetic like Dogecoin, Pepe, or Shiba Inu.`;
+    `Single iconic image, suitable as a profile picture at small sizes. ` +
+    `NO text, NO letters, NO numbers in the image. ` +
+    `Centered composition, dark background, high contrast, readable at thumbnail size. ` +
+    `Should feel native to crypto/meme culture — bold, clean, memorable.`;
 }
 
 /**

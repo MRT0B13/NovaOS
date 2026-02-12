@@ -80,8 +80,13 @@ export function recordMessageSent(): void {
 }
 
 /**
- * Attempt to restart the Telegram polling connection
- * Disabled when TG_DISABLE_AUTO_RESTART=true (for webhook mode)
+ * Attempt to restart the Telegram polling connection.
+ * 
+ * - If TG_DISABLE_AUTO_RESTART=true → skip entirely.  
+ * - If TG_WEBHOOK_URL is set (webhook mode) → re-register the webhook via
+ *   the Telegram API instead of calling bot.launch() (which would delete the
+ *   webhook and start polling, causing a 409 conflict).
+ * - Otherwise (polling mode) → stop + bot.launch() as before.
  */
 async function attemptRestart(): Promise<boolean> {
   // Check if auto-restart is disabled (e.g., when using webhooks)
@@ -114,7 +119,56 @@ async function attemptRestart(): Promise<boolean> {
   state.restartAttempts++;
   
   logger.warn(`[TelegramHealth] 🔄 Attempting Telegram restart (attempt ${state.restartAttempts}/${MAX_RESTART_ATTEMPTS})`);
-  
+
+  // ── Webhook mode: re-register webhook instead of polling ──────────────
+  const webhookUrl = env.TG_WEBHOOK_URL;
+  if (webhookUrl && env.TG_BOT_TOKEN) {
+    try {
+      const fullUrl = webhookUrl.endsWith('/telegram-webhook')
+        ? webhookUrl
+        : `${webhookUrl}/telegram-webhook`;
+
+      const allowedUpdates = [
+        'message', 'edited_message', 'channel_post', 'edited_channel_post',
+        'callback_query', 'my_chat_member', 'chat_member',
+        'message_reaction', 'message_reaction_count',
+      ];
+
+      const response = await fetch(
+        `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/setWebhook`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: fullUrl,
+            secret_token: env.TG_WEBHOOK_SECRET,
+            allowed_updates: allowedUpdates,
+          }),
+        },
+      );
+      const result = (await response.json()) as any;
+
+      if (result.ok) {
+        logger.info(`[TelegramHealth] ✅ Re-registered webhook: ${fullUrl}`);
+      } else {
+        logger.error('[TelegramHealth] ❌ Webhook re-registration failed:', result);
+      }
+
+      await notifyError({
+        source: 'TelegramHealth',
+        error: `Telegram webhook re-registered (attempt ${state.restartAttempts})`,
+        context: 'The bot detected a stale connection and re-registered the webhook.',
+        severity: 'low',
+      });
+
+      return result.ok === true;
+    } catch (err: any) {
+      logger.error(`[TelegramHealth] Webhook re-registration error: ${err.message}`);
+      return false;
+    }
+  }
+
+  // ── Polling mode: stop + bot.launch() ─────────────────────────────────
   try {
     const telegramService = runtimeRef.getService('telegram') as any;
     

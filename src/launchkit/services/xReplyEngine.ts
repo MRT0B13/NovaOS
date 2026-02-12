@@ -49,6 +49,7 @@ const state = {
   running: false,
   intervalHandle: null as ReturnType<typeof setInterval> | null,
   roundCount: 0, // Alternates between mention rounds and search rounds
+  rateLimitBackoffUntil: 0, // Timestamp — skip rounds until this time (set on 429)
 };
 
 // ============================================================================
@@ -142,6 +143,13 @@ async function runReplyRound(): Promise<void> {
     return;
   }
   
+  // Check 429 backoff — if Twitter told us to chill, respect it
+  if (state.rateLimitBackoffUntil > Date.now()) {
+    const remainMin = Math.ceil((state.rateLimitBackoffUntil - Date.now()) / 60000);
+    logger.debug(`[ReplyEngine] Rate-limit backoff active — ${remainMin}m remaining`);
+    return;
+  }
+
   // Check rate limit
   const advice = getPostingAdvice();
   if (!advice.canPost) {
@@ -219,8 +227,18 @@ async function runReplyRound(): Promise<void> {
     state.roundCount++;
     
     logger.info(`[ReplyEngine] Reply #${state.repliesToday} posted (${candidate.source}: ${candidate.tweetId.slice(0, 8)})`);
-  } catch (err) {
-    logger.warn(`[ReplyEngine] Failed to post reply: ${(err as Error).message}`);
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    const code = err?.code || '';
+
+    if (code === 'X_RATE_LIMIT' || msg.includes('429') || msg.includes('rate limit')) {
+      // Back off for 15 minutes on 429
+      const backoffMs = 15 * 60 * 1000;
+      state.rateLimitBackoffUntil = Date.now() + backoffMs;
+      logger.warn(`[ReplyEngine] Twitter 429 rate limit — backing off for 15 minutes`);
+    } else {
+      logger.warn(`[ReplyEngine] Failed to post reply: ${msg}`);
+    }
   }
 }
 

@@ -598,7 +598,7 @@ async function executeAutonomousLaunchWithIdea(idea: TokenIdea, launchType: 'sch
   logger.info('[Autonomous] 🚀 Continuing launch with pre-generated idea...');
   logger.info(`[Autonomous] ✨ Idea: $${idea.ticker} - ${idea.name}`);
   
-  // NOTE: Feedback post (🧠 "yo frens") is already posted by the caller
+  // NOTE: Feedback post is already posted by the caller
   // (executeScheduledLaunch or handleReactiveLaunch). Do NOT post again here.
   
   // DRY RUN: Stop here and just log
@@ -794,7 +794,6 @@ async function schedulerTick(): Promise<void> {
       details: `${idea.description}\n\nMascot: ${idea.mascot}\nConfidence: ${(idea.confidence * 100).toFixed(0)}%\nDry run: ${state.dryRun ? 'Yes' : 'No'}`,
     });
     
-    // Post scheduled idea to channel for community feedback (🧠 "yo frens" post)
     // Post scheduled idea to channel for community feedback
     // Wrapped in its own try/catch so a posting failure doesn't abort the launch
     try {

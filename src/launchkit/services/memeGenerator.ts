@@ -205,24 +205,24 @@ function buildMemePrompt(
   // Remove copyrighted character names and potentially problematic terms
   const sanitizedMascot = sanitizeForDallE(mascot || '');
   const mascotDesc = sanitizedMascot || 'a friendly cartoon animal character';
-  const baseStyle = 'Colorful meme-style cartoon image, funny, positive vibes, no text or words in the image.';
+  const baseStyle = 'Bold, clean meme-native image. High contrast, readable at thumbnail size. Internet culture aesthetic, not corporate. NO text overlay, NO words, NO letters.';
   
   const typePrompts: Record<string, string> = {
-    gm_post: `${mascotDesc} waking up happy, stretching, sunrise in background, morning coffee vibes. ${baseStyle}`,
+    gm_post: `${mascotDesc} in a minimal morning scene, dark background with warm sunrise accent color, calm and focused energy. ${baseStyle}`,
     
-    chart_update: `${mascotDesc} looking at a chart going up, excited expression, green candles, moon in background. ${baseStyle}`,
+    chart_update: `${mascotDesc} analyzing a chart, green candles visible, dark background with neon green accent, data-focused composition. ${baseStyle}`,
     
-    community_hype: `${mascotDesc} celebrating with confetti, party hat, super excited, jumping for joy. ${baseStyle}`,
+    community_hype: `${mascotDesc} standing confidently, bold composition, dark background with bright accent color, strong and assertive pose. ${baseStyle}`,
     
-    meme_drop: `${mascotDesc} doing something silly and funny, absurd humor, meme worthy pose. ${baseStyle}`,
+    meme_drop: `${mascotDesc} in a funny absurd situation, meme-worthy composition, bold colors on dark background, internet humor aesthetic. ${baseStyle}`,
     
-    alpha_tease: `${mascotDesc} with a mysterious expression, wearing sunglasses, looking cool and secretive. ${baseStyle}`,
+    alpha_tease: `${mascotDesc} with a focused analytical expression, dark background with subtle data elements, mysterious and sharp aesthetic. ${baseStyle}`,
     
-    holder_appreciation: `${mascotDesc} hugging diamonds, grateful expression, hearts around, wholesome vibes. ${baseStyle}`,
+    holder_appreciation: `${mascotDesc} in a respectful confident pose, clean composition, dark background with gold accent, understated strength. ${baseStyle}`,
     
-    question: `${mascotDesc} with a thinking pose, question marks around, curious expression. ${baseStyle}`,
+    question: `${mascotDesc} with a thoughtful pose, minimal design, dark background with blue accent, contemplative mood. ${baseStyle}`,
     
-    milestone: `${mascotDesc} on a rocket ship, celebration, fireworks, champagne, epic achievement vibes. ${baseStyle}`,
+    milestone: `${mascotDesc} reaching a summit or peak, dramatic composition, dark background with bright achievement accent, bold and clean. ${baseStyle}`,
   };
   
   // Get specific prompt or use default

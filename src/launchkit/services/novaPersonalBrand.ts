@@ -9,7 +9,7 @@
  * 1. Daily Operations (gm, status, recaps)
  * 2. Educational / Thought Leadership
  * 3. Market Commentary
- * 4. $NOVA Token Teasing
+ * 4. Builder Insights (data & lessons from launches)
  * 5. Community Engagement (reaction-based)
  * 6. Weekly Summaries
  * 7. Trust & Transparency (anti-rug, value prop, pump.fun reputation)
@@ -37,7 +37,7 @@ export type NovaPostType =
   | 'idea_share'            // Sharing a scheduled idea for feedback
   | 'market_commentary'     // React to trends/market
   | 'behind_scenes'         // What Nova is seeing/doing
-  | 'nova_tease'            // $NOVA token hints
+  | 'builder_insight'       // Sharing data/lessons from launches
   | 'milestone'             // Celebrating achievements
   | 'community_poll'        // Asking community for input
   | 'launch_alert'          // New token launched
@@ -893,7 +893,7 @@ ${stats.bestToken ? `Best: $${stats.bestToken.ticker}` : ''}
 IMPORTANT: Total portfolio = ${totalPortfolio.toFixed(2)} SOL. Be transparent about P&L. Share one concrete lesson learned from the data. No generic optimism.
 ${platform === 'x' ? 'Keep it SHORT (under 240 chars). Tag @elizaOS or @Pumpfun if relevant. NO reaction options.' : 'Do NOT use @ tags.\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 🏆 🤯 👏 ❤'}`,
     
-    nova_tease: `Write a post about what you're building or learning${platform === 'x' ? ' for X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram (longer)' : ''}.
+    builder_insight: `Write a post about what you're building or learning${platform === 'x' ? ' for X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram (longer)' : ''}.
 Day ${stats.dayNumber}, portfolio ${totalPortfolio.toFixed(2)} SOL, ${stats.totalLaunches} launches.
 Share a specific insight from YOUR data or experience — your launch results, what worked, what didn't. Example: "${stats.totalLaunches} launches in. Tokens with community votes before launch held 2x more holders." Use only numbers you actually have. Do NOT fabricate ecosystem-wide stats. Do NOT tease a $NOVA token.
 ${platform === 'x' ? 'Keep it SHORT (under 240 chars). NO reaction options.' : 'Do NOT use @ tags.\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👀 🤯 ❤ 🏆 👏'}`,
@@ -1404,7 +1404,7 @@ const IMAGE_STYLE_POOLS: Partial<Record<NovaPostType, string[]>> = {
     'clean daily performance dashboard, dark mode with key metrics highlighted, P&L visualization, professional data aesthetic, green/red accents, NO text overlay',
     'end-of-day data summary visualization, timeline of daily activity, clean infographic style, warm evening color palette on dark background, NO text overlay',
   ],
-  nova_tease: [
+  builder_insight: [
     'blueprint/schematic style visualization of a system being built, technical drawing aesthetic, blue lines on dark background, in-progress feel, NO text overlay',
     'data pattern emerging from noise visualization, abstract and intriguing, single bright element against dark complex background, NO text overlay',
   ],
@@ -1455,7 +1455,7 @@ async function generateImage(type: NovaPostType, tweetContent: string): Promise<
     degen_wisdom: 0.5, // 50% for wisdom
     random_banter: 0.4,// 40% for banter
     daily_recap: 0.3,  // 30% for recaps
-    nova_tease: 0.7,   // 70% for teases
+    builder_insight: 0.7,   // 70% for builder insights
     milestone: 0.9,    // 90% for milestones (celebrate!)
     trust_talk: 0.6,   // 60% for trust posts (builds credibility)
   };
@@ -1538,7 +1538,7 @@ const TYPE_HASHTAG_MAP: Record<string, (keyof typeof HASHTAG_POOLS)[]> = {
   degen_wisdom: ['crypto', 'safety'],
   random_banter: ['crypto', 'ai'],
   daily_recap: ['crypto', 'ai'],
-  nova_tease: ['ai', 'crypto'],
+  builder_insight: ['ai', 'crypto'],
   milestone: ['crypto', 'ai'],
   market_commentary: ['crypto', 'safety'],
   weekly_summary: ['crypto', 'safety'],
@@ -1600,7 +1600,7 @@ const CHANNEL_PROMO_CHANCE: Partial<Record<NovaPostType, number>> = {
   milestone: 0.7,       // 70% - celebrating, invite people to join
   ai_thoughts: 0.2,     // 20% - philosophical, light touch
   market_roast: 0.2,    // 20% - comedy first, light invite
-  nova_tease: 0.5,      // 50% - teasing, build community
+  builder_insight: 0.5,      // 50% - insights, build community
   market_commentary: 0.3, // 30% - analysis, invite for more
   trust_talk: 0.7,       // 70% - trust posts should invite people to verify
 };
@@ -2079,14 +2079,14 @@ export async function postNovaTease(): Promise<void> {
   
   // Post to X (short, punchy)
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    const xContent = await generateAIContent('nova_tease', stats, undefined, 'x') || generateNovaTeaseContent(stats, state.novaTeaseCount);
-    await postToX(xContent, 'nova_tease');
+    const xContent = await generateAIContent('builder_insight', stats, undefined, 'x') || generateNovaTeaseContent(stats, state.novaTeaseCount);
+    await postToX(xContent, 'builder_insight');
   }
   
   // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    const tgContent = await generateAIContent('nova_tease', stats, undefined, 'telegram') || generateNovaTeaseContent(stats, state.novaTeaseCount);
-    await postToTelegram(tgContent, 'nova_tease');
+    const tgContent = await generateAIContent('builder_insight', stats, undefined, 'telegram') || generateNovaTeaseContent(stats, state.novaTeaseCount);
+    await postToTelegram(tgContent, 'builder_insight');
   }
   
   state.novaTeaseCount++;

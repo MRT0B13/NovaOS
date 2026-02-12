@@ -681,7 +681,7 @@ export async function registerBrandPostForFeedback(
   // Map internal post types to friendly display names
   const friendlyNames: Record<string, string> = {
     gm: 'GM',
-    nova_tease: 'Nova',
+    builder_insight: 'Nova',
     daily_recap: 'Recap',
     weekly_summary: 'Weekly',
     idea_share: 'Idea',

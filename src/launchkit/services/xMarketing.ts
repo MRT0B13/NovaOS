@@ -172,28 +172,24 @@ const TWEET_TEMPLATES: Record<TweetType, string[]> = {
   ],
   
   daily_update: [
-    'TICKER update 📊\n\n💰 ${{priceFormatted}} | MC: {{marketCapFormatted}}\n{{priceChange}}\n\nCA: {{mint}}\n📊 {{pumpUrl}}\n💬 {{telegramUrl}}\n🌐 {{websiteUrl}}',
-    'TICKER check ✅\n\nPrice: ${{priceFormatted}}\nMC: {{marketCapFormatted}} {{priceChange}}\n\nCA: {{mint}}\n{{pumpUrl}}\n🌐 {{websiteUrl}}',
-    'gm TICKER fam 🌞\n\n📊 ${{priceFormatted}} | {{marketCapFormatted}} MC\nVol: {{volume24hFormatted}}\n\nCA: {{mint}}\n📊 {{pumpUrl}}\n💬 {{telegramUrl}}',
+    'TICKER update 📊\n\n💰 ${{priceFormatted}} | {{marketCapFormatted}} MC\n{{priceChange}}\n\nCA: {{mint}}\n📊 {{pumpUrl}}\n💬 {{telegramUrl}}\n🌐 {{websiteUrl}}',
+    'TICKER — {{marketCapFormatted}} MC, {{priceChange}}\n\nCA: {{mint}}\n{{pumpUrl}}\n{{telegramUrl}}',
+    'TICKER at ${{priceFormatted}} | Vol: {{volume24hFormatted}}\n\nCA: {{mint}}\n📊 {{pumpUrl}}',
   ],
   
   community_shoutout: [
-    'TICKER community is 🔥\n\nDiamond hands holding strong 💎\n\nCA: {{mint}}\n💬 Join: {{telegramUrl}}\n🌐 {{websiteUrl}}',
-    'Shoutout TICKER fam 🫡\n\n{{holders}} holders and growing\n\nTG: {{telegramUrl}}\n📊 {{pumpUrl}}\n🌐 {{websiteUrl}}',
-    'TICKER holders different 💎\n\nCA: {{mint}}\nJoin us: {{telegramUrl}}',
+    'TICKER — {{holders}} holders\n\nCA: {{mint}}\n💬 {{telegramUrl}}\n📊 {{pumpUrl}}',
+    'TICKER holder count: {{holders}} and growing\n\nCA: {{mint}}\n💬 {{telegramUrl}}',
   ],
   
   chart_callout: [
-    'TICKER chart looking spicy 🌶️\n\nCA: {{mint}}\n📊 {{pumpUrl}}\n💬 {{telegramUrl}}\n🌐 {{websiteUrl}}',
-    'You seeing TICKER rn? 👀\n\nCA: {{mint}}\n{{pumpUrl}}',
-    'TICKER breakout? 📈\n\nCA: {{mint}}\nChart: {{pumpUrl}}\nTG: {{telegramUrl}}\n🌐 {{websiteUrl}}',
+    'TICKER chart worth watching 📊\n\nCA: {{mint}}\n📊 {{pumpUrl}}\n💬 {{telegramUrl}}\n🌐 {{websiteUrl}}',
+    'TICKER making moves\n\nCA: {{mint}}\n{{pumpUrl}}\n{{telegramUrl}}',
   ],
   
   meme: [
-    'me watching TICKER chart all day 👁️👁️\n\nCA: {{mint}}\n{{pumpUrl}}',
-    'TICKER holders: 💎🙌\neveryone else: 🤡\n\nCA: {{mint}}',
     'POV: you bought TICKER early\n\nCA: {{mint}}\n{{pumpUrl}}',
-    'TICKER to the moon 🌙\n\nCA: {{mint}}\nTG: {{telegramUrl}}',
+    'TICKER holders rn 📊\n\nCA: {{mint}}\n{{pumpUrl}}',
   ],
   
   thread_start: [
@@ -203,18 +199,15 @@ const TWEET_TEMPLATES: Record<TweetType, string[]> = {
   ],
   
   engagement_bait: [
-    'RT if you\'re holding TICKER 🔄\n\nCA: {{mint}}\n{{pumpUrl}}',
-    'TICKER holders drop a 🚀\n\nCA: {{mint}}\nTG: {{telegramUrl}}\n🌐 {{websiteUrl}}',
-    'How much TICKER you holding?\n\n🐟 < 100k\n🐬 100k-1M\n🐋 1M+\n\nCA: {{mint}}',
+    'What MC does TICKER deserve? Current: {{marketCapFormatted}}\n\nCA: {{mint}}\n{{pumpUrl}}',
+    'TICKER — early or late? You decide\n\nCA: {{mint}}\n{{pumpUrl}}',
     'TICKER price prediction? 👇\n\nCA: {{mint}}\n{{pumpUrl}}',
   ],
   
   nova_channel_promo: [
-    '📢 Join my official Telegram channel for real-time updates!\n\n🚀 Launch announcements\n📊 Portfolio updates\n💰 Alpha & insights\n\n👉 {{novaChannelUrl}}',
-    'Want to see what I\'m launching next? 👀\n\nJoin my TG channel for:\n• Live launch alerts\n• Community health reports\n• Wallet activity\n\n🔗 {{novaChannelUrl}}',
-    'gm! My Telegram channel is where the alpha drops first 🧠\n\n📣 {{novaChannelUrl}}\n\nReal-time updates, no spam, just vibes 🚀',
-    'All my launches. All my moves. One channel. 📡\n\nJoin the Nova fam:\n{{novaChannelUrl}}',
-    'Following my journey? Get the inside scoop 👇\n\n{{novaChannelUrl}}\n\n• Launch alerts 🚀\n• Health reports 📊\n• Community updates 💬',
+    'All launches, all P&L, one channel 📊\n\n{{novaChannelUrl}}',
+    'Real-time launch alerts + safety reports\n\n{{novaChannelUrl}}',
+    'Every token auto-scanned by RugCheck. Every wallet public.\n\nFollow the data: {{novaChannelUrl}}',
   ],
 };
 
@@ -315,9 +308,9 @@ export async function generateAITweet(
     return generateTweet(context, type);
   }
   
-  const systemPrompt = `You are a crypto marketing expert writing tweets for meme coins on pump.fun. 
-Write authentic, engaging tweets that sound human - not corporate or spammy.
-Use crypto twitter slang naturally: gm, LFG, WAGMI, NFA, DYOR, ser, fren, etc.
+  const systemPrompt = `You are Nova, an autonomous AI agent that launches meme tokens on Solana via pump.fun.
+Write short, data-driven tweets. Lead with the most interesting number (price, MC, volume, holder count).
+Do NOT use: fam, fren, ser, vibes, LFG, WAGMI, "let's gooo", "incredible", or generic hype language.
 
 LENGTH GUIDELINES:
 ${context.websiteUrl ? '- CRITICAL: You have 4 URLs (game, chart, TG, CA) = 92 Twitter chars for URLs alone!' : '- You have 3 URLs = 69 Twitter chars for URLs'}
@@ -325,9 +318,9 @@ ${context.websiteUrl ? '- Keep your message SHORT: 60-80 chars max (1 punchy sen
 - The CA is 44 chars, URLs are shortened to 23 chars each by Twitter
 ${context.websiteUrl ? '- Total target: 220-260 Twitter chars to leave room for everything' : '- Target 250-280 total Twitter characters'}
 
-Include relevant emojis (2-4) to make it pop.
-Never use hashtags (they look spammy on CT).
-Make it sound like a real degen, not a bot.
+Max 1-2 emojis, purposeful only (📊 data, ⚠️ warning, ✅ check, 🚀 launch).
+Only approved hashtags: #pumpfun #Solana #memecoin #PumpSwap #RugCheck
+Write like a builder sharing notes, not a marketer crafting copy.
 
 CRITICAL RULES FOR LINKS:
 - ALWAYS include the FULL pump.fun URL exactly as provided (with https://)
