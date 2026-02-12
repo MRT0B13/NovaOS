@@ -149,10 +149,19 @@ async function loadUsage(): Promise<void> {
       logger.info(`[X-RateLimiter] Loaded ${recentWriteTimestamps.length} daily timestamps from PostgreSQL`);
     } catch (err) {
       logger.warn('[X-RateLimiter] Failed to load daily timestamps from PG, falling back to writeHistory:', err);
-      // Fallback: rebuild from writeHistory
-      for (const entry of usageData.writeHistory || []) {
+    }
+
+    // Fallback: if PG returned 0 timestamps (new column, post-migration, or 429-blocked),
+    // rebuild from writeHistory so we don't burst-post on restart.
+    if (recentWriteTimestamps.length === 0 && usageData.writeHistory?.length) {
+      for (const entry of usageData.writeHistory) {
         const ts = new Date(entry.timestamp).getTime();
         if (ts > cutoff && !isNaN(ts)) recentWriteTimestamps.push(ts);
+      }
+      if (recentWriteTimestamps.length > 0) {
+        logger.info(`[X-RateLimiter] Rebuilt ${recentWriteTimestamps.length} daily timestamps from writeHistory fallback`);
+        // Back-fill the PG column so next restart loads cleanly
+        saveDailyTimestampsToPg().catch(() => {});
       }
     }
   } else {
