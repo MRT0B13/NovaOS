@@ -112,6 +112,10 @@ async function attemptRestart(): Promise<boolean> {
   // Check max attempts
   if (state.restartAttempts >= MAX_RESTART_ATTEMPTS) {
     logger.error(`[TelegramHealth] ❌ Exhausted ${MAX_RESTART_ATTEMPTS} restart attempts - manual intervention required`);
+    import('./adminNotify.ts').then(m => m.notifyAdminWarning('tg_restart_exhausted',
+      `🚨 Telegram bot exhausted all <b>${MAX_RESTART_ATTEMPTS}</b> restart attempts.\n<b>Manual intervention required!</b>`,
+      { force: true }
+    )).catch(() => {});
     return false;
   }
   

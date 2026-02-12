@@ -261,9 +261,15 @@ export async function recordWrite(tweetText?: string): Promise<void> {
   
   if (dailyRemaining <= 3) {
     logger.warn(`[X-RateLimiter] ⚠️ LOW DAILY QUOTA: Only ${dailyRemaining} tweets left in 24h window!`);
+    import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_daily_quota',
+      `Only <b>${dailyRemaining}</b> tweets left in 24h rolling window (limit: ${DAILY_WRITE_LIMIT}).`
+    )).catch(() => {});
   }
   if (monthlyRemaining <= 50) {
     logger.warn(`[X-RateLimiter] ⚠️ LOW MONTHLY QUOTA: Only ${monthlyRemaining} tweets remaining this month!`);
+    import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_monthly_quota',
+      `Only <b>${monthlyRemaining}</b> tweets remaining this month (limit: ${getWriteLimit()}).`
+    )).catch(() => {});
   }
 }
 
@@ -309,6 +315,9 @@ export function reportRateLimit(): void {
   rateLimitedUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
   const resumeAt = new Date(rateLimitedUntil).toISOString();
   logger.warn(`[X-RateLimiter] ⚠️ Twitter 429 — ALL posting paused until ${resumeAt} (15 min backoff)`);
+  import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_429_write',
+    `Twitter <b>429 rate limit</b> hit on writes.\nAll posting paused until <code>${resumeAt}</code> (15 min backoff).`
+  )).catch(() => {});
 }
 
 /**
@@ -325,6 +334,9 @@ export function reportReadRateLimit(): void {
   readRateLimitedUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
   const resumeAt = new Date(readRateLimitedUntil).toISOString();
   logger.warn(`[X-RateLimiter] ⚠️ Read 429 — searches paused until ${resumeAt} (15 min backoff)`);
+  import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_429_read',
+    `Twitter <b>429 rate limit</b> hit on reads (search/mentions).\nReads paused until <code>${resumeAt}</code> (15 min backoff).`
+  )).catch(() => {});
 }
 
 /**
@@ -482,11 +494,17 @@ export async function safeTweet(
   
   if (!advice.canPost) {
     logger.warn(`[X-RateLimiter] Tweet blocked: ${advice.reason}`);
+    import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_tweet_blocked',
+      `Tweet blocked: ${advice.reason}`
+    )).catch(() => {});
     return { success: false, error: advice.reason };
   }
   
   if (advice.urgency === 'high') {
     logger.warn(`[X-RateLimiter] ⚠️ High urgency warning: ${advice.reason}`);
+    import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_high_urgency',
+      `High urgency: ${advice.reason}`
+    )).catch(() => {});
   }
   
   try {

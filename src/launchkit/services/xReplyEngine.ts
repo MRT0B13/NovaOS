@@ -157,6 +157,9 @@ async function runReplyRound(): Promise<void> {
   const quota = getQuota();
   if (!canRead()) {
     logger.warn(`[ReplyEngine] Read budget exhausted (${quota.reads.used} reads used). Pausing until next month.`);
+    import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_budget_exhausted',
+      `X read budget exhausted (${quota.reads.used} reads used).\nReply engine paused until next month.`
+    )).catch(() => {});
     return;
   }
   
@@ -249,6 +252,9 @@ async function runReplyRound(): Promise<void> {
       logger.warn(`[ReplyEngine] Twitter 429 rate limit — all posting paused for 15 minutes`);
     } else {
       logger.warn(`[ReplyEngine] Failed to post reply: ${msg}`);
+      import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_reply_failed',
+        `Reply engine failed to post reply.\nTweet ID: <code>${candidate.tweetId}</code>\nError: ${msg}`
+      )).catch(() => {});
     }
   }
 }

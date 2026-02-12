@@ -488,6 +488,9 @@ export class XPublisherService {
     const advice = getPostingAdvice();
     if (!advice.canPost) {
       logger.warn(`[XPublisher] Rate limit reached: ${advice.reason}`);
+      import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_publish_blocked',
+        `Token publish blocked: ${advice.reason}`
+      )).catch(() => {});
       throw errorWithCode('X_RATE_LIMIT', advice.reason);
     }
 
@@ -501,6 +504,9 @@ export class XPublisherService {
     if (quota.writes.remaining < tweetsToSend) {
       const msg = `Not enough quota for thread. Need ${tweetsToSend} tweets, have ${quota.writes.remaining} remaining.`;
       logger.warn(`[XPublisher] ${msg}`);
+      import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_insufficient_quota',
+        `Insufficient quota for thread publish.\nNeed: ${tweetsToSend} tweets, Have: ${quota.writes.remaining} remaining.`
+      )).catch(() => {});
       throw errorWithCode('X_INSUFFICIENT_QUOTA', msg);
     }
 
@@ -543,6 +549,9 @@ export class XPublisherService {
         // Check quota before each thread reply
         if (!canWrite()) {
           logger.warn('[XPublisher] Rate limit hit mid-thread, stopping');
+          import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_thread_stopped',
+            `Rate limit hit mid-thread — thread publishing stopped.\nPosted ${tweetIds.length} of ${(claim.x?.thread?.length || 0) + 1} tweets.`
+          )).catch(() => {});
           break;
         }
         // Resolve placeholders with actual URLs

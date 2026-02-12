@@ -290,6 +290,37 @@ Nova's admin notification system is working correctly.`;
   }
 }
 
+// ============================================================================
+// Warning Notifications (throttled to avoid spam)
+// ============================================================================
+
+// Throttle: max 1 notification per category per 15 minutes
+const WARNING_THROTTLE_MS = 15 * 60 * 1000;
+const lastWarningByCategory = new Map<string, number>();
+
+/**
+ * Send a warning to admin chat. Throttled per category to avoid spam.
+ * Categories: 'x_429_write', 'x_429_read', 'x_daily_quota', 'x_monthly_quota',
+ *             'x_tweet_blocked', 'x_reply_failed', 'x_budget_exhausted', etc.
+ */
+export async function notifyAdminWarning(
+  category: string,
+  message: string,
+  options?: { force?: boolean; silent?: boolean }
+): Promise<boolean> {
+  if (!options?.force) {
+    const lastSent = lastWarningByCategory.get(category) || 0;
+    if (Date.now() - lastSent < WARNING_THROTTLE_MS) {
+      return false; // Throttled
+    }
+  }
+  
+  lastWarningByCategory.set(category, Date.now());
+  
+  const text = `⚠️ <b>Warning: ${category.replace(/_/g, ' ').toUpperCase()}</b>\n\n${message}`;
+  return sendToAdmin(text, { silent: options?.silent });
+}
+
 export default {
   notifyWithdrawal,
   notifyError,
@@ -298,4 +329,5 @@ export default {
   notifyAdmin,
   notifyAdminForce,
   testAdminNotify,
+  notifyAdminWarning,
 };
