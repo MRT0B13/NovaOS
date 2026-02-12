@@ -428,7 +428,16 @@ async function generateCommunityShoutout(): Promise<string | null> {
   if (state.lastShoutoutDate === today) return null; // Max 1 per day
   
   try {
+    // Check per-endpoint cooldown before calling mentions
+    const { canReadMentions, recordMentionRead, mentionsCooldownRemaining } = await import('./xRateLimiter.ts');
+    if (!canReadMentions()) {
+      const wait = mentionsCooldownRemaining();
+      logger.info(`[NovaPersonalBrand] Mentions on cooldown (${wait}s remaining) — skipping shoutout`);
+      return null;
+    }
+    
     const mentions = await xPublisher.getMentions(20);
+    await recordMentionRead();
     if (!mentions || mentions.length === 0) return null;
     
     // Find unique repliers who've engaged multiple times
@@ -2473,11 +2482,20 @@ export async function processEngagementReplies(): Promise<number> {
       return 0;
     }
     
-    // Try to get mentions (requires Basic tier)
+    // Try to get mentions (requires Basic tier + cooldown check)
     let mentions: Array<{ id: string; text: string; authorId?: string; authorName?: string }> = [];
     
     try {
+      const { canReadMentions, recordMentionRead, canReadSearch, recordSearchRead, mentionsCooldownRemaining, searchCooldownRemaining } = await import('./xRateLimiter.ts');
+      
+      if (!canReadMentions()) {
+        const wait = mentionsCooldownRemaining();
+        logger.info(`[NovaPersonalBrand] Mentions on cooldown (${wait}s) — skipping engagement replies`);
+        return 0;
+      }
+      
       const raw = await xPublisher!.getMentions(10);
+      await recordMentionRead();
       if (raw && Array.isArray(raw)) {
         mentions = raw.map((m: any) => ({
           id: m.id,
@@ -2487,13 +2505,21 @@ export async function processEngagementReplies(): Promise<number> {
         }));
       }
     } catch (mentionErr: any) {
-      // Free tier doesn't support mentions endpoint
-      logger.info('[NovaPersonalBrand] Mentions not available (may need Basic tier):', mentionErr?.message);
+      // Mentions endpoint failed
+      logger.info('[NovaPersonalBrand] Mentions not available:', mentionErr?.message);
       
-      // Fallback: search for our handle (also may need Basic tier)
+      // Fallback: search for our handle (also needs cooldown check)
       try {
+        const { canReadSearch, recordSearchRead, searchCooldownRemaining } = await import('./xRateLimiter.ts');
+        if (!canReadSearch()) {
+          const wait = searchCooldownRemaining();
+          logger.info(`[NovaPersonalBrand] Search on cooldown (${wait}s) — skipping engagement replies`);
+          return 0;
+        }
+        
         const handle = env.NOVA_X_HANDLE || 'NovaAIAgent';
         const searchResults = await xPublisher!.searchTweets(`@${handle}`, 10);
+        await recordSearchRead();
         if (searchResults && Array.isArray(searchResults)) {
           mentions = searchResults.map((s: any) => ({
             id: s.id,
@@ -2503,7 +2529,7 @@ export async function processEngagementReplies(): Promise<number> {
           }));
         }
       } catch {
-        logger.info('[NovaPersonalBrand] Tweet search not available (needs Basic tier)');
+        logger.info('[NovaPersonalBrand] Tweet search not available');
         return 0;
       }
     }

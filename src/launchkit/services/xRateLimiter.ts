@@ -41,6 +41,18 @@ let rateLimitedUntil = 0;
 // Separate read backoff — search/mentions 429 (free tier: 1 search per 15 min)
 let readRateLimitedUntil = 0;
 
+// Per-endpoint read tracking — pay-per-use allows 1 call per 15-min window per endpoint.
+// We use a 16-min cooldown to add safety margin.
+const READ_ENDPOINT_COOLDOWN_MS = 16 * 60 * 1000; // 16 minutes
+let lastMentionReadAt = 0;
+let lastSearchReadAt  = 0;
+
+// Daily write tracking — X pay-per-use enforces 17 tweets per 24h rolling window.
+// We track timestamps of recent writes so we can proactively refuse before hitting 429.
+const DAILY_WRITE_LIMIT = 17; // x-app-limit-24hour-limit from X API headers
+const DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const recentWriteTimestamps: number[] = [];
+
 function getCurrentMonth(): string {
   return new Date().toISOString().slice(0, 7); // YYYY-MM
 }
@@ -163,10 +175,24 @@ export function isPayPerUseReads(): boolean {
 
 /**
  * Check if we can make a write (post/tweet)
+ * Checks both monthly cap and 24h rolling window (17/day on pay-per-use)
  */
 export function canWrite(): boolean {
   resetIfNewMonth();
-  return usageData.writes < getWriteLimit();
+  if (usageData.writes >= getWriteLimit()) return false;
+  // Check 24h rolling window
+  const cutoff = Date.now() - DAILY_WINDOW_MS;
+  const writesInWindow = recentWriteTimestamps.filter(t => t > cutoff).length;
+  return writesInWindow < DAILY_WRITE_LIMIT;
+}
+
+/**
+ * Get remaining daily tweet budget (24h rolling window)
+ */
+export function getDailyWritesRemaining(): number {
+  const cutoff = Date.now() - DAILY_WINDOW_MS;
+  const writesInWindow = recentWriteTimestamps.filter(t => t > cutoff).length;
+  return Math.max(0, DAILY_WRITE_LIMIT - writesInWindow);
 }
 
 /**
@@ -211,6 +237,12 @@ export async function recordWrite(tweetText?: string): Promise<void> {
   resetIfNewMonth();
   usageData.writes++;
   usageData.lastWrite = new Date().toISOString();
+  recentWriteTimestamps.push(Date.now());
+  // Prune old timestamps (older than 24h)
+  const cutoff = Date.now() - DAILY_WINDOW_MS;
+  while (recentWriteTimestamps.length > 0 && recentWriteTimestamps[0] < cutoff) {
+    recentWriteTimestamps.shift();
+  }
   if (tweetText) {
     usageData.writeHistory.push({
       timestamp: usageData.lastWrite,
@@ -223,11 +255,15 @@ export async function recordWrite(tweetText?: string): Promise<void> {
   }
   await saveUsage();
   
-  const remaining = getWriteLimit() - usageData.writes;
-  logger.info(`[X-RateLimiter] Tweet sent. ${remaining} writes remaining this month.`);
+  const dailyRemaining = getDailyWritesRemaining();
+  const monthlyRemaining = getWriteLimit() - usageData.writes;
+  logger.info(`[X-RateLimiter] Tweet sent. ${dailyRemaining} daily / ${monthlyRemaining} monthly writes remaining.`);
   
-  if (remaining <= 50) {
-    logger.warn(`[X-RateLimiter] ⚠️ LOW QUOTA: Only ${remaining} tweets remaining this month!`);
+  if (dailyRemaining <= 3) {
+    logger.warn(`[X-RateLimiter] ⚠️ LOW DAILY QUOTA: Only ${dailyRemaining} tweets left in 24h window!`);
+  }
+  if (monthlyRemaining <= 50) {
+    logger.warn(`[X-RateLimiter] ⚠️ LOW MONTHLY QUOTA: Only ${monthlyRemaining} tweets remaining this month!`);
   }
 }
 
@@ -298,6 +334,52 @@ export function isReadRateLimited(): boolean {
   return readRateLimitedUntil > Date.now();
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Per-endpoint read gating (prevents 429s proactively)
+// Pay-per-use allows 1 search + 1 mentions call per 15-min window. These
+// functions enforce a 16-min cooldown so no caller ever triggers a 429.
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Check if enough time has passed since the last mentions read */
+export function canReadMentions(): boolean {
+  if (isReadRateLimited()) return false;
+  if (!canRead()) return false;
+  return Date.now() - lastMentionReadAt >= READ_ENDPOINT_COOLDOWN_MS;
+}
+
+/** Check if enough time has passed since the last search read */
+export function canReadSearch(): boolean {
+  if (isReadRateLimited()) return false;
+  if (!canRead()) return false;
+  return Date.now() - lastSearchReadAt >= READ_ENDPOINT_COOLDOWN_MS;
+}
+
+/** How many seconds until mentions endpoint is available again */
+export function mentionsCooldownRemaining(): number {
+  const remaining = (lastMentionReadAt + READ_ENDPOINT_COOLDOWN_MS) - Date.now();
+  return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
+}
+
+/** How many seconds until search endpoint is available again */
+export function searchCooldownRemaining(): number {
+  const remaining = (lastSearchReadAt + READ_ENDPOINT_COOLDOWN_MS) - Date.now();
+  return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
+}
+
+/** Record a mentions read — sets the cooldown clock */
+export async function recordMentionRead(): Promise<void> {
+  lastMentionReadAt = Date.now();
+  await recordRead();
+  logger.info(`[X-RateLimiter] Mentions read recorded. Next allowed in ${READ_ENDPOINT_COOLDOWN_MS / 60000}m`);
+}
+
+/** Record a search read — sets the cooldown clock */
+export async function recordSearchRead(): Promise<void> {
+  lastSearchReadAt = Date.now();
+  await recordRead();
+  logger.info(`[X-RateLimiter] Search read recorded. Next allowed in ${READ_ENDPOINT_COOLDOWN_MS / 60000}m`);
+}
+
 /**
  * Check if posting is advisable based on usage patterns
  * Returns recommendation for the agent
@@ -319,6 +401,17 @@ export function getPostingAdvice(): {
     };
   }
 
+  // Check daily 24h rolling window (17 tweets/day on pay-per-use)
+  const dailyRemaining = getDailyWritesRemaining();
+  if (dailyRemaining <= 0) {
+    return {
+      canPost: false,
+      shouldPost: false,
+      reason: `Daily tweet limit reached (${DAILY_WRITE_LIMIT}/24h). Wait for oldest tweet to age out.`,
+      urgency: 'none',
+    };
+  }
+
   const quota = getQuota();
   
   if (!canWrite()) {
@@ -330,12 +423,23 @@ export function getPostingAdvice(): {
     };
   }
   
+  // Use the tighter of daily or monthly remaining
+  const effectiveRemaining = Math.min(dailyRemaining, quota.writes.remaining);
   const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate();
   const currentDay = new Date().getDate();
   const daysRemaining = daysInMonth - currentDay;
   const tweetsPerDay = daysRemaining > 0 ? quota.writes.remaining / daysRemaining : 0;
   
-  if (quota.writes.remaining <= 10) {
+  if (dailyRemaining <= 3) {
+    return {
+      canPost: true,
+      shouldPost: false,
+      reason: `Only ${dailyRemaining} tweets left in 24h window! Save for critical posts only.`,
+      urgency: 'high',
+    };
+  }
+  
+  if (effectiveRemaining <= 10) {
     return {
       canPost: true,
       shouldPost: false,
@@ -410,4 +514,11 @@ export default {
   isRateLimited,
   reportReadRateLimit,
   isReadRateLimited,
+  canReadMentions,
+  canReadSearch,
+  recordMentionRead,
+  recordSearchRead,
+  mentionsCooldownRemaining,
+  searchCooldownRemaining,
+  getDailyWritesRemaining,
 };

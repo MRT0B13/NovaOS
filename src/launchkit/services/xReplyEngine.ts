@@ -1,7 +1,7 @@
 import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
 import { getTwitterReader, XPublisherService } from './xPublisher.ts';
-import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseReads, reportRateLimit, reportReadRateLimit } from './xRateLimiter.ts';
+import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseReads, reportRateLimit, reportReadRateLimit, canReadMentions, canReadSearch, recordMentionRead, recordSearchRead, mentionsCooldownRemaining, searchCooldownRemaining } from './xRateLimiter.ts';
 import { scanToken, formatReportForTweet } from './rugcheck.ts';
 
 /**
@@ -274,10 +274,10 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
   const doSearch   = state.roundCount % 2 !== 0;
   
   // Mentions
-  if (doMentions && canRead()) {
+  if (doMentions && canReadMentions()) {
     try {
       const mentions = await reader.getMentions(10);
-      await recordRead();
+      await recordMentionRead();
       for (const m of mentions) {
         if (!state.repliedTweetIds.has(m.id)) {
           candidates.push({
@@ -294,18 +294,21 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
       if (msg.includes('429') || msg.includes('rate limit') || msg.includes('Too Many')) {
         reportReadRateLimit();
       }
-      try { await recordRead(); } catch {}
+      try { await recordMentionRead(); } catch {}
     }
+  } else if (doMentions) {
+    const wait = mentionsCooldownRemaining();
+    if (wait > 0) logger.info(`[ReplyEngine] Mentions on cooldown — ${wait}s remaining`);
   }
   
   // Search
-  if (doSearch && canRead()) {
+  if (doSearch && canReadSearch()) {
     const queries = (env.X_REPLY_SEARCH_QUERIES || '').split(',').map(q => q.trim()).filter(Boolean);
     if (queries.length > 0) {
       const query = queries[Math.floor(Math.random() * queries.length)];
       try {
         const results = await reader.searchTweets(query, 10);
-        await recordRead();
+        await recordSearchRead();
         for (const t of results) {
           if (!state.repliedTweetIds.has(t.id)) {
             candidates.push({
@@ -323,9 +326,12 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
         if (msg.includes('429') || msg.includes('rate limit') || msg.includes('Too Many')) {
           reportReadRateLimit();
         }
-        try { await recordRead(); } catch {}
+        try { await recordSearchRead(); } catch {}
       }
     }
+  } else if (doSearch) {
+    const wait = searchCooldownRemaining();
+    if (wait > 0) logger.info(`[ReplyEngine] Search on cooldown — ${wait}s remaining`);
   }
   
   return candidates;

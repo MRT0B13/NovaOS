@@ -187,6 +187,10 @@ class StandaloneTwitterClient {
       // Search requires Basic tier - Free tier won't work
       if (error?.code === 403) {
         logger.warn('[StandaloneTwitter] Search requires Basic API tier (not available on Free)');
+      } else if (error?.code === 429 || error?.message?.includes('429') || error?.message?.includes('Too Many')) {
+        logger.warn('[StandaloneTwitter] Search 429 rate limit hit');
+        try { const { reportReadRateLimit } = await import('./xRateLimiter.ts'); reportReadRateLimit(); } catch {}
+        throw error; // Re-throw so caller knows it was a rate limit
       } else {
         logger.error('[StandaloneTwitter] Failed to search tweets:', error);
       }
@@ -219,6 +223,10 @@ class StandaloneTwitterClient {
     } catch (error: any) {
       if (error?.code === 403) {
         logger.warn('[StandaloneTwitter] Mentions requires Basic API tier');
+      } else if (error?.code === 429 || error?.message?.includes('429') || error?.message?.includes('Too Many')) {
+        logger.warn('[StandaloneTwitter] Mentions 429 rate limit hit');
+        try { const { reportReadRateLimit } = await import('./xRateLimiter.ts'); reportReadRateLimit(); } catch {}
+        throw error; // Re-throw so caller knows it was a rate limit
       } else {
         logger.error('[StandaloneTwitter] Failed to get mentions:', error);
       }
