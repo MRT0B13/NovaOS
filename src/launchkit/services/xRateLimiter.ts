@@ -35,6 +35,10 @@ let usageData: UsageData = {
   writeHistory: [],
 };
 
+// Shared 429 backoff — when ANY component hits a Twitter 429, ALL posting pauses.
+const RATE_LIMIT_BACKOFF_MS = 15 * 60 * 1000; // 15 minutes
+let rateLimitedUntil = 0;
+
 function getCurrentMonth(): string {
   return new Date().toISOString().slice(0, 7); // YYYY-MM
 }
@@ -258,6 +262,24 @@ ${quota.lastWrite ? `Last tweet: ${new Date(quota.lastWrite).toLocaleString()}` 
 }
 
 /**
+ * Report a Twitter 429 rate limit hit. Any component (reply engine,
+ * brand posts, marketing) should call this when it receives a 429.
+ * Sets a shared backoff so ALL posting pauses for 15 minutes.
+ */
+export function reportRateLimit(): void {
+  rateLimitedUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
+  const resumeAt = new Date(rateLimitedUntil).toISOString();
+  logger.warn(`[X-RateLimiter] ⚠️ Twitter 429 — ALL posting paused until ${resumeAt} (15 min backoff)`);
+}
+
+/**
+ * Check if we're currently in a 429 backoff window.
+ */
+export function isRateLimited(): boolean {
+  return rateLimitedUntil > Date.now();
+}
+
+/**
  * Check if posting is advisable based on usage patterns
  * Returns recommendation for the agent
  */
@@ -267,6 +289,17 @@ export function getPostingAdvice(): {
   reason: string;
   urgency: 'high' | 'medium' | 'low' | 'none';
 } {
+  // Check shared 429 backoff first — blocks ALL posting
+  if (isRateLimited()) {
+    const remainMin = Math.ceil((rateLimitedUntil - Date.now()) / 60000);
+    return {
+      canPost: false,
+      shouldPost: false,
+      reason: `Twitter rate limited (429). Resuming in ~${remainMin}m.`,
+      urgency: 'none',
+    };
+  }
+
   const quota = getQuota();
   
   if (!canWrite()) {
@@ -354,4 +387,6 @@ export default {
   safeTweet,
   getReadSpendUsd,
   isPayPerUseReads,
+  reportRateLimit,
+  isRateLimited,
 };

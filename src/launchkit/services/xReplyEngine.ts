@@ -1,7 +1,7 @@
 import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
 import { getTwitterReader, XPublisherService } from './xPublisher.ts';
-import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseReads } from './xRateLimiter.ts';
+import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseReads, reportRateLimit } from './xRateLimiter.ts';
 import { scanToken, formatReportForTweet } from './rugcheck.ts';
 
 /**
@@ -49,7 +49,6 @@ const state = {
   running: false,
   intervalHandle: null as ReturnType<typeof setInterval> | null,
   roundCount: 0, // Alternates between mention rounds and search rounds
-  rateLimitBackoffUntil: 0, // Timestamp — skip rounds until this time (set on 429)
 };
 
 // ============================================================================
@@ -143,14 +142,7 @@ async function runReplyRound(): Promise<void> {
     return;
   }
   
-  // Check 429 backoff — if Twitter told us to chill, respect it
-  if (state.rateLimitBackoffUntil > Date.now()) {
-    const remainMin = Math.ceil((state.rateLimitBackoffUntil - Date.now()) / 60000);
-    logger.debug(`[ReplyEngine] Rate-limit backoff active — ${remainMin}m remaining`);
-    return;
-  }
-
-  // Check rate limit
+  // Check rate limit (includes shared 429 backoff)
   const advice = getPostingAdvice();
   if (!advice.canPost) {
     logger.debug(`[ReplyEngine] Write rate limited: ${advice.reason}`);
@@ -232,10 +224,9 @@ async function runReplyRound(): Promise<void> {
     const code = err?.code || '';
 
     if (code === 'X_RATE_LIMIT' || msg.includes('429') || msg.includes('rate limit')) {
-      // Back off for 15 minutes on 429
-      const backoffMs = 15 * 60 * 1000;
-      state.rateLimitBackoffUntil = Date.now() + backoffMs;
-      logger.warn(`[ReplyEngine] Twitter 429 rate limit — backing off for 15 minutes`);
+      // Signal shared backoff — pauses ALL X posting (replies, brand, marketing)
+      reportRateLimit();
+      logger.warn(`[ReplyEngine] Twitter 429 rate limit — all posting paused for 15 minutes`);
     } else {
       logger.warn(`[ReplyEngine] Failed to post reply: ${msg}`);
     }

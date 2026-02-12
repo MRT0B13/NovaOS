@@ -4,7 +4,7 @@ import { LaunchPackStore } from '../db/launchPackRepository.ts';
 import { getEnv } from '../env.ts';
 import { nowIso } from './time.ts';
 import { appendAudit } from './audit.ts';
-import { canWrite, recordWrite, getQuota, getPostingAdvice, getUsageSummary } from './xRateLimiter.ts';
+import { canWrite, recordWrite, getQuota, getPostingAdvice, getUsageSummary, reportRateLimit } from './xRateLimiter.ts';
 import { recordTweetSent } from './systemReporter.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
 
@@ -269,6 +269,7 @@ class StandaloneTwitterClient {
         });
       }
       if (code === 429) {
+        reportRateLimit(); // Signal shared backoff — pauses ALL X posting
         throw errorWithCode('X_RATE_LIMIT', 'Twitter rate limit exceeded');
       }
       if (code === 401) {
