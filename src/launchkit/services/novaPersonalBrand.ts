@@ -1650,6 +1650,27 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     return { success: false };
   }
   
+  // Check rate limit BEFORE doing any expensive work (image gen, etc.)
+  try {
+    const { isRateLimited, getPostingAdvice, getDailyWritesRemaining } = await import('./xRateLimiter.ts');
+    if (isRateLimited()) {
+      logger.info('[NovaPersonalBrand] X posting skipped — rate limited (429 backoff active)');
+      return { success: false };
+    }
+    const advice = getPostingAdvice();
+    if (!advice.canPost) {
+      logger.info(`[NovaPersonalBrand] X posting skipped — ${advice.reason}`);
+      return { success: false };
+    }
+    const dailyRemaining = getDailyWritesRemaining();
+    if (dailyRemaining <= 0) {
+      logger.info('[NovaPersonalBrand] X posting skipped — daily tweet limit reached');
+      return { success: false };
+    }
+  } catch (checkErr) {
+    logger.warn('[NovaPersonalBrand] Rate limit pre-check failed, proceeding cautiously:', checkErr);
+  }
+  
   // Initialize xPublisher on demand if not already done (same pattern as pumpLauncher)
   if (!xPublisher) {
     try {
@@ -2653,10 +2674,7 @@ export async function processEngagementReplies(): Promise<number> {
           repliedTo.add(mention.id);
           repliesPosted++;
           logger.info(`[NovaPersonalBrand] ✅ Replied to @${mention.authorName}: "${replyContent.substring(0, 50)}..."`);
-          
-          // Track write
-          const { recordWrite } = await import('./xRateLimiter.ts');
-          recordWrite('engagement_reply');
+          // Note: recordWrite is already called inside xPublisher.reply() — no need to call it again
         }
       } catch (replyErr) {
         logger.warn(`[NovaPersonalBrand] Failed to reply to mention ${mention.id}:`, replyErr);
@@ -2807,6 +2825,21 @@ export function startNovaPersonalScheduler(): void {
   // Check every 15 minutes
   schedulerInterval = setInterval(async () => {
     try {
+      // Early exit: if we're in a 429 backoff, skip ALL posting this tick
+      try {
+        const { isRateLimited, getDailyWritesRemaining } = await import('./xRateLimiter.ts');
+        if (isRateLimited()) {
+          logger.info('[NovaPersonalBrand] Scheduler tick skipped — Twitter 429 backoff active');
+          return;
+        }
+        if (getDailyWritesRemaining() <= 0) {
+          logger.info('[NovaPersonalBrand] Scheduler tick skipped — daily tweet limit reached');
+          return;
+        }
+      } catch {
+        // Rate limiter might not be initialized yet, continue
+      }
+
       const now = new Date();
       const currentHour = now.getUTCHours();
       const currentTime = `${currentHour.toString().padStart(2, '0')}:${now.getUTCMinutes().toString().padStart(2, '0')}`;

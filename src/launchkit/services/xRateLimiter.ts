@@ -36,8 +36,11 @@ let usageData: UsageData = {
 };
 
 // Shared 429 backoff — when ANY component hits a Twitter 429, ALL posting pauses.
-const RATE_LIMIT_BACKOFF_MS = 15 * 60 * 1000; // 15 minutes
+const BASE_RATE_LIMIT_BACKOFF_MS = 16 * 60 * 1000; // 16 minutes (> Twitter's 15-min window)
+const MAX_RATE_LIMIT_BACKOFF_MS = 120 * 60 * 1000; // 2 hours max
 let rateLimitedUntil = 0;
+let consecutive429Count = 0; // Track consecutive 429s for exponential backoff
+let last429At = 0; // When the last 429 occurred
 // Separate read backoff — search/mentions 429 (free tier: 1 search per 15 min)
 let readRateLimitedUntil = 0;
 
@@ -48,8 +51,8 @@ let lastMentionReadAt = 0;
 let lastSearchReadAt  = 0;
 
 // Daily write tracking — X pay-per-use enforces 17 tweets per 24h rolling window.
-// We track timestamps of recent writes so we can proactively refuse before hitting 429.
-const DAILY_WRITE_LIMIT = 17; // x-app-limit-24hour-limit from X API headers
+// We use 15 as a safety buffer (2 under the real limit of 17) to avoid 429s.
+const DAILY_WRITE_LIMIT = 15; // x-app-limit-24hour-limit is 17, we use 15 for safety margin
 const DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const recentWriteTimestamps: number[] = [];
 
@@ -311,6 +314,9 @@ export async function recordWrite(tweetText?: string): Promise<void> {
   await saveUsage();
   await saveDailyTimestampsToPg(); // persist 24h window to Postgres
   
+  // Successful tweet — reset consecutive 429 counter
+  consecutive429Count = 0;
+  
   const dailyRemaining = getDailyWritesRemaining();
   const monthlyRemaining = getWriteLimit() - usageData.writes;
   logger.info(`[X-RateLimiter] Tweet sent. ${dailyRemaining} daily / ${monthlyRemaining} monthly writes remaining.`);
@@ -365,14 +371,29 @@ ${quota.lastWrite ? `Last tweet: ${new Date(quota.lastWrite).toLocaleString()}` 
 /**
  * Report a Twitter 429 rate limit hit. Any component (reply engine,
  * brand posts, marketing) should call this when it receives a 429.
- * Sets a shared backoff so ALL posting pauses for 15 minutes.
+ * Uses exponential backoff: 16 min → 32 min → 64 min → 2h max.
+ * Consecutive 429 counter resets after 1 hour of no 429s.
  */
 export function reportRateLimit(): void {
-  rateLimitedUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
+  const now = Date.now();
+  // Reset consecutive counter if it's been > 1 hour since the last 429
+  if (now - last429At > 60 * 60 * 1000) {
+    consecutive429Count = 0;
+  }
+  consecutive429Count++;
+  last429At = now;
+  
+  // Exponential backoff: 16 min * 2^(consecutive-1), capped at 2 hours
+  const backoffMs = Math.min(
+    BASE_RATE_LIMIT_BACKOFF_MS * Math.pow(2, consecutive429Count - 1),
+    MAX_RATE_LIMIT_BACKOFF_MS
+  );
+  rateLimitedUntil = now + backoffMs;
   const resumeAt = new Date(rateLimitedUntil).toISOString();
-  logger.warn(`[X-RateLimiter] ⚠️ Twitter 429 — ALL posting paused until ${resumeAt} (15 min backoff)`);
+  const backoffMin = Math.round(backoffMs / 60000);
+  logger.warn(`[X-RateLimiter] ⚠️ Twitter 429 #${consecutive429Count} — ALL posting paused until ${resumeAt} (${backoffMin} min backoff)`);
   import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_429_write',
-    `Twitter <b>429 rate limit</b> hit on writes.\nAll posting paused until <code>${resumeAt}</code> (15 min backoff).`
+    `Twitter <b>429 rate limit</b> hit (#${consecutive429Count}).\nAll posting paused until <code>${resumeAt}</code> (${backoffMin} min backoff).`
   )).catch(() => {});
 }
 
@@ -384,14 +405,14 @@ export function isRateLimited(): boolean {
 }
 
 /**
- * Report a Twitter 429 on read/search. Pauses reads for 15 minutes.
+ * Report a Twitter 429 on read/search. Pauses reads for 16 minutes.
  */
 export function reportReadRateLimit(): void {
-  readRateLimitedUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
+  readRateLimitedUntil = Date.now() + BASE_RATE_LIMIT_BACKOFF_MS;
   const resumeAt = new Date(readRateLimitedUntil).toISOString();
-  logger.warn(`[X-RateLimiter] ⚠️ Read 429 — searches paused until ${resumeAt} (15 min backoff)`);
+  logger.warn(`[X-RateLimiter] ⚠️ Read 429 — searches paused until ${resumeAt} (16 min backoff)`);
   import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_429_read',
-    `Twitter <b>429 rate limit</b> hit on reads (search/mentions).\nReads paused until <code>${resumeAt}</code> (15 min backoff).`
+    `Twitter <b>429 rate limit</b> hit on reads (search/mentions).\nReads paused until <code>${resumeAt}</code> (16 min backoff).`
   )).catch(() => {});
 }
 
