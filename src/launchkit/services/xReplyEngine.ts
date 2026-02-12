@@ -1,7 +1,7 @@
 import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
 import { getTwitterReader, XPublisherService } from './xPublisher.ts';
-import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseReads, reportRateLimit } from './xRateLimiter.ts';
+import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseReads, reportRateLimit, reportReadRateLimit } from './xRateLimiter.ts';
 import { scanToken, formatReportForTweet } from './rugcheck.ts';
 
 /**
@@ -81,8 +81,12 @@ export function startReplyEngine(): void {
   state.running = true;
   logger.info(`[ReplyEngine] Started (max ${env.X_REPLY_MAX_PER_DAY}/day, every ${env.X_REPLY_INTERVAL_MINUTES || 60}m)`);
   
-  // Run immediately, then on interval
-  runReplyRound().catch(err => logger.error('[ReplyEngine] Initial round failed:', err));
+  // Delay first round by 5 minutes to avoid startup 429 collisions
+  // (deploy restarts, ElizaOS init, and webhook setup all hit the API on boot)
+  const startDelayMs = 5 * 60 * 1000;
+  setTimeout(() => {
+    runReplyRound().catch(err => logger.error('[ReplyEngine] Initial round failed:', err));
+  }, startDelayMs);
   
   state.intervalHandle = setInterval(() => {
     runReplyRound().catch(err => logger.error('[ReplyEngine] Round failed:', err));
@@ -269,7 +273,11 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
           });
         }
       }
-    } catch {
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      if (msg.includes('429') || msg.includes('rate limit') || msg.includes('Too Many')) {
+        reportReadRateLimit();
+      }
       try { await recordRead(); } catch {}
     }
   }
@@ -294,7 +302,11 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
             });
           }
         }
-      } catch {
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        if (msg.includes('429') || msg.includes('rate limit') || msg.includes('Too Many')) {
+          reportReadRateLimit();
+        }
         try { await recordRead(); } catch {}
       }
     }

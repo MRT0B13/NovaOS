@@ -38,6 +38,8 @@ let usageData: UsageData = {
 // Shared 429 backoff — when ANY component hits a Twitter 429, ALL posting pauses.
 const RATE_LIMIT_BACKOFF_MS = 15 * 60 * 1000; // 15 minutes
 let rateLimitedUntil = 0;
+// Separate read backoff — search/mentions 429 (free tier: 1 search per 15 min)
+let readRateLimitedUntil = 0;
 
 function getCurrentMonth(): string {
   return new Date().toISOString().slice(0, 7); // YYYY-MM
@@ -168,10 +170,11 @@ export function canWrite(): boolean {
 }
 
 /**
- * Check if we can make a read
+ * Check if we can make a read (respects both monthly quota and 429 backoff)
  */
 export function canRead(): boolean {
   resetIfNewMonth();
+  if (isReadRateLimited()) return false;
   return usageData.reads < getReadLimit();
 }
 
@@ -277,6 +280,22 @@ export function reportRateLimit(): void {
  */
 export function isRateLimited(): boolean {
   return rateLimitedUntil > Date.now();
+}
+
+/**
+ * Report a Twitter 429 on read/search. Pauses reads for 15 minutes.
+ */
+export function reportReadRateLimit(): void {
+  readRateLimitedUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
+  const resumeAt = new Date(readRateLimitedUntil).toISOString();
+  logger.warn(`[X-RateLimiter] ⚠️ Read 429 — searches paused until ${resumeAt} (15 min backoff)`);
+}
+
+/**
+ * Check if reads are currently in a 429 backoff window.
+ */
+export function isReadRateLimited(): boolean {
+  return readRateLimitedUntil > Date.now();
 }
 
 /**
@@ -389,4 +408,6 @@ export default {
   isPayPerUseReads,
   reportRateLimit,
   isRateLimited,
+  reportReadRateLimit,
+  isReadRateLimited,
 };
