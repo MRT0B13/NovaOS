@@ -1245,7 +1245,8 @@ export function getCommunityInsights(): string {
 export async function announceVoteResult(vote: PendingVote): Promise<boolean> {
   const env = getEnv();
   const botToken = env.TG_BOT_TOKEN;
-  const channelId = env.NOVA_CHANNEL_ID;
+  // Post results to the community where people voted (fall back to channel)
+  const channelId = env.TELEGRAM_COMMUNITY_CHAT_ID || env.NOVA_CHANNEL_ID;
   
   if (!botToken || !channelId) return false;
   

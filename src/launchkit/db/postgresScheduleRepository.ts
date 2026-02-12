@@ -259,6 +259,11 @@ export class PostgresScheduleRepository {
         write_history JSONB DEFAULT '[]'::jsonb
       );
     `);
+    // Migration: add daily_write_ts column (epoch-ms array for 24h rolling window)
+    await this.pool.query(`
+      ALTER TABLE sched_x_usage
+      ADD COLUMN IF NOT EXISTS daily_write_ts JSONB DEFAULT '[]'::jsonb;
+    `);
 
     // Trend Pool
     await this.pool.query(`
@@ -767,6 +772,36 @@ export class PostgresScheduleRepository {
         reads = sched_x_usage.reads + 1,
         last_read = $2
     `, [month, now]);
+  }
+
+  /**
+   * Get the 24h rolling-window tweet timestamps (epoch ms) from Postgres.
+   * Returns only timestamps within the last 24 hours.
+   */
+  async getDailyWriteTimestamps(): Promise<number[]> {
+    const month = new Date().toISOString().slice(0, 7);
+    const result = await this.pool.query(
+      `SELECT daily_write_ts FROM sched_x_usage WHERE month = $1`, [month]
+    );
+    const raw: number[] = result.rows[0]?.daily_write_ts || [];
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    return raw.filter(ts => ts > cutoff);
+  }
+
+  /**
+   * Save the 24h rolling-window tweet timestamps to Postgres.
+   * Prunes entries older than 24h before saving.
+   */
+  async saveDailyWriteTimestamps(timestamps: number[]): Promise<void> {
+    const month = new Date().toISOString().slice(0, 7);
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const pruned = timestamps.filter(ts => ts > cutoff);
+    await this.pool.query(`
+      INSERT INTO sched_x_usage (month, daily_write_ts)
+      VALUES ($1, $2)
+      ON CONFLICT (month) DO UPDATE SET
+        daily_write_ts = $2
+    `, [month, JSON.stringify(pruned)]);
   }
 
   /**

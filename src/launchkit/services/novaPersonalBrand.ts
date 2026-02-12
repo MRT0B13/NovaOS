@@ -1977,6 +1977,95 @@ export async function postToTelegram(
   }
 }
 
+/**
+ * Post to the COMMUNITY GROUP (polls, engagement, behind-the-scenes).
+ * Uses TELEGRAM_COMMUNITY_CHAT_ID if set, otherwise falls back to NOVA_CHANNEL_ID.
+ */
+export async function postToCommunity(
+  content: string,
+  type: NovaPostType,
+  options?: { pin?: boolean }
+): Promise<{ success: boolean; messageId?: number }> {
+  const env = getEnv();
+
+  if (env.NOVA_PERSONAL_TG_ENABLE !== 'true') {
+    logger.info('[NovaPersonalBrand] TG posting disabled');
+    return { success: false };
+  }
+
+  const botToken = env.TG_BOT_TOKEN;
+  // Prefer community group; fall back to channel if not configured
+  const chatId = env.TELEGRAM_COMMUNITY_CHAT_ID || env.NOVA_CHANNEL_ID;
+
+  if (!botToken || !chatId) {
+    logger.warn('[NovaPersonalBrand] Missing TG_BOT_TOKEN or TELEGRAM_COMMUNITY_CHAT_ID/NOVA_CHANNEL_ID');
+    return { success: false };
+  }
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: content,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+
+    const json = await res.json();
+
+    if (!json.ok) {
+      logger.error(`[NovaPersonalBrand] Community post failed: ${json.description}`);
+      return { success: false };
+    }
+
+    const messageId = json.result?.message_id;
+
+    if (options?.pin && messageId) {
+      await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          disable_notification: false,
+        }),
+      });
+    }
+
+    logger.info(`[NovaPersonalBrand] ✅ Posted ${type} to community (chat: ${chatId}, ID: ${messageId})`);
+
+    recordTGPostSent();
+    recordMessageSent();
+
+    const feedbackMinutes = type === 'community_poll' ? 120 : 240;
+    if (messageId) {
+      await registerBrandPostForFeedback(messageId, chatId, type, content, feedbackMinutes);
+    }
+
+    const post: NovaPost = {
+      id: `community_${Date.now()}`,
+      type,
+      platform: 'telegram',
+      content,
+      scheduledFor: new Date().toISOString(),
+      status: 'posted',
+      postedAt: new Date().toISOString(),
+      postId: String(messageId),
+      createdAt: new Date().toISOString(),
+    };
+    state.posts.push(post);
+    await saveStateToPostgres();
+
+    return { success: true, messageId };
+  } catch (err) {
+    logger.error('[NovaPersonalBrand] Community post error:', err);
+    return { success: false };
+  }
+}
+
 // ============================================================================
 // Scheduled Posts
 // ============================================================================
@@ -2155,9 +2244,9 @@ export async function postCommunityPoll(
   const env = getEnv();
   let messageId: number | undefined;
   
-  // Polls mainly for TG (reactions work better there)
+  // Polls go to community group (reactions work better there)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    const result = await postToTelegram(content, 'community_poll');
+    const result = await postToCommunity(content, 'community_poll');
     messageId = result.messageId;
   }
   
@@ -2169,10 +2258,10 @@ export async function postBehindScenes(activity: string): Promise<void> {
   
   const env = getEnv();
   
-  // Post to TG (more casual, behind-scenes vibe)
+  // Behind-the-scenes goes to community group (casual vibe)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
     const tgContent = await generateAIContent('behind_scenes', stats, activity, 'telegram') || generateBehindScenesContent(activity);
-    await postToTelegram(tgContent, 'behind_scenes');
+    await postToCommunity(tgContent, 'behind_scenes');
   }
 }
 

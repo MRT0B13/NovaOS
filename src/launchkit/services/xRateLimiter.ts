@@ -53,6 +53,11 @@ const DAILY_WRITE_LIMIT = 17; // x-app-limit-24hour-limit from X API headers
 const DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const recentWriteTimestamps: number[] = [];
 
+// Startup write cooldown — prevent burst-tweeting immediately after redeploy.
+// The bot waits this long before allowing any writes after init.
+const STARTUP_WRITE_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
+let startupTime = Date.now();
+
 function getCurrentMonth(): string {
   return new Date().toISOString().slice(0, 7); // YYYY-MM
 }
@@ -126,6 +131,43 @@ async function loadUsage(): Promise<void> {
     await loadUsageFromFile();
   }
   resetIfNewMonth();
+
+  // Restore the 24h rolling window from Postgres (primary) or writeHistory (fallback).
+  // Without this, every restart would reset the daily counter and cause 429s.
+  const cutoff = Date.now() - DAILY_WINDOW_MS;
+  recentWriteTimestamps.length = 0;
+
+  if (usePostgres && pgRepo) {
+    try {
+      const pgTimestamps = await pgRepo.getDailyWriteTimestamps();
+      for (const ts of pgTimestamps) {
+        if (ts > cutoff) recentWriteTimestamps.push(ts);
+      }
+      logger.info(`[X-RateLimiter] Loaded ${recentWriteTimestamps.length} daily timestamps from PostgreSQL`);
+    } catch (err) {
+      logger.warn('[X-RateLimiter] Failed to load daily timestamps from PG, falling back to writeHistory:', err);
+      // Fallback: rebuild from writeHistory
+      for (const entry of usageData.writeHistory || []) {
+        const ts = new Date(entry.timestamp).getTime();
+        if (ts > cutoff && !isNaN(ts)) recentWriteTimestamps.push(ts);
+      }
+    }
+  } else {
+    // File-based: rebuild from writeHistory
+    for (const entry of usageData.writeHistory || []) {
+      const ts = new Date(entry.timestamp).getTime();
+      if (ts > cutoff && !isNaN(ts)) recentWriteTimestamps.push(ts);
+    }
+  }
+
+  recentWriteTimestamps.sort((a, b) => a - b);
+  const dailyUsed = recentWriteTimestamps.length;
+  const dailyRemaining = Math.max(0, DAILY_WRITE_LIMIT - dailyUsed);
+  logger.info(`[X-RateLimiter] 24h window: ${dailyUsed} tweets sent, ${dailyRemaining} daily remaining`);
+
+  // Reset startup cooldown clock
+  startupTime = Date.now();
+  logger.info(`[X-RateLimiter] Startup write cooldown active for ${STARTUP_WRITE_COOLDOWN_MS / 1000}s`);
 }
 
 async function saveUsage(): Promise<void> {
@@ -133,6 +175,17 @@ async function saveUsage(): Promise<void> {
     await pgRepo.saveXUsage(usageData as XUsageData);
   } else {
     await saveUsageToFile();
+  }
+}
+
+/** Persist the 24h write timestamps to Postgres */
+async function saveDailyTimestampsToPg(): Promise<void> {
+  if (usePostgres && pgRepo) {
+    try {
+      await pgRepo.saveDailyWriteTimestamps([...recentWriteTimestamps]);
+    } catch (err) {
+      logger.warn('[X-RateLimiter] Failed to persist daily timestamps to PG:', err);
+    }
   }
 }
 
@@ -179,6 +232,8 @@ export function isPayPerUseReads(): boolean {
  */
 export function canWrite(): boolean {
   resetIfNewMonth();
+  // Startup cooldown — don't tweet for 2 min after boot to avoid burst
+  if (Date.now() - startupTime < STARTUP_WRITE_COOLDOWN_MS) return false;
   if (usageData.writes >= getWriteLimit()) return false;
   // Check 24h rolling window
   const cutoff = Date.now() - DAILY_WINDOW_MS;
@@ -254,6 +309,7 @@ export async function recordWrite(tweetText?: string): Promise<void> {
     }
   }
   await saveUsage();
+  await saveDailyTimestampsToPg(); // persist 24h window to Postgres
   
   const dailyRemaining = getDailyWritesRemaining();
   const monthlyRemaining = getWriteLimit() - usageData.writes;
@@ -354,6 +410,7 @@ export function isReadRateLimited(): boolean {
 
 /** Check if enough time has passed since the last mentions read */
 export function canReadMentions(): boolean {
+  if (Date.now() - startupTime < STARTUP_WRITE_COOLDOWN_MS) return false; // boot cooldown
   if (isReadRateLimited()) return false;
   if (!canRead()) return false;
   return Date.now() - lastMentionReadAt >= READ_ENDPOINT_COOLDOWN_MS;
@@ -361,6 +418,7 @@ export function canReadMentions(): boolean {
 
 /** Check if enough time has passed since the last search read */
 export function canReadSearch(): boolean {
+  if (Date.now() - startupTime < STARTUP_WRITE_COOLDOWN_MS) return false; // boot cooldown
   if (isReadRateLimited()) return false;
   if (!canRead()) return false;
   return Date.now() - lastSearchReadAt >= READ_ENDPOINT_COOLDOWN_MS;
@@ -402,6 +460,17 @@ export function getPostingAdvice(): {
   reason: string;
   urgency: 'high' | 'medium' | 'low' | 'none';
 } {
+  // Startup cooldown — don't tweet for 2 min after boot
+  if (Date.now() - startupTime < STARTUP_WRITE_COOLDOWN_MS) {
+    const remainSec = Math.ceil((startupTime + STARTUP_WRITE_COOLDOWN_MS - Date.now()) / 1000);
+    return {
+      canPost: false,
+      shouldPost: false,
+      reason: `Startup cooldown — writes paused for ${remainSec}s after boot.`,
+      urgency: 'none',
+    };
+  }
+
   // Check shared 429 backoff first — blocks ALL posting
   if (isRateLimited()) {
     const remainMin = Math.ceil((rateLimitedUntil - Date.now()) / 60000);
