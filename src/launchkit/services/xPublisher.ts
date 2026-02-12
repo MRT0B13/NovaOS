@@ -56,6 +56,7 @@ function resolvePlaceholders(text: string, mint?: string, telegramUrl?: string, 
 class StandaloneTwitterClient {
   private client: TwitterApi | null = null;
   private initialized = false;
+  private cachedUserId: string | null = null;
 
   initialize(): boolean {
     const env = getEnv();
@@ -209,8 +210,13 @@ class StandaloneTwitterClient {
   }>> {
     if (!this.client) return [];
     try {
-      const me = await this.client.v2.me();
-      const mentions = await this.client.v2.userMentionTimeline(me.data.id, {
+      // Cache user ID to avoid burning an API call every round
+      if (!this.cachedUserId) {
+        const me = await this.client.v2.me();
+        this.cachedUserId = me.data.id;
+        logger.info(`[StandaloneTwitter] Cached user ID: ${this.cachedUserId}`);
+      }
+      const mentions = await this.client.v2.userMentionTimeline(this.cachedUserId, {
         max_results: maxResults,
         'tweet.fields': ['created_at', 'author_id'],
       });

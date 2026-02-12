@@ -43,12 +43,24 @@ let consecutive429Count = 0; // Track consecutive 429s for exponential backoff
 let last429At = 0; // When the last 429 occurred
 // Separate read backoff — search/mentions 429 (free tier: 1 search per 15 min)
 let readRateLimitedUntil = 0;
+let readConsecutive429Count = 0;
+let lastRead429At = 0;
 
-// Per-endpoint read tracking — pay-per-use allows 1 call per 15-min window per endpoint.
-// We use a 16-min cooldown to add safety margin.
-const READ_ENDPOINT_COOLDOWN_MS = 16 * 60 * 1000; // 16 minutes
+// Per-endpoint read tracking — cooldowns depend on tier.
+// Pay-per-use: mentions 5/15min → 4 min cooldown; search 60/15min → 1 min cooldown.
+// Free tier: 1 per 15 min per endpoint → 16 min cooldown.
+const PPU_MENTION_COOLDOWN_MS = 4 * 60 * 1000;   // 4 minutes (5 per 15 min)
+const PPU_SEARCH_COOLDOWN_MS  = 1 * 60 * 1000;   // 1 minute  (60 per 15 min)
+const FREE_ENDPOINT_COOLDOWN_MS = 16 * 60 * 1000; // 16 minutes (1 per 15 min)
 let lastMentionReadAt = 0;
 let lastSearchReadAt  = 0;
+
+function getMentionCooldownMs(): number {
+  return isPayPerUseReads() ? PPU_MENTION_COOLDOWN_MS : FREE_ENDPOINT_COOLDOWN_MS;
+}
+function getSearchCooldownMs(): number {
+  return isPayPerUseReads() ? PPU_SEARCH_COOLDOWN_MS : FREE_ENDPOINT_COOLDOWN_MS;
+}
 
 // Daily write tracking — X pay-per-use enforces 17 tweets per 24h rolling window.
 // We use 15 as a safety buffer (2 under the real limit of 17) to avoid 429s.
@@ -414,14 +426,29 @@ export function isRateLimited(): boolean {
 }
 
 /**
- * Report a Twitter 429 on read/search. Pauses reads for 16 minutes.
+ * Report a Twitter 429 on read/search.
+ * Uses exponential backoff: 16 min → 32 min → 64 min → 2h max.
+ * Consecutive counter resets after 1 hour of no read 429s.
  */
 export function reportReadRateLimit(): void {
-  readRateLimitedUntil = Date.now() + BASE_RATE_LIMIT_BACKOFF_MS;
+  const now = Date.now();
+  // Reset consecutive counter if it's been > 1 hour since the last read 429
+  if (now - lastRead429At > 60 * 60 * 1000) {
+    readConsecutive429Count = 0;
+  }
+  readConsecutive429Count++;
+  lastRead429At = now;
+
+  const backoffMs = Math.min(
+    BASE_RATE_LIMIT_BACKOFF_MS * Math.pow(2, readConsecutive429Count - 1),
+    MAX_RATE_LIMIT_BACKOFF_MS
+  );
+  readRateLimitedUntil = now + backoffMs;
   const resumeAt = new Date(readRateLimitedUntil).toISOString();
-  logger.warn(`[X-RateLimiter] ⚠️ Read 429 — searches paused until ${resumeAt} (16 min backoff)`);
+  const backoffMin = Math.round(backoffMs / 60000);
+  logger.warn(`[X-RateLimiter] ⚠️ Read 429 #${readConsecutive429Count} — reads paused until ${resumeAt} (${backoffMin} min backoff)`);
   import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_429_read',
-    `Twitter <b>429 rate limit</b> hit on reads (search/mentions).\nReads paused until <code>${resumeAt}</code> (16 min backoff).`
+    `Twitter <b>429 rate limit</b> hit on reads (#${readConsecutive429Count}).\nReads paused until <code>${resumeAt}</code> (${backoffMin} min backoff).`
   )).catch(() => {});
 }
 
@@ -434,8 +461,8 @@ export function isReadRateLimited(): boolean {
 
 // ────────────────────────────────────────────────────────────────────────────
 // Per-endpoint read gating (prevents 429s proactively)
-// Pay-per-use allows 1 search + 1 mentions call per 15-min window. These
-// functions enforce a 16-min cooldown so no caller ever triggers a 429.
+// Pay-per-use: mentions 5/15min (4 min cooldown), search 60/15min (1 min cooldown)
+// Free tier: 1/15min per endpoint (16 min cooldown)
 // ────────────────────────────────────────────────────────────────────────────
 
 /** Check if enough time has passed since the last mentions read */
@@ -443,7 +470,7 @@ export function canReadMentions(): boolean {
   if (Date.now() - startupTime < STARTUP_WRITE_COOLDOWN_MS) return false; // boot cooldown
   if (isReadRateLimited()) return false;
   if (!canRead()) return false;
-  return Date.now() - lastMentionReadAt >= READ_ENDPOINT_COOLDOWN_MS;
+  return Date.now() - lastMentionReadAt >= getMentionCooldownMs();
 }
 
 /** Check if enough time has passed since the last search read */
@@ -451,33 +478,37 @@ export function canReadSearch(): boolean {
   if (Date.now() - startupTime < STARTUP_WRITE_COOLDOWN_MS) return false; // boot cooldown
   if (isReadRateLimited()) return false;
   if (!canRead()) return false;
-  return Date.now() - lastSearchReadAt >= READ_ENDPOINT_COOLDOWN_MS;
+  return Date.now() - lastSearchReadAt >= getSearchCooldownMs();
 }
 
 /** How many seconds until mentions endpoint is available again */
 export function mentionsCooldownRemaining(): number {
-  const remaining = (lastMentionReadAt + READ_ENDPOINT_COOLDOWN_MS) - Date.now();
+  const remaining = (lastMentionReadAt + getMentionCooldownMs()) - Date.now();
   return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
 }
 
 /** How many seconds until search endpoint is available again */
 export function searchCooldownRemaining(): number {
-  const remaining = (lastSearchReadAt + READ_ENDPOINT_COOLDOWN_MS) - Date.now();
+  const remaining = (lastSearchReadAt + getSearchCooldownMs()) - Date.now();
   return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
 }
 
 /** Record a mentions read — sets the cooldown clock */
 export async function recordMentionRead(): Promise<void> {
   lastMentionReadAt = Date.now();
+  readConsecutive429Count = 0; // Successful read — reset backoff
   await recordRead();
-  logger.info(`[X-RateLimiter] Mentions read recorded. Next allowed in ${READ_ENDPOINT_COOLDOWN_MS / 60000}m`);
+  const cdMin = (getMentionCooldownMs() / 60000).toFixed(0);
+  logger.info(`[X-RateLimiter] Mentions read recorded. Next allowed in ${cdMin}m`);
 }
 
 /** Record a search read — sets the cooldown clock */
 export async function recordSearchRead(): Promise<void> {
   lastSearchReadAt = Date.now();
+  readConsecutive429Count = 0; // Successful read — reset backoff
   await recordRead();
-  logger.info(`[X-RateLimiter] Search read recorded. Next allowed in ${READ_ENDPOINT_COOLDOWN_MS / 60000}m`);
+  const cdMin = (getSearchCooldownMs() / 60000).toFixed(1);
+  logger.info(`[X-RateLimiter] Search read recorded. Next allowed in ${cdMin}m`);
 }
 
 /**

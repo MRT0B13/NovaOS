@@ -197,14 +197,14 @@ async function runReplyRound(): Promise<void> {
   // Check daily limit
   const maxPerDay = env.X_REPLY_MAX_PER_DAY || 50;
   if (state.repliesToday >= maxPerDay) {
-    logger.debug(`[ReplyEngine] Daily limit reached (${state.repliesToday}/${maxPerDay})`);
+    logger.info(`[ReplyEngine] Daily limit reached (${state.repliesToday}/${maxPerDay})`);
     return;
   }
   
   // Check rate limit (includes shared 429 backoff)
   const advice = getPostingAdvice();
   if (!advice.canPost) {
-    logger.debug(`[ReplyEngine] Write rate limited: ${advice.reason}`);
+    logger.info(`[ReplyEngine] Write rate limited: ${advice.reason}`);
     return;
   }
   
@@ -240,9 +240,10 @@ async function runReplyRound(): Promise<void> {
   }
   
   // Find candidates
+  logger.info(`[ReplyEngine] Round #${state.roundCount} — finding candidates...`);
   const candidates = await findCandidates(reader);
   if (candidates.length === 0) {
-    logger.debug('[ReplyEngine] No candidates found this round');
+    logger.info(`[ReplyEngine] Round #${state.roundCount} — no candidates found`);
     return;
   }
   
@@ -406,9 +407,10 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
         }
       }
     } catch (err: any) {
+      // getMentions() already calls reportReadRateLimit() on 429 — don't double-fire
       const msg = err?.message || String(err);
       if (msg.includes('429') || msg.includes('rate limit') || msg.includes('Too Many')) {
-        reportReadRateLimit();
+        logger.info(`[ReplyEngine] Mentions 429 — read backoff active, will retry next round`);
       }
       try { await recordMentionRead(); } catch {}
     }
@@ -438,9 +440,10 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
           }
         }
       } catch (err: any) {
+        // searchTweets() already calls reportReadRateLimit() on 429 — don't double-fire
         const msg = err?.message || String(err);
         if (msg.includes('429') || msg.includes('rate limit') || msg.includes('Too Many')) {
-          reportReadRateLimit();
+          logger.info(`[ReplyEngine] Search 429 — read backoff active, will retry next round`);
         }
         try { await recordSearchRead(); } catch {}
       }
