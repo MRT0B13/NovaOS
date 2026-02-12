@@ -990,6 +990,32 @@ export async function startSystemReporter(): Promise<void> {
   });
   
   logger.info(`[SystemReporter] ✅ Started (reports every ${STATUS_REPORT_INTERVAL_MS / (60 * 60 * 1000)}h, daily summary at ${DAILY_REPORT_HOUR_UTC}:00 UTC, midnight reset check hourly)`);
+
+  // ── Auto-track errors & warnings by patching the ElizaOS logger ──
+  // This ensures ALL logger.error() and logger.warn() calls in the codebase
+  // are counted, without needing to sprinkle recordError() everywhere.
+  try {
+    const origError = logger.error.bind(logger);
+    const origWarn  = logger.warn.bind(logger);
+    (logger as any).error = (...args: any[]) => {
+      metrics.errors24h++;
+      // Fire-and-forget PG increment (debounced via saveMetrics)
+      if (usePostgres && pgRepo) {
+        pgRepo.incrementMetric('errors24h').catch(() => {});
+      }
+      return origError(...args);
+    };
+    (logger as any).warn = (...args: any[]) => {
+      metrics.warnings24h++;
+      if (usePostgres && pgRepo) {
+        pgRepo.incrementMetric('warnings24h').catch(() => {});
+      }
+      return origWarn(...args);
+    };
+    logger.info('[SystemReporter] Logger patched — errors/warnings now auto-tracked');
+  } catch (patchErr) {
+    logger.warn('[SystemReporter] Failed to patch logger for error/warning tracking:', patchErr);
+  }
 }
 
 /**
