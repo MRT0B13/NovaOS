@@ -244,14 +244,14 @@ class StandaloneTwitterClient {
       return { id: result.data.id };
     } catch (error: any) {
       // Log full error for debugging
-      logger.error('[StandaloneTwitter] Tweet error:', {
+      logger.error('[StandaloneTwitter] Tweet error:', JSON.stringify({
         code: error?.code,
         status: error?.data?.status,
         detail: error?.data?.detail,
         title: error?.data?.title,
         errors: error?.data?.errors,
         message: error?.message,
-      });
+      }));
       
       // Parse Twitter API errors into cleaner messages
       const code = error?.code || error?.data?.status || 0;

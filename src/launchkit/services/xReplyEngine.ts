@@ -188,9 +188,22 @@ async function runReplyRound(): Promise<void> {
     return;
   }
   
-  // Pick best candidate (prioritize mentions, then targets, then search)
+  // Pick best candidate (prioritize mentions, filter spam/irrelevant)
   const candidate = pickBestCandidate(candidates);
   if (!candidate) return;
+  
+  // Delay between read and write to avoid landing in the same 15-min rate window
+  const delayMs = 30_000 + Math.random() * 30_000;
+  const delaySec = Math.round(delayMs / 1000);
+  logger.info(`[ReplyEngine] Waiting ${delaySec}s before replying...`);
+  await new Promise(resolve => setTimeout(resolve, delayMs));
+  
+  // Re-check rate limits — another service may have posted during the wait
+  const postCheckAdvice = getPostingAdvice();
+  if (!postCheckAdvice.canPost) {
+    logger.debug(`[ReplyEngine] Rate limited after delay: ${postCheckAdvice.reason}`);
+    return;
+  }
   
   // Generate a reply
   const replyText = await generateReply(candidate);
@@ -321,15 +334,101 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
 function pickBestCandidate(candidates: ReplyCandidate[]): ReplyCandidate | null {
   if (candidates.length === 0) return null;
   
+  const totalCount = candidates.length;
+  const viable: ReplyCandidate[] = [];
+  
+  for (const c of candidates) {
+    // Spam filter first — catch scam bots even if they mention us
+    if (isSpam(c.text)) {
+      logger.debug(`[ReplyEngine] Skipping spam: "${c.text.slice(0, 60)}..."`);
+      state.repliedTweetIds.add(c.tweetId);
+      continue;
+    }
+    
+    // Relevance filter — mentions always pass, search must have keywords
+    if (!isRelevant(c.text, c.source)) {
+      logger.debug(`[ReplyEngine] Skipping irrelevant: "${c.text.slice(0, 60)}..."`);
+      state.repliedTweetIds.add(c.tweetId);
+      continue;
+    }
+    
+    viable.push(c);
+  }
+  
+  if (viable.length === 0) {
+    logger.info(`[ReplyEngine] All ${totalCount} candidates filtered out (spam/irrelevant)`);
+    return null;
+  }
+  
   // Priority: mentions > search
-  const mentions = candidates.filter(c => c.source === 'mention');
+  const mentions = viable.filter(c => c.source === 'mention');
   if (mentions.length > 0) return mentions[0];
   
   // For search results, pick one at random
-  const search = candidates.filter(c => c.source === 'search');
+  const search = viable.filter(c => c.source === 'search');
   if (search.length > 0) return search[Math.floor(Math.random() * search.length)];
   
-  return candidates[0];
+  return viable[0];
+}
+
+// ============================================================================
+// Spam & Relevance Filters
+// ============================================================================
+
+const SPAM_PATTERNS: string[] = [
+  // DM bait / scams
+  'dm me', 'send me a dm', 'check your dm', 'check inbox', 'check dm',
+  'slide into', "let's connect", "let's talk privately", "let's collaborate",
+  'message me', 'inbox me', 'text me', 'whatsapp me',
+  // Follow farming
+  'follow me', 'follow back', 'f4f', 'follow for follow',
+  'like and retweet', 'like and follow', 'retweet this', 'repost this',
+  // Wallet scams
+  'claim your', 'airdrop claim', 'connect wallet', 'connect your wallet',
+  'validate your wallet', 'sync your wallet', 'verify wallet', 'whitelist spot',
+  'guaranteed profit', 'free mint', 'free airdrop', '100x guaranteed',
+  'send sol to', 'send eth to', '10x your',
+  // Promo spam
+  'i can help you grow', 'grow your account', 'grow your brand',
+  'promote your', 'marketing services', 'paid promo', 'paid promotion',
+  'book a call', 'schedule a call', 'link in bio', 'check my bio',
+  // Generic bot replies
+  'nice project', 'great project', 'amazing project', 'interesting project',
+  'check out my', 'check my pin', 'check my latest',
+  // Engagement bait
+  'drop your wallet', 'drop wallet below', 'tag 3 friends',
+];
+
+function isSpam(text: string): boolean {
+  const lower = text.toLowerCase();
+  return SPAM_PATTERNS.some(pattern => lower.includes(pattern));
+}
+
+const RELEVANCE_KEYWORDS: string[] = [
+  // Solana ecosystem
+  'solana', 'sol', 'pump.fun', 'pumpfun', 'pumpswap', 'raydium',
+  'jupiter', 'dexscreener', 'birdeye',
+  // Token/crypto
+  'memecoin', 'meme coin', 'meme token', 'token launch', 'token',
+  'crypto', 'defi', 'dex', 'swap', 'liquidity', 'bonding curve',
+  'graduated', 'market cap',
+  // Safety
+  'rugcheck', 'rug pull', 'rugged', 'mint authority', 'freeze authority',
+  'lp locked', 'lp burned',
+  // Community
+  'degen', 'crypto twitter', 'holder', 'airdrop',
+  // AI agents
+  'ai agent', 'eliza', 'elizaos', 'autonomous', 'nova',
+  // Chain/wallet
+  'wallet', 'on-chain', 'onchain', 'blockchain', 'web3',
+];
+
+function isRelevant(text: string, source: string): boolean {
+  // Mentions are always relevant — someone tagged Nova directly
+  if (source === 'mention') return true;
+  // Search results must contain at least one keyword
+  const lower = text.toLowerCase();
+  return RELEVANCE_KEYWORDS.some(kw => lower.includes(kw));
 }
 
 // ============================================================================

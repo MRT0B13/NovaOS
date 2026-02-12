@@ -24,11 +24,11 @@ function smartTruncate(text: string, maxLength: number = TWITTER_MAX_LENGTH): st
   
   // Extract URLs (they'll be shortened to 23 chars each by Twitter)
   const urlRegex = /https?:\/\/[^\s]+/gi;
-  const urls = text.match(urlRegex) || [];
+  const urls: string[] = text.match(urlRegex) ?? [];
   
   // Also match pump.fun/... and t.me/... without protocol
   const shortUrlRegex = /(?:pump\.fun|t\.me)\/[^\s]+/gi;
-  const shortUrls = text.match(shortUrlRegex) || [];
+  const shortUrls: string[] = text.match(shortUrlRegex) ?? [];
   shortUrls.forEach(url => {
     if (!urls.some(u => u.includes(url))) {
       urls.push(url);
@@ -417,8 +417,8 @@ Write the tweet now. No quotes. Raw text only.`;
     text = smartTruncate(text);
     
     // Calculate Twitter char count for logging
-    const urls = text.match(/https?:\/\/[^\s]+/gi) || [];
-    const urlActualChars = urls.reduce((sum, url) => sum + url.length, 0);
+    const urls: string[] = text.match(/https?:\/\/[^\s]+/gi) ?? [];
+    const urlActualChars = urls.reduce((sum: number, url: string) => sum + url.length, 0);
     const twitterCharCount = text.length - urlActualChars + (urls.length * 23);
     
     logger.info(`[XMarketing] Generated AI tweet (${twitterCharCount}/280 Twitter chars): ${text.substring(0, 60)}...`);
