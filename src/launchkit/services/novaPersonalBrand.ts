@@ -396,39 +396,42 @@ async function checkMarketTriggers(): Promise<{ trigger: string; context: string
 // Enhancement #4: Post Performance Tracking
 // ============================================================================
 
-/** Check metrics on recent tweets and record performance */
+/** Check metrics on recent tweets — reads from reply engine cache, ZERO API calls */
 async function trackPostPerformance(): Promise<void> {
-  if (!xPublisher) return;
-  
-  // Get posts from last 24h that have tweet IDs
-  const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-  const recentPosts = state.posts.filter(p => 
-    p.platform === 'x' && 
-    p.postId && 
-    p.postedAt && 
-    new Date(p.postedAt).getTime() > oneDayAgo
-  );
-  
-  for (const post of recentPosts.slice(-5)) { // Check last 5 to avoid rate limits
-    try {
-      const tweet = await xPublisher.getTweet(post.postId!);
-      if (tweet?.metrics) {
-        // Initialize if needed
+  try {
+    // Queue recent posts for checking by the reply engine (1 per round)
+    const { queuePerfCheck, getPerfResults } = await import('./xReplyEngine.ts');
+    
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const recentPosts = state.posts.filter(p => 
+      p.platform === 'x' && 
+      p.postId && 
+      p.postedAt && 
+      new Date(p.postedAt).getTime() > oneDayAgo
+    );
+    
+    // Queue up to 5 recent posts for the engine to check (1 per round)
+    for (const post of recentPosts.slice(-5)) {
+      if (post.postId) queuePerfCheck(post.postId);
+    }
+    
+    // Read whatever results the engine has collected so far
+    const results = getPerfResults();
+    for (const post of recentPosts) {
+      if (!post.postId) continue;
+      const metrics = results.get(post.postId);
+      if (metrics) {
         if (!state.postPerformance[post.type]) {
           state.postPerformance[post.type] = { totalLikes: 0, totalRetweets: 0, count: 0 };
         }
-        
         const perf = state.postPerformance[post.type];
-        perf.totalLikes += tweet.metrics.likes;
-        perf.totalRetweets += tweet.metrics.retweets;
+        perf.totalLikes += metrics.likes;
+        perf.totalRetweets += metrics.retweets;
         perf.count += 1;
-        
-        const avgLikes = (perf.totalLikes / perf.count).toFixed(1);
-        logger.debug(`[NovaPersonalBrand] 📊 ${post.type}: ${tweet.metrics.likes} likes, ${tweet.metrics.retweets} RTs (avg: ${avgLikes} likes over ${perf.count} posts)`);
       }
-    } catch {
-      // Free tier may not support metrics — silently skip
     }
+  } catch {
+    // Non-fatal
   }
 }
 
@@ -455,43 +458,24 @@ function getPerformanceInsights(): { bestType: NovaPostType | null; worstType: N
 // Enhancement #5: Community Shoutouts
 // ============================================================================
 
-/** Generate a community shoutout by checking who replied to recent tweets */
+/** Generate a community shoutout — reads from reply engine cache, ZERO API calls */
 async function generateCommunityShoutout(): Promise<string | null> {
-  if (!xPublisher) return null;
-  
   const today = new Date().toISOString().split('T')[0];
   if (state.lastShoutoutDate === today) return null; // Max 1 per day
   
   try {
-    // Check per-endpoint cooldown before calling mentions
-    const { canReadMentions, recordMentionRead, mentionsCooldownRemaining } = await import('./xRateLimiter.ts');
-    if (!canReadMentions()) {
-      const wait = mentionsCooldownRemaining();
-      logger.info(`[NovaPersonalBrand] Mentions on cooldown (${wait}s remaining) — skipping shoutout`);
-      return null;
-    }
+    // Read from reply engine's shared data — NO separate API call
+    const { getTopEngagers } = await import('./xReplyEngine.ts');
+    const topEngagers = getTopEngagers(2); // Need at least 2 mentions
     
-    const mentions = await xPublisher.getMentions(20);
-    await recordMentionRead();
-    if (!mentions || mentions.length === 0) return null;
+    if (topEngagers.length === 0) return null;
     
-    // Find unique repliers who've engaged multiple times
-    const replierCounts = new Map<string, number>();
-    for (const mention of mentions) {
-      if (mention.authorUsername) {
-        replierCounts.set(mention.authorUsername, (replierCounts.get(mention.authorUsername) || 0) + 1);
-      }
-    }
+    const top = topEngagers[0];
+    state.lastShoutoutDate = today;
     
-    // Find top engager
-    const sorted = [...replierCounts.entries()].sort((a, b) => b[1] - a[1]);
-    if (sorted.length > 0 && sorted[0][1] >= 2) {
-      state.lastShoutoutDate = today;
-      const [username, count] = sorted[0];
-      return `shoutout to @${username} who's been engaging like crazy — ${count} replies recently! the real ones show up consistently and y'all see it 🤝`;
-    }
-    
-    return null;
+    // We only have authorId, not username — use a generic format
+    // (username resolution would require another API call)
+    return `Data point: one account has engaged ${top.count} times recently. The real ones show up consistently. You know who you are 🤝`;
   } catch {
     return null;
   }
@@ -2582,143 +2566,13 @@ export async function postCollabTweet(): Promise<boolean> {
 // ============================================================================
 
 /**
- * Check recent mentions/interactions and auto-reply to build engagement.
- * Uses xPublisher.getMentions() if available, otherwise searches for @handle.
+ * @deprecated Engagement replies are now handled by xReplyEngine (single-source X reader).
+ * This stub is kept for backwards compatibility (tests, exports).
+ * It makes ZERO API calls — the reply engine does all reading and replying.
  */
 export async function processEngagementReplies(): Promise<number> {
-  const env = getEnv();
-  
-  if (env.NOVA_PERSONAL_X_ENABLE !== 'true') {
-    return 0;
-  }
-  
-  // Initialize xPublisher on demand
-  if (!xPublisher) {
-    try {
-      const { XPublisherService } = await import('./xPublisher.ts');
-      xPublisher = new XPublisherService(null as any);
-    } catch (initErr) {
-      logger.error('[NovaPersonalBrand] Failed to init X publisher for replies:', initErr);
-      return 0;
-    }
-  }
-  
-  try {
-    const { getQuota } = await import('./xRateLimiter.ts');
-    const quota = getQuota();
-    
-    // Reserve writes for scheduled posts — only use surplus for replies
-    const reservedWrites = 10; // keep 10 writes for scheduled content
-    const availableForReplies = Math.max(0, quota.writes.remaining - reservedWrites);
-    const maxReplies = Math.min(availableForReplies, 3); // cap at 3 per cycle
-    
-    if (maxReplies <= 0) {
-      logger.info('[NovaPersonalBrand] Not enough X quota for engagement replies');
-      return 0;
-    }
-    
-    // Try to get mentions (requires Basic tier + cooldown check)
-    let mentions: Array<{ id: string; text: string; authorId?: string; authorName?: string }> = [];
-    
-    try {
-      const { canReadMentions, recordMentionRead, canReadSearch, recordSearchRead, mentionsCooldownRemaining, searchCooldownRemaining } = await import('./xRateLimiter.ts');
-      
-      if (!canReadMentions()) {
-        const wait = mentionsCooldownRemaining();
-        logger.info(`[NovaPersonalBrand] Mentions on cooldown (${wait}s) — skipping engagement replies`);
-        return 0;
-      }
-      
-      const raw = await xPublisher!.getMentions(10);
-      await recordMentionRead();
-      if (raw && Array.isArray(raw)) {
-        mentions = raw.map((m: any) => ({
-          id: m.id,
-          text: m.text || '',
-          authorId: m.author_id,
-          authorName: m.author?.username || m.author_id,
-        }));
-      }
-    } catch (mentionErr: any) {
-      // Mentions endpoint failed
-      logger.info('[NovaPersonalBrand] Mentions not available:', mentionErr?.message);
-      
-      // Fallback: search for our handle (also needs cooldown check)
-      try {
-        const { canReadSearch, recordSearchRead, searchCooldownRemaining } = await import('./xRateLimiter.ts');
-        if (!canReadSearch()) {
-          const wait = searchCooldownRemaining();
-          logger.info(`[NovaPersonalBrand] Search on cooldown (${wait}s) — skipping engagement replies`);
-          return 0;
-        }
-        
-        const handle = env.NOVA_X_HANDLE || 'NovaAIAgent';
-        const searchResults = await xPublisher!.searchTweets(`@${handle}`, 10);
-        await recordSearchRead();
-        if (searchResults && Array.isArray(searchResults)) {
-          mentions = searchResults.map((s: any) => ({
-            id: s.id,
-            text: s.text || '',
-            authorId: s.author_id,
-            authorName: s.author?.username || s.author_id,
-          }));
-        }
-      } catch {
-        logger.info('[NovaPersonalBrand] Tweet search not available');
-        return 0;
-      }
-    }
-    
-    if (mentions.length === 0) {
-      logger.info('[NovaPersonalBrand] No mentions found to reply to');
-      return 0;
-    }
-    
-    // Filter out mentions we've already replied to
-    const repliedTo = state.repliedMentions || new Set<string>();
-    const unreplied = mentions.filter(m => !repliedTo.has(m.id));
-    
-    if (unreplied.length === 0) {
-      logger.info('[NovaPersonalBrand] No new unreplied mentions');
-      return 0;
-    }
-    
-    let repliesPosted = 0;
-    const stats = await getNovaStats();
-    
-    for (const mention of unreplied.slice(0, maxReplies)) {
-      try {
-        // Generate a contextual reply
-        const replyContent = await generateEngagementReply(mention.text, mention.authorName || 'anon', stats);
-        
-        if (!replyContent) continue;
-        
-        const result = await xPublisher!.reply(replyContent, mention.id);
-        
-        if (result?.id) {
-          repliedTo.add(mention.id);
-          repliesPosted++;
-          logger.info(`[NovaPersonalBrand] ✅ Replied to @${mention.authorName}: "${replyContent.substring(0, 50)}..."`);
-          // Note: recordWrite is already called inside xPublisher.reply() — no need to call it again
-        }
-      } catch (replyErr) {
-        logger.warn(`[NovaPersonalBrand] Failed to reply to mention ${mention.id}:`, replyErr);
-      }
-    }
-    
-    // Persist replied set (keep last 200 entries)
-    const repliedArray = Array.from(repliedTo);
-    if (repliedArray.length > 200) {
-      state.repliedMentions = new Set(repliedArray.slice(-200));
-    } else {
-      state.repliedMentions = repliedTo;
-    }
-    
-    return repliesPosted;
-  } catch (err) {
-    logger.error('[NovaPersonalBrand] Engagement reply error:', err);
-    return 0;
-  }
+  logger.debug('[NovaPersonalBrand] processEngagementReplies() is deprecated — xReplyEngine handles all X reads/replies');
+  return 0;
 }
 
 /**

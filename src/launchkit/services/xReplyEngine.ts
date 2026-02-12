@@ -53,6 +53,60 @@ const state = {
 };
 
 // ============================================================================
+// Shared Read Data
+// ============================================================================
+// The reply engine is the ONLY service that reads from the X API.
+// Other services (shoutouts, performance tracking) consume from this cache.
+// This prevents duplicate API calls and 429s.
+
+const sharedData = {
+  /** Raw mentions from last fetch — other services can read this */
+  lastMentions: [] as Array<{ id: string; text: string; authorId?: string; createdAt?: string }>,
+  lastMentionFetchAt: 0,
+  
+  /** Engager tracking — counts how many times each authorId has mentioned us */
+  engagerCounts: new Map<string, number>(),
+  
+  /** Performance tracking — brand scheduler queues tweet IDs, engine checks 1 per round */
+  perfQueue: [] as string[],
+  perfResults: new Map<string, { likes: number; retweets: number; replies: number; checkedAt: number }>(),
+};
+
+// ── Exported accessors (consumed by novaPersonalBrand.ts) ──
+
+/** Get top engagers sorted by mention count. Used by community shoutout. */
+export function getTopEngagers(minCount = 2): Array<{ authorId: string; count: number }> {
+  return [...sharedData.engagerCounts.entries()]
+    .filter(([_, count]) => count >= minCount)
+    .sort((a, b) => b[1] - a[1])
+    .map(([authorId, count]) => ({ authorId, count }));
+}
+
+/** Queue a tweet ID for performance checking. Engine will check 1 per round. */
+export function queuePerfCheck(tweetId: string): void {
+  if (!sharedData.perfQueue.includes(tweetId) && !sharedData.perfResults.has(tweetId)) {
+    sharedData.perfQueue.push(tweetId);
+    // Keep queue reasonable
+    if (sharedData.perfQueue.length > 20) {
+      sharedData.perfQueue = sharedData.perfQueue.slice(-20);
+    }
+  }
+}
+
+/** Get performance results for checked tweets. */
+export function getPerfResults(): Map<string, { likes: number; retweets: number; replies: number; checkedAt: number }> {
+  return sharedData.perfResults;
+}
+
+/** Get last fetched mentions (for any service that needs them without a separate API call). */
+export function getLastMentions() {
+  return {
+    mentions: sharedData.lastMentions,
+    fetchedAt: sharedData.lastMentionFetchAt,
+  };
+}
+
+// ============================================================================
 // Core Engine
 // ============================================================================
 
@@ -267,6 +321,31 @@ async function runReplyRound(): Promise<void> {
       )).catch(() => {});
     }
   }
+  
+  // ── Piggyback: check 1 queued tweet's performance per round ──
+  // Spreads the load (1 read per round instead of 5 at once)
+  if (sharedData.perfQueue.length > 0 && canRead()) {
+    const tweetId = sharedData.perfQueue.shift()!;
+    try {
+      const perfReader = getTwitterReader();
+      const tweet = await perfReader.getTweet(tweetId);
+      await recordRead();
+      if (tweet?.metrics) {
+        sharedData.perfResults.set(tweetId, {
+          ...tweet.metrics,
+          checkedAt: Date.now(),
+        });
+        logger.debug(`[ReplyEngine] Perf check: ${tweetId.slice(0, 8)} → ${tweet.metrics.likes} likes, ${tweet.metrics.retweets} RTs`);
+      }
+      // Trim old results
+      if (sharedData.perfResults.size > 50) {
+        const entries = [...sharedData.perfResults.entries()].sort((a, b) => b[1].checkedAt - a[1].checkedAt);
+        sharedData.perfResults = new Map(entries.slice(0, 30));
+      }
+    } catch {
+      // Non-fatal — just skip this round's perf check
+    }
+  }
 }
 
 // ============================================================================
@@ -294,6 +373,27 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
     try {
       const mentions = await reader.getMentions(10);
       await recordMentionRead();
+      
+      // ── Populate shared data (consumed by brand scheduler) ──
+      sharedData.lastMentions = mentions;
+      sharedData.lastMentionFetchAt = Date.now();
+      
+      // Track engager counts (for community shoutouts)
+      for (const m of mentions) {
+        if (m.authorId) {
+          sharedData.engagerCounts.set(
+            m.authorId,
+            (sharedData.engagerCounts.get(m.authorId) || 0) + 1
+          );
+        }
+      }
+      // Trim engager map if it gets too large
+      if (sharedData.engagerCounts.size > 500) {
+        const sorted = [...sharedData.engagerCounts.entries()].sort((a, b) => b[1] - a[1]);
+        sharedData.engagerCounts = new Map(sorted.slice(0, 200));
+      }
+      // ── End shared data ──
+      
       for (const m of mentions) {
         if (!state.repliedTweetIds.has(m.id)) {
           candidates.push({
@@ -614,4 +714,9 @@ export default {
   startReplyEngine,
   stopReplyEngine,
   getReplyEngineStatus,
+  // Shared data (single-source reads)
+  getTopEngagers,
+  queuePerfCheck,
+  getPerfResults,
+  getLastMentions,
 };
