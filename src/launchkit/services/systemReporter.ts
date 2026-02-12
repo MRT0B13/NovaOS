@@ -997,20 +997,20 @@ export async function startSystemReporter(): Promise<void> {
   try {
     const origError = logger.error.bind(logger);
     const origWarn  = logger.warn.bind(logger);
-    (logger as any).error = (...args: any[]) => {
+    (logger as any).error = function (...args: unknown[]) {
       metrics.errors24h++;
-      // Fire-and-forget PG increment (debounced via saveMetrics)
+      // Fire-and-forget PG increment
       if (usePostgres && pgRepo) {
         pgRepo.incrementMetric('errors24h').catch(() => {});
       }
-      return origError(...args);
+      return (origError as Function).apply(logger, args);
     };
-    (logger as any).warn = (...args: any[]) => {
+    (logger as any).warn = function (...args: unknown[]) {
       metrics.warnings24h++;
       if (usePostgres && pgRepo) {
         pgRepo.incrementMetric('warnings24h').catch(() => {});
       }
-      return origWarn(...args);
+      return (origWarn as Function).apply(logger, args);
     };
     logger.info('[SystemReporter] Logger patched — errors/warnings now auto-tracked');
   } catch (patchErr) {
