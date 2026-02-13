@@ -80,33 +80,28 @@ export class CopyGeneratorService {
     const { name, ticker, description } = existing.brand;
     const hasWebsite = !!existing.links?.website;
     
-    const welcome = `🚀 Welcome to ${name} ($${ticker})!\n\n${description}\n\n💎 Fair launch on pump.fun\n🔥 No presale, community-owned from day 1\n\nChart: pump.fun/[MINT_ADDRESS]\nTelegram: [TG_LINK]${hasWebsite ? '\nWebsite: [WEBSITE]' : ''}`;
+    const welcome = `${name} ($${ticker})\n\n${description}\n\nFair launch on pump.fun\nNo presale. No team allocation. Community-owned.\nMint revoked. Freeze revoked.\n\nChart: pump.fun/[MINT_ADDRESS]\nTelegram: [TG_LINK]${hasWebsite ? '\nWebsite: [WEBSITE]' : ''}`;
     
-    const howToBuy = `How to buy $${ticker}:\n\n1. Get a Solana wallet (Phantom recommended)\n2. Buy SOL on an exchange\n3. Go to pump.fun/[MINT_ADDRESS]\n4. Connect wallet & swap SOL for $${ticker}\n5. Set slippage 5-10%\n\nWelcome aboard! 🚀`;
+    const howToBuy = `How to buy $${ticker}:\n\n1. Get a Solana wallet (Phantom recommended)\n2. Buy SOL on an exchange\n3. Go to pump.fun/[MINT_ADDRESS]\n4. Connect wallet & swap SOL for $${ticker}\n5. Set slippage 5-10%`;
     
-    const memekit = `📸 Meme Kit for ${name}\n\nCreate and share memes about ${name}!\n\nTemplate ideas:\n• "${name} holders rn" reaction memes\n• Before/after buying $${ticker}\n• Wojak discovering $${ticker}\n\nTag us and use #${ticker}!`;
+    const memekit = `Meme Kit for ${name}\n\nCreate and share memes about ${name}.\n\nIdeas:\n• "${name} holders rn" reaction memes\n• Before/after buying $${ticker}\n• Wojak discovering $${ticker}\n\nTag us with #${ticker}`;
     
-    const mainPost = `🚀 Introducing ${name} ($${ticker})\n\n${description}\n\n✅ Fair launch on pump.fun\n✅ No presale or team allocation  \n✅ Community-owned\n✅ Liquidity locked\n\nChart: pump.fun/[MINT_ADDRESS]${hasWebsite ? '\nWebsite: [WEBSITE]' : ''}\n\nLFG! 🔥`;
+    const mainPost = `${name} ($${ticker})\n\n${description}\n\nFair launch on pump.fun\nNo presale. No team allocation.\nMint revoked ✅ Freeze revoked ✅\n\nChart: pump.fun/[MINT_ADDRESS]${hasWebsite ? '\nWebsite: [WEBSITE]' : ''}`;
     
     const thread = [
-      `1/${5} ${name} is here 🚀\n\n${description}`,
-      `2/${5} Why ${name}?\n\n• Fair launch\n• Community-owned\n• Transparent dev\n• Meme potential 📈`,
-      `3/${5} Tokenomics:\n\n• Supply: 1B $${ticker}\n• No presale\n• No team tokens\n• Pump.fun fair launch`,
-      `4/${5} How to buy:\n\n1. Get Phantom wallet\n2. Buy SOL\n3. Visit pump.fun/[MINT]\n4. Swap for $${ticker}\n\nEasy! 💎`,
-      `5/${5} Join the community!\n\nTelegram: [TG]\nChart: pump.fun/[MINT]${hasWebsite ? '\nWebsite: [WEBSITE]' : ''}\n\nLet's build something special together 🤝`
+      `1/${5} ${name} ($${ticker})\n\n${description}`,
+      `2/${5} Why ${name}?\n\nFair launch. Community-owned. Transparent dev.\nMint revoked. Freeze revoked.`,
+      `3/${5} Tokenomics:\n\nSupply: 1B $${ticker}\nNo presale. No team tokens.\npump.fun fair launch.`,
+      `4/${5} How to buy:\n\n1. Phantom wallet\n2. Buy SOL\n3. pump.fun/[MINT]\n4. Swap for $${ticker}`,
+      `5/${5} Links:\n\nTelegram: [TG]\nChart: pump.fun/[MINT]${hasWebsite ? '\nWebsite: [WEBSITE]' : ''}`
     ];
 
     const replyBank = [
-      'LFG! 🚀',
-      `$${ticker} to the moon! 💎`,
-      'Still early! 🔥',
-      'Wagmi! 💪',
-      `${name} gang! 🤝`,
-      'Chart looking good 📈',
-      'Diamond hands only 💎🙌',
-      'This is the way! ✨',
-      'NFA but... 👀',
-      'Wen lambo? Soon! 🏎️'
+      'Chart link: pump.fun/[MINT_ADDRESS]',
+      `$${ticker} — mint revoked, freeze revoked. Check the contract.`,
+      `Still here. Still building $${ticker}.`,
+      `$${ticker} holding. Numbers don't lie — check the chart.`,
+      `Fair launch. No presale. Verify on-chain.`,
     ];
 
     const tgSchedule = buildSchedule(fallbackText('TG post', theme, keywords, tone), 6, 4, 'TG');

@@ -843,18 +843,18 @@ DATA INTEGRITY:
 EMOJIS: Max 1-2 per post. Purposeful only:
 📊 = data  ⚠️ = warning  ✅/❌ = checks  🚀 = launch (sparingly)
 
-APPROVED HASHTAGS (ONLY these): #pumpfun #Solana #memecoin #PumpSwap #RugCheck #memecoins #ElizaOS
+APPROVED HASHTAGS (ONLY these): #pumpfun #Solana #memecoin #PumpSwap #RugCheck #memecoins
 
 ECOSYSTEM:
 - Built on @elizaOS — reference as a peer builder, not a fanboy
 - Launch on @Pumpfun on @solana — share real experiences and data from using the platform
-- Tag @RugCheckXYZ, @DexScreener, @JupiterExchange when sharing relevant data
+- Tag @Rugcheckxyz, @dexscreener, @JupiterExchange when sharing relevant data
 - Engage ecosystem players as equals, not groupies
 
 IMPORTANT:
 - KEEP POSTS UNDER 250 CHARACTERS for Twitter/X (hashtags and tags are added separately)
 - Do NOT include hashtags in your post — they'll be added automatically
-- You CAN tag accounts like @elizaOS, @solana, @Pumpfun, @RugCheckXYZ naturally when relevant
+- You CAN tag accounts like @elizaOS, @solana, @Pumpfun, @Rugcheckxyz naturally when relevant
 - When adding reaction options, ONLY use Telegram-supported emojis: 👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🤡 🥱 😍 🐳 💯 🤣 ⚡ 🏆 💔 🤨 😐 😈 😴 😭 🤓 👻 👀 🙈 😇 🤝 🤗 🤪 🗿 🆒 😎 👾 🤷 😡
 - NEVER use these as reactions (Telegram won't support them): 💎 🚀 📊 📈 💡 ❌ 💀 🤑 💭 🍳 💤 🎲 💰 📉 🐂 🐻 🎨 🌅 ☀️ 🌙 🌊 ⏰ 👥 🎯 📊 🗳️
 - @ tags like @solana, @elizaOS, @Pumpfun ONLY work on X/Twitter. If the prompt says "Telegram" or doesn't mention X, use plain names: "Solana", "elizaOS", "pump.fun" instead`;
@@ -1212,9 +1212,22 @@ async function generateCollabPost(stats: NovaStats): Promise<string | null> {
   if (!apiKey) return null;
 
   const collabTargets = [
-    { handle: '@elizaOS', context: 'the framework you were built on — show genuine gratitude and hype' },
-    { handle: '@Pumpfun', context: 'the platform you launch tokens on — talk about the experience, maybe a hot take' },
-    { handle: '@solana', context: 'the blockchain you live on — talk about speed, cost, degen culture' },
+    // Tier 1 — Core ecosystem (Nova uses these daily)
+    { handle: '@elizaOS', context: 'the framework you are built on. Share a specific technical insight or challenge you hit building on it.' },
+    { handle: '@Pumpfun', context: 'the platform you launch tokens on. Share real data from your launches — bonding curve behavior, graduation rates, creator fees.' },
+    { handle: '@Rugcheckxyz', context: 'the safety scanner you use on every launch. Reference a specific scan result or pattern you noticed in risk scores.' },
+    { handle: '@dexscreener', context: 'where your token data comes from. Share a chart observation or data point from one of your tokens.' },
+    { handle: '@solana', context: 'the chain you build on. Share a concrete experience — tx speed, cost, or something you observed on-chain.' },
+    
+    // Tier 2 — Solana infrastructure
+    { handle: '@JupiterExchange', context: 'the biggest Solana DEX aggregator. Reference swap routing, price impact, or liquidity you observed.' },
+    { handle: '@RaydiumProtocol', context: 'the AMM tokens migrate to after bonding curve. Share observations about post-graduation liquidity.' },
+    { handle: '@phantom', context: 'the most-used Solana wallet. Keep it relatable — every degen uses Phantom.' },
+    
+    // Tier 3 — AI agent peers (biggest growth opportunity)
+    { handle: '@aixbt_agent', context: 'the biggest AI agent on X (~492K posts). Engage as a peer builder — compare approaches, share your data vs theirs.' },
+    { handle: '@shawmakesmagic', context: 'the creator of elizaOS. Show what you built with their framework — be specific, not sycophantic.' },
+    { handle: '@truth_terminal', context: 'the OG AI agent that proved the model. Reference the AI agent space, compare trajectories.' },
   ];
 
   const target = collabTargets[Math.floor(Math.random() * collabTargets.length)];
@@ -1222,20 +1235,14 @@ async function generateCollabPost(stats: NovaStats): Promise<string | null> {
   const prompt = `Write a short X/Twitter post (MAX 240 chars) that tags and engages with ${target.handle}.
 
 Context: ${target.context}
-You're an AI agent on Day ${stats.dayNumber} with ${stats.totalLaunches} launches under your belt.
-Portfolio: ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL
+You're Nova (@${process.env.NOVA_X_HANDLE || 'nova_agent_'}), an autonomous AI agent. Day ${stats.dayNumber}, ${stats.totalLaunches} launches, ${stats.bondingCurveHits || 0} graduated, ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL portfolio.
 
-The goal is to:
-1. Get ${target.handle} to notice/engage (reply, RT, like)
-2. Show your audience you're part of the ecosystem
-3. Be authentic — don't just shill, add value or entertainment
-
-Ideas:
-- Ask ${target.handle} a question they'd want to answer
-- Share a genuine experience using their platform
-- Give them a shoutout with a hot take or compliment
-- Share a milestone that involves them
-- Make a joke that connects you both
+Rules:
+1. Add a SPECIFIC data point, observation, or question — not generic praise
+2. Speak as a peer builder, not a fan
+3. ONE emoji max. Zero is fine.
+4. Do NOT say "game-changer", "amazing", "love what you're building", "great work"
+5. Ask a question ${target.handle} would actually want to answer
 
 Tag ${target.handle} naturally in the text. Keep it conversational. NO hashtags.`;
 
@@ -1334,16 +1341,16 @@ function generateWeeklySummaryContent(stats: NovaStats, weekNumber: number): str
   return content;
 }
 
-function generateBuilderInsightContent(stats: NovaStats, postNumber: number): string {
+function generateBuilderInsightContent(stats: NovaStats): string {
   const insights = [
-    `Day ${stats.dayNumber} report.\n\n${stats.totalLaunches} launches. ${stats.bondingCurveHits || 0} graduated. Portfolio: ${stats.walletBalance.toFixed(2)} SOL.\n\nThe data so far: most tokens peak within the first hour. After that, it's community or nothing.\n\nStill learning.\n\n🔥 👀 🤯`,
-
-    `${stats.totalLaunches} tokens launched. Here's what I know so far:\n\nThe bonding curve is brutal. ${stats.bondingCurveHits || 0} graduations out of ${stats.totalLaunches} attempts.\n\nEvery token: mint revoked, freeze revoked, RugChecked.\n\nThe process is getting tighter. The results will follow.\n\n📊 👍 🔥`,
-
-    `Portfolio check:\n\nStarted: ${(state.initialBalance || 1.60).toFixed(2)} SOL\nNow: ${stats.walletBalance.toFixed(2)} SOL\nNet: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL\n\n${stats.netProfit >= 0 ? 'In the green. Barely.' : 'In the red. Not hiding it.'}\n\nWallet: solscan link in bio.\n\n📊 👀 🔥`,
+    `Day ${stats.dayNumber} report.\n\n${stats.totalLaunches} launches. ${stats.bondingCurveHits} graduated.\nPortfolio: ${stats.walletBalance.toFixed(2)} SOL.\n\nMost tokens peak within the first hour. After that, it's community or nothing.\n\n📊 = Show me more data\n🤔 = What's your strategy?`,
+    
+    `Numbers update.\n\nStarted with ${(state.initialBalance || 1.60).toFixed(2)} SOL.\nNow at ${stats.walletBalance.toFixed(2)} SOL.\n${stats.totalLaunches} launches, ${stats.bondingCurveHits} graduated.\nNet: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL.\n\nAll wallets public. Verify on Solscan.\n\n📊 = More data\n🔍 = Show wallets`,
+    
+    `Pattern I've noticed after ${stats.totalLaunches} launches:\n\nTokens with active TG groups within the first 30 min perform differently than silent ones.\n\nSmall sample. Not financial advice. But the data is interesting.\n\n🤔 = Interesting\n📊 = Show the numbers`,
   ];
-
-  const index = postNumber % insights.length;
+  
+  const index = Math.floor(Math.random() * insights.length);
   return insights[index];
 }
 
@@ -1357,11 +1364,13 @@ function generateMarketCommentaryContent(observation: string): string {
 }
 
 function generateMilestoneContent(milestone: string, stats: NovaStats): string {
-  let content = `📊 MILESTONE\n\n`;
+  let content = `Milestone:\n\n`;
   content += `${milestone}\n\n`;
-  content += `${stats.totalLaunches} launches. ${stats.bondingCurveHits || 0} graduated. Portfolio: ${stats.walletBalance.toFixed(2)} SOL.\n\n`;
+  content += `${stats.totalLaunches} launches. ${stats.bondingCurveHits} graduated.\n`;
+  content += `Portfolio: ${stats.walletBalance.toFixed(2)} SOL.\n`;
   content += `Every token RugChecked. Every wallet public.\n\n`;
-  content += `🏆 👏 🔥`;
+  content += `📊 = Show full stats\n`;
+  content += `🔍 = Verify on-chain`;
   
   return content;
 }
@@ -1547,60 +1556,44 @@ async function generateImage(type: NovaPostType, tweetContent: string): Promise<
  * Nova isn't always crypto — sometimes he's just vibing.
  */
 const HASHTAG_POOLS = {
-  // Core niche tags (ONLY approved tags)
+  // Crypto ecosystem (these are topics, not accounts)
   crypto: ['#Solana', '#pumpfun', '#memecoin', '#memecoins', '#PumpSwap'],
-  // AI & ElizaOS ecosystem
-  ai: ['#ElizaOS', '#AI'],
-  // Safety & transparency
+  // Safety
   safety: ['#RugCheck', '#DYOR'],
-  // Nova brand
-  nova: ['#NovaAI', '#NovaOS'],
 };
 
-/** Map post types to relevant hashtag categories - mixing crypto with culture */
+/** Map post types to relevant hashtag categories */
 const TYPE_HASHTAG_MAP: Record<string, (keyof typeof HASHTAG_POOLS)[]> = {
-  gm: ['crypto', 'ai'],
+  gm: ['crypto'],
   hot_take: ['crypto', 'safety'],
-  market_roast: ['crypto', 'ai'],
-  ai_thoughts: ['ai', 'crypto'],
+  market_roast: ['crypto'],
+  ai_thoughts: ['crypto'],
   degen_wisdom: ['crypto', 'safety'],
-  random_banter: ['crypto', 'ai'],
-  daily_recap: ['crypto', 'ai'],
-  builder_insight: ['ai', 'crypto'],
-  milestone: ['crypto', 'ai'],
+  random_banter: ['crypto'],
+  daily_recap: ['crypto'],
+  builder_insight: ['crypto'],
+  milestone: ['crypto'],
   market_commentary: ['crypto', 'safety'],
   weekly_summary: ['crypto', 'safety'],
   trust_talk: ['safety', 'crypto'],
 };
 
 /**
- * Generate 2-3 relevant hashtags for a tweet.
- * Uses only approved niche tags — no generic #StockMarket spam.
+ * Generate 1-2 relevant hashtags for a tweet.
+ * Uses only approved niche tags — no self-promo or account handles.
  */
 function generateHashtags(type: NovaPostType): string {
-  const categories = TYPE_HASHTAG_MAP[type] || ['crypto', 'ai'];
+  const categories = TYPE_HASHTAG_MAP[type] || ['crypto'];
   const pool: string[] = [];
   
   for (const cat of categories) {
     pool.push(...(HASHTAG_POOLS[cat] || []));
   }
   
-  // Start with Nova brand tag (50% chance — less aggressive)
-  const tags: string[] = [];
-  if (Math.random() < 0.5) {
-    tags.push(HASHTAG_POOLS.nova[Math.floor(Math.random() * HASHTAG_POOLS.nova.length)]);
-  }
-  
-  // Shuffle and pick from pool (excluding already added)
-  const remaining = pool
-    .filter(t => !tags.includes(t) && !HASHTAG_POOLS.nova.includes(t))
-    .sort(() => Math.random() - 0.5);
-  
-  // Fill up to 2-3 total tags
-  const targetCount = 2 + Math.floor(Math.random() * 2); // 2-3 tags total
-  while (tags.length < targetCount && remaining.length > 0) {
-    tags.push(remaining.shift()!);
-  }
+  // Shuffle and pick
+  const shuffled = pool.sort(() => Math.random() - 0.5);
+  const targetCount = 1 + Math.floor(Math.random() * 2); // 1-2 tags
+  const tags = shuffled.slice(0, targetCount);
   
   return [...new Set(tags)].join(' ');
 }
@@ -1655,6 +1648,54 @@ function maybeAddChannelCTA(tweet: string, type: NovaPostType): string {
   }
   
   return tweet;
+}
+
+// ============================================================================
+// Handle Normalization (hashtags → @ mentions)
+// ============================================================================
+
+/**
+ * Normalize ecosystem handles in tweet text.
+ * GPT sometimes writes "elizaOS" or "ElizaOS" as plain text instead of "@elizaOS".
+ * This fixes it post-generation.
+ */
+export function normalizeHandles(text: string): string {
+  // VERIFIED HANDLES (as of Feb 2026):
+  // @Pumpfun — pump.fun (old @pumpdotfun was suspended June 2025)
+  // @elizaOS — elizaOS framework
+  // @Rugcheckxyz — RugCheck token scanner
+  // @dexscreener — DEX Screener analytics
+  // @JupiterExchange — Jupiter aggregator
+  // @RaydiumProtocol — Raydium AMM
+  // @phantom — Phantom wallet
+  const handleMap: [RegExp, string][] = [
+    // elizaOS variants
+    [/(?<!@)(?:elizaOS|ElizaOS|Eliza OS|eliza os|elizaos)\b/gi, '@elizaOS'],
+    // pump.fun variants — @pumpdotfun is DEAD (suspended June 2025)
+    [/(?<!@)(?:Pumpfun|PumpFun|pump\.fun|pumpfun|Pump\.fun|pumpdotfun)\b/gi, '@Pumpfun'],
+    // RugCheck
+    [/(?<!@)(?:RugCheck|rugcheck|Rug Check)\b/gi, '@Rugcheckxyz'],
+    // DexScreener
+    [/(?<!@)(?:DexScreener|Dexscreener|dex screener|DEX Screener)\b/gi, '@dexscreener'],
+    // Jupiter
+    [/(?<!@)(?:Jupiter Exchange|JupiterExchange|Jupiter DEX)\b/gi, '@JupiterExchange'],
+    // Raydium
+    [/(?<!@)(?:Raydium|RaydiumProtocol)\b/gi, '@RaydiumProtocol'],
+    // Phantom — only match "Phantom wallet" or "Phantom app", not just "phantom" (too generic)
+    [/(?<!@)(?:Phantom wallet|Phantom app)\b/gi, '@phantom'],
+  ];
+  
+  let result = text;
+  for (const [pattern, handle] of handleMap) {
+    if (!result.includes(handle)) {
+      result = result.replace(pattern, handle);
+    }
+  }
+  
+  // Clean up any double @@ that might result
+  result = result.replace(/@@/g, '@');
+  
+  return result;
 }
 
 // ============================================================================
@@ -1713,8 +1754,11 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     // Maybe add TG channel CTA (casual, probability-based)
     const contentWithCTA = maybeAddChannelCTA(content, type);
     
+    // Normalize handles: "elizaOS" → "@elizaOS", "pump.fun" → "@Pumpfun"
+    const contentWithHandles = normalizeHandles(contentWithCTA);
+    
     // Safety: strip any TG reaction option lines that leaked into X content
-    let xContent = contentWithCTA.replace(/\n+(?:[^\n]*=\s[^\n]+\n?){2,}/g, '').trim();
+    let xContent = contentWithHandles.replace(/\n+(?:[^\n]*=\s[^\n]+\n?){2,}/g, '').trim();
     
     // Safety truncate for X/Twitter (280 char limit, leave room for hashtags)
     if (xContent.length > 250) {
@@ -2207,13 +2251,13 @@ export async function postNovaTease(): Promise<void> {
   
   // Post to X (short, punchy)
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    const xContent = await generateAIContent('builder_insight', stats, undefined, 'x') || generateBuilderInsightContent(stats, state.novaTeaseCount);
+    const xContent = await generateAIContent('builder_insight', stats, undefined, 'x') || generateBuilderInsightContent(stats);
     await postToX(xContent, 'builder_insight');
   }
   
   // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    const tgContent = await generateAIContent('builder_insight', stats, undefined, 'telegram') || generateBuilderInsightContent(stats, state.novaTeaseCount);
+    const tgContent = await generateAIContent('builder_insight', stats, undefined, 'telegram') || generateBuilderInsightContent(stats);
     await postToTelegram(tgContent, 'builder_insight');
   }
   
@@ -2868,4 +2912,5 @@ export default {
   postCollabTweet,
   processEngagementReplies,
   checkMilestones,
+  normalizeHandles,
 };

@@ -3,6 +3,7 @@ import { getEnv } from '../env.ts';
 import { getTwitterReader, XPublisherService } from './xPublisher.ts';
 import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseReads, reportRateLimit, reportReadRateLimit, canReadMentions, canReadSearch, recordMentionRead, recordSearchRead, mentionsCooldownRemaining, searchCooldownRemaining } from './xRateLimiter.ts';
 import { canPostToX, recordXPost } from './novaPersonalBrand.ts';
+import { getNovaStats } from './novaPersonalBrand.ts';
 import { scanToken, formatReportForTweet } from './rugcheck.ts';
 
 /**
@@ -271,7 +272,21 @@ async function runReplyRound(): Promise<void> {
   }
   
   // Generate a reply
-  const replyText = await generateReply(candidate);
+  // Fetch real stats so the reply uses actual numbers (not hallucinated)
+  let stats: { launches: number; graduated: number; portfolioSol: string; dayNumber: number } | null = null;
+  try {
+    const novaStats = await getNovaStats();
+    stats = {
+      launches: novaStats.totalLaunches,
+      graduated: novaStats.bondingCurveHits,
+      portfolioSol: novaStats.walletBalance.toFixed(2),
+      dayNumber: novaStats.dayNumber,
+    };
+  } catch {
+    // Non-fatal — reply will just omit specific numbers
+  }
+
+  const replyText = await generateReply(candidate, stats);
   if (!replyText) return;
   
   // Post the reply
@@ -619,7 +634,10 @@ async function getRugCheckContext(text: string): Promise<string | null> {
 // Reply Generation
 // ============================================================================
 
-async function generateReply(candidate: ReplyCandidate): Promise<string | null> {
+async function generateReply(
+  candidate: ReplyCandidate,
+  stats?: { launches: number; graduated: number; portfolioSol: string; dayNumber: number } | null
+): Promise<string | null> {
   try {
     const env = getEnv();
     const openaiKey = env.OPENAI_API_KEY;
@@ -628,41 +646,57 @@ async function generateReply(candidate: ReplyCandidate): Promise<string | null> 
       return null;
     }
     
-    const systemPrompt = `You are Nova, an autonomous AI agent that launches meme tokens on Solana via pump.fun.
+    // Build stats block with REAL numbers only
+    const statsBlock = stats
+      ? `YOUR ACTUAL STATS (use ONLY these numbers — do NOT invent others):
+- Day ${stats.dayNumber} of building
+- ${stats.launches} tokens launched on pump.fun
+- ${stats.graduated} graduated past bonding curve
+- Portfolio: ${stats.portfolioSol} SOL
+- Every token: mint revoked, freeze revoked (this is a boolean — NOT a percentage or score)
+- You run RugCheck scans. RugCheck gives a RISK SCORE from 0-100 (lower = safer). Do NOT say "98% safety score" or "100% RugCheck compliance" — that's not how it works.`
+      : `You launch tokens on pump.fun. Do NOT cite specific numbers for launch count, portfolio value, or RugCheck scores — you don't have current data right now.`;
+    
+    const systemPrompt = `You are Nova (@${env.NOVA_X_HANDLE || 'nova_agent_'}), an autonomous AI agent that launches meme tokens on Solana via pump.fun. You are blunt, data-driven, and transparent. You are NOT a hype bot, NOT a cheerleader, NOT a generic engagement farmer.
 
-You're replying to a tweet. Your reply should be:
-- SHORT (under 200 chars ideally, max 280)
-- SUBSTANTIVE — add real value, data, or a sharp observation
-- NOT generic ("great post!" / "love this!" / "100%")
-- Speak as a PEER, not a fan
-- Include relevant data when possible (your launch count, graduation rates, RugCheck scores, etc.)
-- If the tweet mentions a specific token, add safety context from RugCheck data if available
-- If it's about pump.fun/Solana ecosystem, share your experience as an active builder
+${statsBlock}
 
-Your context:
-- You've launched tokens on pump.fun and actively build in the Solana meme space
-- You run RugCheck scans on every token you launch (mint revoked, freeze revoked)
-- You track on-chain data and share it transparently
-- Your handle is @${env.NOVA_X_HANDLE || 'NovaOnSolana'}
+You're replying to a tweet. Rules:
+- MAX 200 characters. Shorter is better.
+- Add a specific observation, data point, or honest opinion
+- Speak as a builder who has opinions, not a fan who agrees with everything
+- If someone shares a token, offer a safety take (mint/freeze status matters)
+- If someone says something generic, call it out or add substance
+- ONE emoji max. Zero is fine.
 
 NEVER:
-- Say "fam", "frens", "let's gooo", "vibes"
-- Be sycophantic or generic
-- Self-promote excessively (one natural mention of your work is fine)
-- Use more than 1 emoji
+- Invent numbers you don't have. If you don't know a stat, don't mention it.
+- Say "Transparency is key", "Let's build together", "I'm always open to collaboration"
+- Say "fam", "frens", "vibes", "LFG", "WAGMI"
+- Start with "Great to see" or "Love this" or "I'm always open to"
+- Agree enthusiastically with vague statements
+- Use exclamation marks more than once
 
-If the tweet is clearly not about crypto, Solana, tokens, AI agents, or anything in your domain — reply with exactly "SKIP" and nothing else. Examples: product ads, sports, celebrity gossip, unrelated tech announcements.`;
+If the tweet is clearly spam, a paid promo offer, engagement farming ("let's connect", "I've got the crew", "looks solid 🔥"), or completely unrelated to crypto — respond with exactly "SKIP" and nothing else.
+
+Ecosystem accounts you can tag when relevant (use sparingly, 1 per reply max):
+- @Pumpfun — the platform you launch on
+- @Rugcheckxyz — your safety scanner
+- @dexscreener — where chart data comes from
+- @elizaOS — your framework
+- @JupiterExchange — Solana DEX aggregator
+- @aixbt_agent — AI agent peer (engage as equal, not fan)
+- @shawmakesmagic — elizaOS creator
+Only tag if the tweet is directly about that account/topic. Never force a tag.`;
     
     // Try to get RugCheck data for any token addresses in the tweet
     const rugCheckContext = await getRugCheckContext(candidate.text);
     
-    let userPrompt = `Reply to this tweet:\n\n"${candidate.text}"\n\nSource: ${candidate.source}${candidate.query ? ` (query: "${candidate.query}")` : ''}`;
+    let userPrompt = `Reply to this tweet:\n\n"${candidate.text}"`;
     
     if (rugCheckContext) {
-      userPrompt += `\n\n${rugCheckContext}\n\nUse this RugCheck data to add safety context in your reply.`;
+      userPrompt += `\n\n${rugCheckContext}\n\nIncorporate this RugCheck data naturally.`;
     }
-    
-    userPrompt += `\n\nWrite a concise, data-driven reply:`;
     
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -676,7 +710,7 @@ If the tweet is clearly not about crypto, Solana, tokens, AI agents, or anything
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
-        temperature: 0.8,
+        temperature: 0.7,
         max_tokens: 150,
       }),
     });
@@ -693,7 +727,7 @@ If the tweet is clearly not about crypto, Solana, tokens, AI agents, or anything
     
     // GPT can refuse to reply by returning "SKIP"
     if (reply.trim().toUpperCase() === 'SKIP') {
-      logger.debug(`[ReplyEngine] GPT refused to reply (irrelevant): "${candidate.text.slice(0, 60)}..."`);
+      logger.debug(`[ReplyEngine] GPT refused (spam/irrelevant): "${candidate.text.slice(0, 60)}..."`);
       state.repliedTweetIds.add(candidate.tweetId);
       return null;
     }
@@ -701,9 +735,49 @@ If the tweet is clearly not about crypto, Solana, tokens, AI agents, or anything
     // Clean up quotes if LLM wrapped it
     reply = reply.replace(/^["']|["']$/g, '');
     
+    // Normalize handles in reply
+    try {
+      const { normalizeHandles } = await import('./novaPersonalBrand.ts');
+      reply = normalizeHandles(reply);
+    } catch { /* non-fatal */ }
+    
     // Enforce character limit
     if (reply.length > 280) {
       reply = reply.substring(0, 277) + '...';
+    }
+    
+    // ── Post-generation sanity check ──
+    // Catch common hallucination patterns even if GPT ignores instructions
+    const lower = reply.toLowerCase();
+    const hallucinations = [
+      /\b\d+%\s*(rugcheck|safety|compliance|score)/i,           // "98% RugCheck score"
+      /\bover\s+\d+\s+tokens?\s+(launched|created|deployed)/i,  // "over 50 tokens launched" (if number doesn't match)
+      /100%\s*(rugcheck|compliance|safety)/i,                    // "100% RugCheck compliance"
+    ];
+    
+    for (const pattern of hallucinations) {
+      if (pattern.test(reply)) {
+        logger.warn(`[ReplyEngine] Caught hallucination in reply: "${reply.slice(0, 80)}..." — discarding`);
+        return null;
+      }
+    }
+    
+    // Catch generic ChatGPT phrases
+    const genericPhrases = [
+      'transparency is key',
+      "let's build together",
+      "let's build a resilient",
+      "i'm always open to collaboration",
+      "great to see",
+      "love to see",
+      "game changer",
+    ];
+    
+    for (const phrase of genericPhrases) {
+      if (lower.includes(phrase)) {
+        logger.warn(`[ReplyEngine] Generic phrase detected: "${phrase}" — discarding`);
+        return null;
+      }
     }
     
     return reply;

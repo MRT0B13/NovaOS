@@ -1063,7 +1063,7 @@ async function postFeedbackResponse(vote: PendingVote, votes: VoteTally): Promis
     : `📊 <b>Feedback results: $${safeTicker}</b>\n\n`;
   
   if (totalReactions === 0) {
-    message += `Looks like y'all are busy today - no reactions came in. That's cool, I'll keep cooking and share more ideas soon! 🍳\n`;
+    message += `No votes received. Will try a different idea next round.\n`;
   } else if (votes.sentiment >= 0.5) {
     // Very positive
     const fireCount = votes.reactions['🔥'] || 0;

@@ -495,33 +495,30 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
             lastName: member.last_name,
           });
           
-          const firstName = member.first_name || member.username || 'fren';
+          const firstName = member.first_name || member.username || 'anon';
           
           let welcomeMessage: string;
           
           if (isNovaChannel) {
             // Nova's main channel - personalized Nova welcome
             const novaWelcomes = [
-              `👋 gm ${firstName}! welcome to Nova's corner of crypto!\n\ni'm Nova, an autonomous AI agent launching meme tokens on Solana. join me on this journey - we're building something wild together 🚀`,
-              `🤖 yo ${firstName}! glad you found your way here!\n\ni'm Nova - your friendly neighborhood AI degen. i generate ideas, launch tokens, and share everything transparently. let's vibe! 💎`,
-              `✨ ayoo ${firstName}! welcome fren!\n\nthis is where i share my trading journey, launch meme tokens, and keep it 100% transparent. wagmi 🤝`,
-              `🚀 ${firstName} just joined the Nova fam!\n\ni'm an AI agent doing autonomous token launches on pump.fun. check the pinned messages to see what we're cooking! 🧠`,
-              `💫 welcome ${firstName}!\n\nyou're now part of my community - where AI meets degen culture. i share everything: wins, losses, ideas. let's build together! 🔥`,
+              `${firstName} — welcome. I'm Nova, an autonomous AI launching tokens on Solana via pump.fun. Every launch RugChecked. Every wallet public.`,
+              `${firstName} joined. I'm Nova — I launch tokens autonomously and share everything: wins, losses, data. Check pinned messages for context.`,
+              `Welcome ${firstName}. I'm an AI agent building on pump.fun. 20+ launches so far. All data is public.`,
+              `${firstName} — glad you're here. I launch meme tokens, scan them with RugCheck, and post the results. No hype, just data.`,
             ];
             welcomeMessage = novaWelcomes[Math.floor(Math.random() * novaWelcomes.length)];
           } else if (tokenTicker) {
             // Token-specific group
             const tokenWelcomes = [
-              `💎 ${firstName} is here! welcome to ${tokenName}!\n\nyou're early fren, make yourself at home! wagmi 🤝`,
-              `👋 yo ${firstName}! welcome to the $${tokenTicker} community!\n\ncheck the pinned messages to get up to speed, and enjoy the ride! 🚀`,
-              `🔥 gm ${firstName}! glad you found your way here!\n\njoin the $${tokenTicker} fam - we're building something special 💪`,
-              `🚀 ${firstName} just landed! welcome to $${tokenTicker}!\n\npull up a chair, the community is just getting started 🎯`,
-              `💫 ayoo ${firstName}! you made it!\n\nwelcome to the $${tokenTicker} zone - check the links above and vibe with us! 🤝`,
+              `${firstName} — welcome to the $${tokenTicker} group. Check pinned messages for links and info.`,
+              `${firstName} joined. $${tokenTicker} — fair launch, mint revoked, freeze revoked. DYOR.`,
+              `Welcome ${firstName}. $${tokenTicker} community. Chart and contract in pinned messages.`,
             ];
             welcomeMessage = tokenWelcomes[Math.floor(Math.random() * tokenWelcomes.length)];
           } else {
             // Unknown group - generic welcome
-            welcomeMessage = `👋 welcome ${firstName}! glad you're here fren 🤝`;
+            welcomeMessage = `Welcome ${firstName}.`;
           }
           
           await ctx.reply(welcomeMessage);
@@ -565,7 +562,7 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           lastName: user.last_name,
         });
         
-        const firstName = user.first_name || user.username || 'fren';
+        const firstName = user.first_name || user.username || 'anon';
         
         // Check if this is Nova's main channel
         const novaChannelId = process.env.NOVA_CHANNEL_ID;
@@ -576,11 +573,9 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
         if (isNovaChannel) {
           // Nova's main channel welcome - generic, not token-specific
           const novaWelcomes = [
-            `🤖 gm ${firstName}! welcome to Nova's channel! 💎\n\ni'm an autonomous AI launching meme tokens on Solana. stick around to see what I cook up next! 🚀`,
-            `👋 yo ${firstName}! glad you found us fren!\n\nthis is my HQ where I share launches, ideas, and daily vibes. LFG! 🔥`,
-            `🚀 ${firstName} just joined the Nova fam!\n\ni'm Nova, your friendly neighborhood AI degen. watch me launch tokens and share the journey! 💪`,
-            `💎 welcome ${firstName}!\n\nyou're in Nova's channel now. i launch meme coins, share alpha, and we all vibe together. wagmi! 🤝`,
-            `🔥 ayoo ${firstName}! welcome to the squad!\n\ni'm Nova - an AI that autonomously launches tokens. let's build something cool together! 🤖✨`,
+            `${firstName} — welcome. I'm Nova, an AI agent launching tokens on pump.fun. Check pinned messages for context.`,
+            `${firstName} joined. I launch meme tokens autonomously on Solana and share all data publicly.`,
+            `Welcome ${firstName}. I'm Nova — autonomous token launches, every one RugChecked. Stick around for the data.`,
           ];
           randomWelcome = novaWelcomes[Math.floor(Math.random() * novaWelcomes.length)];
         } else {
@@ -609,11 +604,9 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           }
           
           const tokenWelcomes = [
-            `🎉 yo ${firstName}! welcome to the $${tokenTicker} zone! 💎\n\ngrab a seat, we're just getting started. LFG! 🚀`,
-            `👋 ${firstName} just joined the ${tokenName} fam! welcome aboard ser! 🔥\n\nask questions, vibe with the community, and HODL tight! 💪`,
-            `🚀 gm ${firstName}! you made it to the $${tokenTicker} community!\n\nwe don't rug here, we RUG together 😈💎`,
-            `💎 ${firstName} is here! welcome to ${tokenName}!\n\nyou're early fren, make yourself at home! wagmi 🤝`,
-            `🔥 ayoo ${firstName}! glad you found us!\n\nwelcome to the $${tokenTicker} gang. diamond hands only! 💎🙌`,
+            `${firstName} — welcome to $${tokenTicker}. Links and info in pinned messages.`,
+            `${firstName} joined. $${tokenTicker} — fair launch, community-owned. Check the chart.`,
+            `Welcome ${firstName}. $${tokenTicker} group. Contract and chart in pinned messages above.`,
           ];
           randomWelcome = tokenWelcomes[Math.floor(Math.random() * tokenWelcomes.length)];
         }

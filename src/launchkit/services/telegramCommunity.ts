@@ -734,32 +734,31 @@ export class TelegramCommunityService {
     
     // Greetings
     if (text.includes('gm') || text.includes('good morning')) {
-      return `GM ${userName ? userName + '! ' : ''}☀️ Ready for another day with $${ticker}! 🚀`;
+      return `GM${userName ? ' ' + userName : ''}. $${ticker} still here.`;
     }
     
     if (text.includes('hello') || text.includes('hi') || text.includes('hey')) {
-      return `Hey ${userName ? userName + '! ' : ''}👋 Welcome to the $${ticker} community! LFG! 🔥`;
+      return `Hey${userName ? ' ' + userName : ''}. Welcome to $${ticker}.`;
     }
     
-    // Excitement/hype
+    // Excitement/hype — match energy but with substance
     if (text.includes('moon') || text.includes('pump') || text.includes('lfg') || text.includes('🚀')) {
-      const hypeResponses = [
-        `LFG! $${ticker} to the moon! 🚀🌕`,
-        `We're just getting started! $${ticker} 💎🙌`,
-        `The $${ticker} community is BUILT DIFFERENT! 🔥`,
-        `$${ticker} holders are the real ones! 💪`,
+      const responses = [
+        `$${ticker} chart is public — check it and decide for yourself.`,
+        `Energy is good but check the contract first. Mint revoked, freeze revoked.`,
+        `$${ticker} is doing what it's doing. The chart doesn't need hype.`,
       ];
-      return hypeResponses[Math.floor(Math.random() * hypeResponses.length)];
+      return responses[Math.floor(Math.random() * responses.length)];
     }
     
-    // When/roadmap questions
+    // When/roadmap questions — be honest, don't promise
     if (text.includes('when') || text.includes('roadmap') || text.includes('plans')) {
-      return `Big things coming for $${ticker}! 👀 Stay tuned and stay based. Community first! 💪`;
+      return `$${ticker} is a fair launch meme token. No roadmap, no promises. Just a community and a chart. DYOR.`;
     }
     
-    // Wen lambo type questions (playful)
+    // Wen lambo type questions
     if (text.includes('lambo') || text.includes('rich') || text.includes('millionaire')) {
-      return `Wen lambo? Soon™ 😎 Just keep holding $${ticker} and trust the process! 🔥`;
+      return `Nobody gets rich from meme tokens without someone else losing. Check the chart, manage your risk. NFA.`;
     }
     
     // Don't respond to everything - return null for random messages
