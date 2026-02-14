@@ -649,8 +649,16 @@ export async function postScheduledIdeaForFeedback(
     
     // Pin the idea so community can easily find it
     try {
-      await pinMessage(messageId, true); // silent pin
-      logger.info(`[CommunityVoting] 📌 Pinned scheduled idea to channel`);
+      await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: channelId,
+          message_id: messageId,
+          disable_notification: true,
+        }),
+      });
+      logger.info(`[CommunityVoting] 📌 Pinned scheduled idea to community`);
     } catch (pinErr) {
       logger.warn(`[CommunityVoting] Failed to pin scheduled idea: ${pinErr}`);
     }

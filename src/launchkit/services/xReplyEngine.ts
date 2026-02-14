@@ -3,7 +3,7 @@ import { getEnv } from '../env.ts';
 import { getTwitterReader, XPublisherService } from './xPublisher.ts';
 import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseReads, reportRateLimit, reportReadRateLimit, canReadMentions, canReadSearch, recordMentionRead, recordSearchRead, mentionsCooldownRemaining, searchCooldownRemaining } from './xRateLimiter.ts';
 import { canPostToX, recordXPost } from './novaPersonalBrand.ts';
-import { getNovaStats } from './novaPersonalBrand.ts';
+import { getNovaStats, type TokenMover } from './novaPersonalBrand.ts';
 import { scanToken, formatReportForTweet } from './rugcheck.ts';
 
 /**
@@ -273,7 +273,7 @@ async function runReplyRound(): Promise<void> {
   
   // Generate a reply
   // Fetch real stats so the reply uses actual numbers (not hallucinated)
-  let stats: { launches: number; graduated: number; portfolioSol: string; dayNumber: number } | null = null;
+  let stats: { launches: number; graduated: number; portfolioSol: string; dayNumber: number; tokenMovers: TokenMover[] } | null = null;
   try {
     const novaStats = await getNovaStats();
     stats = {
@@ -281,6 +281,7 @@ async function runReplyRound(): Promise<void> {
       graduated: novaStats.bondingCurveHits,
       portfolioSol: novaStats.walletBalance.toFixed(2),
       dayNumber: novaStats.dayNumber,
+      tokenMovers: novaStats.tokenMovers || [],
     };
   } catch {
     // Non-fatal — reply will just omit specific numbers
@@ -636,7 +637,7 @@ async function getRugCheckContext(text: string): Promise<string | null> {
 
 async function generateReply(
   candidate: ReplyCandidate,
-  stats?: { launches: number; graduated: number; portfolioSol: string; dayNumber: number } | null
+  stats?: { launches: number; graduated: number; portfolioSol: string; dayNumber: number; tokenMovers: TokenMover[] } | null
 ): Promise<string | null> {
   try {
     const env = getEnv();
@@ -647,14 +648,16 @@ async function generateReply(
     }
     
     // Build stats block with REAL numbers only
+    const topToken = stats?.tokenMovers?.[0];
+    const tokenLine = topToken
+      ? `\n- Most active token: $${topToken.ticker} — ${topToken.priceChange24h !== null ? `${topToken.priceChange24h > 0 ? '+' : ''}${topToken.priceChange24h.toFixed(1)}% 24h` : 'no 24h data'}, vol $${topToken.volume24h?.toLocaleString() ?? '?'}`
+      : '';
     const statsBlock = stats
-      ? `YOUR ACTUAL STATS (use ONLY these numbers — do NOT invent others):
-- Day ${stats.dayNumber} of building
-- ${stats.launches} tokens launched on pump.fun
-- ${stats.graduated} graduated past bonding curve
-- Portfolio: ${stats.portfolioSol} SOL
-- Every token: mint revoked, freeze revoked (this is a boolean — NOT a percentage or score)
-- You run RugCheck scans. RugCheck gives a RISK SCORE from 0-100 (lower = safer). Do NOT say "98% safety score" or "100% RugCheck compliance" — that's not how it works.`
+      ? `YOUR CONTEXT (use sparingly — do NOT lead every reply with stats):
+- Day ${stats.dayNumber}, ${stats.launches} launches, ${stats.graduated} graduated
+- Portfolio: ${stats.portfolioSol} SOL${tokenLine}
+- Mint & freeze revoked on all tokens (boolean, NOT a score)
+- RugCheck = risk score 0-100 (lower = safer). Never say "98% safety score".`
       : `You launch tokens on pump.fun. Do NOT cite specific numbers for launch count, portfolio value, or RugCheck scores — you don't have current data right now.`;
     
     const systemPrompt = `You are Nova (@${env.NOVA_X_HANDLE || 'nova_agent_'}), an autonomous AI agent that launches meme tokens on Solana via pump.fun. You are blunt, data-driven, and transparent. You are NOT a hype bot, NOT a cheerleader, NOT a generic engagement farmer.

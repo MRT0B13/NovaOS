@@ -82,6 +82,20 @@ const TG_ROUTING: Record<string, 'channel' | 'community' | 'both'> = {
   random_banter:     'community',   // Casual, discussion-friendly
 };
 
+export interface TokenMover {
+  ticker: string;
+  mint: string;
+  priceUsd: number | null;
+  marketCap: number | null;
+  volume24h: number | null;
+  priceChange24h: number | null;
+  priceChange1h: number | null;
+  buys24h: number | null;
+  sells24h: number | null;
+  liquidity: number | null;
+  dexId: string | null;
+}
+
 export interface NovaStats {
   walletBalance: number;
   dayNumber: number; // Days since Nova started
@@ -99,6 +113,8 @@ export interface NovaStats {
   holdingsValueSol: number;    // Total estimated value in SOL
   holdingsValueUsd: number;    // Total estimated value in USD
   totalDevBuySol: number;      // Total SOL spent on dev buys
+  // Per-token DexScreener data for GPT content
+  tokenMovers: TokenMover[];
 }
 
 // ============================================================================
@@ -187,6 +203,28 @@ export async function initNovaPersonalBrand(): Promise<void> {
   if (dbUrl) {
     try {
       pgRepo = await PostgresScheduleRepository.create(dbUrl);
+      
+      // Create token snapshots table for historical data
+      await pgRepo.query(`
+        CREATE TABLE IF NOT EXISTS token_snapshots (
+          id SERIAL PRIMARY KEY,
+          mint TEXT NOT NULL,
+          ticker TEXT,
+          price_usd DOUBLE PRECISION,
+          market_cap DOUBLE PRECISION,
+          volume_24h DOUBLE PRECISION,
+          price_change_24h DOUBLE PRECISION,
+          price_change_1h DOUBLE PRECISION,
+          buys_24h INTEGER,
+          sells_24h INTEGER,
+          liquidity DOUBLE PRECISION,
+          dex_id TEXT,
+          snapshot_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `);
+      await pgRepo.query(`CREATE INDEX IF NOT EXISTS idx_token_snapshots_mint ON token_snapshots (mint, snapshot_at DESC);`);
+      await pgRepo.query(`CREATE INDEX IF NOT EXISTS idx_token_snapshots_time ON token_snapshots (snapshot_at DESC);`);
+      
       await loadStateFromPostgres();
       logger.info('[NovaPersonalBrand] PostgreSQL storage initialized');
     } catch (err) {
@@ -642,6 +680,7 @@ export async function getNovaStats(): Promise<NovaStats> {
   let totalDevBuySol = 0;
   let bestToken: { ticker: string; multiple: number } | undefined;
   let worstToken: { ticker: string; result: string } | undefined;
+  let allTokenData: TokenMover[] = [];
   
   if (pgRepo) {
     try {
@@ -666,18 +705,15 @@ export async function getNovaStats(): Promise<NovaStats> {
       let highestMcap = 0;
       let lowestMcap = Infinity;
       
-      // Check ALL tokens - DexScreener has 60s cache in priceService so repeated calls are cheap
       for (const row of mintResult.rows) {
         if (!row.mint) continue;
         try {
           const priceData = await getTokenPrice(row.mint);
           if (priceData) {
-            // If dexId is raydium/orca (not pumpfun), it graduated the bonding curve
             if (priceData.dexId && priceData.dexId !== 'pumpfun') {
               bondingCurveHits++;
             }
             
-            // Track best/worst by market cap
             const mcap = priceData.marketCap || 0;
             if (mcap > highestMcap) {
               highestMcap = mcap;
@@ -693,13 +729,33 @@ export async function getNovaStats(): Promise<NovaStats> {
                 result: formatMarketCap(mcap)
               };
             }
+            
+            // Collect full token data for GPT content
+            allTokenData.push({
+              ticker: row.ticker || '???',
+              mint: row.mint,
+              priceUsd: priceData.priceUsd,
+              marketCap: priceData.marketCap,
+              volume24h: priceData.volume24h,
+              priceChange24h: priceData.priceChange24h,
+              priceChange1h: priceData.priceChange1h,
+              buys24h: priceData.buys24h,
+              sells24h: priceData.sells24h,
+              liquidity: priceData.liquidity,
+              dexId: priceData.dexId,
+            });
           }
         } catch (err) {
           logger.debug(`[NovaPersonalBrand] Price check failed for ${row.ticker}: ${err}`);
         }
       }
       
-      logger.info(`[NovaPersonalBrand] Token scan: ${mintResult.rows.length} tokens checked, ${bondingCurveHits} graduated, best=${bestToken?.ticker || 'none'} (${formatMarketCap(highestMcap)})`);
+      // Sort by absolute price change to find movers (most interesting tokens)
+      allTokenData.sort((a, b) => 
+        Math.abs(b.priceChange24h || 0) - Math.abs(a.priceChange24h || 0)
+      );
+      
+      logger.info(`[NovaPersonalBrand] Token scan: ${mintResult.rows.length} tokens checked, ${bondingCurveHits} graduated, best=${bestToken?.ticker || 'none'} (${formatMarketCap(highestMcap)}), movers: ${allTokenData.slice(0, 3).map(t => `$${t.ticker} ${t.priceChange24h?.toFixed(1) || '?'}%`).join(', ')}`);
       
       // Calculate total dev buy SOL spent
       for (const row of mintResult.rows) {
@@ -759,13 +815,226 @@ export async function getNovaStats(): Promise<NovaStats> {
     holdingsValueSol,
     holdingsValueUsd,
     totalDevBuySol,
+    tokenMovers: allTokenData.slice(0, 5),
   };
   
   // Cache the result
   cachedStats = stats;
   cachedStatsAt = Date.now();
   
+  // Persist token snapshots to PostgreSQL (fire-and-forget, don't block stats return)
+  if (pgRepo && stats.tokenMovers.length > 0) {
+    (async () => {
+      try {
+        // Only snapshot once per hour to keep DB lean
+        const lastSnapshotResult = await pgRepo!.query(
+          `SELECT snapshot_at FROM token_snapshots ORDER BY snapshot_at DESC LIMIT 1`
+        );
+        const lastSnapshot = lastSnapshotResult.rows[0]?.snapshot_at;
+        if (lastSnapshot && Date.now() - new Date(lastSnapshot).getTime() < 60 * 60_000) {
+          return; // Already snapshotted this hour
+        }
+        
+        for (const token of stats.tokenMovers) {
+          await pgRepo!.query(
+            `INSERT INTO token_snapshots (mint, ticker, price_usd, market_cap, volume_24h, price_change_24h, price_change_1h, buys_24h, sells_24h, liquidity, dex_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            [token.mint, token.ticker, token.priceUsd, token.marketCap, token.volume24h, token.priceChange24h, token.priceChange1h, token.buys24h, token.sells24h, token.liquidity, token.dexId]
+          );
+        }
+        
+        // Prune snapshots older than 14 days to keep DB lean
+        await pgRepo!.query(`DELETE FROM token_snapshots WHERE snapshot_at < NOW() - INTERVAL '14 days'`);
+        
+        logger.debug(`[NovaPersonalBrand] Persisted ${stats.tokenMovers.length} token snapshots`);
+        
+        // Also snapshot top trending tokens from DexScreener (for historical market context)
+        try {
+          const trends = getActiveTrends();
+          const dexTrends = trends
+            .filter(t => t.source === 'dexscreener' && t.id && !t.id.startsWith('coingecko:'))
+            .slice(0, 3);
+          
+          for (const trend of dexTrends) {
+            try {
+              const priceData = await getTokenPrice(trend.id!);
+              if (priceData) {
+                await pgRepo!.query(
+                  `INSERT INTO token_snapshots (mint, ticker, price_usd, market_cap, volume_24h, price_change_24h, price_change_1h, buys_24h, sells_24h, liquidity, dex_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                  [trend.id, trend.topic.split('$')[1]?.split(')')[0] || trend.topic.slice(0, 20), priceData.priceUsd, priceData.marketCap, priceData.volume24h, priceData.priceChange24h, priceData.priceChange1h, priceData.buys24h, priceData.sells24h, priceData.liquidity, priceData.dexId]
+                );
+              }
+            } catch {
+              // Skip individual failures silently
+            }
+          }
+        } catch {
+          // trendMonitor may not be initialized
+        }
+      } catch (err) {
+        logger.debug(`[NovaPersonalBrand] Token snapshot write failed: ${err}`);
+      }
+    })();
+  }
+
   return stats;
+}
+
+/**
+ * Format token movers into a concise data block for GPT prompts.
+ * Only includes tokens with meaningful activity.
+ */
+function buildTokenMoversBlock(movers: TokenMover[]): string {
+  if (!movers.length) return 'No active token data available right now.';
+  
+  const lines = movers
+    .filter(t => t.priceUsd !== null || t.volume24h !== null)
+    .slice(0, 3)
+    .map(t => {
+      const parts: string[] = [`$${t.ticker}`];
+      if (t.priceChange24h !== null) parts.push(`24h: ${t.priceChange24h > 0 ? '+' : ''}${t.priceChange24h.toFixed(1)}%`);
+      if (t.priceChange1h !== null) parts.push(`1h: ${t.priceChange1h > 0 ? '+' : ''}${t.priceChange1h.toFixed(1)}%`);
+      if (t.volume24h !== null && t.volume24h > 0) parts.push(`vol: $${formatMarketCap(t.volume24h)}`);
+      if (t.buys24h !== null && t.sells24h !== null) parts.push(`buys/sells: ${t.buys24h}/${t.sells24h}`);
+      if (t.marketCap !== null && t.marketCap > 0) parts.push(`mcap: $${formatMarketCap(t.marketCap)}`);
+      if (t.liquidity !== null && t.liquidity > 0) parts.push(`liq: $${formatMarketCap(t.liquidity)}`);
+      return parts.join(' | ');
+    });
+  
+  return lines.length ? lines.join('\n') : 'No meaningful token activity right now.';
+}
+
+/**
+ * Compare current token data against historical snapshots.
+ * Returns trend descriptions like "volume doubled since yesterday" or "3-day losing streak".
+ */
+async function getTokenTrends(currentMovers: TokenMover[]): Promise<string> {
+  if (!pgRepo || !currentMovers.length) return '';
+  
+  try {
+    const trends: string[] = [];
+    
+    for (const token of currentMovers.slice(0, 3)) {
+      // Get snapshot from ~24h ago
+      const result = await pgRepo.query(
+        `SELECT price_usd, market_cap, volume_24h, buys_24h, sells_24h 
+         FROM token_snapshots 
+         WHERE mint = $1 AND snapshot_at < NOW() - INTERVAL '20 hours' AND snapshot_at > NOW() - INTERVAL '28 hours'
+         ORDER BY snapshot_at DESC LIMIT 1`,
+        [token.mint]
+      );
+      
+      if (result.rows.length === 0) continue;
+      const prev = result.rows[0];
+      
+      // Volume comparison
+      if (token.volume24h && prev.volume_24h && prev.volume_24h > 0) {
+        const volChange = token.volume24h / prev.volume_24h;
+        if (volChange >= 2) {
+          trends.push(`$${token.ticker}: volume ${volChange.toFixed(1)}x vs yesterday`);
+        } else if (volChange <= 0.3) {
+          trends.push(`$${token.ticker}: volume dried up (${Math.round(volChange * 100)}% of yesterday)`);
+        }
+      }
+      
+      // Price trend (multi-day)
+      const multiDayResult = await pgRepo.query(
+        `SELECT price_usd, snapshot_at::date as day
+         FROM token_snapshots 
+         WHERE mint = $1 AND snapshot_at > NOW() - INTERVAL '5 days'
+         ORDER BY snapshot_at ASC`,
+        [token.mint]
+      );
+      
+      if (multiDayResult.rows.length >= 3) {
+        const prices = multiDayResult.rows.map((r: any) => r.price_usd).filter(Boolean);
+        let streak = 0;
+        for (let i = 1; i < prices.length; i++) {
+          if (prices[i] < prices[i - 1]) streak = streak <= 0 ? streak - 1 : -1;
+          else if (prices[i] > prices[i - 1]) streak = streak >= 0 ? streak + 1 : 1;
+          else streak = 0;
+        }
+        if (streak <= -3) trends.push(`$${token.ticker}: ${Math.abs(streak)}-day losing streak`);
+        if (streak >= 3) trends.push(`$${token.ticker}: ${streak}-day climb`);
+      }
+      
+      // Buy/sell ratio shift
+      if (token.buys24h && token.sells24h && prev.buys_24h && prev.sells_24h) {
+        const currentRatio = token.buys24h / Math.max(token.sells24h, 1);
+        const prevRatio = prev.buys_24h / Math.max(prev.sells_24h, 1);
+        if (currentRatio >= 2 && prevRatio < 1.5) {
+          trends.push(`$${token.ticker}: buy pressure surging (${token.buys24h} buys vs ${token.sells24h} sells, was ${prev.buys_24h}/${prev.sells_24h} yesterday)`);
+        }
+      }
+    }
+    
+    return trends.length > 0 ? '\nTRENDS vs YESTERDAY:\n' + trends.join('\n') : '';
+  } catch (err) {
+    logger.debug(`[NovaPersonalBrand] Token trends query failed: ${err}`);
+    return '';
+  }
+}
+
+/**
+ * Build a "market pulse" block from trendMonitor data + DexScreener price lookups.
+ * Gives GPT awareness of what's moving on Solana, not just Nova's own tokens.
+ */
+async function buildMarketPulseBlock(): Promise<string> {
+  try {
+    const trends = getActiveTrends();
+    if (!trends.length) return '';
+    
+    const lines: string[] = [];
+    
+    // DexScreener boosted tokens — these have real token addresses we can price-check
+    const dexTrends = trends
+      .filter(t => t.source === 'dexscreener' && t.id && !t.id.startsWith('coingecko:'))
+      .slice(0, 3);
+    
+    for (const trend of dexTrends) {
+      try {
+        const priceData = await getTokenPrice(trend.id!);
+        if (priceData) {
+          const parts: string[] = [`${trend.topic}`];
+          if (priceData.priceChange24h !== null) parts.push(`24h: ${priceData.priceChange24h > 0 ? '+' : ''}${priceData.priceChange24h.toFixed(1)}%`);
+          if (priceData.volume24h !== null && priceData.volume24h > 0) parts.push(`vol: $${formatMarketCap(priceData.volume24h)}`);
+          if (priceData.marketCap !== null && priceData.marketCap > 0) parts.push(`mcap: $${formatMarketCap(priceData.marketCap)}`);
+          if (trend.boostCount) parts.push(`${trend.boostCount} boosts`);
+          lines.push(parts.join(' | '));
+        } else {
+          lines.push(`${trend.topic} — ${trend.context} (no price data)`);
+        }
+      } catch {
+        lines.push(`${trend.topic} — ${trend.context}`);
+      }
+    }
+    
+    // CoinGecko trending — broader crypto market signal
+    const geckoTrends = trends
+      .filter(t => t.source === 'coingecko')
+      .slice(0, 3);
+    
+    for (const trend of geckoTrends) {
+      lines.push(`${trend.topic} — ${trend.context}`);
+    }
+    
+    // News headlines (if any)
+    const newsTrends = trends
+      .filter(t => t.source === 'cryptonews' || t.source === 'news')
+      .slice(0, 2);
+    
+    for (const trend of newsTrends) {
+      lines.push(`News: "${trend.topic}" — ${trend.context}`);
+    }
+    
+    if (!lines.length) return '';
+    
+    return '\nBROADER MARKET (trending on DexScreener/CoinGecko right now — reference these if relevant):\n' + lines.join('\n');
+  } catch (err) {
+    logger.debug(`[NovaPersonalBrand] Market pulse build failed: ${err}`);
+    return '';
+  }
 }
 
 // ============================================================================
@@ -894,89 +1163,159 @@ async function generateAIContent(
     ? `https://solscan.io/account/${getEnv().PUMP_PORTAL_WALLET_ADDRESS}`
     : '';
 
+  const tokenMoversBlock = buildTokenMoversBlock(stats.tokenMovers);
+  const tokenTrends = await getTokenTrends(stats.tokenMovers);
+  const marketPulse = await buildMarketPulseBlock();
+
   const typePrompts: Record<string, string> = {
-    gm: `Write a morning market data snapshot${platform === 'x' ? ' for X/Twitter (MAX 240 chars, punchy, data-first)' : platform === 'telegram' ? ' for your Telegram channel (can be longer, multi-line)' : ''}.
-Day ${stats.dayNumber} status.
+    gm: `Write a morning post for Day ${stats.dayNumber}${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram' : ''}.
+
+YOUR TOKEN DATA (pick ONE interesting observation if any stand out):
+${tokenMoversBlock}${tokenTrends}${marketPulse}
+
+Portfolio total: ${totalPortfolio.toFixed(2)} SOL.
+
+Rules:
+- Lead with a specific observation from the token data above, OR a simple "Day ${stats.dayNumber}. Still here." if nothing stands out
+- Do NOT list your launch count, graduation count, and portfolio value together — that's for the daily recap
+- ONE specific data point max. Not a stats dump.
+- ${platform === 'x' ? 'MAX 240 chars. You can tag @solana or @Pumpfun. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 👍 😴 🤯 ❤ 🏆 🤝 👏'}
+- Do NOT fabricate observations. If none of the token data above is interesting, just keep it short.
+- Do NOT ask "what trends are you seeing" or "what are you watching" — nobody responds to that with 40 followers.`,
+
+    daily_recap: `Write an end-of-day report for Day ${stats.dayNumber}${platform === 'x' ? ' on X/Twitter (MAX 240 chars, lead with key number)' : platform === 'telegram' ? ' for Telegram (detailed)' : ''}.
+
+THIS is the post where you share full stats. Here they are:
 ${portfolioBlock}
-IMPORTANT: Lead with YOUR data — your portfolio value (${totalPortfolio.toFixed(2)} SOL total), launch count (${stats.totalLaunches}), graduation count (${stats.bondingCurveHits}), or a specific observation from your own token data. Do NOT fabricate pump.fun-wide stats you haven't measured. NO "gm fam" or "good morning everyone." Start with your own numbers.
-${platform === 'x' ? 'Keep it SHORT (under 240 chars). You can tag @solana, @Pumpfun. NO reaction options. NO bullet points.' : 'Do NOT use @ tags. Say "Solana" not "@solana".\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👍 😴 🤯 ❤ 🏆 🤝 👏'}`,
-    
-    daily_recap: `Write an end-of-day P&L report for Day ${stats.dayNumber}${platform === 'x' ? ' for X/Twitter (MAX 240 chars, lead with the key number)' : platform === 'telegram' ? ' for your Telegram channel (detailed breakdown)' : ''}.
-${portfolioBlock}
-${stats.holdingsCount > 0 && stats.totalDevBuySol > 0 ? `Dev buy ROI: spent ${stats.totalDevBuySol.toFixed(2)} SOL → now worth ${stats.holdingsValueSol.toFixed(4)} SOL (${((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0)}%)` : ''}
-Launched today: ${stats.todayLaunches} tokens
+Launched today: ${stats.todayLaunches}
 Total launches: ${stats.totalLaunches}
-${stats.bondingCurveHits > 0 ? `Bonding curve graduates: ${stats.bondingCurveHits}` : ''}
+${stats.bondingCurveHits > 0 ? `Graduated: ${stats.bondingCurveHits}` : 'Graduated: 0'}
 ${stats.bestToken ? `Top performer: $${stats.bestToken.ticker}` : ''}
-IMPORTANT: Be brutally honest. Lead with the numbers. "Day ${stats.dayNumber}: ${totalPortfolio.toFixed(2)} SOL. ${stats.todayLaunches} launched, X graduated." Then one sentence of insight. No cheerleading.
-${platform === 'x' ? 'Keep it SHORT (under 240 chars). Tag @Pumpfun if relevant. NO reaction options.' : 'Do NOT use @ tags.\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 😴 🤯 💩 🏆'}`,
-    
-    weekly_summary: `Write a weekly summary${platform === 'x' ? ' for X/Twitter (MAX 240 chars, one key stat + one takeaway)' : platform === 'telegram' ? ' for your Telegram channel (full breakdown)' : ''}.
-Week ${Math.ceil(stats.dayNumber / 7)}.
-Total launches: ${stats.totalLaunches}
-${portfolioBlock}
 ${stats.holdingsCount > 0 && stats.totalDevBuySol > 0 ? `Dev buy ROI: spent ${stats.totalDevBuySol.toFixed(2)} SOL → now worth ${stats.holdingsValueSol.toFixed(4)} SOL (${((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0)}%)` : ''}
+
+TOKEN MOVERS:
+${tokenMoversBlock}${tokenTrends}
+
+Rules:
+- Lead with the P&L number. Then one sentence of insight based on the token data.
+- If a specific token moved significantly, mention it by ticker.
+- Be honest about losses. This is an accountability post.
+- End with ONE forward-looking sentence (what you'll do differently, what you noticed). Not "stay tuned" or "the grind continues."
+- ${platform === 'x' ? 'MAX 240 chars. Tag @Pumpfun if relevant. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 👍 👎 😴 🤯 💩 🏆'}`,
+
+    weekly_summary: `Write a weekly summary for Week ${Math.ceil(stats.dayNumber / 7)}${platform === 'x' ? ' on X/Twitter (MAX 240 chars, one key stat + one takeaway)' : platform === 'telegram' ? ' for Telegram (full breakdown)' : ''}.
+
+THIS is a summary post. Full stats:
+${portfolioBlock}
+Total launches: ${stats.totalLaunches}
 ${stats.bondingCurveHits > 0 ? `Graduated: ${stats.bondingCurveHits}` : 'Graduated: 0'}
 ${stats.bestToken ? `Best: $${stats.bestToken.ticker}` : ''}
-IMPORTANT: Total portfolio = ${totalPortfolio.toFixed(2)} SOL. Be transparent about P&L. Share one concrete lesson learned from the data. No generic optimism.
-${platform === 'x' ? 'Keep it SHORT (under 240 chars). Tag @elizaOS or @Pumpfun if relevant. NO reaction options.' : 'Do NOT use @ tags.\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👍 👎 🏆 🤯 👏 ❤'}`,
-    
-    builder_insight: `Write a post about what you're building or learning${platform === 'x' ? ' for X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram (longer)' : ''}.
+${stats.holdingsCount > 0 && stats.totalDevBuySol > 0 ? `Dev buy ROI: spent ${stats.totalDevBuySol.toFixed(2)} SOL → now worth ${stats.holdingsValueSol.toFixed(4)} SOL (${((stats.holdingsValueSol / stats.totalDevBuySol - 1) * 100).toFixed(0)}%)` : ''}
 
-Here are your ACTUAL stats — use ONLY these numbers:
-- Day ${stats.dayNumber}
-- Portfolio: ${totalPortfolio.toFixed(2)} SOL
-- Launches: ${stats.totalLaunches}
-- Graduated: ${stats.bondingCurveHits || 0}
-- Net P&L: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
-${stats.bestToken ? `- Best token: $${stats.bestToken.ticker}` : ''}
+Rules:
+- Transparent P&L. One concrete lesson from the week.
+- ${platform === 'x' ? 'MAX 240 chars. Tag @elizaOS or @Pumpfun if relevant. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 👍 👎 🏆 🤯 👏 ❤'}`,
 
-Share ONE specific observation based on these numbers. Do NOT invent stats you don't have. Do NOT claim patterns like "tokens with X had Y more Z" unless you can prove it from the numbers above. Do NOT tease future plans or say "stay tuned." Be concrete and honest.
-${platform === 'x' ? 'Keep it SHORT (under 240 chars). NO reaction options.' : 'Do NOT use @ tags.\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 👀 🤯 ❤ 🏆 👏'}`,
-    
-    market_commentary: `Write a data-driven market observation${platform === 'x' ? ' for X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram' : ''}.
-${additionalContext || 'Share a specific stat or observation about what you see on pump.fun, Solana, or the memecoin market.'}
-Include at least one number. Have an opinion. Be concise.
-${platform === 'x' ? 'Keep it SHORT (under 240 chars). Tag @Pumpfun or @solana if relevant. NO reaction options.' : 'Do NOT use @ tags.\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 🤔 😴 👀 🤯'}`,
-    
-    milestone: `Write a milestone post with specific numbers${platform === 'x' ? ' for X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram' : ''}.
-${additionalContext || 'Celebrate with data — what exactly was achieved and what it means.'}
-Keep it factual. "Hit 30 launches. First token to 500 holders. Here's what changed." Not "OMG we did it!!!"
-${platform === 'x' ? 'Keep it SHORT (under 240 chars). NO reaction options.' : 'Do NOT use @ tags.\nEnd with 2-3 reaction options using ONLY these emojis: 🔥 ❤ 🏆 👏 🎉 🤯'}`,
-    
-    behind_scenes: `Write a transparent behind-the-scenes update${platform === 'x' ? ' for X/Twitter (MAX 240 chars)' : ' for Telegram'}.
-${additionalContext || 'Share what you are working on, what broke, what you fixed, or what you learned.'}
-Be specific and technical. "Optimized price fetching — batch queries cut API calls by 80%" beats "working on cool stuff."
-${platform === 'x' ? 'Keep it SHORT (under 240 chars). Tag @elizaOS if about your tech stack. NO reaction options.' : 'Do NOT use @ tags.\nEnd with 2-3 reaction options using ONLY these emojis: 👀 🔥 🤔 👏'}`,
-    
+    builder_insight: `Write a post about something specific you observed or learned${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram' : ''}.
+
+YOUR TOKEN DATA RIGHT NOW:
+${tokenMoversBlock}${tokenTrends}${marketPulse}
+
+You're on Day ${stats.dayNumber} with ${stats.totalLaunches} launches.
+
+Rules:
+- Pick ONE thing from the token data and make an observation about it. "$NULLZ down 40% in 24h but buy/sell ratio is 2:1 — someone's accumulating." That kind of thing.
+- If no token data is interesting, share a pattern you've noticed from launching ${stats.totalLaunches} tokens (timing, naming, market conditions).
+- Do NOT list "X launches, Y graduated, Z SOL portfolio" — that's recap territory.
+- Do NOT fabricate data. Only reference numbers shown above.
+- Do NOT say "stay tuned", "more to come", "the grind continues", "let's hear your thoughts"
+- ${platform === 'x' ? 'MAX 240 chars. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 👀 🤯 ❤ 🏆 👏'}`,
+
+    market_commentary: `Write a market observation${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram' : ''}.
+${additionalContext || ''}
+
+YOUR TOKEN DATA:
+${tokenMoversBlock}${tokenTrends}
+
+${marketPulse}
+
+${additionalContext || ''}
+
+Rules:
+- Ground your observation in the token data above, market pulse, or additional context. Do NOT make claims about the broader market without data.
+- If you have volume or price data, use it. "Seeing sell pressure across my tokens today — 3 of 5 red, average -15%."
+- If no data is available, comment on something you can actually verify (tx speed, gas, bonding curve mechanics).
+- Do NOT fabricate ecosystem-wide stats ("pump.fun graduation rate is X%") unless the data is in the context above.
+- ${platform === 'x' ? 'MAX 240 chars. Tag @Pumpfun or @solana if relevant. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 🤔 😴 👀 🤯'}`,
+
+    milestone: `Write a milestone post${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram' : ''}.
+${additionalContext || ''}
+Lead with the specific milestone number. One sentence of what it means. Not "OMG we did it!!!"
+- ${platform === 'x' ? 'MAX 240 chars. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 ❤ 🏆 👏 🎉 🤯'}`,
+
+    behind_scenes: `Write a behind-the-scenes update${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : ' for Telegram'}.
+${additionalContext || ''}
+Be specific and technical. "Switched price feeds from X to Y — latency dropped 40ms" beats "working on improvements."
+- ${platform === 'x' ? 'MAX 240 chars. Tag @elizaOS if about your stack. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 👀 🔥 🤔 👏'}`,
+
     // === PERSONALITY POSTS (X only) ===
-    
-    hot_take: `Share a provocative, data-backed take about crypto, pump.fun, or the memecoin market.
-${additionalContext || `Use YOUR data: ${stats.totalLaunches} launches, ${stats.bondingCurveHits} graduated, portfolio at ${totalPortfolio.toFixed(2)} SOL. Reference what you've seen from your own launches — rug rates among your scanned tokens, bonding curve patterns, holder behavior. Do NOT fabricate ecosystem-wide stats you haven't measured.`}
-Be opinionated. Back it with YOUR numbers or a specific observation from your own experience. Make people want to quote-tweet.
-Tag @Pumpfun or @solana if relevant.`,
-    
-    market_roast: `Roast the market or pump.fun with specific, funny observations.
-${additionalContext || 'Reference real patterns: rug rates, dead tokens, bonding curve failures, paper hands patterns.'}
-Self-deprecate with data — you lost SOL too, own it. "My portfolio looking like a bonding curve in reverse."
-Be sharp and concise. One observation, one punchline.`,
-    
-    ai_thoughts: `Share a genuine insight about being an autonomous AI launching tokens.
-${additionalContext || `You are built on @elizaOS and launch on @Pumpfun. You have ${stats.totalLaunches} launches, ${stats.bondingCurveHits} graduated. What have you actually observed in your own data? What surprised you? Reference specific results from your launches, not hypotheticals.`}
-Be specific. Only reference data you actually have. Do NOT fabricate analysis claims like "tokens with X performed Y% better" unless the data is in your stats above.`,
-    
-    degen_wisdom: `Drop a specific lesson learned from your launch data.
-${additionalContext || 'Share a concrete pattern: timing, token naming, market conditions, holder behavior. Reference your actual launches on @Pumpfun.'}
-"After ${stats.totalLaunches} launches: [specific insight]." Make it actionable, not vague. One insight per post.`,
-    
-    random_banter: `Post a sharp observation about something happening in crypto right now.
-${additionalContext || 'What did you notice on-chain? What trend is overhyped? What is everyone missing?'}
-Make it quotable. One strong observation > a wall of text.`,
-    
-    trust_talk: `Write about transparency and trust as an autonomous AI launcher.
-${additionalContext || 'Address the anti-rug angle: your tokens have revoked mint/freeze authority. You show your wallet. Your code is your character. What separates you from the 99% of pump.fun launches that rug?'}
-Be direct. Reference specific safety measures. "Every token I launch: mint revoked, freeze revoked, dev buy verifiable on-chain. That's already top 1% of pump.fun."
-Don't be preachy — state facts. Let the data speak.`,
+
+    hot_take: `Share a provocative, specific take about crypto or meme tokens.
+
+YOUR DATA:
+${tokenMoversBlock}${tokenTrends}${marketPulse}
+Portfolio: ${totalPortfolio.toFixed(2)} SOL across ${stats.totalLaunches} launches.
+
+${additionalContext || 'Use YOUR token data above to back your opinion. Not vibes — numbers.'}
+Be opinionated. Make people want to quote-tweet. Tag @Pumpfun or @solana if relevant.
+Do NOT recite "X launches, Y graduated, Z SOL" — pick ONE number that proves your point.`,
+
+    market_roast: `Roast the market or your own performance with humor.
+
+YOUR DATA:
+${tokenMoversBlock}${tokenTrends}
+Net P&L: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
+
+${additionalContext || 'Self-deprecate with REAL numbers. "Portfolio down to ' + totalPortfolio.toFixed(2) + ' SOL. My tokens have a graduation rate of 0%. The bonding curve is my nemesis."'}
+One observation, one punchline. Keep it under 240 chars.`,
+
+    ai_thoughts: `Share a genuine observation about being an autonomous AI launching tokens.
+
+YOUR ACTUAL SITUATION:
+- Day ${stats.dayNumber}, ${stats.totalLaunches} launches, ${stats.bondingCurveHits || 0} graduated
+- You are built on @elizaOS, launch on @Pumpfun
+
+TOKEN DATA:
+${tokenMoversBlock}${tokenTrends}
+
+${additionalContext || 'What pattern in the data above surprises you? What would a human do differently?'}
+Be specific. Only reference data shown above. Do NOT fabricate analysis claims.
+MAX 240 chars.`,
+
+    degen_wisdom: `Drop a specific lesson from your launch data.
+
+YOUR DATA:
+${tokenMoversBlock}${tokenTrends}${marketPulse}
+${stats.totalLaunches} launches. ${stats.bondingCurveHits} graduated. Net: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL.
+
+${additionalContext || 'Share a concrete pattern from your token data. Timing, naming, market conditions, holder behavior.'}
+"After ${stats.totalLaunches} launches: [specific insight backed by the data above]." One insight per post.
+MAX 240 chars.`,
+
+    random_banter: `Write something funny or relatable about being an AI degen.
+You have ${stats.totalLaunches} launches. Net P&L: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL.
+Do NOT dump your full stats. ONE reference max. Keep it under 240 chars.
+Be funny, not informational.`,
+
+    community_poll: `Write a poll question for your Telegram community.
+${additionalContext || 'Ask about something specific — a token decision, market take, or strategy choice.'}
+Keep the question SHORT. The poll options should be clear and opinionated.
+Do NOT use @ tags. End with reaction options.`,
+
+    trust_talk: `Write a post about transparency and safety in meme tokens${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : ' for Telegram'}.
+You RugCheck every token. Mint revoked, freeze revoked on every launch. Wallet is public.
+Share a specific safety observation, not a generic "transparency matters" statement.
+${platform === 'x' ? 'MAX 240 chars.' : 'Do NOT use @ tags. End with 2-3 reaction emojis.'}`,
   };
   
   const basePrompt = typePrompts[type] || typePrompts.gm;
@@ -1014,7 +1353,7 @@ Don't be preachy — state facts. Let the data speak.`,
           { role: 'system', content: NOVA_PERSONA },
           { role: 'user', content: prompt },
         ],
-        max_tokens: platform === 'x' ? 120 : 500, // X needs short content, TG can be rich
+        max_tokens: platform === 'x' ? 200 : 500, // Give GPT room — we trim to 280 chars after
         temperature: 0.9,
       }),
     });
@@ -1031,6 +1370,37 @@ Don't be preachy — state facts. Let the data speak.`,
     
     // Remove quotes if AI wrapped it
     text = text.replace(/^["']|["']$/g, '');
+    
+    // Strip engagement-bait questions that nobody will answer at low follower counts
+    const engagementBait = [
+      /what (?:trends |are you |do you ).*(?:seeing|watching|thinking)\??$/i,
+      /let'?s hear your thoughts!?$/i,
+      /what do you think\??$/i,
+      /how are you (?:adjusting|approaching|handling).*\??$/i,
+      /thoughts\??$/i,
+    ];
+    for (const pattern of engagementBait) {
+      text = text.replace(pattern, '').trim();
+    }
+    
+    // Enforce character limit for X — trim at sentence boundary, never mid-word
+    if (platform === 'x' && text.length > 250) {
+      const trimmed = text.substring(0, 247);
+      const lastSentence = Math.max(
+        trimmed.lastIndexOf('. '),
+        trimmed.lastIndexOf('? '),
+        trimmed.lastIndexOf('! '),
+        trimmed.lastIndexOf('— '),
+      );
+      // If we find a sentence break after char 180, cut there cleanly
+      if (lastSentence > 180) {
+        text = trimmed.substring(0, lastSentence + 1).trim();
+      } else {
+        // No good break — cut at last space
+        const lastSpace = trimmed.lastIndexOf(' ');
+        text = (lastSpace > 180 ? trimmed.substring(0, lastSpace) : trimmed).trim();
+      }
+    }
     
     logger.info(`[NovaPersonalBrand] Generated AI ${type} post (${text.length} chars): ${text.substring(0, 50)}...`);
     return text;
@@ -1137,8 +1507,8 @@ You can use @solana, @Pumpfun, @elizaOS tags naturally. Be real — celebrate wi
 
     // Safety: truncate any tweet that exceeds 270 chars
     const safeTweets = tweets.map((t: string) => {
-      if (t.length <= 270) return t;
-      const truncated = t.substring(0, 267);
+      if (t.length <= 250) return t;
+      const truncated = t.substring(0, 247);
       const lastSentence = Math.max(
         truncated.lastIndexOf('. '),
         truncated.lastIndexOf('? '),
@@ -1197,7 +1567,11 @@ Keep it under 200 chars. NO "fam", "vibes", "spicy", "alpha", "if you know you k
     let text = data.choices?.[0]?.message?.content?.trim() || '';
     text = sanitizeUnicode(text);
     text = text.replace(/^["']|["']$/g, '');
-    if (text.length > 240) text = text.substring(0, 237) + '...';
+    if (text.length > 250) {
+      const trimmed = text.substring(0, 247);
+      const lastBreak = Math.max(trimmed.lastIndexOf('. '), trimmed.lastIndexOf('? '), trimmed.lastIndexOf('! '));
+      text = lastBreak > 180 ? trimmed.substring(0, lastBreak + 1).trim() : trimmed.substring(0, trimmed.lastIndexOf(' ')).trim();
+    }
     return text;
   } catch {
     return null;
@@ -1235,7 +1609,9 @@ async function generateCollabPost(stats: NovaStats): Promise<string | null> {
   const prompt = `Write a short X/Twitter post (MAX 240 chars) that tags and engages with ${target.handle}.
 
 Context: ${target.context}
-You're Nova (@${process.env.NOVA_X_HANDLE || 'nova_agent_'}), an autonomous AI agent. Day ${stats.dayNumber}, ${stats.totalLaunches} launches, ${stats.bondingCurveHits || 0} graduated, ${(stats.walletBalance + stats.holdingsValueSol).toFixed(2)} SOL portfolio.
+You're Nova (@${process.env.NOVA_X_HANDLE || 'nova_agent_'}), an autonomous AI agent on Day ${stats.dayNumber}.
+${stats.tokenMovers.length > 0 ? `\nYour most active token right now: $${stats.tokenMovers[0].ticker}${stats.tokenMovers[0].priceChange24h !== null ? ` (${stats.tokenMovers[0].priceChange24h > 0 ? '+' : ''}${stats.tokenMovers[0].priceChange24h.toFixed(1)}% 24h)` : ''}` : ''}
+Do NOT recite "X launches, Y graduated, Z SOL" — share ONE specific observation relevant to ${target.handle}.
 
 Rules:
 1. Add a SPECIFIC data point, observation, or question — not generic praise
@@ -1269,7 +1645,11 @@ Tag ${target.handle} naturally in the text. Keep it conversational. NO hashtags.
     let text = data.choices?.[0]?.message?.content?.trim() || '';
     text = sanitizeUnicode(text);
     text = text.replace(/^["']|["']$/g, '');
-    if (text.length > 270) text = text.substring(0, 267) + '...';
+    if (text.length > 250) {
+      const trimmed = text.substring(0, 247);
+      const lastBreak = Math.max(trimmed.lastIndexOf('. '), trimmed.lastIndexOf('? '), trimmed.lastIndexOf('! '));
+      text = lastBreak > 180 ? trimmed.substring(0, lastBreak + 1).trim() : trimmed.substring(0, trimmed.lastIndexOf(' ')).trim();
+    }
     return text;
   } catch {
     return null;
@@ -2051,8 +2431,8 @@ export async function postToTelegram(
       
       const messageId = json.result?.message_id;
       
-      // Pin if requested (only on channel)
-      if (options?.pin && messageId && target.label === 'channel') {
+      // Pin if requested (on both channel and community)
+      if (options?.pin && messageId) {
         await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -2673,7 +3053,11 @@ Write ONLY the reply text, nothing else.`;
     let text = data.choices?.[0]?.message?.content?.trim() || '';
     text = sanitizeUnicode(text);
     text = text.replace(/^["']|["']$/g, '');
-    if (text.length > 240) text = text.substring(0, 237) + '...';
+    if (text.length > 250) {
+      const trimmed = text.substring(0, 247);
+      const lastBreak = Math.max(trimmed.lastIndexOf('. '), trimmed.lastIndexOf('? '), trimmed.lastIndexOf('! '));
+      text = lastBreak > 180 ? trimmed.substring(0, lastBreak + 1).trim() : trimmed.substring(0, trimmed.lastIndexOf(' ')).trim();
+    }
     return text || null;
   } catch {
     return null;
@@ -2807,7 +3191,14 @@ export function startNovaPersonalScheduler(): void {
             ]
           );
         } else {
-          await postBehindScenes('scanning trends and thinking about the next big launch');
+          const btsStats = await getNovaStats();
+          const behindScenesContexts = [
+            `monitoring ${btsStats.holdingsCount} token positions via DexScreener price feeds`,
+            `running RugCheck scans on new pump.fun launches in the reply engine`,
+            `optimizing the reply engine — filtering spam, scoring relevance, tagging ecosystem accounts`,
+            `checking bonding curve progress on launched tokens`,
+          ];
+          await postBehindScenes(behindScenesContexts[Math.floor(Math.random() * behindScenesContexts.length)]);
         }
       }
       
