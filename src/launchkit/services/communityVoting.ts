@@ -486,7 +486,7 @@ export async function postIdeaForVoting(
     
     // Pin the voting post so community can see it
     try {
-      await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
+      const pinRes = await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -495,7 +495,16 @@ export async function postIdeaForVoting(
           disable_notification: false, // Notify users about new idea
         }),
       });
-      logger.info(`[CommunityVoting] 📌 Pinned voting post for $${idea.ticker}`);
+      const pinJson = await pinRes.json();
+      if (pinJson.ok) {
+        logger.info(`[CommunityVoting] 📌 Pinned voting post for $${idea.ticker} in ${channelId}`);
+      } else {
+        logger.warn(`[CommunityVoting] ❌ Pin failed for $${idea.ticker}: ${pinJson.description} (chat_id: ${channelId})`);
+        // Notify admin so they can grant bot pin permission
+        import('./adminNotify.ts').then(m => m.notifyAdminWarning('pin_failed',
+          `Failed to pin voting post for $${idea.ticker} in community.\nError: ${pinJson.description}\n\nMake sure the bot is an admin with "Pin Messages" permission in the community group.`
+        )).catch(() => {});
+      }
     } catch (pinErr) {
       logger.warn(`[CommunityVoting] Failed to pin voting post:`, pinErr);
     }
@@ -649,7 +658,7 @@ export async function postScheduledIdeaForFeedback(
     
     // Pin the idea so community can easily find it
     try {
-      await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
+      const pinRes = await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -658,7 +667,15 @@ export async function postScheduledIdeaForFeedback(
           disable_notification: true,
         }),
       });
-      logger.info(`[CommunityVoting] 📌 Pinned scheduled idea to community`);
+      const pinJson = await pinRes.json();
+      if (pinJson.ok) {
+        logger.info(`[CommunityVoting] 📌 Pinned scheduled idea to community (${channelId})`);
+      } else {
+        logger.warn(`[CommunityVoting] ❌ Pin failed for scheduled idea: ${pinJson.description} (chat_id: ${channelId})`);
+        import('./adminNotify.ts').then(m => m.notifyAdminWarning('pin_failed',
+          `Failed to pin scheduled idea in community.\nError: ${pinJson.description}\n\nMake sure the bot is an admin with "Pin Messages" permission in the community group.`
+        )).catch(() => {});
+      }
     } catch (pinErr) {
       logger.warn(`[CommunityVoting] Failed to pin scheduled idea: ${pinErr}`);
     }

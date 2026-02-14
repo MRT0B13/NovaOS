@@ -2433,15 +2433,28 @@ export async function postToTelegram(
       
       // Pin if requested (on both channel and community)
       if (options?.pin && messageId) {
-        await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: target.id,
-            message_id: messageId,
-            disable_notification: true,
-          }),
-        });
+        try {
+          const pinRes = await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: target.id,
+              message_id: messageId,
+              disable_notification: true,
+            }),
+          });
+          const pinJson = await pinRes.json();
+          if (pinJson.ok) {
+            logger.info(`[NovaPersonalBrand] 📌 Pinned ${type} in ${target.label} (${target.id})`);
+          } else {
+            logger.warn(`[NovaPersonalBrand] ❌ Pin failed in ${target.label}: ${pinJson.description}`);
+            import('./adminNotify.ts').then(m => m.notifyAdminWarning('pin_failed',
+              `Failed to pin ${type} in ${target.label}.\nError: ${pinJson.description}\n\nMake sure the bot is an admin with "Pin Messages" permission.`
+            )).catch(() => {});
+          }
+        } catch (pinErr) {
+          logger.warn(`[NovaPersonalBrand] Pin error in ${target.label}:`, pinErr);
+        }
       }
       
       logger.info(`[NovaPersonalBrand] ✅ TG ${type} → ${target.label}`);
