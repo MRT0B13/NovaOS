@@ -504,11 +504,6 @@ export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promi
       message += '\n';
     }
     
-    // Join link
-    if (token.tgInviteLink) {
-      message += `🔗 <a href="${token.tgInviteLink}">Join Community</a>\n`;
-    }
-    
     message += '\n';
   }
   
