@@ -514,6 +514,12 @@ export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promi
   
   message += `<i>Updated ${new Date().toLocaleTimeString()}</i>`;
   
+  // Add channel link for community members who see this in the discussion group
+  const env = getEnv();
+  if (env.NOVA_CHANNEL_INVITE) {
+    message += `\n\n📢 <a href="${env.NOVA_CHANNEL_INVITE}">Nova Announcements Channel</a>`;
+  }
+  
   // Post to channel for visibility
   await sendToChannel(message);
   // Also post to community group for discussion (if configured)
@@ -565,6 +571,15 @@ export async function announceSystem(
   }[type];
   
   const fullMessage = `${emoji} <b>System</b>\n\n${message}`;
+  
+  // Startup/shutdown messages go to admin only — channel doesn't need to see reboots
+  if (type === 'startup' || type === 'shutdown') {
+    try {
+      const { notifyAdmin } = await import('./adminNotify.ts');
+      await notifyAdmin(fullMessage, 'system');
+    } catch {}
+    return true;
+  }
   
   return sendToChannel(fullMessage);
 }
