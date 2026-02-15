@@ -480,6 +480,15 @@ export class PostgresScheduleRepository {
       ON CONFLICT (id) DO NOTHING;
     `);
 
+    // General-purpose key-value store for persisting in-memory state across restarts
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS sched_kv_store (
+        key TEXT PRIMARY KEY,
+        value JSONB NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
     logger.info('[ScheduleRepository] PostgreSQL schema ensured');
   }
 
@@ -1322,5 +1331,34 @@ export class PostgresScheduleRepository {
         last_updated = NOW()
       WHERE id = 'main'
     `, [date]);
+  }
+
+  // ==========================================================================
+  // Key-Value Store (general-purpose state persistence)
+  // ==========================================================================
+
+  /** Store a JSON-serialisable value under a key (upsert) */
+  async kvSet(key: string, value: unknown): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO sched_kv_store (key, value, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+      [key, JSON.stringify(value)]
+    );
+  }
+
+  /** Retrieve a value by key, or null if missing */
+  async kvGet<T = unknown>(key: string): Promise<T | null> {
+    const res = await this.pool.query(
+      `SELECT value FROM sched_kv_store WHERE key = $1`,
+      [key]
+    );
+    if (res.rows.length === 0) return null;
+    return res.rows[0].value as T;
+  }
+
+  /** Delete a key */
+  async kvDelete(key: string): Promise<void> {
+    await this.pool.query(`DELETE FROM sched_kv_store WHERE key = $1`, [key]);
   }
 }

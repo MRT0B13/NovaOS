@@ -5,6 +5,7 @@ import { lookupTelegramUser, lookupTelegramUserByEntity } from '../services/tele
 import { getAllGroups, getGroupsSummary, trackGroup } from '../services/groupTracker.ts';
 import { getHealthMonitor, trackMessage, analyzeSentiment, type GroupHealth } from '../services/groupHealthMonitor.ts';
 import { crossBanUser } from '../services/novaChannel.ts';
+import { loadMap, saveMap } from '../services/persistenceStore.ts';
 
 // ============================================================================
 // SCAM/SPAM WARNING TRACKER
@@ -20,6 +21,20 @@ interface ScamWarning {
 
 // Map of chatId:userId -> warning info
 const scamWarnings = new Map<string, ScamWarning>();
+
+// Restore scam warnings from DB on import
+loadMap<ScamWarning>('scam_warnings').then(saved => {
+  if (saved.size > 0) {
+    const now = Date.now();
+    for (const [k, v] of saved) {
+      // Skip expired warnings
+      if (now - v.lastWarning <= WARNING_EXPIRY_MS) {
+        scamWarnings.set(k, v);
+      }
+    }
+    console.log(`[SCAM_TRACKER] Restored ${scamWarnings.size} active warnings from DB`);
+  }
+}).catch(() => {});
 
 // Warning config
 const WARNING_THRESHOLD = 2; // Kick after this many warnings
@@ -125,6 +140,7 @@ export function trackScamWarning(
   if (entityId) warning.entityId = entityId;
   
   scamWarnings.set(key, warning);
+  saveMap('scam_warnings', scamWarnings);
   
   console.log(`[SCAM_TRACKER] User ${userId} in chat ${chatId}: ${warning.count} warnings (${reason})`);
   
@@ -148,6 +164,7 @@ export function getScamWarnings(chatId: string, userId: string | number): ScamWa
 export function clearScamWarnings(chatId: string, userId: string | number): void {
   const key = `${chatId}:${userId}`;
   scamWarnings.delete(key);
+  saveMap('scam_warnings', scamWarnings);
 }
 
 const UUID_RE =

@@ -5,6 +5,7 @@ import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseR
 import { canPostToX, recordXPost } from './novaPersonalBrand.ts';
 import { getNovaStats, type TokenMover } from './novaPersonalBrand.ts';
 import { scanToken, formatReportForTweet } from './rugcheck.ts';
+import { loadSet, saveSet, loadMap, saveMap } from './persistenceStore.ts';
 
 /**
  * X Reply Engine
@@ -132,6 +133,9 @@ export function startReplyEngine(): void {
     return;
   }
   
+  // Restore persisted state from PG before first round
+  restorePersistedState().catch(e => logger.warn('[ReplyEngine] Could not restore persisted state:', e));
+  
   const intervalMs = (env.X_REPLY_INTERVAL_MINUTES || 60) * 60 * 1000;
   
   state.running = true;
@@ -148,6 +152,22 @@ export function startReplyEngine(): void {
   state.intervalHandle = setInterval(() => {
     runReplyRound().catch(err => logger.error('[ReplyEngine] Round failed:', err));
   }, intervalMs);
+}
+
+/** Restore repliedTweetIds + engagerCounts from PG */
+async function restorePersistedState(): Promise<void> {
+  const [savedIds, savedEngagers] = await Promise.all([
+    loadSet('reply_engine:replied_tweet_ids'),
+    loadMap<number>('reply_engine:engager_counts'),
+  ]);
+  if (savedIds.size > 0) {
+    for (const id of savedIds) state.repliedTweetIds.add(id);
+    logger.info(`[ReplyEngine] Restored ${savedIds.size} replied tweet IDs from DB`);
+  }
+  if (savedEngagers.size > 0) {
+    for (const [k, v] of savedEngagers) sharedData.engagerCounts.set(k, v);
+    logger.info(`[ReplyEngine] Restored ${savedEngagers.size} engager counts from DB`);
+  }
 }
 
 /**
@@ -319,6 +339,7 @@ async function _runReplyRoundInner(): Promise<void> {
     state.repliesToday++;
     state.lastReplyAt = Date.now();
     state.repliedTweetIds.add(candidate.tweetId);
+    saveSet('reply_engine:replied_tweet_ids', state.repliedTweetIds);
     state.trackedReplies.push({
       tweetId: candidate.tweetId,
       replyId: result.id,
@@ -431,6 +452,8 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
         const sorted = [...sharedData.engagerCounts.entries()].sort((a, b) => b[1] - a[1]);
         sharedData.engagerCounts = new Map(sorted.slice(0, 200));
       }
+      // Persist engager counts (debounced 10s)
+      saveMap('reply_engine:engager_counts', sharedData.engagerCounts, 10000);
       // ── End shared data ──
       
       for (const m of mentions) {

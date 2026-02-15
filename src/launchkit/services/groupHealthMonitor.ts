@@ -7,6 +7,7 @@
 import { getEnv } from '../env.ts';
 import type { LaunchPackStore } from '../db/launchPackRepository.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
+import { kvSaveDebounced, kvLoad } from './persistenceStore.ts';
 
 interface ChatInfo {
   id: number;
@@ -35,9 +36,40 @@ interface MessageActivity {
   sentiment?: 'positive' | 'neutral' | 'negative';
 }
 
-// In-memory activity tracking (persisted to file periodically)
+// In-memory activity tracking (persisted to PG via KV store)
 const activityLog: Map<string, MessageActivity[]> = new Map();
 const memberCountHistory: Map<string, { count: number; timestamp: number }[]> = new Map();
+
+// Restore persisted state on import
+(async () => {
+  try {
+    const savedActivity = await kvLoad<Record<string, MessageActivity[]>>('health:activity_log');
+    if (savedActivity) {
+      const now = Date.now();
+      const cutoff = now - 24 * 60 * 60 * 1000;
+      let restored = 0;
+      for (const [chatId, activities] of Object.entries(savedActivity)) {
+        const fresh = activities.filter(a => a.timestamp > cutoff);
+        if (fresh.length > 0) {
+          activityLog.set(chatId, fresh);
+          restored += fresh.length;
+        }
+      }
+      if (restored > 0) console.log(`[GROUP_HEALTH] Restored ${restored} activity records from DB`);
+    }
+    const savedMembers = await kvLoad<Record<string, { count: number; timestamp: number }[]>>('health:member_history');
+    if (savedMembers) {
+      const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      for (const [chatId, history] of Object.entries(savedMembers)) {
+        const fresh = history.filter(h => h.timestamp > cutoff);
+        if (fresh.length > 0) memberCountHistory.set(chatId, fresh);
+      }
+      console.log(`[GROUP_HEALTH] Restored member history for ${memberCountHistory.size} chats from DB`);
+    }
+  } catch (e) {
+    console.warn('[GROUP_HEALTH] Could not restore persisted state:', e);
+  }
+})();
 
 // Sentiment keywords
 const BULLISH_KEYWORDS = [
@@ -123,6 +155,8 @@ export function trackMessage(chatId: string, userId: number, username: string | 
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   const filtered = existing.filter(a => a.timestamp > cutoff);
   activityLog.set(chatId, filtered);
+  // Debounced save to PG (every 30s)
+  kvSaveDebounced('health:activity_log', () => Object.fromEntries(activityLog), 30000);
 }
 
 /**
@@ -198,6 +232,8 @@ export class GroupHealthMonitor {
       // Keep only last 7 days
       const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
       memberCountHistory.set(chatId, history.filter(h => h.timestamp > cutoff));
+      // Debounced save to PG (every 60s)
+      kvSaveDebounced('health:member_history', () => Object.fromEntries(memberCountHistory), 60000);
       
       return count;
     } catch (err) {

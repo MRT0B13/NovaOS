@@ -3,6 +3,7 @@ import { getEnv } from '../env.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
 import { recordMessageSent } from './telegramHealthMonitor.ts';
 import { recordTGPostSent } from './systemReporter.ts';
+import { loadValue, saveValue } from './persistenceStore.ts';
 
 /**
  * Nova Channel Service
@@ -519,6 +520,7 @@ export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promi
   
   // Community gets the FULL health report + rules/disclaimers
   healthUpdateCount++;
+  saveValue('health_update_count', healthUpdateCount, 1000);
   const includeRules = healthUpdateCount % RULES_REMINDER_EVERY === 0;
 
   let communityMessage = message; // same health data as channel
@@ -845,6 +847,14 @@ function getRulesReminder(): string {
 // Track how many health updates have been sent so we can append rules every Nth time
 let healthUpdateCount = 0;
 const RULES_REMINDER_EVERY = 3; // append rules reminder every 3rd health update
+
+// Restore healthUpdateCount from DB on import
+loadValue<number>('health_update_count').then(v => {
+  if (v != null) {
+    healthUpdateCount = v;
+    logger.info(`[NovaChannel] Restored healthUpdateCount=${v} from DB`);
+  }
+}).catch(() => {});
 
 /**
  * Post the full community rules to the community group and attempt to pin.

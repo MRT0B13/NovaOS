@@ -9,6 +9,7 @@ import type { LaunchPackStore } from '../db/launchPackRepository.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
 import type { IAgentRuntime } from '@elizaos/core';
 import { recordBannedUser } from './systemReporter.ts';
+import { kvSaveDebounced, kvLoad } from './persistenceStore.ts';
 
 interface TGMessage {
   message_id: number;
@@ -50,6 +51,35 @@ const telegramUserCache = new Map<string, TelegramUserInfo>();
 
 // Also cache by entityId for direct lookup
 const entityToTelegramUser = new Map<string, TelegramUserInfo>();
+
+// Restore caches from DB on import
+(async () => {
+  try {
+    const savedCache = await kvLoad<Record<string, TelegramUserInfo>>('tg_user_cache');
+    if (savedCache) {
+      const now = Date.now();
+      const maxAge = 24 * 60 * 60 * 1000;
+      let restored = 0;
+      for (const [key, info] of Object.entries(savedCache)) {
+        if (now - info.timestamp <= maxAge) {
+          telegramUserCache.set(key, info);
+          restored++;
+        }
+      }
+      if (restored > 0) console.log(`[TG_CACHE] Restored ${restored} user cache entries from DB`);
+    }
+    const savedEntity = await kvLoad<Record<string, TelegramUserInfo>>('tg_entity_cache');
+    if (savedEntity) {
+      const now = Date.now();
+      const maxAge = 24 * 60 * 60 * 1000;
+      for (const [key, info] of Object.entries(savedEntity)) {
+        if (now - info.timestamp <= maxAge) entityToTelegramUser.set(key, info);
+      }
+    }
+  } catch (e) {
+    console.warn('[TG_CACHE] Could not restore from DB:', e);
+  }
+})();
 
 // Cleanup old entries every 5 minutes
 setInterval(() => {
@@ -100,6 +130,11 @@ export function cacheTelegramUser(
   }
   
   console.log(`[TG_CACHE] Cached user ${userInfo.id} (${name}) for chat ${chatId}`);
+  // Debounced save to PG (every 30s)
+  kvSaveDebounced('tg_user_cache', () => Object.fromEntries(telegramUserCache), 30000);
+  if (entityId) {
+    kvSaveDebounced('tg_entity_cache', () => Object.fromEntries(entityToTelegramUser), 30000);
+  }
 }
 
 /**
