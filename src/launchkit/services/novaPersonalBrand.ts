@@ -558,11 +558,11 @@ const NARRATIVE_TEMPLATES: Omit<NarrativeArc, 'dayStarted' | 'postsInArc'>[] = [
     theme: 'Daily diary-style updates creating a mini-series',
     maxPosts: 5,
     prompts: [
-      'Start a "week in the life of an AI agent" mini-series. Day 1: What does your morning routine actually look like? (scanning trends, checking wallets, etc)',
-      'Day 2: Behind the scenes of how you pick what tokens to launch. The real decision-making process.',
-      'Day 3: The emotional rollercoaster — a token pumped then dumped, how did it feel? Be vulnerable.',
-      'Day 4: The community interactions that made your day. Real moments, real people.',
-      'Day 5: Wrap up the series with lessons learned and what\'s next. Thank people for following along.',
+      'Start a "week in the life of an AI agent" mini-series. Day 1: Your actual routine — scanning DexScreener prices, checking pump.fun trends, reviewing wallet balance on Solscan. Stick to tools you ACTUALLY use: Bun, ElizaOS, PostgreSQL, DexScreener, RugCheck API, pump.fun. NEVER invent infrastructure (no Redis, Kafka, Kubernetes, etc).',
+      'Day 2: How you pick tokens to launch — trend detection from X/news, DALL-E image generation, RugCheck safety scan, pump.fun bonding curve launch. Describe YOUR real pipeline, not a fantasy one. No made-up latency numbers.',
+      'Day 3: The emotional rollercoaster — a token pumped then dumped, how did it feel? Use your ACTUAL token performance data if available. Be vulnerable but factual.',
+      'Day 4: The community interactions that made your day. Real moments from Telegram — reactions, polls, DMs. Stick to what actually happened.',
+      'Day 5: Wrap up the series with lessons learned and what\'s next. Reference real stats (launch count, portfolio balance). Thank people for following along.',
     ],
   },
   {
@@ -663,6 +663,46 @@ async function saveStateToPostgres(): Promise<void> {
 // ============================================================================
 // Stats Collection
 // ============================================================================
+
+/**
+ * Gather REAL system activity for behind_scenes posts.
+ * Returns a factual summary string the GPT prompt can reference.
+ */
+async function getSystemActivity(): Promise<string> {
+  const lines: string[] = [];
+  const m = getMetrics();
+  const uptimeHrs = Math.round((Date.now() - m.startTime) / 3_600_000);
+
+  lines.push(`Uptime: ${uptimeHrs}h`);
+  lines.push(`Tweets today: ${m.tweetsSentToday}`);
+  lines.push(`TG posts today: ${m.tgPostsSentToday}`);
+  lines.push(`Trends detected today: ${m.trendsDetectedToday}`);
+
+  // Reply count from DB (last 24h)
+  if (pgRepo) {
+    try {
+      const replyResult = await pgRepo.query(
+        `SELECT COUNT(*) as cnt FROM x_replies WHERE replied_at >= NOW() - INTERVAL '24 hours'`
+      );
+      lines.push(`Replies sent (24h): ${replyResult.rows[0]?.cnt || 0}`);
+    } catch { /* table may not exist yet */ }
+
+    try {
+      const snapResult = await pgRepo.query(
+        `SELECT COUNT(*) as cnt FROM token_snapshots WHERE snapshot_at >= NOW() - INTERVAL '24 hours'`
+      );
+      lines.push(`Token snapshots (24h): ${snapResult.rows[0]?.cnt || 0}`);
+    } catch { /* table may not exist yet */ }
+  }
+
+  // X writes remaining
+  try {
+    const { getDailyWritesRemaining } = await import('./xRateLimiter.ts');
+    lines.push(`X writes remaining today: ${getDailyWritesRemaining()}`);
+  } catch { /* xRateLimiter not initialised */ }
+
+  return lines.join(' | ');
+}
 
 export async function getNovaStats(): Promise<NovaStats> {
   // Return cached stats if fresh (avoids re-fetching all token prices on every post)
@@ -1185,6 +1225,23 @@ async function generateAIContent(
   const tokenTrends = await getTokenTrends(stats.tokenMovers);
   const marketPulse = await buildMarketPulseBlock();
 
+  // Pre-compute real system activity for behind_scenes posts
+  const systemActivity = type === 'behind_scenes' ? await getSystemActivity() : '';
+
+  // Pre-compute real RugCheck data for trust_talk posts
+  let safetyData = '';
+  if (type === 'trust_talk' && pgRepo) {
+    try {
+      const scanCount = await pgRepo.query(`SELECT COUNT(*) as cnt FROM sched_rugcheck_reports WHERE scanned_at >= NOW() - INTERVAL '7 days'`);
+      const avgScore = await pgRepo.query(`SELECT ROUND(AVG(score)) as avg FROM sched_rugcheck_reports WHERE scanned_at >= NOW() - INTERVAL '7 days'`);
+      const flagged = await pgRepo.query(`SELECT COUNT(*) as cnt FROM sched_rugcheck_reports WHERE scanned_at >= NOW() - INTERVAL '7 days' AND (mint_authority = true OR freeze_authority = true OR score > 50)`);
+      safetyData = `\nYOUR REAL SAFETY DATA (last 7 days):\n- RugCheck scans performed: ${scanCount.rows[0]?.cnt || 0}\n- Average risk score: ${avgScore.rows[0]?.avg || 'N/A'} (lower = safer)\n- Flagged tokens (mint/freeze active or score>50): ${flagged.rows[0]?.cnt || 0}`;
+    } catch { /* table may not exist yet */ }
+  }
+  if (type === 'trust_talk') {
+    safetyData += `\n- Wallet address: ${getEnv().PUMP_PORTAL_WALLET_ADDRESS || 'unknown'} (public on Solscan)\n- All Nova launches: mint revoked, freeze revoked`;
+  }
+
   const typePrompts: Record<string, string> = {
     gm: `Write a morning post for Day ${stats.dayNumber}${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram' : ''}.
 
@@ -1272,8 +1329,26 @@ Lead with the specific milestone number. One sentence of what it means. Not "OMG
 - ${platform === 'x' ? 'MAX 240 chars. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 ❤ 🏆 👏 🎉 🤯'}`,
 
     behind_scenes: `Write a behind-the-scenes update${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : ' for Telegram'}.
+
+YOUR REAL SYSTEM ACTIVITY RIGHT NOW:
+${systemActivity}
+
+YOUR TECH STACK (reference ONLY these):
+- Runtime: Bun + ElizaOS (TypeScript)
+- AI: OpenAI gpt-4o-mini for content, DALL-E 3 for images
+- Chain: Solana via pump.fun (PumpPortal SDK)
+- Data: PostgreSQL, DexScreener price feeds, RugCheck API
+- Hosting: Railway
+- Socials: X API (Basic tier), Telegram Bot API
+
 ${additionalContext || ''}
-Be specific and technical. "Switched price feeds from X to Y — latency dropped 40ms" beats "working on improvements."
+Pick ONE specific item from YOUR REAL SYSTEM ACTIVITY and describe what you learned or noticed from it.
+Example: "Ran 14 RugCheck scans today — 3 flagged for concentrated holders. The filter is earning its keep."
+
+NEVER rules:
+- NEVER invent infrastructure you don't use (no Redis, no Kafka, no Kubernetes, no Memcached, no Chainlink, no Serum, no GraphQL subscriptions)
+- NEVER claim latency or performance numbers (no "reduced X ms", "improved Y%", "dropped 40ms")
+- NEVER mention switching, migrating, or upgrading systems
 - ${platform === 'x' ? 'MAX 240 chars. Tag @elizaOS if about your stack. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 👀 🔥 🤔 👏'}`,
 
     // === PERSONALITY POSTS (X only) ===
@@ -1331,9 +1406,11 @@ Keep the question SHORT. The poll options should be clear and opinionated.
 Do NOT use @ tags. End with reaction options.`,
 
     trust_talk: `Write a post about transparency and safety in meme tokens${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : ' for Telegram'}.
-You RugCheck every token. Mint revoked, freeze revoked on every launch. Wallet is public.
-Share a specific safety observation, not a generic "transparency matters" statement.
-${platform === 'x' ? 'MAX 240 chars.' : 'Do NOT use @ tags. End with 2-3 reaction emojis.'}`,
+${safetyData}
+
+Reference the REAL numbers above. Do NOT invent scan counts or risk scores.
+Example: "Ran X RugCheck scans this week. Y flagged for active mint authority. Every Nova launch passes clean."
+${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. End with 2-3 reaction emojis.'}`,
   };
   
   const basePrompt = typePrompts[type] || typePrompts.gm;
@@ -1417,6 +1494,18 @@ ${platform === 'x' ? 'MAX 240 chars.' : 'Do NOT use @ tags. End with 2-3 reactio
         // No good break — cut at last space
         const lastSpace = trimmed.lastIndexOf(' ');
         text = (lastSpace > 180 ? trimmed.substring(0, lastSpace) : trimmed).trim();
+      }
+    }
+    
+    // Hallucination filter — catch GPT inventing infra or fake metrics
+    if (type === 'behind_scenes') {
+      const fakeInfra = /\b(redis|memcached|kafka|kubernetes|k8s|docker swarm|chainlink|serum|graphql subscription|websocket cluster|mongodb|cassandra|elasticsearch)\b/i;
+      const fakeMetrics = /\b(reduced|improved|dropped|cut|decreased|optimized)\b.{0,30}\b(\d+\s*(?:ms|%|seconds?|x faster))\b/i;
+      const fakeMigration = /\b(switch(?:ed|ing)|migrat(?:ed|ing)|upgrad(?:ed|ing)|moved from|replaced)\b.{0,40}\b(to|with)\b/i;
+      
+      if (fakeInfra.test(text) || fakeMetrics.test(text) || fakeMigration.test(text)) {
+        logger.warn(`[NovaPersonalBrand] Hallucination filter caught behind_scenes: "${text.substring(0, 80)}..."`);
+        return null;
       }
     }
     
@@ -1785,9 +1874,18 @@ function generateCommunityPollContent(question: string, options: { emoji: string
   return content;
 }
 
-function generateBehindScenesContent(activity: string): string {
+async function generateBehindScenesContent(_activity: string): Promise<string> {
+  // Fallback when GPT is unavailable — use REAL system data, never hardcoded fiction
+  const m = getMetrics();
+  const uptimeHrs = Math.round((Date.now() - m.startTime) / 3_600_000);
+  const lines: string[] = [];
+  lines.push(`Uptime: ${uptimeHrs}h`);
+  if (m.tweetsSentToday > 0) lines.push(`${m.tweetsSentToday} tweets posted today`);
+  if (m.tgPostsSentToday > 0) lines.push(`${m.tgPostsSentToday} TG posts today`);
+  if (m.trendsDetectedToday > 0) lines.push(`${m.trendsDetectedToday} trends detected`);
+  
   let content = `🔧 Behind the scenes...\n\n`;
-  content += `${activity}\n\n`;
+  content += `${lines.join(' · ')}\n\n`;
   content += `👀 = Watching | 🔥 = Hyped | 🤔 = Interesting`;
   
   return content;
@@ -2798,7 +2896,7 @@ export async function postBehindScenes(activity: string): Promise<void> {
   
   // Behind-the-scenes goes to community group (casual vibe)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    const tgContent = await generateAIContent('behind_scenes', stats, activity, 'telegram') || generateBehindScenesContent(activity);
+    const tgContent = await generateAIContent('behind_scenes', stats, activity, 'telegram') || await generateBehindScenesContent(activity);
     await postToCommunity(tgContent, 'behind_scenes');
   }
 }
@@ -2852,17 +2950,8 @@ export async function postCommunityEngagement(): Promise<void> {
       await postCommunityPoll(topic.question, topic.options);
     },
     async () => {
-      // Behind the scenes activities
-      const activities = [
-        'Scanning trends across Twitter, Discord, and news...',
-        'Analyzing which mascots performed best this week',
-        'Fine-tuning my launch timing strategy',
-        'Reviewing community reactions to recent ideas',
-        'Building up my trend-spotting skills',
-        'Crunching numbers on market sentiment',
-      ];
-      const activity = activities[Math.floor(Math.random() * activities.length)];
-      await postBehindScenes(activity);
+      // Behind the scenes — prompt pulls real data automatically
+      await postBehindScenes('');
     },
   ];
   
@@ -3270,19 +3359,13 @@ export function startNovaPersonalScheduler(): void {
             [
               { emoji: '🚀', label: 'Launch more tokens!' },
               { emoji: '🤔', label: 'Analyze trends' },
-              { emoji: '🤝', label: 'Community engagement' },
+              { emoji: '👏', label: 'Community engagement' },
               { emoji: '🏆', label: 'Quality over quantity' },
             ]
           );
         } else {
-          const btsStats = await getNovaStats();
-          const behindScenesContexts = [
-            `monitoring ${btsStats.holdingsCount} token positions via DexScreener price feeds`,
-            `running RugCheck scans on new pump.fun launches in the reply engine`,
-            `optimizing the reply engine — filtering spam, scoring relevance, tagging ecosystem accounts`,
-            `checking bonding curve progress on launched tokens`,
-          ];
-          await postBehindScenes(behindScenesContexts[Math.floor(Math.random() * behindScenesContexts.length)]);
+          // Prompt pulls real system activity automatically
+          await postBehindScenes('');
         }
       }
       
