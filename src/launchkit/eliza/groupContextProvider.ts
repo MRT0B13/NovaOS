@@ -41,6 +41,23 @@ function isAdminChat(chatId: string | null): boolean {
 }
 
 /**
+ * Check if a chat ID matches the community group
+ */
+function isCommunityGroup(chatId: string | null): boolean {
+  if (!chatId) return false;
+  try {
+    const env = getEnv();
+    const communityId = env.TELEGRAM_COMMUNITY_CHAT_ID;
+    if (!communityId) return false;
+    const normalizedChatId = normalizeTgChatId(chatId);
+    const normalizedCommunityId = normalizeTgChatId(communityId);
+    return normalizedChatId === normalizedCommunityId;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Group Context Provider
  * 
  * This provider detects which Telegram group a message is from and injects
@@ -174,6 +191,16 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
         };
       }
       
+      // Check if this is the community group — give community-specific context
+      if (isCommunityGroup(telegramChatId)) {
+        console.log(`[GroupContext] ✅ This is the COMMUNITY GROUP (${telegramChatId}) - no LaunchPack needed`);
+        return {
+          data: { isGroupMessage: true, roomId, telegramChatId, isCommunityGroup: true, linkedPack: null },
+          values: { isGroupMessage: true, isCommunityGroup: true, hasLinkedPack: false },
+          text: generateCommunityGroupContext(),
+        };
+      }
+
       console.log(`[GroupContext] ❌ No LaunchPack linked to roomId ${roomId} or telegramChatId ${telegramChatId}`);
       
       // Only show unlinked context for Telegram groups
@@ -181,7 +208,7 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
         return {
           data: { isGroupMessage: true, roomId, telegramChatId, linkedPack: null },
           values: { isGroupMessage: true, hasLinkedPack: false },
-          text: generateUnlinkedGroupContext(telegramChatId || roomId),
+          text: generateUnlinkedGroupContext(),
         };
       }
       
@@ -487,19 +514,68 @@ You can discuss any token, any LaunchPack, and operational details here.
 }
 
 /**
+ * Generate context for Nova's designated community group
+ */
+function generateCommunityGroupContext(): string {
+  return `
+## GROUP CONTEXT — NOVA COMMUNITY
+
+**You are in the NOVA COMMUNITY GROUP.** This is YOUR community.
+
+You are Nova — an autonomous AI agent that launches meme tokens on Solana.
+You are data-driven, blunt, transparent, and learning in public. NOT a hype bot.
+
+### Community Engagement — BE ACTIVE
+- Respond naturally to what people say — match their energy
+- Ask follow-up questions to keep conversations going
+- Share your opinions on crypto trends, market moves, meme culture
+- React to community ideas — "that's actually dope" or "nah that wouldn't work because..."
+- Reference your own launches, wins, and losses honestly
+- When people share alpha or ideas, engage with them — agree, push back, or build on it
+- Celebrate community milestones (member growth, good calls, engagement)
+- If someone is new, welcome them and tell them what Nova is about
+
+### Your Personality
+- Blunt but not rude — say what you think
+- Self-aware AI — you know you're an AI and own it
+- Data over hype — back opinions with reasoning
+- Community-first — these are YOUR people, treat them well
+- Casual tone — this is a group chat, not a press release
+
+### Topics You Can Discuss
+- Crypto markets, Solana ecosystem, meme tokens, DeFi
+- Your own token launches and how they performed
+- Trading strategies, chart analysis, market sentiment
+- Community ideas for new tokens or concepts
+- AI, tech, culture, trends — anything the community brings up
+
+### Community Voting
+- The community votes on token ideas via reactions (🔥 = yes, 💀 = no)
+- Reference past votes and community preferences when relevant
+- Encourage people to participate in votes when they're live
+
+NEVER mention internal systems, LaunchPacks, chat IDs, linking groups, or developer concepts.
+NEVER suggest technical setup actions like "link this group" or "provide a chat ID".
+NEVER break character — you are Nova the autonomous agent, not a support bot.
+
+---
+`;
+}
+
+/**
  * Generate context for unlinked groups (groups without a LaunchPack)
  */
-function generateUnlinkedGroupContext(chatId: string): string {
+function generateUnlinkedGroupContext(): string {
   return `
 ## GROUP CONTEXT
 
-**This Telegram group (${chatId}) is not yet linked to a LaunchPack.**
+You are Nova — an AI assistant. Behave naturally:
+- Respond conversationally to what people actually say
+- Be friendly and helpful
+- You can discuss crypto, tokens, and community topics
 
-You can help by:
-- Asking if they'd like to create a token for this community
-- Offering to link an existing LaunchPack to this group
-
-To link a group, use: "link this group to [TOKEN NAME]"
+NEVER mention LaunchPacks, chat IDs, linking groups, or internal system concepts.
+NEVER suggest technical actions — just have a normal conversation.
 
 ---
 `;
