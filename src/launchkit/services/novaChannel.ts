@@ -514,16 +514,19 @@ export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promi
   
   message += `<i>Updated ${new Date().toLocaleTimeString()}</i>`;
   
-  // Add channel link for community members who see this in the discussion group
   const env = getEnv();
+  
+  // Channel gets full health report + community link
+  const channelMessage = env.TELEGRAM_COMMUNITY_LINK
+    ? message + `\n\n💬 <a href="${env.TELEGRAM_COMMUNITY_LINK}">Join the Discussion</a>`
+    : message;
+  await sendToChannel(channelMessage);
+  
+  // Community gets a clean, short message with channel link only
   if (env.NOVA_CHANNEL_INVITE) {
-    message += `\n\n📢 <a href="${env.NOVA_CHANNEL_INVITE}">Nova Announcements Channel</a>`;
+    await sendToCommunity(`📢 <a href="${env.NOVA_CHANNEL_INVITE}">Nova Announcements Channel</a> — latest health update posted!`);
   }
   
-  // Post to channel for visibility
-  await sendToChannel(message);
-  // Also post to community group for discussion (if configured)
-  await sendToCommunity(message);
   return true;
 }
 
