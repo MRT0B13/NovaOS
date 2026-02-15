@@ -3268,9 +3268,9 @@ export function startNovaPersonalScheduler(): void {
           await postCommunityPoll(
             "What should Nova focus on today?",
             [
-              { emoji: '�', label: 'Launch more tokens!' },
+              { emoji: '🚀', label: 'Launch more tokens!' },
               { emoji: '🤔', label: 'Analyze trends' },
-              { emoji: '👏', label: 'Community engagement' },
+              { emoji: '🤝', label: 'Community engagement' },
               { emoji: '🏆', label: 'Quality over quantity' },
             ]
           );
