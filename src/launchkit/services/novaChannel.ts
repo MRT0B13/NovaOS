@@ -572,8 +572,8 @@ export async function announceSystem(
   
   const fullMessage = `${emoji} <b>System</b>\n\n${message}`;
   
-  // Startup/shutdown messages go to admin only — channel doesn't need to see reboots
-  if (type === 'startup' || type === 'shutdown') {
+  // Startup/shutdown/error messages go to admin only — channel only gets info
+  if (type !== 'info') {
     try {
       const { notifyAdmin } = await import('./adminNotify.ts');
       await notifyAdmin(fullMessage, 'system');
