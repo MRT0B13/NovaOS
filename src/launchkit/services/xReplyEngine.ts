@@ -137,9 +137,10 @@ export function startReplyEngine(): void {
   state.running = true;
   logger.info(`[ReplyEngine] Started (max ${env.X_REPLY_MAX_PER_DAY}/day, every ${env.X_REPLY_INTERVAL_MINUTES || 60}m)`);
   
-  // Delay first round by 10 minutes to avoid startup 429 collisions
-  // (deploy restarts, ElizaOS init, brand scheduler, and webhook setup all hit the API on boot)
-  const startDelayMs = 10 * 60 * 1000;
+  // Delay first round by 16 minutes — exceeds X's 15-min rate window.
+  // Previous deploy may have burned the mentions/search quota;
+  // waiting 16 min guarantees a fresh window.
+  const startDelayMs = 16 * 60 * 1000;
   setTimeout(() => {
     runReplyRound().catch(err => logger.error('[ReplyEngine] Initial round failed:', err));
   }, startDelayMs);
@@ -423,10 +424,17 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
         }
       }
     } catch (err: any) {
-      // getMentions() already calls reportReadRateLimit() on 429 — don't double-fire
       const msg = err?.message || String(err);
       if (msg.includes('429') || msg.includes('rate limit') || msg.includes('Too Many')) {
-        logger.info(`[ReplyEngine] Mentions 429 — read backoff active, will retry next round`);
+        // On first two rounds, a 429 is likely leftover from previous deploy's rate window.
+        // Just skip — don't trigger the exponential backoff hammer.
+        if (state.roundCount <= 1) {
+          logger.info(`[ReplyEngine] Mentions 429 on startup round #${state.roundCount} — skipping (previous deploy rate window). Will retry next round.`);
+        } else {
+          // Trigger read backoff for later rounds
+          try { reportReadRateLimit(); } catch {}
+          logger.info(`[ReplyEngine] Mentions 429 — read backoff active, will retry next round`);
+        }
       }
       try { await recordMentionRead(); } catch {}
     }
@@ -456,10 +464,14 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
           }
         }
       } catch (err: any) {
-        // searchTweets() already calls reportReadRateLimit() on 429 — don't double-fire
         const msg = err?.message || String(err);
         if (msg.includes('429') || msg.includes('rate limit') || msg.includes('Too Many')) {
-          logger.info(`[ReplyEngine] Search 429 — read backoff active, will retry next round`);
+          if (state.roundCount <= 1) {
+            logger.info(`[ReplyEngine] Search 429 on startup round #${state.roundCount} — skipping (previous deploy rate window).`);
+          } else {
+            try { reportReadRateLimit(); } catch {}
+            logger.info(`[ReplyEngine] Search 429 — read backoff active, will retry next round`);
+          }
         }
         try { await recordSearchRead(); } catch {}
       }

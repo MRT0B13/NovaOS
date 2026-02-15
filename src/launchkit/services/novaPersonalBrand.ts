@@ -2137,8 +2137,16 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     // Normalize handles: "elizaOS" → "@elizaOS", "pump.fun" → "@Pumpfun"
     const contentWithHandles = normalizeHandles(contentWithCTA);
     
+    // Fix #@ collisions: GPT sometimes writes "#pumpfun" which normalizeHandles
+    // turns into "#@Pumpfun". Strip the # prefix before any @handle.
+    let xContent = contentWithHandles.replace(/#@/g, '@');
+    
+    // Strip any hashtags GPT injected into the body — they're auto-appended later.
+    // This prevents duplicates and keeps the body clean for handle normalization.
+    xContent = xContent.replace(/\s*#(?:pumpfun|Pumpfun|Solana|solana|memecoin|memecoins|PumpSwap|RugCheck|DYOR)\b/gi, '').trim();
+    
     // Safety: strip any TG reaction option lines that leaked into X content
-    let xContent = contentWithHandles.replace(/\n+(?:[^\n]*=\s[^\n]+\n?){2,}/g, '').trim();
+    xContent = xContent.replace(/\n+(?:[^\n]*=\s[^\n]+\n?){2,}/g, '').trim();
     
     // Safety truncate for X/Twitter (280 char limit, leave room for hashtags)
     if (xContent.length > 250) {
