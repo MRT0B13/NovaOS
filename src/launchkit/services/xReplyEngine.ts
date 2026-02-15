@@ -397,10 +397,15 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
   const env = getEnv();
   const candidates: ReplyCandidate[] = [];
   
-  // Round 0: search only (prev deploy's 15-min rate window is still active for mentions).
-  // After round 0: alternate mentions (odd) / search (even).
-  const doMentions = state.roundCount > 0 && state.roundCount % 2 !== 0;
-  const doSearch   = state.roundCount === 0 || state.roundCount % 2 === 0;
+  // Round 0: skip ALL reads — prev deploy's 15-min rate window covers both mentions AND search.
+  // Round 1+: alternate search (even) / mentions (odd).
+  if (state.roundCount === 0) {
+    logger.info('[ReplyEngine] Round #0 — skipping all reads (previous deploy rate window). Will start reading next round.');
+    state.roundCount++;
+    return candidates;
+  }
+  const doMentions = state.roundCount % 2 !== 0;
+  const doSearch   = state.roundCount % 2 === 0;
   
   // Mentions
   if (doMentions && canReadMentions()) {

@@ -432,15 +432,17 @@ export class GroupHealthMonitor {
     if (healthSummaries.length > 0) {
       try {
         const { announceHealthSummary } = await import('./novaChannel.ts');
-        // If token tracking disabled, only show Nova channel
+        // If token tracking disabled, only show Nova channel + community (not individual tokens)
         const summariesToPost = tokenTrackingDisabled 
-          ? healthSummaries.filter(s => s.ticker === 'NOVA')
+          ? healthSummaries.filter(s => ['📢', '💬'].includes(s.ticker))
           : healthSummaries;
+        console.log(`[GROUP_HEALTH] Posting health summary (${summariesToPost.length} groups)`);
         if (summariesToPost.length > 0) {
-          await announceHealthSummary(summariesToPost);
+          const posted = await announceHealthSummary(summariesToPost);
+          console.log(`[GROUP_HEALTH] announceHealthSummary result: ${posted}`);
         }
-      } catch {
-        // Non-fatal
+      } catch (err) {
+        console.error('[GROUP_HEALTH] Failed to post health summary:', err);
       }
     }
   }
