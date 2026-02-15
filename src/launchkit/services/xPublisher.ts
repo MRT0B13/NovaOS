@@ -45,6 +45,8 @@ function resolvePlaceholders(text: string, mint?: string, telegramUrl?: string, 
   result = result.replace(/\nChart: $/gm, '');
   result = result.replace(/\nTelegram: $/gm, '');
   result = result.replace(/\nWebsite: $/gm, '');
+  // Strip bare pump.fun/ URLs with no address
+  result = result.replace(/pump\.fun\/(?!\w)/g, '');
   result = result.replace(/\n\n+/g, '\n\n');
   
   return result.trim();
@@ -252,6 +254,15 @@ class StandaloneTwitterClient {
   async sendTweet(text: string, replyToTweetId?: string, mediaIds?: string[]): Promise<{ id: string }> {
     if (!this.client) {
       throw errorWithCode('X_CLIENT_NOT_INITIALIZED', 'Twitter client not initialized');
+    }
+    
+    // Pre-validate tweet length
+    if (text.length > 280) {
+      logger.error(`[StandaloneTwitter] Tweet too long (${text.length} chars), truncating to 280`);
+      text = text.substring(0, 277) + '...';
+    }
+    if (!text.trim()) {
+      throw errorWithCode('X_TWEET_EMPTY', 'Cannot send empty tweet');
     }
 
     const options: any = {};

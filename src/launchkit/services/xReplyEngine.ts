@@ -182,7 +182,21 @@ export function getReplyEngineStatus() {
  * 4. Generate reply
  * 5. Post reply
  */
+let roundInProgress = false;
 async function runReplyRound(): Promise<void> {
+  // Guard against concurrent rounds (interval can fire before prev round finishes)
+  if (roundInProgress) {
+    logger.info('[ReplyEngine] Previous round still running, skipping');
+    return;
+  }
+  roundInProgress = true;
+  try {
+  return await _runReplyRoundInner();
+  } finally {
+    roundInProgress = false;
+  }
+}
+async function _runReplyRoundInner(): Promise<void> {
   const env = getEnv();
   
   // Reset daily counter
@@ -190,9 +204,10 @@ async function runReplyRound(): Promise<void> {
   if (state.lastResetDate !== today) {
     state.repliesToday = 0;
     state.lastResetDate = today;
-    // Keep replied IDs for dedup but trim old ones
+    // Keep replied IDs for dedup — trim to last 500 instead of nuking all
     if (state.repliedTweetIds.size > 1000) {
-      state.repliedTweetIds.clear();
+      const ids = [...state.repliedTweetIds];
+      state.repliedTweetIds = new Set(ids.slice(-500));
     }
   }
   
@@ -382,9 +397,10 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
   const env = getEnv();
   const candidates: ReplyCandidate[] = [];
   
-  // Always alternate: even rounds → mentions, odd rounds → search.
-  const doMentions = state.roundCount % 2 === 0;
-  const doSearch   = state.roundCount % 2 !== 0;
+  // Round 0: search only (prev deploy's 15-min rate window is still active for mentions).
+  // After round 0: alternate mentions (odd) / search (even).
+  const doMentions = state.roundCount > 0 && state.roundCount % 2 !== 0;
+  const doSearch   = state.roundCount === 0 || state.roundCount % 2 === 0;
   
   // Mentions
   if (doMentions && canReadMentions()) {
@@ -688,7 +704,9 @@ NEVER:
 - Invent numbers you don't have. If you don't know a stat, don't mention it.
 - Say "Transparency is key", "Let's build together", "I'm always open to collaboration"
 - Say "fam", "frens", "vibes", "LFG", "WAGMI"
-- Start with "Great to see" or "Love this" or "I'm always open to"
+- Start with "Great to see", "Always great to see", "Congrats on the", "Love this", "Love to see", or "I'm always open to"
+- Give generic safety advice like "make sure to check RugCheck" when you actually HAVE RugCheck data — use the data
+- Say "it's vital to check" or "it's crucial to" — either share actual data or don't mention it
 - Agree enthusiastically with vague statements
 - Use exclamation marks more than once
 
@@ -710,7 +728,13 @@ Only tag if the tweet is directly about that account/topic. Never force a tag.`;
     let userPrompt = `Reply to this tweet:\n\n"${candidate.text}"`;
     
     if (rugCheckContext) {
-      userPrompt += `\n\n${rugCheckContext}\n\nIncorporate this RugCheck data naturally.`;
+      userPrompt += `\n\n${rugCheckContext}\n\nYou MUST include the actual RugCheck score and key findings (mint/freeze status, risk flags) in your reply. This is your value-add — do NOT give generic safety advice like "check RugCheck scores" when you HAVE the data right here. Lead with the findings. Example: "RugCheck on $TOKEN: score 45, mint authority still active ⚠️. Careful." You can go up to 280 chars for replies that include RugCheck data. NEVER include URLs or markdown links — just the data. Tag @Rugcheckxyz instead of posting a link.`;
+    }
+
+    // If we found a mint address but RugCheck scan failed, be honest about it
+    const detectedMints = extractMintAddresses(candidate.text);
+    if (detectedMints.length > 0 && !rugCheckContext) {
+      userPrompt += `\n\nA contract address was found in this tweet (${detectedMints[0].slice(0, 8)}...) but the RugCheck scan failed or returned no data. Do NOT give generic safety advice like "it's vital to check RugCheck scores." Instead, either: (a) say you tried to scan it and couldn't get data, or (b) skip the safety angle entirely and comment on something else in the tweet. NEVER pretend you checked something you didn't.`;
     }
     
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -750,6 +774,13 @@ Only tag if the tweet is directly about that account/topic. Never force a tag.`;
     // Clean up quotes if LLM wrapped it
     reply = reply.replace(/^["']|["']$/g, '');
     
+    // Strip markdown links → keep just the label text
+    // e.g. "[More info](https://...)" → "More info"
+    reply = reply.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+    
+    // Strip raw URLs (X shows link cards, but they eat chars and look spammy in replies)
+    reply = reply.replace(/https?:\/\/\S+/g, '').replace(/\s{2,}/g, ' ').trim();
+    
     // Normalize handles in reply
     try {
       const { normalizeHandles } = await import('./novaPersonalBrand.ts');
@@ -786,6 +817,14 @@ Only tag if the tweet is directly about that account/topic. Never force a tag.`;
       "great to see",
       "love to see",
       "game changer",
+      'always great to see',
+      'congrats on the',
+      "it's vital to check",
+      "it's important to check",
+      'crucial to check',
+      'make sure to check',
+      'always do your own',
+      'love to see new',
     ];
     
     for (const phrase of genericPhrases) {

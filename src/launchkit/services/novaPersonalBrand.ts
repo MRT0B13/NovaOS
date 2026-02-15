@@ -170,6 +170,15 @@ let state: BrandState = {
 let pgRepo: PostgresScheduleRepository | null = null;
 let xPublisher: any = null;
 
+// ── Circuit breaker: pause X posting after consecutive failures ──────────
+let consecutiveXFailures = 0;
+const X_CIRCUIT_BREAKER_THRESHOLD = 3; // Pause after 3 consecutive failures
+const X_CIRCUIT_BREAKER_PAUSE_MS = 60 * 60 * 1000; // 1 hour
+let circuitBreakerResetAt = 0;
+
+// Track which posts have already been counted for performance
+const countedPostIds = new Set<string>();
+
 // ── Global X write gate ────────────────────────────────────────────────────
 // Enforces a minimum gap between ANY two X writes (tweets, replies, launch
 // announcements) across all services.  Prevents stacking that triggers 429s.
@@ -457,6 +466,8 @@ async function trackPostPerformance(): Promise<void> {
     const results = getPerfResults();
     for (const post of recentPosts) {
       if (!post.postId) continue;
+      // Skip posts already counted to prevent double-counting
+      if (countedPostIds.has(post.postId)) continue;
       const metrics = results.get(post.postId);
       if (metrics) {
         if (!state.postPerformance[post.type]) {
@@ -466,7 +477,14 @@ async function trackPostPerformance(): Promise<void> {
         perf.totalLikes += metrics.likes;
         perf.totalRetweets += metrics.retweets;
         perf.count += 1;
+        countedPostIds.add(post.postId);
       }
+    }
+    // Trim countedPostIds to prevent unbounded growth
+    if (countedPostIds.size > 200) {
+      const arr = [...countedPostIds];
+      countedPostIds.clear();
+      arr.slice(-100).forEach(id => countedPostIds.add(id));
     }
   } catch {
     // Non-fatal
@@ -1424,7 +1442,7 @@ async function generateAIThread(
 
   const totalPortfolio = stats.walletBalance + stats.holdingsValueSol;
   const portfolioBlock = stats.holdingsCount > 0
-    ? `Total portfolio: ${totalPortfolio.toFixed(2)} SOL ($${(stats.holdingsValueUsd + stats.walletBalance * 180).toFixed(0)} approx)
+    ? `Total portfolio: ${totalPortfolio.toFixed(2)} SOL ($${stats.holdingsValueUsd.toFixed(0)} approx)
 Liquid SOL: ${stats.walletBalance.toFixed(2)} SOL
 Token holdings: ${stats.holdingsCount} tokens worth ~${stats.holdingsValueSol.toFixed(4)} SOL ($${stats.holdingsValueUsd.toFixed(2)})
 Net change: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL`
@@ -2118,6 +2136,16 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     return { success: false };
   }
   
+  // Circuit breaker: pause after consecutive failures
+  if (consecutiveXFailures >= X_CIRCUIT_BREAKER_THRESHOLD) {
+    if (Date.now() < circuitBreakerResetAt) {
+      logger.warn(`[NovaPersonalBrand] X circuit breaker OPEN (${consecutiveXFailures} consecutive failures, resets in ${Math.ceil((circuitBreakerResetAt - Date.now()) / 60000)}m)`);
+      return { success: false };
+    }
+    consecutiveXFailures = 0;
+    logger.info('[NovaPersonalBrand] X circuit breaker reset — retrying');
+  }
+  
   // Initialize xPublisher on demand if not already done (same pattern as pumpLauncher)
   if (!xPublisher) {
     try {
@@ -2224,13 +2252,20 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
         createdAt: new Date().toISOString(),
       };
       state.posts.push(post);
+      // Trim memory: keep only last 50 posts
+      if (state.posts.length > 50) state.posts = state.posts.slice(-50);
+      consecutiveXFailures = 0; // Reset circuit breaker on success
       
       return { success: true, tweetId: result.id };
     }
     
+    consecutiveXFailures++;
+    if (consecutiveXFailures >= X_CIRCUIT_BREAKER_THRESHOLD) circuitBreakerResetAt = Date.now() + X_CIRCUIT_BREAKER_PAUSE_MS;
     return { success: false };
   } catch (err) {
     logger.error('[NovaPersonalBrand] X post failed:', err);
+    consecutiveXFailures++;
+    if (consecutiveXFailures >= X_CIRCUIT_BREAKER_THRESHOLD) circuitBreakerResetAt = Date.now() + X_CIRCUIT_BREAKER_PAUSE_MS;
     return { success: false };
   }
 }
@@ -2253,6 +2288,17 @@ export async function postToXThread(
   }
   
   if (tweets.length === 0) return { success: false };
+  
+  // Circuit breaker: pause after consecutive failures
+  if (consecutiveXFailures >= X_CIRCUIT_BREAKER_THRESHOLD) {
+    if (Date.now() < circuitBreakerResetAt) {
+      logger.warn(`[NovaPersonalBrand] X circuit breaker OPEN (${consecutiveXFailures} consecutive failures, resets in ${Math.ceil((circuitBreakerResetAt - Date.now()) / 60000)}m)`);
+      return { success: false };
+    }
+    // Reset after pause period
+    consecutiveXFailures = 0;
+    logger.info('[NovaPersonalBrand] X circuit breaker reset — retrying');
+  }
   
   // Global write gate — enforce minimum gap between ANY two X posts
   if (!canPostToX()) {
@@ -2287,6 +2333,12 @@ export async function postToXThread(
     
     for (let i = 0; i < tweets.length; i++) {
       let tweetText = tweets[i];
+      
+      // Apply same cleanup pipeline as postToX (threads were missing this)
+      tweetText = normalizeHandles(tweetText);
+      tweetText = tweetText.replace(/#@/g, '@');
+      tweetText = tweetText.replace(/\s*#(?:pumpfun|Pumpfun|Solana|solana|memecoin|memecoins|PumpSwap|RugCheck|DYOR)\b/gi, '').trim();
+      tweetText = tweetText.replace(/\n+(?:[^\n]*=\s[^\n]+\n?){2,}/g, '').trim();
       
       // Add hashtags only on last tweet
       if (i === tweets.length - 1) {
@@ -2336,6 +2388,10 @@ export async function postToXThread(
         tweetIds.push(result.id);
         previousId = result.id;
         logger.info(`[NovaPersonalBrand] Thread ${i + 1}/${tweets.length} posted (ID: ${result.id})`);
+        // Small delay between thread tweets to avoid spam detection
+        if (i < tweets.length - 1) {
+          await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
+        }
       } else {
         logger.warn(`[NovaPersonalBrand] Thread tweet ${i + 1} failed, stopping`);
         break;
@@ -2359,6 +2415,9 @@ export async function postToXThread(
         createdAt: new Date().toISOString(),
       };
       state.posts.push(post);
+      // Trim memory: keep only last 50 posts
+      if (state.posts.length > 50) state.posts = state.posts.slice(-50);
+      consecutiveXFailures = 0; // Reset circuit breaker on success
       
       logger.info(`[NovaPersonalBrand] ✅ Thread posted: ${tweetIds.length} tweets`);
       return { success: true, tweetIds };
@@ -2367,6 +2426,8 @@ export async function postToXThread(
     return { success: false };
   } catch (err) {
     logger.error('[NovaPersonalBrand] X thread failed:', err);
+    consecutiveXFailures++;
+    if (consecutiveXFailures >= X_CIRCUIT_BREAKER_THRESHOLD) circuitBreakerResetAt = Date.now() + X_CIRCUIT_BREAKER_PAUSE_MS;
     return { success: false };
   }
 }
@@ -2505,6 +2566,8 @@ export async function postToTelegram(
       createdAt: new Date().toISOString(),
     };
     state.posts.push(post);
+    // Trim memory: keep only last 50 posts
+    if (state.posts.length > 50) state.posts = state.posts.slice(-50);
   }
   
   return lastResult;
