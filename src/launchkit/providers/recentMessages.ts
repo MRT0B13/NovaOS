@@ -78,14 +78,36 @@ export const recentMessagesProvider: Provider = {
         (a, b) => (a.createdAt || 0) - (b.createdAt || 0)
       );
 
+      // Internal jargon that should never leak into community prompts
+      const INTERNAL_JARGON = [
+        'launchpack', 'launch pack', 'link this group', 'link a group',
+        'linked to a', 'chat_id', 'chat id', 'numeric chat', 'telegram chat id',
+        'getidsbot', '@getidsbot', 'link an existing', 'set up a new token',
+        'brainstorm a killer token', 'get one off the ground',
+      ];
+
+      // Sanitize: redact Nova's own messages that contain internal jargon
+      // so the LLM doesn't continue those threads from memory
+      function sanitizeMessage(text: string, isAgent: boolean): string | null {
+        if (!isAgent || !text) return text;
+        const lower = text.toLowerCase();
+        if (INTERNAL_JARGON.some(term => lower.includes(term))) {
+          return null; // Drop the message entirely — it's contaminated
+        }
+        return text;
+      }
+
       // Format messages for display
       const formattedMessages = sortedMessages
         .slice(-10) // Last 10 messages
         .map((mem) => {
           const isAgent = mem.entityId === runtime.agentId;
           const sender = isAgent ? runtime.character.name : 'User';
-          return `${sender}: ${mem.content.text}`;
+          const text = sanitizeMessage(mem.content.text as string, isAgent);
+          if (!text) return null; // Skip contaminated messages
+          return `${sender}: ${text}`;
         })
+        .filter(Boolean)
         .join('\n');
 
       // Combine group context with recent messages
