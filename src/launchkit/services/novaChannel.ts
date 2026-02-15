@@ -518,26 +518,22 @@ export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promi
     : message;
   await sendToChannel(channelMessage);
   
-  // Community gets the FULL health report + rules/disclaimers
+  // Community gets a one-liner redirect + rules reminder (NOT the full report)
   healthUpdateCount++;
   saveValue('health_update_count', healthUpdateCount, 1000);
   const includeRules = healthUpdateCount % RULES_REMINDER_EVERY === 0;
 
-  let communityMessage = message; // same health data as channel
-
-  if (includeRules) {
-    // Every Nth update, append the full community rules
-    communityMessage += '\n━━━━━━━━━━━━━━━\n' + getCommunityRulesMessage();
-  } else {
-    // Other updates, append a short rules reminder
-    communityMessage += getRulesReminder();
-  }
-
   if (env.NOVA_CHANNEL_INVITE) {
-    communityMessage += `\n\n📢 <a href="${env.NOVA_CHANNEL_INVITE}">Nova Announcements Channel</a>`;
-  }
+    let communityMsg = `📢 <a href="${env.NOVA_CHANNEL_INVITE}">Nova Announcements Channel</a> — latest health update posted!`;
 
-  await sendToCommunity(communityMessage);
+    if (includeRules) {
+      communityMsg += '\n\n━━━━━━━━━━━━━━━\n' + getCommunityRulesMessage();
+    } else {
+      communityMsg += '\n' + getRulesReminder();
+    }
+
+    await sendToCommunity(communityMsg);
+  }
   
   return true;
 }
