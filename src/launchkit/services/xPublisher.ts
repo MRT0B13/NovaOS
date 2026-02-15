@@ -80,6 +80,14 @@ class StandaloneTwitterClient {
         accessSecret: accessSecret,
       });
       this.initialized = true;
+      
+      // Pre-seed user ID from env to avoid v2.me() API call on first mentions fetch
+      const userId = env.X_USER_ID;
+      if (userId) {
+        this.cachedUserId = userId;
+        logger.info(`[StandaloneTwitter] User ID pre-seeded from env: ${userId}`);
+      }
+      
       logger.info('[StandaloneTwitter] ✅ Twitter client initialized (read + write, no polling)');
       return true;
     } catch (error) {

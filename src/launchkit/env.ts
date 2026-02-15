@@ -74,6 +74,9 @@ const EnvSchema = z.object({
   NOVA_CHANNEL_UPDATES: z.string().default('launches,wallet,health'),
   // Nova's X/Twitter handle (e.g., 'NovaAgent' without @) - used for autonomous launches
   NOVA_X_HANDLE: z.string().optional(),
+  // Nova's X/Twitter user ID (numeric) — avoids burning a v2.me() API call on every deploy
+  // Get it from: https://tweeterid.com/ or the log line "Cached user ID: <id>"
+  X_USER_ID: z.string().optional(),
   
   // ==========================================
   // Nova Community Group (separate discussion group)
