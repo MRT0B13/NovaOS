@@ -18,6 +18,7 @@ import { recordMessageReceived } from './telegramHealthMonitor.ts';
 import { isAdmin, logAdminCommand, initTelegramSecurity, isAdminSecurityEnabled } from './telegramSecurity.ts';
 import { recordBannedUser, isUserBanned, getBannedUsers } from './systemReporter.ts';
 import { crossBanUser } from './novaChannel.ts';
+import { getEnv } from '../env.ts';
 
 let isRegistered = false;
 let registeredBot: Telegraf | null = null;
@@ -461,16 +462,22 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
         const newMembers = ctx.message.new_chat_members;
         const chatId = String(ctx.message.chat.id);
         
-        // Check if this is Nova's main channel
+        // Check if this is Nova's main channel or community group
         const env = getEnv();
         const novaChannelId = env.NOVA_CHANNEL_ID;
+        const communityGroupId = env.TELEGRAM_COMMUNITY_CHAT_ID;
         const isNovaChannel = novaChannelId && chatId === novaChannelId;
+        const isNovaCommunity = communityGroupId && (
+          chatId === communityGroupId || 
+          chatId === communityGroupId.replace('-100', '-') ||
+          chatId.replace('-100', '') === communityGroupId.replace('-100', '')
+        );
         
         let tokenName = '';
         let tokenTicker = '';
         
-        // Only look up token info for token-specific groups (not Nova's main channel)
-        if (!isNovaChannel) {
+        // Only look up token info for token-specific groups (not Nova's channel/community)
+        if (!isNovaChannel && !isNovaCommunity) {
           const bootstrap = runtime.getService('launchkit_bootstrap') as any;
           const kit = bootstrap?.getLaunchKit?.();
           const store = kit?.store;
@@ -508,8 +515,8 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           
           let welcomeMessage: string;
           
-          if (isNovaChannel) {
-            // Nova's main channel - personalized Nova welcome
+          if (isNovaChannel || isNovaCommunity) {
+            // Nova's main channel or community group - personalized Nova welcome
             const novaWelcomes = [
               `${firstName} — welcome. I'm Nova, an autonomous AI launching tokens on Solana via pump.fun. Every launch RugChecked. Every wallet public.`,
               `${firstName} joined. I'm Nova — I launch tokens autonomously and share everything: wins, losses, data. Check pinned messages for context.`,
@@ -573,14 +580,19 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
         
         const firstName = user.first_name || user.username || 'anon';
         
-        // Check if this is Nova's main channel
+        // Check if this is Nova's main channel or community group
         const novaChannelId = process.env.NOVA_CHANNEL_ID;
-        const isNovaChannel = novaChannelId && (chatId.toString() === novaChannelId || chatId.toString() === novaChannelId.replace('-100', ''));
+        const communityGroupId = process.env.TELEGRAM_COMMUNITY_CHAT_ID;
+        const isNovaChannel = novaChannelId && (chatId === novaChannelId || chatId.replace('-100', '') === novaChannelId.replace('-100', ''));
+        const isNovaCommunity = communityGroupId && (
+          chatId === communityGroupId || 
+          chatId.replace('-100', '') === communityGroupId.replace('-100', '')
+        );
         
         let randomWelcome: string;
         
-        if (isNovaChannel) {
-          // Nova's main channel welcome - generic, not token-specific
+        if (isNovaChannel || isNovaCommunity) {
+          // Nova's main channel or community group - Nova welcome
           const novaWelcomes = [
             `${firstName} — welcome. I'm Nova, an AI agent launching tokens on pump.fun. Check pinned messages for context.`,
             `${firstName} joined. I launch meme tokens autonomously on Solana and share all data publicly.`,
@@ -593,8 +605,8 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           const kit = bootstrap?.getLaunchKit?.();
           const store = kit?.store;
           
-          let tokenName = '$TOKEN';
-          let tokenTicker = 'TOKEN';
+          let tokenName = '';
+          let tokenTicker = '';
           
           if (store) {
             try {
@@ -612,12 +624,16 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
             }
           }
           
-          const tokenWelcomes = [
-            `${firstName} — welcome to $${tokenTicker}. Links and info in pinned messages.`,
-            `${firstName} joined. $${tokenTicker} — fair launch, community-owned. Check the chart.`,
-            `Welcome ${firstName}. $${tokenTicker} group. Contract and chart in pinned messages above.`,
-          ];
-          randomWelcome = tokenWelcomes[Math.floor(Math.random() * tokenWelcomes.length)];
+          if (tokenTicker) {
+            const tokenWelcomes = [
+              `${firstName} — welcome to $${tokenTicker}. Links and info in pinned messages.`,
+              `${firstName} joined. $${tokenTicker} — fair launch, community-owned. Check the chart.`,
+              `Welcome ${firstName}. $${tokenTicker} group. Contract and chart in pinned messages above.`,
+            ];
+            randomWelcome = tokenWelcomes[Math.floor(Math.random() * tokenWelcomes.length)];
+          } else {
+            randomWelcome = `Welcome ${firstName}.`;
+          }
         }
         
         // Send welcome to the chat
