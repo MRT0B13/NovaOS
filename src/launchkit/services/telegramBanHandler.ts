@@ -17,6 +17,7 @@ import { cacheTelegramUser, lookupTelegramUser } from './telegramCommunity.ts';
 import { recordMessageReceived } from './telegramHealthMonitor.ts';
 import { isAdmin, logAdminCommand, initTelegramSecurity, isAdminSecurityEnabled } from './telegramSecurity.ts';
 import { recordBannedUser, isUserBanned, getBannedUsers } from './systemReporter.ts';
+import { crossBanUser } from './novaChannel.ts';
 
 let isRegistered = false;
 let registeredBot: Telegraf | null = null;
@@ -254,6 +255,10 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           );
           
           console.log(`[BAN_HANDLER] ✅ Successfully banned user ${targetUserId}`);
+          
+          // Cross-ban: also remove from the other chat (community ↔ channel)
+          crossBanUser(targetUserId, { reason: 'Manual /ban command', originChatId: String(chatId) })
+            .catch(e => console.error('[BAN_HANDLER] Cross-ban error:', e));
         } catch (banErr: any) {
           console.error('[BAN_HANDLER] Failed to ban:', banErr.message);
           await ctx.reply(
@@ -373,6 +378,10 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
         
         await ctx.reply(`🌹 ${targetName} has been handled.`);
         console.log(`[BAN_HANDLER] /roseban - Banned user ${targetUserId}`);
+        
+        // Cross-ban: also remove from the other chat (community ↔ channel)
+        crossBanUser(targetUserId, { reason: 'Manual /roseban command', originChatId: String(chatId) })
+          .catch(e => console.error('[BAN_HANDLER] Cross-ban error:', e));
       } catch (err: any) {
         console.error('[BAN_HANDLER] /roseban error:', err.message);
       }

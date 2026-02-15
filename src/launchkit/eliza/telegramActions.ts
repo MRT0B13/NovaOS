@@ -4,6 +4,7 @@ import { TelegramSetupService, extractSocialLinks } from '../services/telegramSe
 import { lookupTelegramUser, lookupTelegramUserByEntity } from '../services/telegramCommunity.ts';
 import { getAllGroups, getGroupsSummary, trackGroup } from '../services/groupTracker.ts';
 import { getHealthMonitor, trackMessage, analyzeSentiment, type GroupHealth } from '../services/groupHealthMonitor.ts';
+import { crossBanUser } from '../services/novaChannel.ts';
 
 // ============================================================================
 // SCAM/SPAM WARNING TRACKER
@@ -1996,6 +1997,10 @@ export const kickSpammerAction: Action = {
           
           // Clear their warnings since they're gone
           clearScamWarnings(chatId, userIdToKick);
+          
+          // Cross-ban: also remove from the other chat (community ↔ channel)
+          crossBanUser(userIdToKick, { reason: scamDetection?.reason || 'KICK_SPAMMER', originChatId: chatId })
+            .catch(e => console.log('[KICK_SPAMMER] Cross-ban error:', e));
           
           const reasonText = scamDetection?.reason 
             ? `**Reason:** ${scamDetection.reason}` 

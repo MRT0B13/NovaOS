@@ -74,11 +74,15 @@ SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 
 ## Telegram
 
-| Variable       | Default | Description                        |
-| -------------- | ------- | ---------------------------------- |
-| `TG_ENABLE`    | -       | Enable Telegram integration        |
-| `TG_BOT_TOKEN` | -       | Telegram bot token from @BotFather |
-| `TG_CHAT_ID`   | -       | Default chat ID                    |
+| Variable                  | Default | Description                        |
+| ------------------------- | ------- | ---------------------------------- |
+| `TG_ENABLE`               | -       | Enable Telegram integration        |
+| `TG_BOT_TOKEN`            | -       | Telegram bot token from @BotFather |
+| `TG_CHAT_ID`              | -       | Default chat ID                    |
+| `TELEGRAM_ADMIN_IDS`      | -       | Comma-separated admin user IDs     |
+| `TG_WEBHOOK_SECRET`       | -       | Webhook verification secret        |
+| `TG_WEBHOOK_URL`          | -       | Webhook URL for production         |
+| `TG_DISABLE_AUTO_RESTART` | `false` | Disable auto-restart of TG polling |
 
 ---
 
@@ -103,17 +107,101 @@ SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 
 ## X/Twitter
 
-| Variable                      | Default | Description                     |
-| ----------------------------- | ------- | ------------------------------- |
-| `X_ENABLE`                    | -       | Enable X/Twitter integration    |
-| `TWITTER_API_KEY`             | -       | OAuth 1.0a API key              |
-| `TWITTER_API_SECRET_KEY`      | -       | OAuth 1.0a API secret           |
-| `TWITTER_ACCESS_TOKEN`        | -       | OAuth 1.0a access token         |
-| `TWITTER_ACCESS_TOKEN_SECRET` | -       | OAuth 1.0a access secret        |
-| `X_MONTHLY_WRITE_LIMIT`       | `500`   | Monthly tweet limit (Free tier) |
-| `X_MONTHLY_READ_LIMIT`        | `100`   | Monthly read limit              |
+| Variable                      | Default       | Description                                             |
+| ----------------------------- | ------------- | ------------------------------------------------------- |
+| `X_ENABLE`                    | -             | Enable X/Twitter integration                            |
+| `TWITTER_API_KEY`             | -             | OAuth 1.0a API key                                      |
+| `TWITTER_API_SECRET_KEY`      | -             | OAuth 1.0a API secret                                   |
+| `TWITTER_ACCESS_TOKEN`        | -             | OAuth 1.0a access token                                 |
+| `TWITTER_ACCESS_TOKEN_SECRET` | -             | OAuth 1.0a access secret                                |
+| `X_MONTHLY_WRITE_LIMIT`       | `500`         | Monthly tweet limit (Basic tier)                        |
+| `X_MONTHLY_READ_LIMIT`        | `100`         | Fallback hard cap for reads                             |
+| `X_READ_BUDGET_USD`           | `0`           | Pay-per-use read budget ($0.005/read). 0 = use hard cap |
+| `X_USER_ID`                   | -             | Numeric X user ID (avoids v2.me() API call on startup)  |
+| `NOVA_X_HANDLE`               | `nova_agent_` | X handle for personal brand posts                       |
 
 **Note**: Regenerate access tokens after changing app permissions.
+
+---
+
+## X Reply Engine
+
+| Variable                   | Default       | Description                               |
+| -------------------------- | ------------- | ----------------------------------------- |
+| `X_REPLY_ENGINE_ENABLE`    | `false`       | Enable automated X reply engine           |
+| `X_REPLY_MAX_PER_DAY`      | `10`          | Max replies per day                       |
+| `X_REPLY_INTERVAL_MINUTES` | `60`          | Minutes between reply rounds              |
+| `X_REPLY_TARGETS`          | _(see below)_ | Comma-separated X accounts to reply to    |
+| `X_REPLY_SEARCH_QUERIES`   | _(see below)_ | Comma-separated search queries for tweets |
+
+**Default targets:** `pumpdotfun,DexScreener,JupiterExchange,elizaOS,RugCheckXYZ,aixbt_agent`
+**Default queries:** `pump.fun launched,pump.fun graduated,solana meme token,rugcheck`
+
+---
+
+## X Scheduler (Auto-Tweet Tuning)
+
+| Variable                        | Default | Description                        |
+| ------------------------------- | ------- | ---------------------------------- |
+| `X_AUTO_TWEETS_PER_DAY`         | `2`     | Auto-tweets per day per token      |
+| `X_MIN_PENDING_TWEETS`          | `5`     | Refill threshold for pending queue |
+| `X_REFILL_DAYS`                 | `3`     | Generate tweets for N days ahead   |
+| `X_CHANNEL_PROMO_INTERVAL_DAYS` | `1`     | Days between TG channel promos     |
+| `X_MIN_PENDING_CHANNEL_PROMOS`  | `7`     | Min pending channel promo tweets   |
+| `TOKEN_X_MARKETING_ENABLE`      | `true`  | Enable per-token X marketing       |
+| `TOKEN_TG_MARKETING_ENABLE`     | `true`  | Enable per-token TG marketing      |
+
+---
+
+## Nova Personal Brand
+
+| Variable                          | Default | Description                          |
+| --------------------------------- | ------- | ------------------------------------ |
+| `NOVA_PERSONAL_X_ENABLE`          | `false` | Enable personal X posts (gm, recaps) |
+| `NOVA_PERSONAL_TG_ENABLE`         | `false` | Enable personal TG channel posts     |
+| `NOVA_GM_POST_TIME`               | `08:00` | GM post time (UTC)                   |
+| `NOVA_RECAP_POST_TIME`            | `22:00` | Daily recap post time (UTC)          |
+| `NOVA_WEEKLY_SUMMARY_DAY`         | `0`     | Weekly summary day (0=Sunday)        |
+| `SCHEDULED_IDEA_FEEDBACK_MINUTES` | `60`    | Minutes between idea feedback posts  |
+
+---
+
+## Nova Community Group
+
+| Variable                     | Default | Description                              |
+| ---------------------------- | ------- | ---------------------------------------- |
+| `TELEGRAM_COMMUNITY_CHAT_ID` | -       | TG group for community voting/discussion |
+| `TELEGRAM_COMMUNITY_LINK`    | -       | Public invite link for X CTAs            |
+
+---
+
+## Community Voting
+
+| Variable                              | Default | Description                            |
+| ------------------------------------- | ------- | -------------------------------------- |
+| `COMMUNITY_VOTING_ENABLED`            | `false` | Enable community voting on ideas       |
+| `COMMUNITY_VOTING_WINDOW_MINUTES`     | `30`    | Voting window duration                 |
+| `COMMUNITY_VOTING_MIN_VOTES`          | `3`     | Min votes for quorum                   |
+| `COMMUNITY_VOTING_APPROVAL_THRESHOLD` | `0.4`   | Approval ratio threshold (0-1)         |
+| `COMMUNITY_VOTING_CONFIDENCE_SKIP`    | `0.95`  | Skip voting if confidence exceeds this |
+
+---
+
+## RugCheck
+
+| Variable           | Default | Description                                            |
+| ------------------ | ------- | ------------------------------------------------------ |
+| `RUGCHECK_API_KEY` | -       | Bearer token (optional, GET endpoints work without it) |
+
+**Rate limits:** 20 scans/hour, 30-minute report cache, 100 max cached reports.
+
+---
+
+## System Reporter
+
+| Variable                | Default | Description                    |
+| ----------------------- | ------- | ------------------------------ |
+| `SYSTEM_REPORTS_ENABLE` | `false` | Enable system metric reporting |
 
 ---
 
@@ -183,11 +271,29 @@ Let Nova autonomously generate and launch tokens using a hybrid approach:
 
 ### Reactive/Event-Driven Mode
 
-| Variable                          | Default | Description                            |
-| --------------------------------- | ------- | -------------------------------------- |
-| `AUTONOMOUS_REACTIVE_ENABLE`      | `false` | Enable trend-reactive launches         |
-| `AUTONOMOUS_REACTIVE_MAX_PER_DAY` | `2`     | Max reactive launches per day          |
-| `AUTONOMOUS_REACTIVE_MIN_SCORE`   | `70`    | Minimum trend score (0-100) to trigger |
+| Variable                             | Default | Description                            |
+| ------------------------------------ | ------- | -------------------------------------- |
+| `AUTONOMOUS_REACTIVE_ENABLE`         | `false` | Enable trend-reactive launches         |
+| `AUTONOMOUS_REACTIVE_MAX_PER_DAY`    | `3`     | Max reactive launches per day          |
+| `AUTONOMOUS_REACTIVE_MIN_SCORE`      | `70`    | Minimum trend score (0-100) to trigger |
+| `AUTONOMOUS_REACTIVE_COOLDOWN_HOURS` | `2`     | Hours between reactive launches        |
+| `AUTONOMOUS_SCHEDULED_BUFFER_HOURS`  | `1`     | Buffer hours around scheduled launches |
+| `AUTONOMOUS_REACTIVE_QUIET_START`    | `00:00` | Quiet hours start (UTC)                |
+| `AUTONOMOUS_REACTIVE_QUIET_END`      | `10:00` | Quiet hours end (UTC)                  |
+| `AUTONOMOUS_REACTIVE_BUSY_START`     | `12:00` | Busy hours start (UTC)                 |
+| `AUTONOMOUS_REACTIVE_BUSY_END`       | `22:00` | Busy hours end (UTC)                   |
+
+### Trend Monitor Tuning
+
+| Variable                            | Default | Description                          |
+| ----------------------------------- | ------- | ------------------------------------ |
+| `TREND_POLL_INTERVAL_MINUTES`       | `30`    | Poll interval during active hours    |
+| `TREND_POLL_INTERVAL_QUIET_MINUTES` | `45`    | Poll interval during quiet hours     |
+| `TREND_MIN_PERSISTENCE`             | `2`     | Min sightings before trend qualifies |
+| `TREND_POOL_MAX_SIZE`               | `30`    | Max trends in pool                   |
+| `TREND_POOL_DECAY_PER_HOUR`         | `5`     | Score decay per hour                 |
+| `TREND_POOL_MIN_SCORE`              | `40`    | Min score to keep in pool            |
+| `TREND_POOL_STALE_HOURS`            | `6`     | Remove trends older than this        |
 
 **How scheduled mode works:**
 
@@ -210,6 +316,7 @@ Let Nova autonomously generate and launch tokens using a hybrid approach:
 | Variable              | Default | Description                             |
 | --------------------- | ------- | --------------------------------------- |
 | `CRYPTOPANIC_API_KEY` | –       | API key for CryptoPanic news (optional) |
+| `CRYPTONEWS_API_KEY`  | –       | API key for CryptoNews (optional)       |
 
 **Available Sources:**
 
@@ -222,10 +329,10 @@ Let Nova autonomously generate and launch tokens using a hybrid approach:
 
 ## Admin Notifications
 
-| Variable        | Default | Description                                     |
-| --------------- | ------- | ----------------------------------------------- |
-| `ADMIN_CHAT_ID` | –       | Telegram chat ID for admin alerts               |
-| `ADMIN_ALERTS`  | `all`   | Alert types: withdrawal,error,autonomous,system |
+| Variable        | Default                                | Description                       |
+| --------------- | -------------------------------------- | --------------------------------- |
+| `ADMIN_CHAT_ID` | –                                      | Telegram chat ID for admin alerts |
+| `ADMIN_ALERTS`  | `withdrawals,errors,autonomous,system` | Alert types (comma-separated)     |
 
 **Alert Types:**
 
@@ -273,6 +380,7 @@ AGENT_FUNDING_WALLET_SECRET=your-phantom-private-key
 # ================================
 TG_ENABLE=true
 TG_BOT_TOKEN=123456:ABC-DEF...
+ADMIN_CHAT_ID=your-telegram-user-id
 
 # ================================
 # NOVA CHANNEL (Optional)
@@ -283,6 +391,12 @@ NOVA_CHANNEL_INVITE=https://t.me/+abcdefg123456
 NOVA_CHANNEL_UPDATES=launches,wallet,health,marketing,system
 
 # ================================
+# NOVA COMMUNITY GROUP (Optional)
+# ================================
+TELEGRAM_COMMUNITY_CHAT_ID=-1001234567891
+TELEGRAM_COMMUNITY_LINK=https://t.me/+xyz789
+
+# ================================
 # X/TWITTER
 # ================================
 X_ENABLE=true
@@ -290,6 +404,28 @@ TWITTER_API_KEY=your-api-key
 TWITTER_API_SECRET_KEY=your-api-secret
 TWITTER_ACCESS_TOKEN=your-access-token
 TWITTER_ACCESS_TOKEN_SECRET=your-access-secret
+X_USER_ID=your-numeric-x-user-id
+X_READ_BUDGET_USD=5.0
+
+# ================================
+# X REPLY ENGINE (Optional)
+# ================================
+X_REPLY_ENGINE_ENABLE=true
+X_REPLY_MAX_PER_DAY=10
+X_REPLY_INTERVAL_MINUTES=60
+
+# ================================
+# NOVA PERSONAL BRAND (Optional)
+# ================================
+NOVA_PERSONAL_X_ENABLE=true
+NOVA_PERSONAL_TG_ENABLE=true
+NOVA_X_HANDLE=nova_agent_
+
+# ================================
+# COMMUNITY VOTING (Optional)
+# ================================
+COMMUNITY_VOTING_ENABLED=true
+COMMUNITY_VOTING_WINDOW_MINUTES=30
 
 # ================================
 # TREASURY (Optional)
@@ -305,13 +441,20 @@ TREASURY_LOG_ONLY=true
 AUTO_SELL_ENABLE=false
 AUTO_SELL_MODE=off
 AUTO_WITHDRAW_ENABLE=false
+
+# ================================
+# AUTONOMOUS (Optional)
+# ================================
+AUTONOMOUS_ENABLE=false
+AUTONOMOUS_DRY_RUN=true
+AUTONOMOUS_SCHEDULE=14:00
 ```
 
 ---
 
 ## See Also
 
-- [TREASURY_GUARDRAILS.md](TREASURY_GUARDRAILS.md) - Treasury security
-- [AUTO_TRADING.md](AUTO_TRADING.md) - Auto-sell configuration
+- [POSTGRESQL_ARCHITECTURE.md](POSTGRESQL_ARCHITECTURE.md) - Database schema & persistence
+- [AUTONOMOUS_MODE.md](AUTONOMOUS_MODE.md) - Autonomous launching configuration
 - [TWITTER_PLUGIN_INTEGRATION.md](TWITTER_PLUGIN_INTEGRATION.md) - X/Twitter setup
-- [WALLET_SETUP.md](WALLET_SETUP.md) - Wallet configuration
+- [TELEGRAM_GUIDE.md](TELEGRAM_GUIDE.md) - Telegram integration guide

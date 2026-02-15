@@ -1,201 +1,171 @@
-# Twitter Plugin Integration
+# Twitter / X Integration
 
 ## Overview
 
-The XPublisherService and publishXAction have been refactored to use the `@elizaos/plugin-twitter` client instead of direct Twitter API calls. This provides better integration with ElizaOS's plugin architecture and maintains consistency with the Telegram plugin approach.
+Nova's X/Twitter integration includes four major subsystems:
 
-## Changes Made
+1. **XPublisherService** — Core tweet publishing via `@elizaos/plugin-twitter`
+2. **X Reply Engine** — Autonomous search-and-reply to ecosystem tweets
+3. **Personal Brand System** — Scheduled personality posts (GM, recaps, commentary, threads)
+4. **Token Marketing** — Scheduled promotional tweets per launched token
 
-### 1. XPublisherService (`src/launchkit/services/xPublisher.ts`)
+### Service Files
 
-- **Removed**: Custom `postTweet()` function with manual Twitter API calls
-- **Added**: `TwitterClient` interface for type safety
-- **Added**: `twitterClient` property to store the plugin's client
-- **Added**: `setTwitterClient()` method to inject the plugin client
-- **Updated**: `publish()` method to use `this.twitterClient.sendTweet()` instead of custom API calls
-- **Updated**: Error handling to check for client availability
-
-Key changes:
-
-```typescript
-// Before: Manual API calls
-const idStr = await postTweet(env, mainText);
-
-// After: Plugin client
-const result = await this.twitterClient.sendTweet(mainText);
-const idStr = result?.id || result?.data?.id || String(result);
-```
-
-### 2. publishXAction (`src/launchkit/eliza/publishActions.ts`)
-
-- **Added**: Twitter service retrieval from runtime
-- **Added**: Client injection into XPublisherService before publishing
-- **Added**: Better error messaging when plugin is not available
-
-Key changes:
-
-```typescript
-// Get Twitter client from plugin
-const twitterService = runtime.getService("twitter") as any;
-if (!twitterService?.twitterClient) {
-  throw new Error(
-    "Twitter plugin not available. Ensure @elizaos/plugin-twitter is loaded and configured.",
-  );
-}
-xPublisher.setTwitterClient(twitterService.twitterClient);
-```
-
-### 3. Character Configuration (`src/character.ts`)
-
-The Twitter plugin is conditionally loaded when credentials are available:
-
-```typescript
-plugins: [
-  ...(process.env.TWITTER_API_KEY?.trim() &&
-  process.env.TWITTER_API_SECRET_KEY?.trim()
-    ? ["@elizaos/plugin-twitter"]
-    : []),
-];
-```
-
-### 4. Environment Configuration (`.env`)
-
-Updated to include Twitter API credentials required by the plugin:
-
-```bash
-# Twitter Plugin Configuration
-TWITTER_API_KEY=your_api_key_here
-TWITTER_API_SECRET_KEY=your_api_secret_key_here
-TWITTER_ACCESS_TOKEN=your_access_token_here
-TWITTER_ACCESS_TOKEN_SECRET=your_access_token_secret_here
-
-# Enable X publishing
-X_ENABLE=true
-TWITTER_DRY_RUN=false
-TWITTER_ENABLE_POSTING=true
-```
-
-## Benefits
-
-1. **Consistency**: Matches the Telegram plugin architecture approach
-2. **Maintained**: Twitter client is maintained by the ElizaOS team
-3. **Features**: Access to all plugin features (timeline, interactions, etc.)
-4. **Type Safety**: Proper TypeScript interfaces for the client
-5. **Error Handling**: Better error messages when plugin is not available
-
-## Getting Twitter API Credentials
-
-1. Go to [Twitter Developer Portal](https://developer.twitter.com/en/portal/dashboard)
-2. Create a new Twitter App (or use an existing one)
-3. Enable OAuth 1.0a authentication
-4. Generate API Key & Secret (Consumer Keys)
-5. Generate Access Token & Secret
-6. Copy these credentials to your `.env` file
-
-## Testing
-
-To test the Twitter integration:
-
-1. **Configure credentials** in `.env`:
-
-   ```bash
-   TWITTER_API_KEY=your_actual_api_key
-   TWITTER_API_SECRET_KEY=your_actual_api_secret
-   TWITTER_ACCESS_TOKEN=your_actual_access_token
-   TWITTER_ACCESS_TOKEN_SECRET=your_actual_access_secret
-   X_ENABLE=true
-   ```
-
-2. **Build and start the agent**:
-
-   ```bash
-   bun run build
-   bun start
-   ```
-
-3. **Test publishing**:
-   - Create a LaunchPack: "launch a token called MoonDog"
-   - Publish to X: "publish to x for <launchpack_id>"
-   - Or auto-publish after launch by ensuring pump.fun launch succeeds
+| File                                          | Purpose                                        |
+| --------------------------------------------- | ---------------------------------------------- |
+| `src/launchkit/services/xPublisher.ts`        | Core tweet sending (single tweets + threads)   |
+| `src/launchkit/services/xReplyEngine.ts`      | Search & reply engine for ecosystem engagement |
+| `src/launchkit/services/novaPersonalBrand.ts` | Personal brand content generation & scheduling |
+| `src/launchkit/services/weeklyThread.ts`      | Weekly summary thread generation               |
+| `src/launchkit/services/xMarketing.ts`        | Per-token marketing campaigns                  |
+| `src/launchkit/services/xScheduler.ts`        | Tweet scheduling & queue                       |
+| `src/launchkit/services/xRateLimiter.ts`      | Rate limiting (writes + pay-per-use reads)     |
 
 ## Architecture
 
 ```
-┌─────────────────────┐
-│  publishXAction     │
-│  (eliza action)     │
-└──────────┬──────────┘
-           │
-           │ 1. getService('twitter')
-           ↓
-┌─────────────────────┐
-│ TwitterService      │
-│ (@elizaos/plugin)   │
-└──────────┬──────────┘
-           │
-           │ 2. setTwitterClient()
-           ↓
-┌─────────────────────┐
-│ XPublisherService   │
-│ (custom service)    │
-└──────────┬──────────┘
-           │
-           │ 3. sendTweet()
-           ↓
-┌─────────────────────┐
-│ TwitterClient       │
-│ (plugin client)     │
-└──────────┬──────────┘
-           │
-           │ 4. Twitter API v2
-           ↓
-     Twitter.com
+┌─────────────────────────────────────────────────────────────────┐
+│                    Nova X/Twitter System                         │
+├────────────────┬───────────────────┬────────────────────────────┤
+│  Reply Engine  │  Personal Brand   │  Token Marketing           │
+│  (xReplyEngine)│ (novaPersonalBrand)│ (xMarketing + xScheduler) │
+├────────────────┴───────────────────┴────────────────────────────┤
+│                      XPublisherService                          │
+│              sendTweet() / sendThread()                          │
+├─────────────────────────────────────────────────────────────────┤
+│                      XRateLimiter                                │
+│    canWrite() / canRead() / getDailyWritesRemaining()           │
+├─────────────────────────────────────────────────────────────────┤
+│                   @elizaos/plugin-twitter                        │
+│                    TwitterClient.sendTweet()                     │
+├─────────────────────────────────────────────────────────────────┤
+│                     Twitter API v2                               │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Fallback Behavior
+## X Reply Engine
 
-If the Twitter plugin is not loaded or credentials are missing:
+The reply engine autonomously searches for ecosystem tweets and replies with data-driven content.
 
-- The plugin won't load (conditional in character.ts)
-- Publishing will fail with clear error message
-- Other LaunchPack operations continue to work normally
-- Telegram publishing still works independently
+### How It Works
 
-## Next Steps
+1. **Every ~38 minutes**, runs a reply round
+2. **Round 0 (startup)**: Skips ALL reads to avoid 429 rate limits from stale rate windows
+3. **Odd rounds**: Search for mentions of Nova's handle
+4. **Even rounds**: Search for keyword queries (pump.fun, Solana memecoins, etc.)
+5. **Candidate scoring**: Filters spam, scores relevance, prioritizes ecosystem accounts
+6. **GPT reply generation**: gpt-4o-mini generates a reply (MAX 200 chars, blunt & data-driven)
+7. **RugCheck integration**: If a contract address is detected, auto-scans via RugCheck API and includes real safety data
+8. **Deduplication**: `repliedTweetIds` Set (smart trim to last 500) prevents double-replies
 
-1. ✅ Install `@elizaos/plugin-twitter` package
-2. ✅ Refactor XPublisherService to use plugin client
-3. ✅ Update publishXAction to inject plugin client
-4. ✅ Update character.ts with conditional plugin loading
-5. ✅ Update .env with Twitter API credentials placeholders
-6. ✅ Get Twitter API credentials from Developer Portal
-7. ✅ Test full launch → auto-publish flow
-8. ✅ Verify tweets are posted correctly with LaunchPack content
+### Configuration
+
+```bash
+X_REPLY_ENGINE_ENABLE=true
+X_REPLY_MAX_PER_DAY=10                    # Max replies per day
+X_REPLY_INTERVAL_MINUTES=38               # Minutes between rounds
+X_REPLY_TARGETS=@Pumpfun,@elizaOS         # Accounts to engage with
+X_REPLY_SEARCH_QUERIES=pump.fun,solana memecoin  # Search terms
+X_USER_ID=1203214324086513664             # Your numeric X user ID (for mention detection)
+```
+
+### Safety Features
+
+- **Race condition guard**: `roundInProgress` flag prevents concurrent rounds
+- **Generic phrase blocker**: Blocks canned phrases like "it's vital to check RugCheck" when real data is available
+- **8 blocked generic patterns**: "great to see", "love this", "let's build together", etc.
+- **SKIP detection**: GPT returns "SKIP" for spam/promo tweets — engine silently skips
+- **Sanitized Unicode**: Strips broken surrogate pairs that would crash PostgreSQL
+
+### Ecosystem Tags (used sparingly)
+
+| Tag              | When Used                     |
+| ---------------- | ----------------------------- |
+| @Pumpfun         | Tweet about pump.fun launches |
+| @Rugcheckxyz     | Token safety discussions      |
+| @dexscreener     | Chart/price data              |
+| @elizaOS         | AI agent framework            |
+| @JupiterExchange | Solana DEX topics             |
+| @aixbt_agent     | AI agent peer engagement      |
 
 ---
 
-## X Marketing Features
+## Personal Brand System
 
-### Data Persistence
+Nova posts personality content on a daily schedule, completely autonomously.
 
-All X/Twitter scheduling data persists to PostgreSQL when `DATABASE_URL` is set:
+### Daily Schedule (UTC)
 
-| Data                | PostgreSQL Table    | Description                      |
-| ------------------- | ------------------- | -------------------------------- |
-| Scheduled tweets    | `sched_x_tweets`    | All pending/posted/failed tweets |
-| Marketing schedules | `sched_x_marketing` | Per-token campaign settings      |
-| Rate limiting       | `sched_x_usage`     | API usage tracking per month     |
+| Time   | Post Type                          | Platform |
+| ------ | ---------------------------------- | -------- |
+| 09:00  | GM post                            | X + TG   |
+| 12:00  | Builder insight / Nova tease       | X + TG   |
+| 13:00  | Collab tweet (ecosystem tag)       | X only   |
+| 15:00  | Community engagement (poll or BTS) | TG only  |
+| 20:00  | Personality tweet                  | X only   |
+| 22:00  | Daily recap (thread on X)          | X + TG   |
+| Sunday | Weekly summary thread              | X + TG   |
 
-**Survives restarts:** Yes - scheduled tweets are restored after Railway redeploys.
+### Content Types
 
-**Local Development:** Falls back to JSON files in `./data/`.
+| Type                | Description                                           |
+| ------------------- | ----------------------------------------------------- |
+| `gm`                | Morning greeting with one data observation            |
+| `daily_recap`       | End-of-day stats thread (portfolio, launches, movers) |
+| `weekly_summary`    | Weekly performance thread                             |
+| `market_commentary` | React to token/market data                            |
+| `builder_insight`   | Lessons from launch data                              |
+| `behind_scenes`     | Real system activity (grounded in actual metrics)     |
+| `milestone`         | Celebrating achievements (real numbers only)          |
+| `hot_take`          | Provocative crypto opinions backed by data            |
+| `market_roast`      | Self-deprecating humor with real P&L numbers          |
+| `ai_thoughts`       | Self-aware AI observations                            |
+| `degen_wisdom`      | Lessons from launch data patterns                     |
+| `trust_talk`        | Safety/transparency (real RugCheck scan data)         |
+| `community_poll`    | TG reaction-based polls                               |
 
-Services require async initialization:
+### Hallucination Prevention
 
-- `initXScheduler()` - Tweet scheduling
-- `initXRateLimiter()` - Rate limit tracking
+All content passes through multiple safety layers:
 
-See [POSTGRESQL_ARCHITECTURE.md](./POSTGRESQL_ARCHITECTURE.md) for full details.
+1. **Grounded prompts**: Every prompt includes real portfolio value, token prices, system metrics
+2. **`getSystemActivity()`**: Pulls real uptime, tweet count, reply count, snapshot count from DB
+3. **Tech stack guardrails**: Prompts list actual stack (Bun, ElizaOS, PostgreSQL, DexScreener, RugCheck, pump.fun) and ban unused infra
+4. **Post-generation filter**: Regex catches fabricated infrastructure (Redis, Kafka, Kubernetes, Memcached, Chainlink), fake performance metrics ("reduced X ms"), and fake system migrations
+5. **Engagement bait stripper**: Removes "what are you watching?" questions nobody answers at low follower counts
+6. **`trust_talk` safety data**: Pre-queries `sched_rugcheck_reports` table for real scan counts, avg risk scores, and flagged token counts
+
+### Narrative Arcs
+
+Multi-day story series for audience engagement (20% chance of starting on any personality slot):
+
+- **The Big Question**: 4-part mystery reveal ("been thinking about something...")
+- **Week in the Life**: 5-day diary series (grounded in actual tech stack)
+- **Challenge Accepted**: 3-part public challenge with progress tracking
+- **Unpopular Opinions**: 3-part escalating hot takes
+
+### Configuration
+
+```bash
+NOVA_PERSONAL_X_ENABLE=true
+NOVA_PERSONAL_TG_ENABLE=true
+NOVA_GM_POST_TIME=09:00                    # UTC
+NOVA_RECAP_POST_TIME=22:00                 # UTC
+NOVA_WEEKLY_SUMMARY_DAY=0                  # 0=Sunday
+NOVA_X_HANDLE=nova_agent_                  # Your X handle (no @)
+```
+
+### Circuit Breaker
+
+After 3 consecutive X posting failures:
+
+- All X posting pauses for 1 hour
+- Counter resets on next successful post
+- Prevents burning API quota on persistent errors
+
+---
+
+## Token Marketing
 
 ### Scheduled Tweet Marketing
 
@@ -249,11 +219,11 @@ Agent: "✅ Regenerated 8 tweets with fresh content"
 
 ### Check X Quota
 
-View remaining posts for the month (Free tier = 500/month):
+View remaining posts for the month (Basic tier = 500 writes/month):
 
 ```
 User: "check x quota"
-Agent: "📊 X Posting Quota: 45/500 used this month"
+Agent: "📊 X Posting Quota: 45/500 used this month | Reads: $1.23/$5.00 budget used"
 ```
 
 ---
@@ -298,19 +268,39 @@ CRITICAL RULES FOR LINKS:
 
 ## Rate Limiting
 
-### Free Tier Limits
+### Write Limits (Basic Tier)
 
-- 500 tweets per month
+- 500 tweets per month (free)
 - **1 tweet per token per day** (conservative scheduling)
-- Tracked in `data/x_usage.json`
 - Auto-refill limit: 2 tweets per day per token
+- Tracked via `xRateLimiter.ts` → persisted to PostgreSQL (`sched_x_usage`)
 
-### Rate Limiter Features
+### Read Limits (Pay-Per-Use)
 
-- Automatic daily/monthly tracking
-- Warns when approaching limits
-- Blocks posts when quota exceeded
-- Resets on new month
+- Reads are billed per-use on Basic tier
+- Configurable USD budget cap: `X_READ_BUDGET_USD=5.0`
+- Separate cooldown tracking for mentions vs keyword search
+- Round 0 (startup) skips ALL reads to avoid 429 from stale rate windows
+
+### Rate Limiter Functions
+
+| Function                    | Purpose                                   |
+| --------------------------- | ----------------------------------------- |
+| `canWrite()`                | Check if a write is allowed               |
+| `canRead()`                 | Check if a read is allowed (budget check) |
+| `canReadMentions()`         | Mention-specific read check with cooldown |
+| `canReadSearch()`           | Search-specific read check with cooldown  |
+| `getDailyWritesRemaining()` | Remaining writes for today                |
+| `getPostingAdvice()`        | Human-readable quota advice               |
+| `getQuota()`                | Full quota status object                  |
+| `isPayPerUseReads()`        | Whether reads are billed                  |
+
+### Circuit Breaker
+
+- Tracks `consecutiveXFailures` counter
+- After 3 consecutive failures: pauses ALL X posting for 1 hour
+- `circuitBreakerResetAt` timestamp controls when posting resumes
+- Resets on next successful post
 
 ```typescript
 const advice = getPostingAdvice();
@@ -321,30 +311,20 @@ if (!advice.canPost) {
 
 ---
 
-## Scheduled Tweet Storage
+## Data Persistence
 
-Tweets stored in `data/x_scheduled_tweets.json`:
+All X/Twitter data persists to PostgreSQL when `DATABASE_URL` is set:
 
-```json
-{
-  "id": "uuid",
-  "tokenTicker": "RUG",
-  "tokenMint": "CHWDAsq6...",
-  "launchPackId": "uuid",
-  "type": "chart_callout",
-  "text": "gm frens! Check out $RUG...",
-  "scheduledFor": "2026-01-20T10:00:00Z",
-  "status": "pending",
-  "createdAt": "2026-01-19T20:00:00Z"
-}
-```
+| Data                | PostgreSQL Table         | Description                      |
+| ------------------- | ------------------------ | -------------------------------- |
+| Scheduled tweets    | `sched_x_tweets`         | All pending/posted/failed tweets |
+| Marketing schedules | `sched_x_marketing`      | Per-token campaign settings      |
+| Rate limiting       | `sched_x_usage`          | API usage tracking per month     |
+| RugCheck reports    | `sched_rugcheck_reports` | Token safety scan results        |
 
-**Status values:**
+**Survives restarts:** Yes — scheduled tweets restored after Railway redeploys.
 
-- `pending` - Waiting to be posted
-- `posted` - Successfully tweeted
-- `failed` - Failed to post
-- `cancelled` - User cancelled
+**Local Development:** Falls back to JSON files in `./data/`.
 
 ---
 
@@ -443,9 +423,9 @@ Twitter API error 403: You are not permitted to perform this action
 [X] Post failed: X_RATE_LIMIT
 ```
 
-**Cause:** Hit Twitter's rate limits (500 tweets/month on free tier).
+**Cause:** Hit Twitter's rate limits (500 writes/month on Basic tier, or read budget exhausted).
 
-**Fix:** Wait until monthly reset or upgrade Twitter API tier.
+**Fix:** Wait until monthly reset, increase `X_READ_BUDGET_USD`, or upgrade Twitter API tier. Circuit breaker auto-pauses after 3 consecutive failures and resumes after 1 hour.
 
 ### Handle Not Appearing in Tweets
 

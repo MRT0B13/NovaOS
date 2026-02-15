@@ -517,10 +517,25 @@ export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promi
     : message;
   await sendToChannel(channelMessage);
   
-  // Community gets a clean, short message with channel link only
-  if (env.NOVA_CHANNEL_INVITE) {
-    await sendToCommunity(`📢 <a href="${env.NOVA_CHANNEL_INVITE}">Nova Announcements Channel</a> — latest health update posted!`);
+  // Community gets the FULL health report + rules/disclaimers
+  healthUpdateCount++;
+  const includeRules = healthUpdateCount % RULES_REMINDER_EVERY === 0;
+
+  let communityMessage = message; // same health data as channel
+
+  if (includeRules) {
+    // Every Nth update, append the full community rules
+    communityMessage += '\n━━━━━━━━━━━━━━━\n' + getCommunityRulesMessage();
+  } else {
+    // Other updates, append a short rules reminder
+    communityMessage += getRulesReminder();
   }
+
+  if (env.NOVA_CHANNEL_INVITE) {
+    communityMessage += `\n\n📢 <a href="${env.NOVA_CHANNEL_INVITE}">Nova Announcements Channel</a>`;
+  }
+
+  await sendToCommunity(communityMessage);
   
   return true;
 }
@@ -717,6 +732,181 @@ export async function announceScheduledIdea(idea: ScheduledIdeaData): Promise<{ 
   }
 }
 
+// ============================================================================
+// Cross-Ban: Community ↔ Channel
+// ============================================================================
+
+/**
+ * Ban a user from BOTH the community group AND the broadcast channel.
+ * Call this whenever a user is banned from either one so they can't
+ * lurk in the other.
+ *
+ * Telegram Bot API `banChatMember` works on channels too — the bot
+ * just needs to be admin with ban rights in both.
+ */
+export async function crossBanUser(
+  userId: number,
+  opts?: { reason?: string; originChatId?: string }
+): Promise<{ community: boolean; channel: boolean }> {
+  if (!channelConfig) initNovaChannel();
+  if (!channelConfig?.botToken) return { community: false, channel: false };
+
+  const results = { community: false, channel: false };
+
+  const banFrom = async (chatId: string, label: string): Promise<boolean> => {
+    try {
+      const res = await fetch(
+        `https://api.telegram.org/bot${channelConfig!.botToken}/banChatMember`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, user_id: userId, until_date: 0 }),
+        }
+      );
+      const json = await res.json() as any;
+      if (json?.ok) {
+        logger.info(`[NovaChannel] Cross-ban: banned ${userId} from ${label} (${chatId})`);
+        return true;
+      }
+      // "Bad Request: user not found" is fine — they weren't in that chat
+      if (json?.description?.includes('user not found') || json?.description?.includes('USER_NOT_PARTICIPANT')) {
+        logger.info(`[NovaChannel] Cross-ban: ${userId} not in ${label}, skipping`);
+        return true; // not an error
+      }
+      logger.warn(`[NovaChannel] Cross-ban failed for ${label}: ${json?.description || res.status}`);
+      return false;
+    } catch (err) {
+      logger.error(`[NovaChannel] Cross-ban error for ${label}:`, err);
+      return false;
+    }
+  };
+
+  // Ban from community group (if configured and not the origin)
+  if (channelConfig.communityGroupId && channelConfig.communityGroupId !== opts?.originChatId) {
+    results.community = await banFrom(channelConfig.communityGroupId, 'community');
+  } else {
+    results.community = true; // already banned there (origin)
+  }
+
+  // Ban from broadcast channel (if configured and not the origin)
+  if (channelConfig.channelId && channelConfig.channelId !== opts?.originChatId) {
+    results.channel = await banFrom(channelConfig.channelId, 'channel');
+  } else {
+    results.channel = true; // already banned there (origin)
+  }
+
+  logger.info(`[NovaChannel] Cross-ban result for ${userId}: community=${results.community}, channel=${results.channel} (reason: ${opts?.reason || 'manual'})`);
+  return results;
+}
+
+// ============================================================================
+// Community Rules & Disclaimers
+// ============================================================================
+
+/** Full community rules message — posted & pinned on demand + appended to health updates periodically */
+function getCommunityRulesMessage(): string {
+  return [
+    `<b>Nova Community Rules</b>\n`,
+    `<b>DO</b>`,
+    `- Ask questions about Nova, launches, or Solana`,
+    `- Share ideas for tokens you'd like Nova to launch`,
+    `- Vote on scheduled launch polls`,
+    `- Report scammers/spam to admins`,
+    `- DYOR before aping into anything\n`,
+    `<b>DON'T (Warning → Ban)</b>`,
+    `- Shill other tokens or projects`,
+    `- Beg for mod/admin roles`,
+    `- Solicit DMs ("DM me", "inbox me")`,
+    `- Post external group/Discord/WhatsApp links`,
+    `- Make guaranteed-profit or passive-income promises\n`,
+    `<b>INSTANT BAN — No Warning</b>`,
+    `- Fake giveaways ("first 50 DM me")`,
+    `- Forwarded pump/promo spam`,
+    `- Private Telegram invite links (t.me/+…)`,
+    `- Impersonating admins or support`,
+    `- Wallet recovery / "restore funds" scams\n`,
+    `<b>Disclaimer</b>`,
+    `Nova is an autonomous AI experiment. Nothing posted here is financial advice. All tokens are meme-coins launched via pump.fun — they can go to zero. DYOR. Never invest more than you can afford to lose.\n`,
+    `<i>Rules enforced automatically by Nova + human admins.</i>`,
+    `<i>Violations cross-ban you from both the community group AND the announcements channel.</i>`,
+  ].join('\n');
+}
+
+/** Short rules reminder appended to some community health updates */
+function getRulesReminder(): string {
+  return [
+    `\n<b>Rules Reminder</b>`,
+    `No shilling, no fake giveaways, no DM solicitation, no scam links.`,
+    `Violators get cross-banned from community + channel.`,
+    `Full rules pinned above.`,
+  ].join('\n');
+}
+
+// Track how many health updates have been sent so we can append rules every Nth time
+let healthUpdateCount = 0;
+const RULES_REMINDER_EVERY = 3; // append rules reminder every 3rd health update
+
+/**
+ * Post the full community rules to the community group and attempt to pin.
+ * Call once on startup or via admin command.
+ */
+export async function postCommunityRules(): Promise<boolean> {
+  if (!channelConfig) initNovaChannel();
+  if (!channelConfig?.botToken) return false;
+
+  const targetChatId = channelConfig.communityGroupId || channelConfig.channelId;
+  if (!targetChatId) return false;
+
+  const rulesText = getCommunityRulesMessage();
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${channelConfig.botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: targetChatId,
+        text: sanitizeForTelegram(rulesText),
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+
+    const json = await res.json() as any;
+    if (!res.ok || !json?.ok) {
+      logger.warn(`[NovaChannel] Failed to post rules: ${json?.description || res.status}`);
+      return false;
+    }
+
+    const messageId = json.result?.message_id;
+    recordMessageSent();
+    recordTGPostSent();
+
+    // Try to pin the rules message
+    if (messageId) {
+      try {
+        await fetch(`https://api.telegram.org/bot${channelConfig.botToken}/pinChatMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: targetChatId,
+            message_id: messageId,
+            disable_notification: true,
+          }),
+        });
+        logger.info(`[NovaChannel] Pinned community rules (msgId=${messageId})`);
+      } catch (pinErr) {
+        logger.warn('[NovaChannel] Could not pin rules message:', pinErr);
+      }
+    }
+
+    logger.info('[NovaChannel] Posted community rules');
+    return true;
+  } catch (err) {
+    logger.error('[NovaChannel] Error posting community rules:', err);
+    return false;
+  }
+}
+
 export default {
   initNovaChannel,
   isUpdateEnabled,
@@ -730,4 +920,6 @@ export default {
   sendToCommunity,
   getCommunityGroupId,
   getCommunityLink,
+  crossBanUser,
+  postCommunityRules,
 };

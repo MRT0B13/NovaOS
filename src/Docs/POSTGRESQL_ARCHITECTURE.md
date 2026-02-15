@@ -51,21 +51,26 @@ await pnlRepo.insertTrade(trade);
 
 ## Database Tables
 
-### Scheduling Tables (`sched_*`)
+### Scheduling Tables (`sched_*`) — 14 tables
 
 | Table                      | Purpose                                       | Service                |
 | -------------------------- | --------------------------------------------- | ---------------------- |
 | `sched_tg_posts`           | Telegram scheduled posts                      | `telegramScheduler.ts` |
 | `sched_x_tweets`           | X/Twitter scheduled tweets                    | `xScheduler.ts`        |
 | `sched_x_marketing`        | X marketing campaign schedules                | `xScheduler.ts`        |
-| `sched_x_usage`            | X API rate limit tracking                     | `xRateLimiter.ts`      |
-| `sched_trend_pool`         | Detected trends pool                          | `trendPool.ts`         |
+| `sched_x_usage`            | X API rate limit tracking (monthly)           | `xRateLimiter.ts`      |
+| `sched_trend_pool`         | Detected trends pool (with decay/staleness)   | `trendPool.ts`         |
 | `sched_community_prefs`    | Community voting preferences                  | `communityVoting.ts`   |
 | `sched_community_feedback` | Idea feedback from community                  | `communityVoting.ts`   |
 | `sched_pending_votes`      | Active voting sessions                        | `communityVoting.ts`   |
 | `sched_system_metrics`     | System metrics, banned users, failed attempts | `systemReporter.ts`    |
+| `sched_autonomous_state`   | Autonomous mode state (launches today, etc.)  | `autonomousMode.ts`    |
+| `sched_rugcheck_reports`   | Token safety scan results (30-min cache)      | `rugcheck.ts`          |
+| `sched_reply_tracking`     | X reply history (dedup + cooldown)            | `xReplyEngine.ts`      |
+| `sched_creator_fees`       | PumpSwap creator fee snapshots                | `creatorFeeMonitor.ts` |
+| `sched_fee_claims`         | Fee claim transaction history                 | `creatorFeeMonitor.ts` |
 
-### PnL Tables (`pnl_*`)
+### PnL Tables (`pnl_*`) — 4 tables
 
 | Table           | Purpose                    | Service         |
 | --------------- | -------------------------- | --------------- |
@@ -74,13 +79,15 @@ await pnlRepo.insertTrade(trade);
 | `pnl_sol_flows` | SOL in/out tracking        | `pnlTracker.ts` |
 | `pnl_summary`   | Aggregate P&L summary      | `pnlTracker.ts` |
 
-### Core Tables
+### Core Tables — 3 tables
 
-| Table              | Purpose                     | Service                   |
-| ------------------ | --------------------------- | ------------------------- |
-| `launch_packs`     | Token launch configurations | `launchPackRepository.ts` |
-| `central_messages` | Message bus persistence     | ElizaOS core              |
-| `central_channels` | Channel metadata            | ElizaOS core              |
+| Table              | Purpose                     | Service                          |
+| ------------------ | --------------------------- | -------------------------------- |
+| `launch_packs`     | Token launch configurations | `launchPackRepository.ts`        |
+| `central_messages` | Message bus persistence     | ElizaOS core / `railwayReady.ts` |
+| `central_channels` | Channel metadata            | ElizaOS core / `railwayReady.ts` |
+
+**Total: 21 tables across 5 repository files.**
 
 ---
 
@@ -89,28 +96,33 @@ await pnlRepo.insertTrade(trade);
 Services with PostgreSQL support require async initialization. This happens automatically in `init.ts`:
 
 ```typescript
-// In init.ts
-import { initTelegramScheduler } from "./services/telegramScheduler";
-import { initXScheduler } from "./services/xScheduler";
-import { initXRateLimiter } from "./services/xRateLimiter";
-import { initPoolAsync } from "./services/trendPool";
-import { initCommunityVoting } from "./services/communityVoting";
-import { startSystemReporter } from "./services/systemReporter";
-
-// All called with await during LaunchKit startup
-await initTelegramScheduler();
-await initXScheduler();
-await initXRateLimiter();
-await initPoolAsync();
-await initCommunityVoting();
-await startSystemReporter();
+// In init.ts — initialization order
+logRailwayEnvironment(); // 1. Log Railway env info
+const store = createLaunchPackStoreFromEnv(); // 2. DB-backed LaunchPack store
+createSecretsStore(); // 3. Encrypted secrets
+new CopyGeneratorService(); // 4. AI marketing copy
+new PumpLauncherService(); // 5. pump.fun launcher
+new TelegramPublisherService(); // 6. TG publisher
+new TelegramCommunityService(); // 7. TG community mgmt
+new XPublisherService(); // 8. X publisher
+startLaunchKitServer(); // 9. HTTP API
+initGroupTracker(store); // 10. Load groups into tracker
+initCommunityVoting(); // 11. Restore pending votes
+recoverMarketingFromStore(store); // 12. Recover X marketing
+registerBanCommands(runtime); // 13. /ban, /kick commands (5s delay)
+startSystemReporter(); // 14. PostgreSQL metric tracking
+startTGScheduler(store); // 15. TG marketing scheduler
+startXScheduler(store, tweetFn); // 16. X auto-tweet scheduler
+startAutonomousMode(store, pumpService); // 17. Autonomous launching
 ```
 
 ### Initialization Order
 
-1. **PostgresScheduleRepository** - Creates schema, ensures tables exist
-2. **PostgresPnLRepository** - Creates P&L tables
-3. **Individual services** - Connect to repository, load persisted data
+1. **PostgresScheduleRepository** - Creates schema, ensures all 14 `sched_*` tables exist
+2. **PostgresPnLRepository** - Creates 4 `pnl_*` tables
+3. **LaunchPackRepository** - Creates `launch_packs` table
+4. **railwayReady** - Ensures `central_messages` + `central_channels` tables
+5. **Individual services** - Connect to repository, load persisted data
 
 ---
 
@@ -194,6 +206,82 @@ CREATE TABLE pnl_positions (
 );
 ```
 
+### sched_autonomous_state
+
+```sql
+CREATE TABLE sched_autonomous_state (
+  id TEXT PRIMARY KEY DEFAULT 'global',
+  launches_today INTEGER DEFAULT 0,
+  reactive_launches_today INTEGER DEFAULT 0,
+  last_launch_at TIMESTAMPTZ,
+  last_reactive_at TIMESTAMPTZ,
+  last_reset_date TEXT,
+  data JSONB DEFAULT '{}'
+);
+```
+
+### sched_rugcheck_reports
+
+```sql
+CREATE TABLE sched_rugcheck_reports (
+  token_mint TEXT PRIMARY KEY,
+  token_ticker TEXT,
+  score NUMERIC,
+  risk_level TEXT,
+  risks JSONB DEFAULT '[]',
+  mint_authority TEXT,
+  freeze_authority TEXT,
+  lp_locked BOOLEAN DEFAULT false,
+  top_holder_pct NUMERIC,
+  scanned_at TIMESTAMPTZ DEFAULT NOW(),
+  data JSONB DEFAULT '{}'
+);
+```
+
+### sched_reply_tracking
+
+```sql
+CREATE TABLE sched_reply_tracking (
+  id TEXT PRIMARY KEY,
+  tweet_id TEXT NOT NULL,
+  author_id TEXT,
+  author_username TEXT,
+  reply_tweet_id TEXT,
+  reply_text TEXT,
+  strategy TEXT,
+  replied_at TIMESTAMPTZ DEFAULT NOW(),
+  data JSONB DEFAULT '{}'
+);
+```
+
+### sched_creator_fees
+
+```sql
+CREATE TABLE sched_creator_fees (
+  token_mint TEXT PRIMARY KEY,
+  token_ticker TEXT,
+  fee_vault TEXT,
+  unclaimed_sol NUMERIC DEFAULT 0,
+  total_claimed_sol NUMERIC DEFAULT 0,
+  last_checked_at TIMESTAMPTZ DEFAULT NOW(),
+  data JSONB DEFAULT '{}'
+);
+```
+
+### sched_fee_claims
+
+```sql
+CREATE TABLE sched_fee_claims (
+  id TEXT PRIMARY KEY,
+  token_mint TEXT NOT NULL,
+  token_ticker TEXT,
+  amount_sol NUMERIC NOT NULL,
+  tx_signature TEXT,
+  claimed_at TIMESTAMPTZ DEFAULT NOW(),
+  data JSONB DEFAULT '{}'
+);
+```
+
 ---
 
 ## Hybrid Storage Behavior
@@ -271,15 +359,19 @@ Response includes database status:
 Successful PostgreSQL initialization shows:
 
 ```
-[ScheduleRepository] PostgreSQL schema ensured
+[ScheduleRepository] PostgreSQL schema ensured (14 tables)
 [TGScheduler] Initialized with PostgreSQL storage (Railway)
 [XScheduler] PostgreSQL storage initialized
 [X-RateLimiter] PostgreSQL storage initialized
 [TrendPool] PostgreSQL storage initialized
 [SystemReporter] PostgreSQL storage initialized
 [SystemReporter] Loaded persisted metrics from PostgreSQL
-[PnLRepository] Schema ensured
+[PnLRepository] Schema ensured (4 tables)
 [PnLTracker] Initialized with PostgreSQL storage (Railway)
+[AutonomousMode] State loaded from PostgreSQL
+[RugCheck] Report cache loaded from PostgreSQL
+[XReplyEngine] Reply tracking loaded from PostgreSQL
+[CreatorFeeMonitor] Fee data loaded from PostgreSQL
 ```
 
 ---

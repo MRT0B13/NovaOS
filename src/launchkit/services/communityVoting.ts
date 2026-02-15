@@ -17,6 +17,7 @@ import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
 import type { TokenIdea } from './ideaGenerator.ts';
 import { pinMessage } from './novaChannel.ts';
+import { analyzeSentiment } from './groupHealthMonitor.ts';
 import * as fs from 'fs';
 import * as path from 'path';
 import { 
@@ -96,6 +97,16 @@ export interface VoteTally {
   sentiment: number; // -1 to 1
   reactions: Record<string, number>;
   voters: number;
+  textReplies?: TextReply[];
+}
+
+export interface TextReply {
+  userId: number;
+  username?: string;
+  text: string;
+  sentiment: 'positive' | 'neutral' | 'negative';
+  sentimentScore: number;
+  timestamp: string;
 }
 
 export interface IdeaFeedback {
@@ -894,6 +905,86 @@ export function processReactionUpdate(update: any): void {
 }
 
 /**
+ * Process a text reply to a vote message in the community group
+ * Extracts sentiment and records it alongside emoji reactions
+ */
+export function processTextReply(update: any): void {
+  const message = update.message;
+  if (!message?.reply_to_message || !message?.text) return;
+
+  const replyToId = message.reply_to_message.message_id;
+  const chatId = String(message.chat?.id);
+  const userId = String(message.from?.id || 'unknown');
+  const username = message.from?.username || message.from?.first_name || 'anon';
+  const text = message.text?.trim();
+
+  if (!text || text.length < 2) return;
+
+  // Skip bot's own messages
+  if (message.from?.is_bot) return;
+
+  // Find matching pending vote
+  let matchedEntry: any = null;
+  for (const [, pv] of state.pendingVotes.entries()) {
+    if (pv.messageId === replyToId && pv.chatId === chatId) {
+      matchedEntry = pv;
+      break;
+    }
+  }
+  if (!matchedEntry) return;
+
+  // Analyse sentiment
+  const { sentiment, score } = analyzeSentiment(text);
+
+  // Initialise votes if needed
+  if (!matchedEntry.votes) {
+    matchedEntry.votes = { up: 0, down: 0, voters: 0, textReplies: [] };
+  }
+  if (!matchedEntry.votes.textReplies) {
+    matchedEntry.votes.textReplies = [];
+  }
+
+  // Prevent duplicate entries from the same user
+  const alreadyReplied = matchedEntry.votes.textReplies.some(
+    (r: any) => r.userId === userId
+  );
+  if (alreadyReplied) {
+    logger.info(`[CommunityVoting] User ${username} already replied to vote ${matchedEntry.idea.ticker}, skipping`);
+    return;
+  }
+
+  // Record the text reply
+  const reply: any = {
+    userId,
+    username,
+    text: text.slice(0, 280), // cap length
+    sentiment,
+    score,
+    timestamp: Date.now(),
+  };
+  matchedEntry.votes.textReplies.push(reply);
+
+  // Count sentiment toward overall vote tallies
+  if (sentiment === 'positive') {
+    matchedEntry.votes.up += 1;
+  } else if (sentiment === 'negative') {
+    matchedEntry.votes.down += 1;
+  }
+  matchedEntry.votes.voters += 1;
+
+  // Recalculate overall sentiment
+  const total = matchedEntry.votes.up + matchedEntry.votes.down;
+  if (total > 0) {
+    matchedEntry.votes.sentiment = matchedEntry.votes.up / total >= 0.5 ? 'positive' : 'negative';
+  }
+
+  saveState();
+  logger.info(
+    `[CommunityVoting] Text reply from @${username} on $${matchedEntry.idea.ticker}: "${text.slice(0, 60)}" → ${sentiment} (${score.toFixed(2)})`
+  );
+}
+
+/**
  * Process channel reaction counts (anonymous reactions)
  * This is used for channels where user reactions are aggregated
  */
@@ -1280,16 +1371,35 @@ export async function announceVoteResult(vote: PendingVote): Promise<boolean> {
   
   let message = '';
   
+  // Build text reply summary if any exist
+  const textReplies = votes.textReplies || [];
+  let textSummary = '';
+  if (textReplies.length > 0) {
+    const pos = textReplies.filter((r: any) => r.sentiment === 'positive').length;
+    const neg = textReplies.filter((r: any) => r.sentiment === 'negative').length;
+    const neu = textReplies.length - pos - neg;
+    textSummary += `\n\n💬 <b>${textReplies.length} text replies</b> (👍${pos} 😐${neu} 👎${neg})`;
+    // Show up to 2 notable replies
+    const notable = textReplies.slice(0, 2);
+    for (const r of notable) {
+      const safeText = escapeHtml(r.text.slice(0, 80));
+      const safeUser = escapeHtml(r.username || 'anon');
+      textSummary += `\n  • @${safeUser}: "${safeText}"`;
+    }
+  }
+
   if (vote.status === 'approved') {
     message = `✅ <b>$${safeTicker} APPROVED!</b>\n\n`;
     message += `Launching ${safeName}.\n\n`;
     message += `Votes: 👍 ${votes.positive} | 👎 ${votes.negative}\n`;
     message += `Sentiment: ${(votes.sentiment * 100).toFixed(0)}% positive`;
+    message += textSummary;
   } else if (vote.status === 'rejected') {
     message = `❌ <b>$${safeTicker} REJECTED</b>\n\n`;
     message += `${safeName} rejected. Noted.\n\n`;
     message += `Votes: 👍 ${votes.positive} | 👎 ${votes.negative}\n`;
     message += `Sentiment: ${(votes.sentiment * 100).toFixed(0)}%`;
+    message += textSummary;
   } else if (vote.status === 'no_votes') {
     message = `🤷 <b>$${safeTicker} - No Votes</b>\n\n`;
     message += `No votes received. Launching by default — vote next time if you have an opinion.`;
@@ -1363,6 +1473,7 @@ export default {
   postScheduledIdeaForFeedback,
   registerBrandPostForFeedback,
   processReactionUpdate,
+  processTextReply,
   checkPendingVotes,
   announceVoteResult,
   shouldSkipVoting,

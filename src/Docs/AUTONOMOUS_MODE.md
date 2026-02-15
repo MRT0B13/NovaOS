@@ -49,10 +49,24 @@ AUTONOMOUS_DRY_RUN=true
 AUTONOMOUS_REACTIVE_ENABLE=true
 
 # Max reactive launches per day (in addition to scheduled)
-AUTONOMOUS_REACTIVE_MAX_PER_DAY=2
+AUTONOMOUS_REACTIVE_MAX_PER_DAY=3
 
 # Minimum trend score to trigger (0-100)
 AUTONOMOUS_REACTIVE_MIN_SCORE=70
+
+# Hours between reactive launches
+AUTONOMOUS_REACTIVE_COOLDOWN_HOURS=2
+
+# Buffer hours around scheduled launches (no reactive during this window)
+AUTONOMOUS_SCHEDULED_BUFFER_HOURS=1
+
+# Quiet hours — longer poll interval, no reactive launches
+AUTONOMOUS_REACTIVE_QUIET_START=00:00
+AUTONOMOUS_REACTIVE_QUIET_END=10:00
+
+# Busy hours — shorter poll interval, reactive launches active
+AUTONOMOUS_REACTIVE_BUSY_START=12:00
+AUTONOMOUS_REACTIVE_BUSY_END=22:00
 ```
 
 ### 3. Configure Trend Sources
@@ -61,6 +75,26 @@ AUTONOMOUS_REACTIVE_MIN_SCORE=70
 # CryptoPanic API key (free developer tier)
 # Get from: https://cryptopanic.com/developers/api/
 CRYPTOPANIC_API_KEY=your_api_key_here
+
+# CryptoNews API key (optional)
+CRYPTONEWS_API_KEY=your_api_key_here
+```
+
+### 4. Tune Trend Monitor (Optional)
+
+```env
+# Poll interval (minutes) during active/quiet hours
+TREND_POLL_INTERVAL_MINUTES=30
+TREND_POLL_INTERVAL_QUIET_MINUTES=45
+
+# Min sightings before a trend qualifies for triggering
+TREND_MIN_PERSISTENCE=2
+
+# Pool management
+TREND_POOL_MAX_SIZE=30
+TREND_POOL_DECAY_PER_HOUR=5
+TREND_POOL_MIN_SCORE=40
+TREND_POOL_STALE_HOURS=6
 ```
 
 ---
@@ -161,17 +195,68 @@ When `AUTONOMOUS_DRY_RUN=true`:
 
 ---
 
+## Integrations
+
+Autonomous mode connects with several other Nova services:
+
+### RugCheck Pre-Launch Scanning
+
+Before every launch, Nova automatically scans the token concept via RugCheck API:
+
+- Validates mint/freeze authority settings
+- Checks holder concentration risk
+- Reports safety score in admin notification
+- Data cached in `sched_rugcheck_reports` table (30-min TTL)
+
+### Price Service (DexScreener)
+
+After launch, the price service tracks the token:
+
+- Real-time price from DexScreener API (5-min cache)
+- Market cap, volume, liquidity, buy/sell counts
+- Used in marketing posts and health summaries
+- No API key required (free, 300 req/min)
+
+### X Reply Engine
+
+When `X_REPLY_ENGINE_ENABLE=true`, the reply engine promotes autonomous launches:
+
+- Searches for relevant tweets about pump.fun, meme tokens, Solana
+- Generates data-backed replies mentioning launched tokens
+- 16-min startup delay to avoid rate limit conflicts
+
+### Personal Brand
+
+When `NOVA_PERSONAL_X_ENABLE=true`, personal brand posts reference real activity:
+
+- Behind-the-scenes content uses actual launch data from `sched_system_metrics`
+- Daily recaps include real metrics (launches, tweets, TG posts)
+- Hallucination filters prevent fabricated infrastructure claims
+
+### Community Voting
+
+When `COMMUNITY_VOTING_ENABLED=true`, ideas go through community approval:
+
+- Ideas posted to `TELEGRAM_COMMUNITY_CHAT_ID` for voting
+- Configurable voting window, quorum, and approval threshold
+- High-confidence ideas can skip voting (`COMMUNITY_VOTING_CONFIDENCE_SKIP`)
+- Results persisted in `sched_pending_votes` and `sched_community_feedback`
+
+---
+
 ## Data Persistence
 
 All autonomous mode data persists to PostgreSQL when deployed on Railway:
 
 | Data                         | PostgreSQL Table           | Survives Restart |
 | ---------------------------- | -------------------------- | ---------------- |
+| Autonomous state             | `sched_autonomous_state`   | ✅ Yes           |
 | Trend pool                   | `sched_trend_pool`         | ✅ Yes           |
 | Community voting preferences | `sched_community_prefs`    | ✅ Yes           |
 | Pending votes                | `sched_pending_votes`      | ✅ Yes           |
 | Idea feedback                | `sched_community_feedback` | ✅ Yes           |
 | System metrics               | `sched_system_metrics`     | ✅ Yes           |
+| RugCheck reports             | `sched_rugcheck_reports`   | ✅ Yes           |
 
 Services initialize asynchronously to connect to PostgreSQL:
 
@@ -221,17 +306,36 @@ ADMIN_ALERTS=withdrawal,error,autonomous,system
 
 ### Reactive Mode
 
-| Variable                          | Default | Description                    |
-| --------------------------------- | ------- | ------------------------------ |
-| `AUTONOMOUS_REACTIVE_ENABLE`      | `false` | Enable trend-reactive launches |
-| `AUTONOMOUS_REACTIVE_MAX_PER_DAY` | `2`     | Max reactive launches per day  |
-| `AUTONOMOUS_REACTIVE_MIN_SCORE`   | `70`    | Minimum trend score to trigger |
+| Variable                             | Default | Description                      |
+| ------------------------------------ | ------- | -------------------------------- |
+| `AUTONOMOUS_REACTIVE_ENABLE`         | `false` | Enable trend-reactive launches   |
+| `AUTONOMOUS_REACTIVE_MAX_PER_DAY`    | `3`     | Max reactive launches per day    |
+| `AUTONOMOUS_REACTIVE_MIN_SCORE`      | `70`    | Minimum trend score to trigger   |
+| `AUTONOMOUS_REACTIVE_COOLDOWN_HOURS` | `2`     | Hours between reactive launches  |
+| `AUTONOMOUS_SCHEDULED_BUFFER_HOURS`  | `1`     | Buffer around scheduled launches |
+| `AUTONOMOUS_REACTIVE_QUIET_START`    | `00:00` | Quiet hours start (UTC)          |
+| `AUTONOMOUS_REACTIVE_QUIET_END`      | `10:00` | Quiet hours end (UTC)            |
+| `AUTONOMOUS_REACTIVE_BUSY_START`     | `12:00` | Busy hours start (UTC)           |
+| `AUTONOMOUS_REACTIVE_BUSY_END`       | `22:00` | Busy hours end (UTC)             |
 
 ### Trend Sources
 
 | Variable              | Default | Description                    |
 | --------------------- | ------- | ------------------------------ |
 | `CRYPTOPANIC_API_KEY` | –       | CryptoPanic API key (optional) |
+| `CRYPTONEWS_API_KEY`  | –       | CryptoNews API key (optional)  |
+
+### Trend Monitor Tuning
+
+| Variable                            | Default | Description                   |
+| ----------------------------------- | ------- | ----------------------------- |
+| `TREND_POLL_INTERVAL_MINUTES`       | `30`    | Poll interval (active hours)  |
+| `TREND_POLL_INTERVAL_QUIET_MINUTES` | `45`    | Poll interval (quiet hours)   |
+| `TREND_MIN_PERSISTENCE`             | `2`     | Min sightings to qualify      |
+| `TREND_POOL_MAX_SIZE`               | `30`    | Max trends in pool            |
+| `TREND_POOL_DECAY_PER_HOUR`         | `5`     | Score decay per hour          |
+| `TREND_POOL_MIN_SCORE`              | `40`    | Min score to keep in pool     |
+| `TREND_POOL_STALE_HOURS`            | `6`     | Remove trends older than this |
 
 ---
 

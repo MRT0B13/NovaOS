@@ -19,7 +19,7 @@ import { cacheTelegramUser } from '../services/telegramCommunity.ts';
 import { processUpdate as processBanUpdate } from '../services/telegramBanHandler.ts';
 import { recordMessageReceived } from '../services/telegramHealthMonitor.ts';
 import { verifyWebhookSignature, isWebhookSecurityEnabled, initTelegramSecurity } from '../services/telegramSecurity.ts';
-import { processReactionUpdate } from '../services/communityVoting.ts';
+import { processReactionUpdate, processTextReply } from '../services/communityVoting.ts';
 import { trackMessage } from '../services/groupHealthMonitor.ts';
 import { getEnv } from '../env.ts';
 import { checkDatabaseReadiness, logDbReadinessSummary, type DbReadiness } from '../db/railwayReady.ts';
@@ -319,6 +319,15 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
             processReactionUpdate(update);
           } catch (reactionErr) {
             console.error('[TG_WEBHOOK] Reaction count handler error:', reactionErr);
+          }
+        }
+        
+        // Process text replies to vote messages in the community group
+        if (update.message?.reply_to_message && update.message?.text) {
+          try {
+            processTextReply(update);
+          } catch (textReplyErr) {
+            console.error('[TG_WEBHOOK] Text reply handler error:', textReplyErr);
           }
         }
         
