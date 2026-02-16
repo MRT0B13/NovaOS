@@ -1090,8 +1090,17 @@ export async function checkPendingVotes(): Promise<PendingVote[]> {
     const endsAt = new Date(vote.votingEndsAt);
     if (now < endsAt) continue;
     
-    // Voting window has ended
-    const votes = vote.votes || { positive: 0, negative: 0, total: 0, sentiment: 0, reactions: {}, voters: 0 };
+    // Voting window has ended — safely default every property individually
+    // (vote.votes may exist but have undefined properties, so || on the whole object won't help)
+    const rawVotes = (vote.votes || {}) as Record<string, any>;
+    const votes = {
+      positive: rawVotes.positive ?? 0,
+      negative: rawVotes.negative ?? 0,
+      total: rawVotes.total ?? 0,
+      sentiment: rawVotes.sentiment ?? 0,
+      reactions: rawVotes.reactions ?? {},
+      voters: rawVotes.voters ?? 0,
+    };
     
     // Log detailed vote breakdown
     logger.info(`[CommunityVoting] 🗳️ Vote ended for $${vote.idea.ticker}:`);
