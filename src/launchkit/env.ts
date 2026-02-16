@@ -39,6 +39,11 @@ const EnvSchema = z.object({
   // ==========================================
   RUGCHECK_API_KEY: z.string().optional(),
   
+  // ==========================================
+  // Tavily Search API (web research for ecosystem knowledge)
+  // ==========================================
+  TAVILY_API_KEY: z.string().optional(),
+  
   TG_ENABLE: z.enum(['true', 'false']).optional(),
   TG_BOT_TOKEN: z.string().optional(),
   TG_CHAT_ID: z.string().optional(),

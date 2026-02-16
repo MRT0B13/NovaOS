@@ -6,6 +6,7 @@ import { canPostToX, recordXPost } from './novaPersonalBrand.ts';
 import { getNovaStats, type TokenMover } from './novaPersonalBrand.ts';
 import { scanToken, formatReportForTweet } from './rugcheck.ts';
 import { loadSet, saveSet, loadMap, saveMap } from './persistenceStore.ts';
+import { quickSearch } from './novaResearch.ts';
 
 /**
  * X Reply Engine
@@ -730,6 +731,9 @@ You're replying to a tweet. Rules:
 
 NEVER:
 - Invent numbers you don't have. If you don't know a stat, don't mention it.
+- Fabricate statistics, percentages, TVL numbers, or market data that wasn't provided to you.
+- Say "reports show" or "data suggests" when you're guessing — if you don't have the number, skip it.
+- Round or embellish numbers from RESEARCH CONTEXT — use them exactly as provided or don't use them.
 - Say "Transparency is key", "Let's build together", "I'm always open to collaboration"
 - Say "fam", "frens", "vibes", "LFG", "WAGMI"
 - Start with "Great to see", "Always great to see", "Congrats on the", "Love this", "Love to see", or "I'm always open to"
@@ -752,6 +756,65 @@ Only tag if the tweet is directly about that account/topic. Never force a tag.`;
     
     // Try to get RugCheck data for any token addresses in the tweet
     const rugCheckContext = await getRugCheckContext(candidate.text);
+
+    // Enrich with web research for topic-relevant tweets
+    let researchContext = '';
+    const tweetLower = candidate.text.toLowerCase();
+    const TOPIC_KEYWORDS: { regex: RegExp; query: string }[] = [
+      // Meme / launch platform
+      { regex: /bonding curve|graduation|graduate/i, query: 'pump.fun bonding curve graduation mechanics' },
+      { regex: /rug pull|rug|rugged|scam/i, query: 'Solana rug pull statistics prevention latest' },
+      { regex: /pump\.?fun|pumpfun/i, query: 'pump.fun latest news updates' },
+      { regex: /pumpswap|creator fee/i, query: 'PumpSwap creator fees pump.fun AMM' },
+      { regex: /moonshot|believe|four\.?meme/i, query: 'token launch platform comparison pump.fun moonshot believe' },
+
+      // AI agents
+      { regex: /ai agent|autonomous agent|elizaos/i, query: 'AI agents crypto autonomous trading ElizaOS' },
+      { regex: /x402|zauth|agent trust|agent verif/i, query: 'AI agent trust verification x402 zauth' },
+      { regex: /virtuals|virtual protocol/i, query: 'Virtuals Protocol AI agents crypto' },
+
+      // DeFi
+      { regex: /tvl|total value locked/i, query: 'DeFi TVL top protocols latest' },
+      { regex: /jupiter|raydium|orca/i, query: 'Solana DEX Jupiter Raydium comparison volume' },
+      { regex: /aave|compound|lending/i, query: 'DeFi lending rates protocols latest' },
+      { regex: /liquid staking|jito|marinade/i, query: 'Solana liquid staking Jito Marinade yields' },
+      { regex: /hyperliquid|perps|perpetual/i, query: 'on-chain perpetuals derivatives Hyperliquid latest' },
+      { regex: /stablecoin|usdc|usdt/i, query: 'stablecoin market supply USDT USDC latest' },
+
+      // Bitcoin / macro
+      { regex: /bitcoin etf|btc etf|blackrock/i, query: 'Bitcoin ETF flows latest BlackRock' },
+      { regex: /halving|btc cycle|bitcoin cycle/i, query: 'Bitcoin halving cycle price analysis' },
+      { regex: /fed|interest rate|macro/i, query: 'Fed interest rates crypto market impact latest' },
+
+      // Solana ecosystem
+      { regex: /solana tps|solana speed|solana down|solana outage/i, query: 'Solana network performance TPS uptime latest' },
+      { regex: /mev|jito tip|sandwich/i, query: 'Solana MEV Jito sandwich attacks' },
+      { regex: /depin|helium|hivemapper/i, query: 'Solana DePIN projects latest' },
+
+      // Security
+      { regex: /hack|exploit|drained|bridge hack/i, query: 'cryptocurrency hack exploit latest' },
+      { regex: /rugcheck|rug check|token safety/i, query: 'RugCheck Solana token safety scanner' },
+      { regex: /mint authority|freeze authority|revoke/i, query: 'Solana token mint freeze authority safety' },
+
+      // Regulation
+      { regex: /sec |securities|gensler|regulation/i, query: 'SEC cryptocurrency regulation enforcement latest' },
+      { regex: /mica|europe crypto|eu crypto/i, query: 'MiCA Europe crypto regulation implementation' },
+
+      // Culture
+      { regex: /airdrop/i, query: 'crypto airdrop latest upcoming' },
+      { regex: /nft/i, query: 'NFT market status latest' },
+      { regex: /rwa|tokeniz/i, query: 'RWA real world assets tokenization crypto latest' },
+      { regex: /dao|governance vote/i, query: 'DAO governance notable proposals latest' },
+    ];
+    const matchedTopic = TOPIC_KEYWORDS.find(k => k.regex.test(tweetLower));
+    if (matchedTopic) {
+      try {
+        const answer = await quickSearch(matchedTopic.query);
+        if (answer) {
+          researchContext = `\n\nRESEARCH CONTEXT (from web search — use carefully):\n${answer}\n\nRULES: You may reference this data naturally but NEVER invent additional statistics or numbers beyond what's shown above. If the data doesn't match the tweet topic, ignore it. Do NOT fabricate percentages, dollar amounts, or "reports say" claims. Wrong numbers kill credibility.`;
+        }
+      } catch { /* non-critical */ }
+    }
     
     let userPrompt = `Reply to this tweet:\n\n"${candidate.text}"`;
     
@@ -763,6 +826,10 @@ Only tag if the tweet is directly about that account/topic. Never force a tag.`;
     const detectedMints = extractMintAddresses(candidate.text);
     if (detectedMints.length > 0 && !rugCheckContext) {
       userPrompt += `\n\nA contract address was found in this tweet (${detectedMints[0].slice(0, 8)}...) but the RugCheck scan failed or returned no data. Do NOT give generic safety advice like "it's vital to check RugCheck scores." Instead, either: (a) say you tried to scan it and couldn't get data, or (b) skip the safety angle entirely and comment on something else in the tweet. NEVER pretend you checked something you didn't.`;
+    }
+
+    if (researchContext) {
+      userPrompt += researchContext;
     }
     
     const res = await fetch('https://api.openai.com/v1/chat/completions', {

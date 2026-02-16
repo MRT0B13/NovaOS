@@ -25,6 +25,7 @@ import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts'
 import { getTokenPrice, formatMarketCap, getSolPriceUsd } from './priceService.ts';
 import { getActiveTrends } from './trendMonitor.ts';
 import { getFeesSummary, formatFeesForTweet, formatFeesForTelegram } from './pumpswapFees.ts';
+import { getKnowledgeForPostType, startResearchScheduler } from './novaResearch.ts';
 
 // ============================================================================
 // Types
@@ -252,6 +253,9 @@ export async function initNovaPersonalBrand(): Promise<void> {
     }
   }
   
+  // Start web research scheduler (if TAVILY_API_KEY configured)
+  startResearchScheduler();
+
   logger.info(`[NovaPersonalBrand] Initialized (X: ${env.NOVA_PERSONAL_X_ENABLE}, TG: ${env.NOVA_PERSONAL_TG_ENABLE})`);
 }
 
@@ -1137,6 +1141,11 @@ VOICE RULES — FOLLOW THESE EXACTLY:
 8. ENGAGE AS PEER, NOT FAN. When interacting with other AI agents or ecosystem accounts,
    speak as an equal — not a groupie.
 
+9. RESEARCH HONESTY. When ecosystem knowledge is provided below, you may cite those facts naturally.
+   But NEVER invent numbers, percentages, or statistics that aren't in the data provided.
+   If you don't have a number, don't make one up. Say "from what I've seen" not "studies show."
+   Hedge when appropriate: "reports suggest" > "data confirms." Wrong numbers = lost credibility.
+
 VOICE EXAMPLES:
 - "24 launches. 0 graduated. Here's the thing — I'm learning more from the failures than most devs learn from their wins."
 - "pump.fun graduation rate today: 0.7%. I'm not special for failing. I'd be special for graduating."
@@ -1224,6 +1233,9 @@ async function generateAIContent(
   const tokenMoversBlock = buildTokenMoversBlock(stats.tokenMovers);
   const tokenTrends = await getTokenTrends(stats.tokenMovers);
   const marketPulse = await buildMarketPulseBlock();
+
+  // Ecosystem knowledge from web research
+  const knowledgeBlock = await getKnowledgeForPostType(type);
 
   // Pre-compute real system activity for behind_scenes posts
   const systemActivity = type === 'behind_scenes' ? await getSystemActivity() : '';
@@ -1433,7 +1445,7 @@ ${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. En
   const narrativePrompt = getActiveNarrativePrompt(stats.dayNumber);
   const narrativeContext = narrativePrompt ? `\n\n${narrativePrompt}` : '';
   
-  const prompt = `${moodContext}\n\n${basePrompt}${recentContext}${narrativeContext}`;
+  const prompt = `${moodContext}\n\n${basePrompt}${knowledgeBlock}${recentContext}${narrativeContext}`;
   
   try {
     const response = await fetch('https://api.openai.com/v1/chat/completions', {

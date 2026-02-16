@@ -489,6 +489,25 @@ export class PostgresScheduleRepository {
       );
     `);
 
+    // Web research knowledge store (Tavily search results → GPT-extracted facts)
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS nova_knowledge (
+        id SERIAL PRIMARY KEY,
+        category TEXT NOT NULL,
+        topic TEXT NOT NULL UNIQUE,
+        summary TEXT NOT NULL,
+        facts JSONB DEFAULT '[]',
+        sources JSONB DEFAULT '[]',
+        search_query TEXT,
+        confidence REAL DEFAULT 0.5,
+        fetched_at TIMESTAMPTZ DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_count INTEGER DEFAULT 0
+      );
+    `);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_knowledge_category ON nova_knowledge (category);`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_knowledge_expires ON nova_knowledge (expires_at);`);
+
     logger.info('[ScheduleRepository] PostgreSQL schema ensured');
   }
 
