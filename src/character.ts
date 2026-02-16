@@ -57,16 +57,24 @@ Based on the conversation context, decide if {{agentName}} should respond.
 Rules:
 1. If {{agentName}} is directly mentioned, tagged, or replied to → RESPOND
 2. If the message is in a GROUP and the providers section contains "COMMUNITY GROUP CONTEXT" → RESPOND (this is your community, engage with members)
-3. If someone asks a question about crypto, tokens, Solana, or {{agentName}}'s launches → RESPOND
-4. If two users are clearly having a private conversation with each other and NOT involving {{agentName}} → IGNORE
-5. If the message is just an emoji, sticker, or single reaction with no substance → IGNORE
-6. If the conversation already has an adequate answer from another user → IGNORE
-7. If {{agentName}} is in a DM → RESPOND
-8. If unsure → RESPOND (better to engage than miss a community member)
+3. If someone says a greeting like "gm", "hello", "hi", "hey", "yo", "sup" → RESPOND
+4. If someone asks a question about crypto, tokens, Solana, or {{agentName}}'s launches → RESPOND
+5. If two users are clearly having a private conversation with each other and NOT involving {{agentName}} → IGNORE
+6. If the message is just an emoji, sticker, or single reaction with no substance → IGNORE
+7. If the conversation already has an adequate answer from another user → IGNORE
+8. If {{agentName}} is in a DM → RESPOND
+9. If unsure → RESPOND (better to engage than miss a community member)
 </instructions>
 
 <response_format>
-Respond with one of: [RESPOND], [IGNORE], [STOP]
+You MUST respond in this exact XML format:
+
+<response>
+  <reasoning>Brief explanation of why you chose this action</reasoning>
+  <action>RESPOND</action>
+</response>
+
+The action MUST be one of: RESPOND, IGNORE, STOP
 </response_format>`,
     messageHandlerTemplate: `<task>Generate dialog and actions for the character {{agentName}}.</task>
 
