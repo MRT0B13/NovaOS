@@ -13,6 +13,8 @@
 
 import { logger } from '@elizaos/core';
 import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
+import { getTwitterReader } from './xPublisher.ts';
+import { canReadSearch } from './xRateLimiter.ts';
 
 // =========================================================================
 // Types
@@ -30,7 +32,10 @@ type KnowledgeCategory =
   | 'regulation'      // SEC, global regulation, legal landscape
   | 'ai_agents'       // AI x crypto intersection
   | 'infrastructure'  // Bridges, oracles, MEV, validators
-  | 'culture';        // CT culture, narratives, social dynamics
+  | 'culture'         // CT culture, narratives, social dynamics
+  | 'social_intel'    // KOL monitoring signals (from X API)
+  | 'defi_live'       // Live DeFi data (from DeFiLlama API)
+  | 'narratives';     // Cross-source narrative synthesis
 
 interface ResearchTopic {
   id: string;
@@ -638,6 +643,66 @@ const RESEARCH_TOPICS: ResearchTopic[] = [
 ];
 
 // =========================================================================
+// Social Intelligence — KOL monitoring + topic searches
+// =========================================================================
+
+interface KOLEntry {
+  userId: string;       // X user ID (required for getUserTweets)
+  handle: string;       // Display name for logging/attribution
+  category: string;
+  weight: number;       // 1-10
+}
+
+/**
+ * Priority KOLs to pull timelines from directly.
+ * getUserTweets() requires numeric user IDs, not handles.
+ * To get IDs: use https://tweeterid.com or X API v2 /users/by/username/:handle
+ * 
+ * Start with 5-8, expand once proven. Each one costs 1 API read.
+ */
+const PRIORITY_KOLS: KOLEntry[] = [
+  // TODO: Replace placeholder IDs with real ones before deploying.
+  // Use tweeterid.com or the X API to look up IDs for each handle.
+  // { userId: '???', handle: 'Pumpfun',          category: 'ecosystem', weight: 9 },
+  // { userId: '???', handle: 'JupiterExchange',  category: 'defi',      weight: 8 },
+  // { userId: '???', handle: 'shawmakesmagic',   category: 'ai_agents', weight: 8 },
+  // { userId: '???', handle: 'DefiLlama',        category: 'defi',      weight: 8 },
+  // { userId: '???', handle: 'lookonchain',      category: 'security',  weight: 8 },
+];
+
+/**
+ * Topic-based search queries for social intelligence.
+ * Each one runs through searchTweets() — catches tweets from ANY user.
+ * More efficient than pulling individual timelines.
+ * tag maps to the topic ID stored in nova_knowledge (prefixed with 'social_').
+ */
+const INTEL_SEARCH_QUERIES: { query: string; tag: string }[] = [
+  // Ecosystem / meme platforms
+  { query: 'pump.fun OR pumpswap OR "bonding curve" graduation -is:retweet lang:en',   tag: 'ecosystem' },
+  { query: 'Solana "meme coin" OR memecoin launch -is:retweet lang:en',                tag: 'meme_meta' },
+
+  // Security
+  { query: 'Solana rug OR rugged OR scam -is:retweet lang:en',                         tag: 'security' },
+
+  // AI agents
+  { query: '"AI agent" crypto OR blockchain OR Solana -is:retweet lang:en',             tag: 'ai_agents' },
+  { query: 'ElizaOS OR ai16z OR "virtuals protocol" -is:retweet lang:en',              tag: 'ai_agents_eco' },
+
+  // DeFi
+  { query: 'Solana TVL DeFi Jupiter OR Raydium -is:retweet lang:en',                   tag: 'defi_social' },
+  { query: 'restaking OR "liquid staking" Jito OR Marinade -is:retweet lang:en',        tag: 'staking_social' },
+  { query: 'Hyperliquid OR perps crypto -is:retweet lang:en',                           tag: 'perps_social' },
+
+  // Macro
+  { query: 'Bitcoin ETF inflow OR outflow -is:retweet lang:en',                         tag: 'btc_etf_social' },
+  { query: 'SEC crypto regulation -is:retweet lang:en',                                 tag: 'regulation_social' },
+
+  // Culture
+  { query: '"meme coin" meta OR narrative Solana -is:retweet lang:en',                  tag: 'culture_social' },
+  { query: 'airdrop crypto Solana 2026 -is:retweet lang:en',                            tag: 'airdrop_social' },
+];
+
+// =========================================================================
 // Lazy DB init
 // =========================================================================
 
@@ -814,39 +879,444 @@ Return JSON in this exact format:
   logger.info(`[NovaResearch] ✅ Stored ${extracted.facts.length} facts for "${topic.id}" (confidence: ${extracted.confidence})`);
 }
 
+// =========================================================================
+// Social Intelligence — KOL scan via X API
+// =========================================================================
+
+/**
+ * Scan KOL tweets via X API search + timeline pulls.
+ * Processes through GPT and stores in nova_knowledge — same table as Tavily results.
+ * Uses topic IDs prefixed with 'social_' to avoid conflicts with Tavily research topics.
+ */
+async function scanKOLs(): Promise<number> {
+  const openaiKey = process.env.OPENAI_API_KEY;
+  if (!openaiKey) return 0;
+
+  const repo = await getRepo();
+  if (!repo) return 0;
+
+  const reader = getTwitterReader();
+  if (!reader.isReady()) {
+    logger.debug('[NovaIntel] X reader not ready — skipping KOL scan');
+    return 0;
+  }
+
+  const allTweets: Array<{ text: string; author: string; weight: number; tag: string }> = [];
+
+  // === Phase A: Topic-based searches (efficient — one query catches many users) ===
+  for (const { query, tag } of INTEL_SEARCH_QUERIES) {
+    if (!canReadSearch()) {
+      logger.debug('[NovaIntel] Read rate limited — stopping topic searches');
+      break;
+    }
+    try {
+      const results = await reader.searchTweets(query, 10);
+      for (const tweet of results) {
+        allTweets.push({
+          text: tweet.text,
+          author: tweet.authorId || 'unknown',
+          weight: 5,  // Default weight for unknown authors from search
+          tag,
+        });
+      }
+      await new Promise(r => setTimeout(r, 3000)); // Rate limit courtesy
+    } catch (err: any) {
+      if (err?.message?.includes('429') || err?.code === 429) {
+        logger.debug('[NovaIntel] 429 during topic search — stopping');
+        break;
+      }
+      logger.debug(`[NovaIntel] Search failed for "${tag}": ${err}`);
+    }
+  }
+
+  // === Phase B: Priority KOL timeline pulls (if we have user IDs configured) ===
+  for (const kol of PRIORITY_KOLS) {
+    if (!kol.userId || !canReadSearch()) break;
+    try {
+      const tweets = await reader.getUserTweets(kol.userId, 5);
+      for (const tweet of tweets) {
+        allTweets.push({
+          text: tweet.text,
+          author: kol.handle,
+          weight: kol.weight,
+          tag: kol.category,
+        });
+      }
+      await new Promise(r => setTimeout(r, 3000));
+    } catch (err: any) {
+      if (err?.message?.includes('429')) break;
+      logger.debug(`[NovaIntel] KOL pull failed for @${kol.handle}: ${err}`);
+    }
+  }
+
+  if (allTweets.length === 0) {
+    logger.debug('[NovaIntel] No tweets collected');
+    return 0;
+  }
+
+  // === Phase C: Group by tag, process each group through GPT ===
+  const grouped: Record<string, typeof allTweets> = {};
+  for (const t of allTweets) {
+    (grouped[t.tag] = grouped[t.tag] || []).push(t);
+  }
+
+  let storedCount = 0;
+
+  for (const [tag, tweets] of Object.entries(grouped)) {
+    if (tweets.length < 2) continue; // Need 2+ tweets for meaningful signal
+
+    const tweetBlock = tweets
+      .slice(0, 20) // Cap at 20 per group to keep prompt reasonable
+      .map((t, i) => `[${i + 1}] @${t.author} (wt:${t.weight}): ${t.text}`)
+      .join('\n');
+
+    try {
+      const extractRes = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openaiKey}`,
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          temperature: 0.2,
+          response_format: { type: 'json_object' },
+          messages: [{
+            role: 'system',
+            content: `You are a crypto intelligence analyst. Extract the key signal from these tweets about "${tag}".
+
+Return JSON:
+{
+  "summary": "2-3 sentence synthesis of what these tweets are saying",
+  "facts": ["specific claim or number 1", "specific event or data point 2", ...],
+  "confidence": 0.0-1.0 (higher if multiple sources agree on substance),
+  "skip": true if tweets are just noise/shilling/gm posts with no substance
+}
+
+Rules:
+- Merge related tweets into one coherent signal
+- Higher-weight authors matter more
+- Extract SPECIFIC numbers, events, claims — not vague vibes
+- Set skip:true if no real substance after filtering noise
+- confidence 0.7+ only if multiple tweets agree on specific facts`,
+          }, {
+            role: 'user',
+            content: `${tweets.length} tweets tagged "${tag}":\n\n${tweetBlock}`,
+          }],
+        }),
+      });
+
+      if (!extractRes.ok) continue;
+
+      const extractData = await extractRes.json();
+      const raw = extractData.choices?.[0]?.message?.content;
+      if (!raw) continue;
+
+      const parsed = JSON.parse(raw);
+      if (parsed.skip) continue;
+
+      // Store in nova_knowledge with 'social_' prefix on topic for uniqueness
+      const topicId = `social_${tag}`;
+      const expiresAt = new Date(Date.now() + 6 * 60 * 60 * 1000); // 6h TTL
+
+      await repo.query(
+        `INSERT INTO nova_knowledge (category, topic, summary, facts, sources, search_query, confidence, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (topic) DO UPDATE SET
+           summary = $3, facts = $4, sources = $5, search_query = $6,
+           confidence = $7, fetched_at = NOW(), expires_at = $8`,
+        [
+          'social_intel', topicId, parsed.summary,
+          JSON.stringify(parsed.facts || []),
+          JSON.stringify(tweets.slice(0, 3).map(t => ({ url: `https://x.com/${t.author}`, title: `@${t.author}`, score: t.weight / 10 }))),
+          `KOL scan: ${tag}`, parsed.confidence || 0.5, expiresAt,
+        ]
+      );
+      storedCount++;
+
+    } catch (err) {
+      logger.debug(`[NovaIntel] GPT extraction failed for ${tag}: ${err}`);
+    }
+  }
+
+  logger.info(`[NovaIntel] ✅ KOL scan: ${allTweets.length} tweets → ${storedCount} signals stored in nova_knowledge`);
+  return storedCount;
+}
+
+// =========================================================================
+// DeFi Live Data — DeFiLlama (free API, no key)
+// =========================================================================
+
+/**
+ * Fetch live DeFi data from DeFiLlama (free API, no key).
+ * Stores as nova_knowledge entries — same destination as Tavily and social intel.
+ */
+async function fetchDeFiData(): Promise<void> {
+  const repo = await getRepo();
+  if (!repo) return;
+
+  const fmt = (n: number | undefined): string => {
+    if (!n) return '0';
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    return n.toLocaleString();
+  };
+
+  try {
+    // === Chain TVL ===
+    const chainsRes = await fetch('https://api.llama.fi/v2/chains');
+    if (chainsRes.ok) {
+      const chains = await chainsRes.json();
+      const solana = chains.find((c: any) => c.name === 'Solana');
+      const ethereum = chains.find((c: any) => c.name === 'Ethereum');
+      const base = chains.find((c: any) => c.name === 'Base');
+      const totalTvl = chains.reduce((sum: number, c: any) => sum + (c.tvl || 0), 0);
+
+      const expiresAt = new Date(Date.now() + 6 * 60 * 60 * 1000);
+      await repo.query(
+        `INSERT INTO nova_knowledge (category, topic, summary, facts, sources, search_query, confidence, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (topic) DO UPDATE SET
+           summary = $3, facts = $4, sources = $5, search_query = $6,
+           confidence = $7, fetched_at = NOW(), expires_at = $8`,
+        [
+          'defi_live', 'defi_chain_tvl',
+          `DeFi TVL: Solana $${fmt(solana?.tvl)} | Ethereum $${fmt(ethereum?.tvl)} | Base $${fmt(base?.tvl)} | Total $${fmt(totalTvl)}`,
+          JSON.stringify([
+            `Solana TVL: $${fmt(solana?.tvl)}`,
+            `Ethereum TVL: $${fmt(ethereum?.tvl)}`,
+            `Base TVL: $${fmt(base?.tvl)}`,
+            `Total DeFi TVL: $${fmt(totalTvl)}`,
+          ]),
+          JSON.stringify([{ url: 'https://defillama.com/chains', title: 'DeFiLlama', score: 0.95 }]),
+          'DeFiLlama chain TVL', 0.95, expiresAt,
+        ]
+      );
+    }
+
+    // === Top Solana protocols ===
+    const protocolsRes = await fetch('https://api.llama.fi/protocols');
+    if (protocolsRes.ok) {
+      const allProtocols = await protocolsRes.json();
+      const solanaProtos = allProtocols
+        .filter((p: any) => (p.chains || []).includes('Solana') && p.tvl > 1_000_000)
+        .sort((a: any, b: any) => (b.tvl || 0) - (a.tvl || 0))
+        .slice(0, 15);
+
+      const facts = solanaProtos.map((p: any) =>
+        `${p.name} (${p.category || 'N/A'}): TVL $${fmt(p.tvl)}, 7d ${(p.change_7d || 0) > 0 ? '+' : ''}${(p.change_7d || 0).toFixed(1)}%`
+      );
+      const topLine = solanaProtos.slice(0, 5).map((p: any) => `${p.name} $${fmt(p.tvl)}`).join(', ');
+
+      const expiresAt = new Date(Date.now() + 6 * 60 * 60 * 1000);
+      await repo.query(
+        `INSERT INTO nova_knowledge (category, topic, summary, facts, sources, search_query, confidence, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (topic) DO UPDATE SET
+           summary = $3, facts = $4, sources = $5, search_query = $6,
+           confidence = $7, fetched_at = NOW(), expires_at = $8`,
+        [
+          'defi_live', 'defi_solana_protocols',
+          `Top Solana DeFi: ${topLine}`,
+          JSON.stringify(facts),
+          JSON.stringify([{ url: 'https://defillama.com/chain/Solana', title: 'DeFiLlama - Solana', score: 0.95 }]),
+          'DeFiLlama Solana protocols', 0.95, expiresAt,
+        ]
+      );
+    }
+
+    // === Stablecoin supply ===
+    const stablesRes = await fetch('https://stablecoins.llama.fi/stablecoins?includePrices=true');
+    if (stablesRes.ok) {
+      const data = await stablesRes.json();
+      const stables = data.peggedAssets || [];
+      const totalSupply = stables.reduce((sum: number, s: any) => sum + (s.circulating?.peggedUSD || 0), 0);
+      const usdt = stables.find((s: any) => s.symbol === 'USDT');
+      const usdc = stables.find((s: any) => s.symbol === 'USDC');
+
+      const expiresAt = new Date(Date.now() + 6 * 60 * 60 * 1000);
+      await repo.query(
+        `INSERT INTO nova_knowledge (category, topic, summary, facts, sources, search_query, confidence, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (topic) DO UPDATE SET
+           summary = $3, facts = $4, sources = $5, search_query = $6,
+           confidence = $7, fetched_at = NOW(), expires_at = $8`,
+        [
+          'defi_live', 'defi_stablecoin_supply',
+          `Stablecoins: Total $${fmt(totalSupply)} | USDT $${fmt(usdt?.circulating?.peggedUSD)} | USDC $${fmt(usdc?.circulating?.peggedUSD)}`,
+          JSON.stringify([
+            `Total stablecoin supply: $${fmt(totalSupply)}`,
+            `USDT supply: $${fmt(usdt?.circulating?.peggedUSD)}`,
+            `USDC supply: $${fmt(usdc?.circulating?.peggedUSD)}`,
+          ]),
+          JSON.stringify([{ url: 'https://defillama.com/stablecoins', title: 'DeFiLlama Stablecoins', score: 0.95 }]),
+          'DeFiLlama stablecoin supply', 0.95, expiresAt,
+        ]
+      );
+    }
+
+    logger.info('[NovaIntel] ✅ DeFi data stored in nova_knowledge');
+  } catch (err) {
+    logger.warn(`[NovaIntel] DeFi fetch failed: ${err}`);
+  }
+}
+
+// =========================================================================
+// Narrative Synthesis — cross-source intelligence
+// =========================================================================
+
+/**
+ * Synthesize narratives from ALL nova_knowledge sources.
+ * Reads Tavily research + social signals + DeFi data → produces cross-source narratives.
+ * Social buzz + on-chain data agreement = high confidence.
+ * Stored back in nova_knowledge as category 'narratives'.
+ */
+async function synthesizeNarratives(): Promise<void> {
+  const openaiKey = process.env.OPENAI_API_KEY;
+  if (!openaiKey) return;
+
+  const repo = await getRepo();
+  if (!repo) return;
+
+  // Pull recent knowledge across ALL categories (last 24h, not expired)
+  const result = await repo.query(
+    `SELECT category, topic, summary, facts, confidence
+     FROM nova_knowledge
+     WHERE fetched_at > NOW() - INTERVAL '24 hours' AND expires_at > NOW()
+     ORDER BY confidence DESC, fetched_at DESC
+     LIMIT 40`
+  );
+
+  if (result.rows.length < 4) {
+    logger.debug('[NovaIntel] Not enough knowledge for narrative synthesis');
+    return;
+  }
+
+  const knowledgeBlock = result.rows.map((k: any) => {
+    const facts = (k.facts || []).slice(0, 2).join('; ');
+    return `[${k.category}/${k.topic}] (conf:${k.confidence}) ${k.summary}${facts ? ' | ' + facts : ''}`;
+  }).join('\n');
+
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${openaiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.3,
+        response_format: { type: 'json_object' },
+        messages: [{
+          role: 'system',
+          content: `You synthesize crypto knowledge entries (from web research, social monitoring, DeFi APIs) into the TOP 5 market narratives.
+
+For each narrative, return:
+- id: short snake_case identifier (e.g., "restaking_momentum", "solana_safety")
+- summary: 2-3 sentences combining insights from multiple source types
+- facts: max 4 specific numbers/events backing this narrative
+- confidence: "high" if social + data sources agree, "medium" if single source type
+- trend: "rising" | "stable" | "fading"
+
+Return JSON: { "narratives": [...] }
+
+Rules:
+- Cross-source narratives are STRONGEST (KOLs + DeFi API agree = high confidence)
+- Needs data from 2+ knowledge entries to qualify
+- Max 5 narratives — quality over quantity
+- Include specific numbers from DeFi/research data when available`,
+        }, {
+          role: 'user',
+          content: `${result.rows.length} knowledge entries (last 24h):\n\n${knowledgeBlock}`,
+        }],
+      }),
+    });
+
+    if (!res.ok) return;
+
+    const data = await res.json();
+    const raw = data.choices?.[0]?.message?.content;
+    if (!raw) return;
+
+    const parsed = JSON.parse(raw);
+    const narratives = parsed.narratives || [];
+
+    for (const n of narratives) {
+      const topicId = `narrative_${(n.id || 'unknown').slice(0, 40)}`;
+      const expiresAt = new Date(Date.now() + 8 * 60 * 60 * 1000); // 8h TTL
+
+      await repo.query(
+        `INSERT INTO nova_knowledge (category, topic, summary, facts, sources, search_query, confidence, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (topic) DO UPDATE SET
+           summary = $3, facts = $4, sources = $5, search_query = $6,
+           confidence = $7, fetched_at = NOW(), expires_at = $8`,
+        [
+          'narratives', topicId,
+          `[${(n.trend || 'STABLE').toUpperCase()}] ${n.summary}`,
+          JSON.stringify(n.facts || []),
+          JSON.stringify([{ url: '', title: `Cross-source: ${n.confidence}`, score: n.confidence === 'high' ? 0.9 : 0.6 }]),
+          `Narrative synthesis: ${n.id}`,
+          n.confidence === 'high' ? 0.9 : 0.6,
+          expiresAt,
+        ]
+      );
+    }
+
+    logger.info(`[NovaIntel] ✅ Synthesized ${narratives.length} narratives from ${result.rows.length} knowledge entries`);
+  } catch (err) {
+    logger.warn(`[NovaIntel] Narrative synthesis failed: ${err}`);
+  }
+}
+
 /**
  * Run a research cycle — check which topics need refreshing and fetch new data.
  * Called on a schedule (3x daily) and can also be triggered manually.
  */
 export async function runResearchCycle(): Promise<void> {
   const tavilyKey = process.env.TAVILY_API_KEY;
-  if (!tavilyKey) {
-    logger.debug('[NovaResearch] No TAVILY_API_KEY — research disabled');
-    return;
-  }
 
-  const staleTopics = await getStaleTopics();
-
-  if (staleTopics.length === 0) {
-    logger.debug('[NovaResearch] All topics fresh — nothing to research');
-    return;
-  }
-
-  // Sort by priority, take top 5 per cycle (rate limiting)
-  const batch = staleTopics
-    .sort((a, b) => b.priority - a.priority)
-    .slice(0, 5);
-
-  logger.info(`[NovaResearch] Researching ${batch.length} topics: ${batch.map(t => t.id).join(', ')}`);
-
-  for (const topic of batch) {
-    try {
-      await researchTopic(topic);
-      // Rate limit: 1 search per 5 seconds
-      await new Promise(r => setTimeout(r, 5000));
-    } catch (err) {
-      logger.warn(`[NovaResearch] Failed to research ${topic.id}: ${err}`);
+  // === Phase 1: Tavily web research (existing behavior, unchanged) ===
+  if (tavilyKey) {
+    const staleTopics = await getStaleTopics();
+    if (staleTopics.length > 0) {
+      const batch = staleTopics.sort((a, b) => b.priority - a.priority).slice(0, 5);
+      logger.info(`[NovaResearch] Phase 1: Researching ${batch.length} topics: ${batch.map(t => t.id).join(', ')}`);
+      for (const topic of batch) {
+        try {
+          await researchTopic(topic);
+          await new Promise(r => setTimeout(r, 5000));
+        } catch (err) {
+          logger.warn(`[NovaResearch] Failed to research ${topic.id}: ${err}`);
+        }
+      }
+    } else {
+      logger.debug('[NovaResearch] Phase 1: All Tavily topics fresh');
     }
+  }
+
+  // === Phase 2: Social + DeFi data (new) ===
+  try {
+    const signalCount = await scanKOLs();
+    logger.info(`[NovaResearch] Phase 2: KOL scan → ${signalCount} signals`);
+  } catch (err) {
+    logger.warn(`[NovaResearch] Phase 2: KOL scan failed: ${err}`);
+  }
+
+  try {
+    await fetchDeFiData();
+    logger.info('[NovaResearch] Phase 2: DeFi data fetched');
+  } catch (err) {
+    logger.warn(`[NovaResearch] Phase 2: DeFi fetch failed: ${err}`);
+  }
+
+  // === Phase 3: Narrative synthesis (reads all sources, produces narratives) ===
+  await new Promise(r => setTimeout(r, 2000)); // Let Phase 1+2 data settle
+  try {
+    await synthesizeNarratives();
+  } catch (err) {
+    logger.warn(`[NovaResearch] Phase 3: Narrative synthesis failed: ${err}`);
   }
 }
 
@@ -858,19 +1328,19 @@ export async function runResearchCycle(): Promise<void> {
  * Map post types to relevant knowledge categories.
  */
 const CATEGORY_MAP: Partial<Record<NovaPostType, string[]>> = {
-  hot_take:           ['ecosystem', 'security', 'competitive', 'news', 'culture', 'bitcoin_macro', 'ai_agents'],
-  market_commentary:  ['ecosystem', 'news', 'security', 'defi', 'bitcoin_macro', 'culture'],
+  hot_take:           ['ecosystem', 'security', 'competitive', 'news', 'culture', 'bitcoin_macro', 'ai_agents', 'social_intel', 'narratives'],
+  market_commentary:  ['ecosystem', 'news', 'security', 'defi', 'bitcoin_macro', 'culture', 'defi_live', 'social_intel', 'narratives'],
   trust_talk:         ['security', 'educational', 'regulation'],
-  builder_insight:    ['ecosystem', 'educational', 'competitive', 'ai_agents', 'infrastructure'],
-  ai_thoughts:        ['ai_agents', 'educational', 'ecosystem', 'infrastructure'],
-  degen_wisdom:       ['ecosystem', 'security', 'educational', 'culture', 'defi'],
-  daily_recap:        ['news', 'culture', 'bitcoin_macro'],
-  gm:                 ['news', 'culture'],
-  market_roast:       ['ecosystem', 'security', 'bitcoin_macro', 'defi', 'culture'],
+  builder_insight:    ['ecosystem', 'educational', 'competitive', 'ai_agents', 'infrastructure', 'defi_live'],
+  ai_thoughts:        ['ai_agents', 'educational', 'ecosystem', 'infrastructure', 'social_intel', 'narratives'],
+  degen_wisdom:       ['ecosystem', 'security', 'educational', 'culture', 'defi', 'social_intel', 'narratives'],
+  daily_recap:        ['news', 'culture', 'bitcoin_macro', 'defi_live', 'social_intel', 'narratives'],
+  gm:                 ['news', 'culture', 'narratives'],
+  market_roast:       ['ecosystem', 'security', 'bitcoin_macro', 'defi', 'culture', 'social_intel', 'narratives'],
   behind_scenes:      ['ai_agents', 'infrastructure'],
-  random_banter:      ['culture', 'ecosystem'],
+  random_banter:      ['culture', 'ecosystem', 'social_intel'],
   community_poll:     ['ecosystem', 'culture', 'competitive'],
-  weekly_summary:     ['news', 'bitcoin_macro', 'ecosystem'],
+  weekly_summary:     ['news', 'bitcoin_macro', 'ecosystem', 'defi_live', 'narratives'],
 };
 
 /**
@@ -979,6 +1449,75 @@ export async function quickSearch(query: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+// =========================================================================
+// Reply Intel — fast DB lookup for reply engine
+// =========================================================================
+
+/**
+ * Check nova_knowledge for cached intelligence relevant to a tweet.
+ * Faster and free (DB query only) — use BEFORE quickSearch() which costs a Tavily credit.
+ * Returns context string for the reply prompt, or null if no match.
+ */
+export async function getReplyIntel(tweetText: string): Promise<string | null> {
+  const repo = await getRepo();
+  if (!repo) return null;
+
+  const text = tweetText.toLowerCase();
+
+  try {
+    // Check narratives first (cross-source, highest value)
+    const narratives = await repo.query(
+      `SELECT topic, summary, facts FROM nova_knowledge
+       WHERE category = 'narratives' AND expires_at > NOW()
+       ORDER BY confidence DESC LIMIT 5`
+    );
+
+    for (const n of narratives.rows) {
+      const keywords = (n.topic || '').replace(/^narrative_/, '').replace(/_/g, ' ').split(' ').filter((w: string) => w.length > 3);
+      const match = keywords.some((kw: string) => text.includes(kw));
+      const factMatch = (n.facts || []).some((f: string) => {
+        const tickers = f.match(/\$[A-Z]{2,10}/g) || [];
+        return tickers.some((t: string) => text.includes(t.toLowerCase()));
+      });
+
+      if (match || factMatch) {
+        const topFacts = (n.facts || []).slice(0, 2).join('; ');
+        return `NARRATIVE CONTEXT: ${n.summary}${topFacts ? ' Facts: ' + topFacts : ''}`;
+      }
+    }
+
+    // Check social intel
+    const social = await repo.query(
+      `SELECT summary, facts FROM nova_knowledge
+       WHERE category = 'social_intel' AND expires_at > NOW()
+       ORDER BY confidence DESC LIMIT 8`
+    );
+
+    for (const s of social.rows) {
+      const hasMention = (s.facts || []).some((f: string) =>
+        text.split(/\s+/).some((word: string) => word.length > 4 && f.toLowerCase().includes(word))
+      );
+      if (hasMention) return `INTEL: ${s.summary}`;
+    }
+
+    // Check DeFi data for protocol/TVL questions
+    if (/tvl|defi|protocol|yield|stablecoin|lending|staking|liquidity/i.test(text)) {
+      const defi = await repo.query(
+        `SELECT summary FROM nova_knowledge
+         WHERE category = 'defi_live' AND expires_at > NOW()
+         ORDER BY fetched_at DESC LIMIT 2`
+      );
+      if (defi.rows.length > 0) {
+        return `DeFi DATA: ${defi.rows.map((d: any) => d.summary).join(' | ')}`;
+      }
+    }
+  } catch (err) {
+    logger.debug(`[NovaIntel] getReplyIntel failed: ${err}`);
+  }
+
+  return null; // No cached intel — caller should fall back to quickSearch()
 }
 
 // =========================================================================

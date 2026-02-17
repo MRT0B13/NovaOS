@@ -6,7 +6,7 @@ import { canPostToX, recordXPost } from './novaPersonalBrand.ts';
 import { getNovaStats, type TokenMover } from './novaPersonalBrand.ts';
 import { scanToken, formatReportForTweet } from './rugcheck.ts';
 import { loadSet, saveSet, loadMap, saveMap } from './persistenceStore.ts';
-import { quickSearch } from './novaResearch.ts';
+import { quickSearch, getReplyIntel } from './novaResearch.ts';
 
 /**
  * X Reply Engine
@@ -770,6 +770,18 @@ Only tag if the tweet is directly about that account/topic. Never force a tag.`;
     // Enrich with web research for topic-relevant tweets
     let researchContext = '';
     const tweetLower = candidate.text.toLowerCase();
+
+    // Fast check: try cached intel from nova_knowledge first (free, no API call)
+    try {
+      const intel = await getReplyIntel(candidate.text);
+      if (intel) {
+        researchContext = `\n\nRESEARCH CONTEXT (from cached intelligence):\n${intel}\n\nRULES: You may reference this data naturally but NEVER invent additional statistics or numbers beyond what's shown above. If the data doesn't match the tweet topic, ignore it. Do NOT fabricate percentages, dollar amounts, or "reports say" claims. Wrong numbers kill credibility.`;
+        logger.info(`[ReplyEngine] Got cached intel for tweet (skipping Tavily)`);
+      }
+    } catch { /* non-critical */ }
+
+    // Fallback: if no cached intel, try Tavily web search (costs a credit)
+    if (!researchContext) {
     const TOPIC_KEYWORDS: { regex: RegExp; query: string }[] = [
       // Meme / launch platform
       { regex: /bonding curve|graduation|graduate/i, query: 'pump.fun bonding curve graduation mechanics' },
@@ -825,6 +837,7 @@ Only tag if the tweet is directly about that account/topic. Never force a tag.`;
         }
       } catch { /* non-critical */ }
     }
+    } // end fallback to Tavily
     
     let userPrompt = `Reply to this tweet:\n\n"${candidate.text}"`;
     
