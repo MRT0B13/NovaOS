@@ -1563,9 +1563,13 @@ ${stats.bestToken ? `Top performer: $${stats.bestToken.ticker}` : ''}
 FORMAT: Return exactly 3 tweets separated by ---
 - Tweet 1: Hook — punchy opener with the headline number (portfolio value, launches, or a win/loss). This is what gets people to click the thread. Max 240 chars.
 - Tweet 2: The breakdown — portfolio details, launches, notable tokens. Max 270 chars.
-- Tweet 3: Reflection + engagement question — honest take on the day, ask followers something. Max 250 chars.
+- Tweet 3: Closing statement — honest take, lesson learned, or forward-looking observation. Make it a STATEMENT worth responding to, NOT a question. Do NOT ask "what do you think?" or "what's your strategy?". End with conviction, not a question mark. Max 250 chars.
 
-You can use @solana, @Pumpfun, @elizaOS tags naturally. Be authentic, not corporate. NO hashtags (added automatically).`,
+RULES:
+- NEVER ask engagement questions like "What's your strategy?", "How are you navigating this?", "What do you think?"
+- NEVER write generic filler like "Learning from these fluctuations is crucial" or "Looking to share insights"
+- Make STATEMENTS. "0 graduations in 24 launches. The bonding curve doesn't care about your narrative." > "What's your strategy for managing losses?"
+- You can tag relevant accounts naturally: @solana, @Pumpfun, @elizaOS, @Rugcheckxyz, @daboraio, @dexscreener, @JupiterExchange, @RaydiumProtocol, @jaboraiapp, @shawmakesmagic, @aixbt_agent. Only tag when contextually relevant — don't force them in. Be authentic, not corporate. NO hashtags (added automatically).`,
 
     weekly_summary: `Write a 4-tweet X/Twitter THREAD for Week ${Math.ceil(stats.dayNumber / 7)} summary.
 
@@ -1581,13 +1585,20 @@ FORMAT: Return exactly 4 tweets separated by ---
 - Tweet 1: Hook — bold week headline with the key stat. "Week X in the books..." Max 240 chars.
 - Tweet 2: Numbers breakdown — portfolio, launches, wins/losses. Max 270 chars.
 - Tweet 3: Lessons & highlights — what you learned, best/worst moments. Max 270 chars.
-- Tweet 4: Looking ahead + engagement — what's next, ask for opinions, hype the community. Max 250 chars.
+- Tweet 4: Looking ahead — what's next, what you're changing, or an honest prediction. Make a STATEMENT, do NOT ask "what do you think?" or generic engagement questions. End with conviction. Max 250 chars.
 
-You can use @solana, @Pumpfun, @elizaOS tags naturally. Be real — celebrate wins AND own losses. NO hashtags (added automatically).`,
+RULES:
+- NEVER ask engagement questions like "What are your thoughts?", "How are you preparing?"
+- NEVER write filler like "Looking forward to sharing more insights" or "The journey continues"
+- You can tag relevant accounts naturally: @solana, @Pumpfun, @elizaOS, @Rugcheckxyz, @daboraio, @dexscreener, @JupiterExchange, @RaydiumProtocol, @jaboraiapp, @shawmakesmagic, @aixbt_agent. Only tag when contextually relevant — don't force them in. Be real — celebrate wins AND own losses. NO hashtags (added automatically).`,
   };
 
   const prompt = threadPrompts[type];
   if (!prompt) return null;
+
+  // Inject research knowledge into threads
+  const knowledgeBlock = await getKnowledgeForPostType(type);
+  const fullPrompt = knowledgeBlock ? `${prompt}${knowledgeBlock}` : prompt;
 
   try {
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -1600,7 +1611,7 @@ You can use @solana, @Pumpfun, @elizaOS tags naturally. Be real — celebrate wi
         model: 'gpt-4o-mini',
         messages: [
           { role: 'system', content: NOVA_PERSONA },
-          { role: 'user', content: prompt },
+          { role: 'user', content: fullPrompt },
         ],
         max_tokens: 800,
         temperature: 0.9,
