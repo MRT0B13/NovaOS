@@ -139,9 +139,9 @@ const EnvSchema = z.object({
   // Min interval between reply rounds (minutes) — 60m default keeps reads under ~30/mo
   X_REPLY_INTERVAL_MINUTES: z.coerce.number().default(60),
   // Reply engine target accounts (comma-separated handles without @)
-  X_REPLY_TARGETS: z.string().default('pumpdotfun,DexScreener,JupiterExchange,elizaOS,RugCheckXYZ,aixbt_agent'),
+  X_REPLY_TARGETS: z.string().default('pumpfun,DexScreener,JupiterExchange,elizaOS,RugCheckXYZ,aixbt_agent,solana,RaydiumProtocol,daboraio,jaboraiapp,shawmakesmagic'),
   // Reply engine search queries (comma-separated)
-  X_REPLY_SEARCH_QUERIES: z.string().default('pump.fun launched,pump.fun graduated,solana meme token,rugcheck'),
+  X_REPLY_SEARCH_QUERIES: z.string().default('pump.fun launched,pump.fun graduated,solana meme token,rugcheck,pumpswap,solana memecoin,bonding curve,AI agent crypto,elizaOS agent,meme coin rug'),
   
   // X Scheduler Configuration
   X_AUTO_TWEETS_PER_DAY: z.coerce.number().default(2),       // Tweets per day per token

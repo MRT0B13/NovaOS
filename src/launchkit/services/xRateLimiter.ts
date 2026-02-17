@@ -46,11 +46,11 @@ let readRateLimitedUntil = 0;
 let readConsecutive429Count = 0;
 let lastRead429At = 0;
 
-// Per-endpoint read tracking — cooldowns depend on tier.
-// Pay-per-use: mentions 5/15min → 4 min cooldown; search 60/15min → 1 min cooldown.
-// Free tier: 1 per 15 min per endpoint → 16 min cooldown.
-const PPU_MENTION_COOLDOWN_MS = 4 * 60 * 1000;   // 4 minutes (5 per 15 min)
-const PPU_SEARCH_COOLDOWN_MS  = 1 * 60 * 1000;   // 1 minute  (60 per 15 min)
+// Per-endpoint read tracking — cooldowns to avoid hammering the API.
+// PPU tier actual rate limits: 300/15min for both mentions and search.
+// We use conservative cooldowns to stay well within budget ($0.005/read).
+const PPU_MENTION_COOLDOWN_MS = 4 * 60 * 1000;   // 4 minutes (conservative, limit is 300/15min)
+const PPU_SEARCH_COOLDOWN_MS  = 1 * 60 * 1000;   // 1 minute  (conservative, limit is 300/15min)
 const FREE_ENDPOINT_COOLDOWN_MS = 16 * 60 * 1000; // 16 minutes (1 per 15 min)
 let lastMentionReadAt = 0;
 let lastSearchReadAt  = 0;

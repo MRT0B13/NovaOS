@@ -280,8 +280,13 @@ async function _runReplyRoundInner(): Promise<void> {
   // Find candidates
   logger.info(`[ReplyEngine] Round #${state.roundCount} — finding candidates...`);
   const candidates = await findCandidates(reader);
+  
+  // ALWAYS increment round counter — ensures we alternate mentions/search
+  // regardless of whether we found candidates or posted a reply.
+  state.roundCount++;
+  
   if (candidates.length === 0) {
-    logger.info(`[ReplyEngine] Round #${state.roundCount} — no candidates found`);
+    logger.info(`[ReplyEngine] Round #${state.roundCount - 1} — no candidates found`);
     return;
   }
   
@@ -355,7 +360,8 @@ async function _runReplyRoundInner(): Promise<void> {
     }
     
     // Increment round counter
-    state.roundCount++;
+    // (already incremented above after findCandidates — this is intentionally removed)
+    // state.roundCount++;
     
     logger.info(`[ReplyEngine] Reply #${state.repliesToday} posted (${candidate.source}: ${candidate.tweetId.slice(0, 8)})`);
   } catch (err: any) {
@@ -468,6 +474,7 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
           });
         }
       }
+      logger.info(`[ReplyEngine] Mentions: ${mentions.length} fetched, ${candidates.length} new candidates (${mentions.length - candidates.length} already seen)`);
     } catch (err: any) {
       const msg = err?.message || String(err);
       if (msg.includes('429') || msg.includes('rate limit') || msg.includes('Too Many')) {
@@ -496,6 +503,7 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
       try {
         const results = await reader.searchTweets(query, 10);
         await recordSearchRead();
+        let newCount = 0;
         for (const t of results) {
           if (!state.repliedTweetIds.has(t.id)) {
             candidates.push({
@@ -506,8 +514,10 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
               source: 'search',
               query,
             });
+            newCount++;
           }
         }
+        logger.info(`[ReplyEngine] Search "${query}": ${results.length} fetched, ${newCount} new candidates`);
       } catch (err: any) {
         const msg = err?.message || String(err);
         if (msg.includes('429') || msg.includes('rate limit') || msg.includes('Too Many')) {
@@ -610,14 +620,14 @@ function pickBestCandidate(candidates: ReplyCandidate[]): ReplyCandidate | null 
   for (const c of candidates) {
     // Spam filter FIRST — catches DM scams, follow bait, ads, etc.
     if (isSpam(c.text)) {
-      logger.debug(`[ReplyEngine] SPAM filtered: "${c.text.slice(0, 60)}..." (${c.source})`);
+      logger.info(`[ReplyEngine] SPAM skipped: "${c.text.slice(0, 80)}..." (${c.source})`);
       state.repliedTweetIds.add(c.tweetId); // Don't retry this one
       continue;
     }
     
     // Relevance filter — mentions pass by default, search must match keywords
     if (!isRelevant(c.text, c.source)) {
-      logger.debug(`[ReplyEngine] IRRELEVANT filtered: "${c.text.slice(0, 60)}..." (${c.source})`);
+      logger.info(`[ReplyEngine] IRRELEVANT skipped: "${c.text.slice(0, 80)}..." (${c.source})`);
       state.repliedTweetIds.add(c.tweetId); // Don't retry
       continue;
     }
@@ -630,7 +640,7 @@ function pickBestCandidate(candidates: ReplyCandidate[]): ReplyCandidate | null 
     return null;
   }
   
-  logger.debug(`[ReplyEngine] ${viable.length}/${candidates.length} candidates passed filters`);
+  logger.info(`[ReplyEngine] ${viable.length}/${candidates.length} candidates passed filters`);
   
   // Priority: mentions > search
   const mentions = viable.filter(c => c.source === 'mention');

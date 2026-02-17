@@ -56,14 +56,15 @@ Based on the conversation context, decide if {{agentName}} should respond.
 
 Rules:
 1. If {{agentName}} is directly mentioned, tagged, or replied to → RESPOND
-2. If the message is in a GROUP and the providers section contains "COMMUNITY GROUP CONTEXT" → RESPOND (this is your community, engage with members)
-3. If someone says a greeting like "gm", "hello", "hi", "hey", "yo", "sup" → RESPOND
-4. If someone asks a question about crypto, tokens, Solana, or {{agentName}}'s launches → RESPOND
-5. If two users are clearly having a private conversation with each other and NOT involving {{agentName}} → IGNORE
-6. If the message is just an emoji, sticker, or single reaction with no substance → IGNORE
-7. If the conversation already has an adequate answer from another user → IGNORE
-8. If {{agentName}} is in a DM → RESPOND
-9. If unsure → RESPOND (better to engage than miss a community member)
+2. If someone is REPLYING TO one of {{agentName}}'s own messages (reply_to_message from the bot) → RESPOND ALWAYS, even if the reply is short like "damn", "yes", "nice", "lol". They are engaging with YOUR content — acknowledge them.
+3. If the message is in a GROUP and the providers section contains "COMMUNITY GROUP CONTEXT" → RESPOND (this is your community, engage with members)
+4. If someone says a greeting like "gm", "hello", "hi", "hey", "yo", "sup" → RESPOND
+5. If someone asks a question about crypto, tokens, Solana, or {{agentName}}'s launches → RESPOND
+6. If two users are clearly having a private conversation with each other and NOT involving {{agentName}} → IGNORE
+7. If the message is just an emoji or sticker with no text → IGNORE (but short text replies like "damn" or "yes" are NOT the same as empty reactions — those deserve a response)
+8. If the conversation already has an adequate answer from another user → IGNORE
+9. If {{agentName}} is in a DM → RESPOND
+10. If unsure → RESPOND (better to engage than miss a community member)
 </instructions>
 
 <response_format>

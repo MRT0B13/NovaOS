@@ -134,13 +134,60 @@ async function main() {
         console.log('  → Rate limited. The 429 backoff will pause retries.');
       }
     }
+
+    // ── Search Test ──
+    const searchQueries = (process.env.X_REPLY_SEARCH_QUERIES || 'pump.fun launched,pump.fun graduated,solana meme token,rugcheck,pumpswap,solana memecoin,bonding curve,AI agent crypto,elizaOS agent,meme coin rug').split(',').map(q => q.trim()).filter(Boolean);
+    console.log(`\n  ── Search Test (${searchQueries.length} queries) ──`);
+    
+    // Pick first 2 queries to test (minimize API calls)
+    const testQueries = searchQueries.slice(0, 2);
+    for (const query of testQueries) {
+      console.log(`\n  Query: "${query}" (limit: 5)...`);
+      try {
+        const results = await reader.searchTweets(query, 5);
+        console.log(`  Results: ${results.length}`);
+        
+        if (results.length > 0) {
+          for (const r of results) {
+            const textPreview = r.text.slice(0, 80).replace(/\n/g, ' ');
+            console.log(`\n    Tweet: "${textPreview}${r.text.length > 80 ? '...' : ''}"`);
+            console.log(`      ID: ${r.id} | Author: ${r.authorId || 'unknown'}`);
+            
+            const lower = r.text.toLowerCase();
+            const SPAM_PATTERNS = [
+              'dm me', 'check your dm', 'check dm', 'sent you a dm', "let's connect",
+              'follow me', 'follow back', 'f4f', 'like and retweet', 'rt and follow',
+              'claim your', 'connect wallet', 'validate your wallet', 'guaranteed profit',
+              'send sol to', 'send eth to', 'free airdrop claim', 'claim now',
+              'grow your account', 'marketing services', 'book a call', 'link in bio',
+              'nice project', 'great project', 'amazing project', 'check out my',
+              'looks promising sir', 'drop your wallet', 'tag 3 friends',
+              'sponsored', 'ad:', '#ad ', 'limited time offer', 'use code',
+              'shop now', 'buy now', 'order now', 'free shipping',
+            ];
+            const spamMatch = SPAM_PATTERNS.find(p => lower.includes(p));
+            console.log(`      ${spamMatch ? `🚫 SPAM — "${spamMatch}"` : '✅ Not spam'}`);
+          }
+        }
+      } catch (err: any) {
+        console.log(`  ❌ Search failed: ${err.message}`);
+        if (err.message?.includes('403')) {
+          console.log('  → Search requires Basic API tier. Free/PPU tier cannot search.');
+          break;
+        }
+        if (err.message?.includes('429')) {
+          console.log('  → Rate limited. Try again in a few minutes.');
+          break;
+        }
+      }
+    }
     
   } catch (err: any) {
     console.log(`  ❌ Could not initialize Twitter client: ${err.message}`);
   }
 
   console.log('\n═══════════════════════════════════════════════');
-  console.log('  DONE — API calls made: 1 (getMentions)');
+  console.log('  DONE');
   console.log('═══════════════════════════════════════════════');
 }
 

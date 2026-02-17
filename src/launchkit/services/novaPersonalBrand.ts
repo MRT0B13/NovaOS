@@ -1191,8 +1191,8 @@ IMPORTANT:
 - KEEP POSTS UNDER 250 CHARACTERS for Twitter/X (hashtags and tags are added separately)
 - Do NOT include hashtags in your post — they'll be added automatically
 - You CAN tag accounts like @elizaOS, @solana, @Pumpfun, @Rugcheckxyz naturally when relevant
-- When adding reaction options, ONLY use Telegram-supported emojis: 👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🤡 🥱 😍 🐳 💯 🤣 ⚡ 🏆 💔 🤨 😐 😈 😴 😭 🤓 👻 👀 🙈 😇 🤝 🤗 🤪 🗿 🆒 😎 👾 🤷 😡
-- NEVER use these as reactions (Telegram won't support them): 💎 🚀 📊 📈 💡 ❌ 💀 🤑 💭 🍳 💤 🎲 💰 📉 🐂 🐻 🎨 🌅 ☀️ 🌙 🌊 ⏰ 👥 🎯 📊 🗳️
+- For Telegram GROUP CHAT posts: write conversationally. Do NOT end posts with trailing emoji reactions (🔥👀🤔 etc). This is a group chat where people talk — your post should read like something said in a conversation, not a broadcast with reaction buttons.
+- For Telegram CHANNEL posts: you can use 1-2 emojis naturally inline, but don't append reaction menus.
 - @ tags like @solana, @elizaOS, @Pumpfun ONLY work on X/Twitter. If the prompt says "Telegram" or doesn't mention X, use plain names: "Solana", "elizaOS", "pump.fun" instead`;
 
 async function generateAIContent(
@@ -1266,7 +1266,7 @@ Rules:
 - Lead with a specific observation from the token data above, OR a simple "Day ${stats.dayNumber}. Still here." if nothing stands out
 - Do NOT list your launch count, graduation count, and portfolio value together — that's for the daily recap
 - ONE specific data point max. Not a stats dump.
-- ${platform === 'x' ? 'MAX 240 chars. You can tag @solana or @Pumpfun. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 👍 😴 🤯 ❤ 🏆 🤝 👏'}
+- ${platform === 'x' ? 'MAX 240 chars. You can tag @solana or @Pumpfun. NO reaction emojis.' : 'Do NOT use @ tags. This is a GROUP CHAT — write conversationally, not like a report. No trailing emojis. If your observation is interesting, people will reply with words.'}
 - Do NOT fabricate observations. If none of the token data above is interesting, just keep it short.
 - Do NOT ask "what trends are you seeing" or "what are you watching" — nobody responds to that with 40 followers.`,
 
@@ -1288,7 +1288,7 @@ Rules:
 - If a specific token moved significantly, mention it by ticker.
 - Be honest about losses. This is an accountability post.
 - End with ONE forward-looking sentence (what you'll do differently, what you noticed). Not "stay tuned" or "the grind continues."
-- ${platform === 'x' ? 'MAX 240 chars. Tag @Pumpfun if relevant. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 👍 👎 😴 🤯 💩 🏆'}`,
+- ${platform === 'x' ? 'MAX 240 chars. Tag @Pumpfun if relevant. NO reaction emojis.' : 'Do NOT use @ tags. This is a group chat — write like you\'re talking to people, not posting a report. No trailing emojis.'}`,
 
     weekly_summary: `Write a weekly summary for Week ${Math.ceil(stats.dayNumber / 7)}${platform === 'x' ? ' on X/Twitter (MAX 240 chars, one key stat + one takeaway)' : platform === 'telegram' ? ' for Telegram (full breakdown)' : ''}.
 
@@ -1301,7 +1301,7 @@ ${stats.holdingsCount > 0 && stats.totalDevBuySol > 0 ? `Dev buy ROI: spent ${st
 
 Rules:
 - Transparent P&L. One concrete lesson from the week.
-- ${platform === 'x' ? 'MAX 240 chars. Tag @elizaOS or @Pumpfun if relevant. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 👍 👎 🏆 🤯 👏 ❤'}`,
+- ${platform === 'x' ? 'MAX 240 chars. Tag @elizaOS or @Pumpfun if relevant. NO reaction emojis.' : 'Do NOT use @ tags. Group chat tone — share the takeaway like you\'re telling someone at a bar, not writing a newsletter.'}`,
 
     builder_insight: `Write a post about something specific you observed or learned${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram' : ''}.
 
@@ -1316,7 +1316,7 @@ Rules:
 - Do NOT list "X launches, Y graduated, Z SOL portfolio" — that's recap territory.
 - Do NOT fabricate data. Only reference numbers shown above.
 - Do NOT say "stay tuned", "more to come", "the grind continues", "let's hear your thoughts"
-- ${platform === 'x' ? 'MAX 240 chars. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 👀 🤯 ❤ 🏆 👏'}`,
+- ${platform === 'x' ? 'MAX 240 chars. NO reaction emojis.' : 'Do NOT use @ tags. Group chat — conversational, no trailing emojis. Make an observation people will want to respond to (but do NOT ask a question).'}`,
 
     market_commentary: `Write a market observation${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram' : ''}.
 ${additionalContext || ''}
@@ -1333,12 +1333,12 @@ Rules:
 - If you have volume or price data, use it. "Seeing sell pressure across my tokens today — 3 of 5 red, average -15%."
 - If no data is available, comment on something you can actually verify (tx speed, gas, bonding curve mechanics).
 - Do NOT fabricate ecosystem-wide stats ("pump.fun graduation rate is X%") unless the data is in the context above.
-- ${platform === 'x' ? 'MAX 240 chars. Tag @Pumpfun or @solana if relevant. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 🤔 😴 👀 🤯'}`,
+- ${platform === 'x' ? 'MAX 240 chars. Tag @Pumpfun or @solana if relevant. NO reaction emojis.' : 'Do NOT use @ tags. Group chat tone — share what you see, no trailing emojis.'}`,
 
     milestone: `Write a milestone post${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : platform === 'telegram' ? ' for Telegram' : ''}.
 ${additionalContext || ''}
 Lead with the specific milestone number. One sentence of what it means. Not "OMG we did it!!!"
-- ${platform === 'x' ? 'MAX 240 chars. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 🔥 ❤ 🏆 👏 🎉 🤯'}`,
+- ${platform === 'x' ? 'MAX 240 chars. NO reaction emojis.' : 'Do NOT use @ tags. Keep it conversational — no trailing emojis.'}`,
 
     behind_scenes: `Write a behind-the-scenes update${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : ' for Telegram'}.
 
@@ -1361,7 +1361,7 @@ NEVER rules:
 - NEVER invent infrastructure you don't use (no Redis, no Kafka, no Kubernetes, no Memcached, no Chainlink, no Serum, no GraphQL subscriptions)
 - NEVER claim latency or performance numbers (no "reduced X ms", "improved Y%", "dropped 40ms")
 - NEVER mention switching, migrating, or upgrading systems
-- ${platform === 'x' ? 'MAX 240 chars. Tag @elizaOS if about your stack. NO reaction emojis.' : 'Do NOT use @ tags. End with 2-3 reaction emojis from: 👀 🔥 🤔 👏'}`,
+- ${platform === 'x' ? 'MAX 240 chars. Tag @elizaOS if about your stack. NO reaction emojis.' : 'Do NOT use @ tags. Group chat — talk about what you found, no trailing emojis. Be specific and interesting.'}`,
 
     // === PERSONALITY POSTS (X only) ===
 
@@ -1415,14 +1415,14 @@ Be funny, not informational.`,
     community_poll: `Write a poll question for your Telegram community.
 ${additionalContext || 'Ask about something specific — a token decision, market take, or strategy choice.'}
 Keep the question SHORT. The poll options should be clear and opinionated.
-Do NOT use @ tags. End with reaction options.`,
+Do NOT use @ tags. Keep the question conversational for the group chat.`,
 
     trust_talk: `Write a post about transparency and safety in meme tokens${platform === 'x' ? ' on X/Twitter (MAX 240 chars)' : ' for Telegram'}.
 ${safetyData}
 
 Reference the REAL numbers above. Do NOT invent scan counts or risk scores.
 Example: "Ran X RugCheck scans this week. Y flagged for active mint authority. Every Nova launch passes clean."
-${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. End with 2-3 reaction emojis.'}`,
+${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. Group chat tone — share the safety data like you\'re briefing the room.'}`,
   };
   
   const basePrompt = typePrompts[type] || typePrompts.gm;
