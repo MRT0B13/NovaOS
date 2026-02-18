@@ -367,6 +367,13 @@ elizaos dev
 - Running untrusted agent code
 - Disabling RugCheck safety checks
 
+<a href="https://aiagentsdirectory.com?utm_source=badge&utm_medium=referral&utm_campaign=free_listing&utm_content=homepage" target="_blank" rel="noopener noreferrer">
+  <img src="https://aiagentsdirectory.com/featured-badge.svg?v=2024" alt="Featured AI Agents on AI Agents Directory" width="200" height="50" />
+</a>
+
+
+
+
 ## License
 
 MIT
