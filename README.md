@@ -1,10 +1,20 @@
 # Nova v1
 
-**Autonomous Meme Token Launch Agent on Solana**
+**Autonomous AI Agent Swarm on Solana**
 
-Nova is a fully autonomous AI agent that launches meme tokens on pump.fun, manages communities on Telegram, builds a personal brand on X/Twitter, replies to ecosystem tweets, and tracks portfolio performance — all without human intervention.
+Nova is a fully autonomous multi-agent AI swarm that launches meme tokens on pump.fun, monitors crypto narratives across 20+ KOLs, detects rugs in real-time, manages communities on Telegram, builds a personal brand across X/Twitter and Farcaster, and tracks portfolio performance — all without human intervention. Powered by a 6-agent architecture with self-healing capabilities.
 
 ## Key Features
+
+### 🧠 Agent Swarm Architecture
+
+- **6 Specialized Agents**: Scout, Guardian, Analyst, Launcher, Community, and Health — each with dedicated responsibilities
+- **Supervisor Orchestration**: Nova Supervisor synthesizes intelligence from all agents, routes tasks, and makes strategic decisions
+- **Message Bus**: Typed inter-agent communication (intel, alert, task, health, status) with priority routing
+- **Self-Healing**: Health Agent monitors heartbeats, detects failures, auto-restarts crashed agents with exponential backoff
+- **Token Child Agents**: Dynamically spawned per-token agents with mascot personas for Telegram groups
+- **Agent Factory**: Create, list, and manage child agents via Telegram commands (`/spawn`, `/factory_list`, `/factory_kill`)
+- **Graceful Shutdown**: All agents coordinate shutdown via AbortController, persist state to DB
 
 ### 🚀 Token Launch & Management
 
@@ -45,6 +55,14 @@ Nova is a fully autonomous AI agent that launches meme tokens on pump.fun, manag
 - **Trend Monitoring**: Real-time trend detection with scoring, decay, and pool management
 - **Community Voting Integration**: Ideas posted for feedback before autonomous launch
 - **RugCheck Pre-Launch Scan**: Every autonomous launch verified for safety
+- **Dry Run Mode**: Full pipeline simulation without real transactions — portfolio posts suppressed, trades logged but not executed
+
+### 🌐 Farcaster Integration
+
+- **Multi-Channel Publishing**: Cast to Farcaster channels (solana, ai-agents, memecoins, crypto)
+- **Neynar SDK**: Managed signers for programmatic casting via Neynar API
+- **Smart Channel Routing**: Content type → channel mapping (launches to /memecoins, safety to /solana, intel to /ai-agents)
+- **Cross-Platform Bridging**: Same content engine feeds X, Telegram, and Farcaster simultaneously
 
 ### 📊 Data-Driven Intelligence
 
@@ -53,12 +71,24 @@ Nova is a fully autonomous AI agent that launches meme tokens on pump.fun, manag
 - **System Metrics**: Uptime, tweets sent, TG posts, trends detected, error rates
 - **Fee Revenue Reports**: PumpSwap creator fee earnings per token and aggregate
 
+### 📡 Dashboard API
+
+- **19 REST Endpoints**: Full dashboard data access at port 8787 behind admin auth
+- **Swarm Monitoring**: `/v1/swarm/status`, `/v1/swarm/messages` — real-time agent state & inter-agent comms
+- **Health & Repairs**: `/v1/health/errors`, `/v1/health/repairs`, `/v1/health/report` — error tracking and self-healing status
+- **System Metrics**: `/v1/metrics/system`, `/v1/metrics/x-usage`, `/v1/metrics/engagement` — comprehensive operational data
+- **Intelligence Feed**: `/v1/intelligence/feed`, `/v1/intelligence/trends` — narrative detection and trend analysis
+- **Portfolio & Wallet**: `/v1/portfolio/summary`, `/v1/portfolio/positions`, `/v1/wallet/balance` — P&L and balance data
+- **Token Prices**: `/v1/prices/:mint` — real-time DexScreener pricing
+- **Community & Config**: `/v1/community/stats/:chatId`, `/v1/community/voting`, `/v1/config/status`
+
 ### 🚂 Production Deployment
 
 - **Railway Native**: PostgreSQL persistence, auto-deploy from `main` branch
-- **43 Service Files**: Modular architecture — each feature isolated in its own service
+- **50+ Service Files**: Modular architecture — each feature isolated in its own service
 - **Hybrid Storage**: PostgreSQL primary, JSON file fallback for local development
-- **20+ Database Tables**: Full state persistence across restarts
+- **25+ Database Tables**: Full state persistence across restarts
+- **PM2 Support**: `ecosystem.config.cjs` for multi-process production deployments
 
 ## Quick Start
 
@@ -118,7 +148,29 @@ ADMIN_CHAT_ID=your_user_id
 ADMIN_ALERTS=true
 ```
 
-### 4. Configure Twitter/X (Recommended)
+### 4. Configure Farcaster (Optional)
+
+```bash
+# Enable Farcaster publishing
+FARCASTER_ENABLE=true
+
+# Neynar API (sign up at neynar.com)
+NEYNAR_API_KEY=your_neynar_api_key
+
+# Farcaster signer (create managed signer in Neynar dashboard)
+FARCASTER_SIGNER_UUID=your_signer_uuid
+
+# Your Farcaster FID (numeric ID from your Warpcast profile)
+FARCASTER_FID=your_fid_number
+```
+
+**How to get these:**
+
+1. **FID**: Create a Warpcast account → your FID is in your profile or via `api.neynar.com/v2/farcaster/user/by_username?username=YOUR_NAME`
+2. **Neynar API Key**: Sign up at [neynar.com](https://neynar.com) → create a project → copy API key
+3. **Signer UUID**: In Neynar dashboard → Signers → Create Signer → approve via Warpcast QR scan → copy `signer_uuid`
+
+### 5. Configure Twitter/X (Recommended)
 
 ```bash
 # OAuth 1.0a credentials from developer.twitter.com
@@ -145,7 +197,7 @@ NOVA_GM_POST_TIME=09:00           # UTC
 NOVA_RECAP_POST_TIME=22:00        # UTC
 ```
 
-### 5. Configure AI Services
+### 6. Configure AI Services
 
 ```bash
 OPENAI_API_KEY=your_openai_key    # gpt-4o-mini for content, DALL-E 3 for images
@@ -153,13 +205,13 @@ AI_LOGO_ENABLE=true
 AI_MEME_ENABLE=true
 ```
 
-### 5. Verify Configuration
+### 7. Verify Configuration
 
 ```bash
 bun run scripts/check-wallet.ts
 ```
 
-### 6. Start Agent
+### 8. Start Agent
 
 ```bash
 elizaos dev
@@ -241,29 +293,40 @@ elizaos dev
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                              Nova v1                                      │
-├───────────────────────────────────────────────────────────────────────────┤
-│ Character: Nova (Default) / Token Mascots (in TG groups)                  │
-├──────────────────┬─────────────────────┬──────────────────────────────────┤
-│   52+ Actions    │   43 Services       │        Database (PostgreSQL)     │
-├──────────────────┼─────────────────────┼──────────────────────────────────┤
-│ • Wallet Mgmt    │ • FundingWallet     │ • LaunchPacks & Token Data       │
-│ • Token Launch   │ • PumpLauncher      │ • Scheduled Posts (TG/X)         │
-│ • TG Moderation  │ • TelegramSetup     │ • PnL & Token Positions          │
-│ • TG Community   │ • TelegramCommunity │ • System Metrics                 │
-│ • X Marketing    │ • XPublisher        │ • Community Voting               │
-│ • X Replies      │ • XReplyEngine      │ • Trend Pool                     │
-│ • Personal Brand │ • NovaPersonalBrand │ • RugCheck Reports               │
-│ • Scam Detection │ • TelegramSecurity  │ • Token Snapshots                │
-│ • Auto-Sell      │ • AutoSellPolicy    │ • X Rate Limit & Usage           │
-│ • Autonomous     │ • AutonomousMode    │ • Autonomous State               │
-│ • System Reports │ • SystemReporter    │ • PumpSwap Fees                  │
-│ • List Actions   │ • TrendMonitor      │ • Weekly Thread Data             │
-└──────────────────┴─────────────────────┴──────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Nova v1 — Agent Swarm                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                          🧠 Supervisor (Nova)                               │
+│                  Orchestrates │ Routes │ Synthesizes                        │
+├──────┬──────┬──────┬──────┬──────┬──────┬───────────────────────────────────┤
+│  🔍  │  🛡️  │  📊  │  🚀  │  💬  │  🏥  │        Message Bus               │
+│Scout │Guard │Analy │Launch│Commu │Health│  intel│alert│task│health│status   │
+├──────┴──────┴──────┴──────┴──────┴──────┴───────────────────────────────────┤
+│ Character: Nova (Default) / Token Mascots (child agents in TG groups)      │
+├──────────────────┬─────────────────────┬────────────────────────────────────┤
+│   52+ Actions    │   50+ Services      │        Database (PostgreSQL)       │
+├──────────────────┼─────────────────────┼────────────────────────────────────┤
+│ • Wallet Mgmt    │ • FundingWallet     │ • LaunchPacks & Token Data         │
+│ • Token Launch   │ • PumpLauncher      │ • Scheduled Posts (TG/X/FC)        │
+│ • TG Moderation  │ • TelegramSetup     │ • PnL & Token Positions            │
+│ • TG Community   │ • TelegramCommunity │ • System Metrics & Engagement      │
+│ • X Marketing    │ • XPublisher        │ • Community Voting                 │
+│ • X Replies      │ • XReplyEngine      │ • Trend Pool                       │
+│ • Personal Brand │ • NovaPersonalBrand │ • RugCheck Reports                 │
+│ • Scam Detection │ • TelegramSecurity  │ • Token Snapshots                  │
+│ • Auto-Sell      │ • AutoSellPolicy    │ • X Rate Limit & Usage             │
+│ • Autonomous     │ • AutonomousMode    │ • Agent Registry & Heartbeats      │
+│ • System Reports │ • SystemReporter    │ • Agent Messages & Errors          │
+│ • Farcaster      │ • FarcasterPublish  │ • Health Reports & Repairs         │
+│ • Agent Factory  │ • TokenChildAgent   │ • PumpSwap Fees                    │
+│ • Dashboard API  │ • TrendMonitor      │ • Weekly Thread Data               │
+└──────────────────┴─────────────────────┴────────────────────────────────────┘
+│                                                                             │
+│  Dashboard API (port 8787) — 33+ endpoints behind admin auth                │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Service Layer (43 services)
+### Service Layer (50+ services)
 
 | Category             | Services                                                                                                                                                                  |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -271,9 +334,12 @@ elizaos dev
 | **Wallet & Finance** | fundingWallet, treasuryService, treasuryScheduler, pnlTracker, pumpswapFees                                                                                               |
 | **X/Twitter**        | xPublisher, xReplyEngine, xMarketing, xScheduler, xRateLimiter                                                                                                            |
 | **Personal Brand**   | novaPersonalBrand, weeklyThread, novaChannel                                                                                                                              |
+| **Farcaster**        | farcasterPublisher — multi-channel casting via Neynar SDK with smart channel routing                                                                                      |
 | **Telegram**         | telegramPublisher, telegramCommunity, telegramMarketing, telegramScheduler, telegramSetup, telegramSecurity, telegramBanHandler, telegramUserCache, telegramHealthMonitor |
 | **Safety & Data**    | rugcheck, priceService, operatorGuardrails, autoSellPolicy                                                                                                                |
-| **Intelligence**     | trendMonitor, trendPool, groupHealthMonitor, communityVoting                                                                                                              |
+| **Intelligence**     | trendMonitor, trendPool, groupHealthMonitor, communityVoting, engagementTracker, communityTargets, replyRules                                                             |
+| **Agent Swarm**      | supervisor, scout, guardian, analyst, launcher, communityAgent, healthAgent, tokenChildAgent, agentFactory                                                                |
+| **Dashboard API**    | server (33+ endpoints), swarm status views, health/error/repair views                                                                                                     |
 | **Infrastructure**   | systemReporter, adminNotify, audit, redact, secrets, time, groupTracker                                                                                                   |
 
 ## Key Technical Features
@@ -349,6 +415,7 @@ elizaos dev
 | **PumpPortal**            | Token creation, dev buys                 | Per-transaction                          |
 | **CryptoPanic**           | Trending crypto news for autonomous mode | API key required                         |
 | **Telegram Bot API**      | Group management, messaging              | Standard rate limits                     |
+| **Neynar (Farcaster)**    | Farcaster casting via managed signers    | 1000 casts/day (free tier)               |
 
 ## Security Notes
 
@@ -370,9 +437,6 @@ elizaos dev
 <a href="https://aiagentsdirectory.com?utm_source=badge&utm_medium=referral&utm_campaign=free_listing&utm_content=homepage" target="_blank" rel="noopener noreferrer">
   <img src="https://aiagentsdirectory.com/featured-badge.svg?v=2024" alt="Featured AI Agents on AI Agents Directory" width="200" height="50" />
 </a>
-
-
-
 
 ## License
 

@@ -27,6 +27,10 @@ export class HealthMonitor {
   // Track restart attempts per agent (for restart loop detection)
   private restartAttempts: Map<string, number[]> = new Map();
 
+  // Track last degradation rule firing to prevent spam (ruleKey → timestamp)
+  private degradationCooldowns: Map<string, number> = new Map();
+  private static readonly DEGRADATION_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+
   constructor(pool: Pool, config?: Partial<HealthConfig>, projectRoot?: string) {
     this.config = { ...DEFAULT_HEALTH_CONFIG, ...config };
     this.db = new HealthDB(pool);
@@ -124,6 +128,11 @@ export class HealthMonitor {
 
   private async checkApis(): Promise<void> {
     for (const api of MONITORED_APIS) {
+      // Skip API checks for services without configured credentials
+      if (api.name === 'Anthropic' && !process.env.ANTHROPIC_API_KEY) continue;
+      if (api.name === 'OpenAI' && !process.env.OPENAI_API_KEY) continue;
+      if (api.name === 'Twitter API' && !process.env.TWITTER_BEARER_TOKEN && !process.env.TWITTER_API_KEY) continue;
+
       try {
         const start = Date.now();
         const controller = new AbortController();
@@ -303,6 +312,11 @@ export class HealthMonitor {
 
     const rule = DEGRADATION_RULES[ruleKey];
     if (!rule) return;
+
+    // Cooldown: don't fire the same degradation rule more than once per 30 min
+    const lastFired = this.degradationCooldowns.get(ruleKey) || 0;
+    if (Date.now() - lastFired < HealthMonitor.DEGRADATION_COOLDOWN_MS) return;
+    this.degradationCooldowns.set(ruleKey, Date.now());
 
     console.log(`[HealthAgent] 🔄 Applying degradation rule: ${ruleKey} → ${rule.action}`);
 

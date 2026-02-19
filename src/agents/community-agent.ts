@@ -163,25 +163,35 @@ export class CommunityAgent extends BaseAgent {
     let activeGroups = 0;
 
     try {
-      // Check recent bans from system_reporter data (stored in fail_log or similar)
-      const banResult = await this.pool.query(`
-        SELECT COUNT(*) as cnt FROM engagement_log
-        WHERE action = 'ban' AND created_at > NOW() - INTERVAL '30 minutes'
-      `);
-      newBans = parseInt(banResult.rows[0]?.cnt) || 0;
+      // Check recent bans (verify engagement_log exists to avoid PG error log noise)
+      const tableCheck = await this.pool.query(
+        `SELECT 1 FROM information_schema.tables WHERE table_name = 'engagement_log' LIMIT 1`
+      );
+      if (tableCheck.rows.length > 0) {
+        const banResult = await this.pool.query(`
+          SELECT COUNT(*) as cnt FROM engagement_log
+          WHERE action = 'ban' AND created_at > NOW() - INTERVAL '30 minutes'
+        `);
+        newBans = parseInt(banResult.rows[0]?.cnt) || 0;
+      }
     } catch {
       // Not critical
     }
 
     try {
-      // Count active Telegram groups
-      const groupResult = await this.pool.query(`
-        SELECT COUNT(DISTINCT data->'tg'->>'chat_id') as cnt
-        FROM kv_store
-        WHERE key LIKE 'launchpack:%'
-          AND data->'tg'->>'chat_id' IS NOT NULL
-      `);
-      activeGroups = parseInt(groupResult.rows[0]?.cnt) || 0;
+      // Count active Telegram groups (check if kv_store exists first to avoid PG error log noise)
+      const tableCheck = await this.pool.query(
+        `SELECT 1 FROM information_schema.tables WHERE table_name = 'kv_store' LIMIT 1`
+      );
+      if (tableCheck.rows.length > 0) {
+        const groupResult = await this.pool.query(`
+          SELECT COUNT(DISTINCT data->'tg'->>'chat_id') as cnt
+          FROM kv_store
+          WHERE key LIKE 'launchpack:%'
+            AND data->'tg'->>'chat_id' IS NOT NULL
+        `);
+        activeGroups = parseInt(groupResult.rows[0]?.cnt) || 0;
+      }
     } catch {
       // kv_store may not exist
     }

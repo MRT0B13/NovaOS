@@ -118,13 +118,20 @@ export abstract class BaseAgent {
   }
 
   protected async updateStatus(status: string): Promise<void> {
+    // Map task-specific statuses to valid DB column values
+    // DB CHECK constraint only allows: 'alive', 'degraded', 'dead', 'disabled'
+    const VALID_DB_STATUSES = new Set(['alive', 'degraded', 'dead', 'disabled']);
+    const dbStatus = VALID_DB_STATUSES.has(status) ? status
+      : (status === 'error' ? 'degraded'
+        : (status === 'stopped' ? 'disabled'
+          : 'alive'));  // researching, analyzing, idle, gathering, active → alive
     try {
       await this.pool.query(
         `INSERT INTO agent_heartbeats (agent_name, status, current_task, last_beat)
          VALUES ($1, $2, $3, NOW())
          ON CONFLICT (agent_name) DO UPDATE
          SET status = $2, current_task = $3, last_beat = NOW()`,
-        [this.agentId, status, status],
+        [this.agentId, dbStatus, status],
       );
     } catch (err) {
       // Silent — health agent will notice missing heartbeats
