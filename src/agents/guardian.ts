@@ -100,7 +100,14 @@ export class GuardianAgent extends BaseAgent {
   /** Load launched tokens from launchpack DB to auto-watch */
   private async loadWatchListFromDB(): Promise<void> {
     try {
-      // Check if launchpacks table exists and has launched tokens
+      // Check if kv_store table exists before querying to avoid PG error log noise
+      const tableCheck = await this.pool.query(
+        `SELECT 1 FROM information_schema.tables WHERE table_name = 'kv_store' LIMIT 1`
+      );
+      if (tableCheck.rows.length === 0) {
+        logger.debug('[guardian] No existing tokens to watch (kv_store not available)');
+        return;
+      }
       const result = await this.pool.query(
         `SELECT data FROM kv_store WHERE key LIKE 'launchpack:%'`,
       );

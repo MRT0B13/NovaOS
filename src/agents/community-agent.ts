@@ -168,9 +168,10 @@ export class CommunityAgent extends BaseAgent {
         `SELECT 1 FROM information_schema.tables WHERE table_name = 'engagement_log' LIMIT 1`
       );
       if (tableCheck.rows.length > 0) {
+        // engagement_log uses 'reply_style' not 'action' — check for ban-related entries
         const banResult = await this.pool.query(`
           SELECT COUNT(*) as cnt FROM engagement_log
-          WHERE action = 'ban' AND created_at > NOW() - INTERVAL '30 minutes'
+          WHERE reply_style = 'ban' AND created_at > NOW() - INTERVAL '30 minutes'
         `);
         newBans = parseInt(banResult.rows[0]?.cnt) || 0;
       }

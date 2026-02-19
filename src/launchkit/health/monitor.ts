@@ -60,9 +60,9 @@ export class HealthMonitor {
       setInterval(() => this.db.cleanupExpiredMessages(), 300_000),
     );
 
-    // Run initial checks
+    // Run initial checks (heartbeats only — skip initial API check to avoid
+    // degradation rule spam on startup before services are fully warmed up)
     this.checkHeartbeats();
-    this.checkApis();
 
     console.log('[HealthAgent] ✅ All monitoring loops active');
   }

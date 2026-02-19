@@ -101,7 +101,12 @@ export class LauncherAgent extends BaseAgent {
   private async monitorGraduations(): Promise<void> {
     if (!this.running) return;
     try {
-      // Check for tokens that have recently graduated (hit bonding curve target)
+      // Check if kv_store exists before querying to avoid PG error log noise
+      const tableCheck = await this.pool.query(
+        `SELECT 1 FROM information_schema.tables WHERE table_name = 'kv_store' LIMIT 1`
+      );
+      if (tableCheck.rows.length === 0) return;
+
       const result = await this.pool.query(
         `SELECT data FROM kv_store WHERE key LIKE 'launchpack:%'`,
       );
