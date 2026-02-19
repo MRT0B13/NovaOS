@@ -19,6 +19,15 @@ import { startAutonomousMode, stopAutonomousMode } from './services/autonomousMo
 import { startTGScheduler, stopTGScheduler } from './services/telegramScheduler.ts';
 import { startSystemReporter, stopSystemReporter } from './services/systemReporter.ts';
 import { initCommunityVoting } from './services/communityVoting.ts';
+import { initHealthSystem, stopHealthSystem, getHealthbeat } from './health/singleton';
+import { registerHealthCommands } from './services/telegramHealthCommands.ts';
+import { registerScanCommand } from './services/telegramScanCommand.ts';
+import { registerFactoryCommands } from './services/telegramFactoryCommands.ts';
+import { initSwarm, stopSwarm, type SwarmHandle } from '../agents/index.ts';
+import { Pool } from 'pg';
+
+// Module-level swarm handle for shutdown
+let _swarmHandle: SwarmHandle | null = null;
 
 /**
  * Log Railway-specific environment info at startup
@@ -60,6 +69,53 @@ export async function initLaunchKit(
   const store: LaunchPackStore = storeWithClose;
   const closeStore = storeWithClose.close;
   const secretsStore = await createSecretsStore();
+
+  // Initialize Health Agent system (heartbeat + monitor)
+  const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+  if (databaseUrl) {
+    try {
+      const { heartbeat, monitor } = initHealthSystem(databaseUrl);
+      heartbeat.start();
+      monitor.start();
+
+      // Handle degradation commands from Health Agent
+      heartbeat.onCommand(async (action, params) => {
+        switch (action) {
+          case 'reduce_frequency':
+            logger.warn(`[Nova] Health Agent: reducing reply frequency to ${params.newMaxRepliesPerHour}/hr`);
+            setTimeout(() => {
+              logger.info('[Nova] Reply frequency cooldown expired');
+            }, params.resumeAfterMs || 900_000);
+            break;
+          case 'rotate_rpc':
+            logger.warn(`[Nova] Health Agent: RPC rotation requested → ${params.backupRPCs?.[0]}`);
+            break;
+          case 'switch_model':
+            logger.warn(`[Nova] Health Agent: model switch requested → ${params.fallback}`);
+            break;
+          default:
+            logger.info(`[Nova] Health Agent command: ${action}`);
+        }
+      });
+
+      logger.info('[LaunchKit] 🏥 Health Agent system initialized (heartbeat + monitor)');
+    } catch (healthErr) {
+      logger.warn({ error: healthErr }, '[LaunchKit] Health Agent init failed (non-fatal)');
+    }
+
+    // Initialize Nova Agent Swarm (5 agents + Supervisor)
+    let pool: InstanceType<typeof Pool> | null = null;
+    try {
+      pool = new Pool({ connectionString: databaseUrl });
+      _swarmHandle = await initSwarm(pool, {
+        // Callbacks are wired later when xPublisher/novaChannel are available
+        // See the setTimeout block below that wires post-init callbacks
+      });
+      logger.info('[LaunchKit] 🐝 Nova agent swarm initialized (6 agents)');
+    } catch (swarmErr) {
+      logger.warn({ error: swarmErr }, '[LaunchKit] Agent swarm init failed (non-fatal)');
+    }
+  }
 
   const copyService = new CopyGeneratorService(store, runtime);
   const pumpService = new PumpLauncherService(store, {
@@ -193,6 +249,80 @@ export async function initLaunchKit(
     } catch (banErr) {
       logger.warn({ error: banErr }, 'Failed to register ban commands (non-fatal)');
     }
+
+    // Also register health commands (/health, /errors, /repairs, /approve, /reject)
+    try {
+      const healthRegistered = await registerHealthCommands(runtime);
+      if (healthRegistered) {
+        logger.info('[LaunchKit] 🏥 Health TG commands registered (/health, /errors, /repairs)');
+      }
+    } catch (healthErr) {
+      logger.warn({ error: healthErr }, 'Failed to register health TG commands (non-fatal)');
+    }
+
+    // Wire Supervisor callbacks now that X/TG services are ready
+    if (_swarmHandle) {
+      // Lazy-load Farcaster publisher (only imported if enabled)
+      let farcasterPost: ((content: string, channel: string) => Promise<void>) | undefined;
+      try {
+        const fc = await import('./services/farcasterPublisher.ts');
+        if (fc.isFarcasterEnabled()) {
+          farcasterPost = async (content: string, channel: string) => {
+            await fc.postCast(content, channel as any);
+          };
+          logger.info('[LaunchKit] 📣 Farcaster publisher enabled');
+        }
+      } catch { /* Farcaster not configured — skip */ }
+
+      _swarmHandle.supervisor.setCallbacks({
+        onPostToX: async (content: string) => {
+          try { await xPublisher.tweet(content); } catch (err) {
+            logger.warn('[swarm] Supervisor → X post failed:', err);
+          }
+        },
+        onPostToTelegram: async (chatId: string, content: string) => {
+          try {
+            const tgService = runtime.getService('telegram') as any;
+            const bot = tgService?.messageManager?.bot;
+            if (bot) {
+              await bot.telegram.sendMessage(chatId, content, { parse_mode: 'Markdown' });
+            } else {
+              logger.warn('[swarm] Supervisor → TG: no bot instance available');
+            }
+          } catch (err) {
+            logger.warn('[swarm] Supervisor → TG post failed:', err);
+          }
+        },
+        onPostToChannel: async (content: string) => {
+          // Nova channel posting is handled by novaChannel service
+          logger.info(`[swarm] Supervisor channel post: ${content.slice(0, 80)}...`);
+        },
+        onPostToFarcaster: farcasterPost,
+      });
+      logger.info('[LaunchKit] 🐝 Supervisor callbacks wired (X + TG + Channel + Farcaster)');
+
+      // Register /scan and /children TG commands
+      try {
+        const scanRegistered = await registerScanCommand(runtime, _swarmHandle.supervisor);
+        if (scanRegistered) {
+          logger.info('[LaunchKit] 🔍 Scan TG commands registered (/scan, /children)');
+        }
+      } catch (scanErr) {
+        logger.warn({ error: scanErr }, 'Failed to register scan commands (non-fatal)');
+      }
+
+      // Register /request_agent, /approve_agent, /reject_agent, /my_agents, /stop_agent
+      if (pool) {
+        try {
+          const factoryRegistered = await registerFactoryCommands(runtime, _swarmHandle.supervisor, pool);
+          if (factoryRegistered) {
+            logger.info('[LaunchKit] 🏭 Factory TG commands registered (/request_agent, /approve_agent, /my_agents)');
+          }
+        } catch (factoryErr) {
+          logger.warn({ error: factoryErr }, 'Failed to register factory commands (non-fatal)');
+        }
+      }
+    }
   }, 5000); // Wait 5 seconds for Telegram service to initialize
 
   // Start system reporter FIRST (initializes PostgreSQL for metric tracking)
@@ -226,6 +356,13 @@ export async function initLaunchKit(
 
   const close = async () => {
     try {
+      // Clean up agent swarm
+      if (_swarmHandle) {
+        await stopSwarm(_swarmHandle);
+        _swarmHandle = null;
+      }
+      // Clean up health system
+      await stopHealthSystem();
       // Clean up autonomous mode
       stopAutonomousMode();
       // Clean up TG scheduler

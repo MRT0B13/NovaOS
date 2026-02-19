@@ -5,6 +5,7 @@
  */
 
 import { getEnv } from '../env.ts';
+import { getHealthbeat } from '../health/singleton';
 import type { LaunchPackStore } from '../db/launchPackRepository.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
 import type { IAgentRuntime } from '@elizaos/core';
@@ -245,6 +246,7 @@ export class TelegramCommunityService {
       } catch (err: any) {
         lastError = err;
         console.log(`[TG_COMMUNITY] ${method} failed with chat_id ${chatId}: ${err.message}`);
+        getHealthbeat()?.reportError({ errorType: 'TG_SEND_FAILED', errorMessage: err.message, severity: 'error', context: { task: 'tg_send_message', method, chatId } }).catch(() => {});
         // Only continue if it's a "chat not found" error
         if (!err.message?.includes('chat not found') && !err.message?.includes('Bad Request')) {
           throw err;
@@ -650,6 +652,7 @@ export class TelegramCommunityService {
       }
     } catch (err: any) {
       console.error('[TG_COMMUNITY] Failed to send launch announcement:', err);
+      getHealthbeat()?.reportError({ errorType: 'TG_ANNOUNCEMENT_FAILED', errorMessage: err.message || String(err), severity: 'critical', context: { task: 'launch_announcement' } }).catch(() => {});
       results.error = (results.error ? results.error + ' | ' : '') + `Announcement failed: ${err.message}`;
     }
     

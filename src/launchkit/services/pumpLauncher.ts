@@ -1,4 +1,5 @@
 import { logger } from '@elizaos/core';
+import { getHealthbeat } from '../health/singleton';
 import bs58 from 'bs58';
 import { Keypair, Connection, PublicKey } from '@solana/web3.js';
 import { nowIso } from './time.ts';
@@ -607,9 +608,11 @@ export class PumpLauncherService {
       // If pump.fun failed, use Bonk's IPFS as fallback (free, no API key needed)
       if (errMsg.includes('403') || errMsg.includes('blocked') || errMsg.includes('Cloudflare')) {
         logger.warn({ error: errMsg }, 'pump.fun IPFS blocked, falling back to Bonk IPFS');
+        getHealthbeat()?.reportError({ errorType: 'IPFS_UPLOAD_BLOCKED', errorMessage: errMsg, severity: 'error', context: { task: 'ipfs_upload', fallback: 'bonk' } }).catch(() => {});
         return await this.uploadToBonkIPFS(pack);
       }
       
+      getHealthbeat()?.reportError({ errorType: 'IPFS_UPLOAD_FAILED', errorMessage: errMsg, severity: 'critical', context: { task: 'ipfs_upload' } }).catch(() => {});
       throw err;
     }
   }
@@ -917,6 +920,7 @@ export class PumpLauncherService {
         pumpBalance = depositResult.balance;
       } catch (err: any) {
         if (err.code === 'INSUFFICIENT_FUNDS') throw err;
+        getHealthbeat()?.reportError({ errorType: 'AUTO_FUND_FAILED', errorMessage: err.message, stackTrace: err.stack, severity: 'critical', context: { task: 'wallet_auto_fund' } }).catch(() => {});
         throw errorWithCode(
           'AUTO_FUND_FAILED',
           `Launch requires ${requiredSol.toFixed(4)} SOL but pump wallet only has ${pumpBalance.toFixed(4)} SOL.\n` +
@@ -1002,6 +1006,7 @@ export class PumpLauncherService {
               }
             } catch (chainErr) {
               logger.warn(`[Launch] On-chain balance query failed: ${chainErr}`);
+              getHealthbeat()?.reportError({ errorType: 'CHAIN_BALANCE_QUERY_FAILED', errorMessage: String(chainErr), severity: 'error', context: { task: 'on_chain_balance' } }).catch(() => {});
             }
           }
           

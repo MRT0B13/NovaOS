@@ -7,6 +7,10 @@ import { getNovaStats, type TokenMover } from './novaPersonalBrand.ts';
 import { scanToken, formatReportForTweet } from './rugcheck.ts';
 import { loadSet, saveSet, loadMap, saveMap } from './persistenceStore.ts';
 import { quickSearch, getReplyIntel } from './novaResearch.ts';
+import { getHealthbeat } from '../health/singleton';
+import { getTargetConfig, getAllTargetHandles, REPLY_STYLE_GUIDES } from '../community-targets.ts';
+import { validateReply, recordReplyForRules, shouldSkipPost } from '../reply-rules.ts';
+import { logEngagement } from '../engagement-tracker.ts';
 
 /**
  * X Reply Engine
@@ -313,6 +317,19 @@ async function _runReplyRoundInner(): Promise<void> {
     return;
   }
   
+  // ── Validate via reply rules before generating ──
+  if (candidate.authorHandle) {
+    const preCheck = validateReply(
+      'placeholder-check', // We check length/content after generation; here we check rate limits
+      candidate.authorHandle,
+    );
+    // Only block on rate-limit reasons (not content reasons — those apply post-generation)
+    if (!preCheck.valid && (preCheck.reason?.includes('cap reached') || preCheck.reason?.includes('Already replied') || preCheck.reason?.includes('Too soon'))) {
+      logger.info(`[ReplyEngine] Reply rules blocked: ${preCheck.reason}`);
+      return;
+    }
+  }
+
   // Generate a reply
   // Fetch real stats so the reply uses actual numbers (not hallucinated)
   let stats: { launches: number; graduated: number; portfolioSol: string; dayNumber: number; tokenMovers: TokenMover[] } | null = null;
@@ -331,6 +348,15 @@ async function _runReplyRoundInner(): Promise<void> {
 
   const replyText = await generateReply(candidate, stats);
   if (!replyText) return;
+
+  // ── Post-generation content validation via reply rules ──
+  if (candidate.authorHandle) {
+    const contentCheck = validateReply(replyText, candidate.authorHandle);
+    if (!contentCheck.valid) {
+      logger.info(`[ReplyEngine] Reply rules rejected content: ${contentCheck.reason}`);
+      return;
+    }
+  }
   
   // Post the reply
   try {
@@ -353,6 +379,25 @@ async function _runReplyRoundInner(): Promise<void> {
       repliedAt: new Date().toISOString(),
       source: candidate.source,
     });
+
+    // Record for anti-spam rate limiting
+    recordReplyForRules(candidate.authorHandle || 'unknown', candidate.tweetId);
+
+    // Log engagement for tracking
+    const targetCfg = candidate.authorHandle ? getTargetConfig(candidate.authorHandle) : null;
+    const tierNum = targetCfg ? (
+      targetCfg.style === 'peer' ? 1 : targetCfg.style === 'analyst' ? 2 : 3
+    ) as 1 | 2 | 3 : 0 as 0;
+    logEngagement({
+      platform: 'x',
+      targetHandle: candidate.authorHandle || 'unknown',
+      postId: candidate.tweetId,
+      replyId: result.id,
+      replyContent: replyText,
+      replyStyle: targetCfg?.style || 'general',
+      tier: tierNum,
+      timestamp: new Date(),
+    }).catch(() => {});
     
     // Keep tracked replies trimmed
     if (state.trackedReplies.length > 200) {
@@ -375,8 +420,10 @@ async function _runReplyRoundInner(): Promise<void> {
       // Signal shared backoff — pauses ALL X posting (replies, brand, marketing)
       reportRateLimit();
       logger.warn(`[ReplyEngine] Twitter 429 rate limit — all posting paused for 15 minutes`);
+      getHealthbeat()?.reportError({ errorType: 'X_RATE_LIMIT', errorMessage: msg, severity: 'warning', context: { task: 'reply_post', tweetId: candidate.tweetId } }).catch(() => {});
     } else {
       logger.warn(`[ReplyEngine] Failed to post reply: ${msg}`);
+      getHealthbeat()?.reportError({ errorType: err?.name || 'ReplyPostError', errorMessage: msg, stackTrace: err?.stack, severity: 'error', context: { task: 'reply_post', tweetId: candidate.tweetId } }).catch(() => {});
       import('./adminNotify.ts').then(m => m.notifyAdminWarning('x_reply_failed',
         `Reply engine failed to post reply.\nTweet ID: <code>${candidate.tweetId}</code>\nError: ${msg}`
       )).catch(() => {});
@@ -487,6 +534,7 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
           try { reportReadRateLimit(); } catch {}
           logger.info(`[ReplyEngine] Mentions 429 — read backoff active, will retry next round`);
         }
+        getHealthbeat()?.reportError({ errorType: 'X_READ_429', errorMessage: msg, severity: 'warning', context: { task: 'mentions_fetch' } }).catch(() => {});
       }
       try { await recordMentionRead(); } catch {}
     }
@@ -727,9 +775,13 @@ async function generateReply(
 - RugCheck = risk score 0-100 (lower = safer). Never say "98% safety score".`
       : `You launch tokens on pump.fun. Do NOT cite specific numbers for launch count, portfolio value, or RugCheck scores — you don't have current data right now.`;
     
+    // Determine reply style based on community target tier
+    const targetConfig = candidate.authorHandle ? getTargetConfig(candidate.authorHandle) : null;
+    const styleGuide = targetConfig ? `\n\nREPLY STYLE for @${candidate.authorHandle}: ${REPLY_STYLE_GUIDES[targetConfig.style]}` : '';
+
     const systemPrompt = `You are Nova (@${env.NOVA_X_HANDLE || 'nova_agent_'}), an autonomous AI agent that launches meme tokens on Solana via pump.fun. You are blunt, data-driven, and transparent. You are NOT a hype bot, NOT a cheerleader, NOT a generic engagement farmer.
 
-${statsBlock}
+${statsBlock}${styleGuide}
 
 You're replying to a tweet. Rules:
 - MAX 200 characters. Shorter is better.

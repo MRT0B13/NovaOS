@@ -12,6 +12,7 @@
  */
 
 import { logger } from '@elizaos/core';
+import { getHealthbeat } from '../health/singleton';
 import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
 import { getTwitterReader } from './xPublisher.ts';
 import { canReadSearch } from './xRateLimiter.ts';
@@ -923,6 +924,7 @@ async function scanKOLs(): Promise<number> {
     } catch (err: any) {
       if (err?.message?.includes('429') || err?.code === 429) {
         logger.debug('[NovaIntel] 429 during topic search — stopping');
+        getHealthbeat()?.reportError({ errorType: 'X_READ_429', errorMessage: '429 during KOL topic search', severity: 'warning', context: { task: 'kol_scan' } }).catch(() => {});
         break;
       }
       logger.debug(`[NovaIntel] Search failed for "${tag}": ${err}`);
@@ -1158,6 +1160,7 @@ async function fetchDeFiData(): Promise<void> {
     logger.info('[NovaIntel] ✅ DeFi data stored in nova_knowledge');
   } catch (err) {
     logger.warn(`[NovaIntel] DeFi fetch failed: ${err}`);
+    getHealthbeat()?.reportError({ errorType: 'DEFI_FETCH_FAILED', errorMessage: String(err), severity: 'warning', context: { task: 'defi_data' } }).catch(() => {});
   }
 }
 
@@ -1289,6 +1292,7 @@ export async function runResearchCycle(): Promise<void> {
           await new Promise(r => setTimeout(r, 5000));
         } catch (err) {
           logger.warn(`[NovaResearch] Failed to research ${topic.id}: ${err}`);
+          getHealthbeat()?.reportError({ errorType: 'TAVILY_RESEARCH_FAILED', errorMessage: String(err), severity: 'warning', context: { task: 'tavily_research', topic: topic.id } }).catch(() => {});
         }
       }
     } else {

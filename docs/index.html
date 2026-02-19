@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nova — Autonomous AI Agent Swarm on Solana</title>
+    <meta name="description" content="Nova is an autonomous AI agent swarm that launches meme tokens, monitors crypto narratives, and provides real-time safety analysis. Built on ElizaOS, powered by Solana." />
+    <meta property="og:title" content="Nova — Autonomous AI Agent Swarm on Solana" />
+    <meta property="og:description" content="Intelligence. Safety. Autonomy. Nova scans KOLs, detects rugs, and launches tokens — 24/7. The first self-healing AI swarm on Solana." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Nova — Autonomous AI Agent Swarm on Solana" />
+    <meta name="twitter:description" content="Intelligence. Safety. Autonomy. The first autonomous AI swarm on Solana." />
+    <style>
+      :root {
+        --bg: #0a0a0f;
+        --surface: #12121a;
+        --border: #1e1e2e;
+        --text: #e0e0e8;
+        --text-dim: #8888a0;
+        --accent: #7c5bf5;
+        --accent-glow: rgba(124, 91, 245, 0.15);
+        --green: #22c55e;
+        --red: #ef4444;
+        --yellow: #eab308;
+      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.6;
+      }
+      .container { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+
+      /* Hero */
+      .hero { text-align: center; padding: 80px 0 60px; }
+      .hero h1 {
+        font-size: 3rem; font-weight: 700; margin-bottom: 16px;
+        background: linear-gradient(135deg, #7c5bf5, #22c55e);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      }
+      .hero .tagline { font-size: 1.25rem; color: var(--text-dim); max-width: 600px; margin: 0 auto 32px; }
+      .hero .badges { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+      .badge {
+        display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px;
+        border-radius: 20px; border: 1px solid var(--border); background: var(--surface);
+        font-size: 0.85rem; color: var(--text-dim); text-decoration: none;
+      }
+      .badge:hover { border-color: var(--accent); }
+      .badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+
+      /* Stats */
+      .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; padding: 40px 0; }
+      .stat-card {
+        background: var(--surface); border: 1px solid var(--border);
+        border-radius: 12px; padding: 24px; text-align: center;
+      }
+      .stat-card .number { font-size: 2rem; font-weight: 700; color: var(--accent); }
+      .stat-card .label { font-size: 0.85rem; color: var(--text-dim); margin-top: 4px; }
+
+      /* Architecture */
+      .architecture { padding: 40px 0; }
+      .architecture h2 { font-size: 1.5rem; margin-bottom: 24px; text-align: center; }
+      .swarm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 24px; }
+      .agent-card {
+        background: var(--surface); border: 1px solid var(--border);
+        border-radius: 12px; padding: 16px; text-align: center;
+        transition: border-color 0.2s;
+      }
+      .agent-card:hover { border-color: var(--accent); }
+      .agent-card .icon { font-size: 1.5rem; margin-bottom: 8px; }
+      .agent-card h4 { font-size: 0.95rem; margin-bottom: 4px; }
+      .agent-card p { font-size: 0.75rem; color: var(--text-dim); }
+      .supervisor-card {
+        background: var(--accent-glow); border: 1px solid var(--accent);
+        border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 16px;
+      }
+      .supervisor-card h3 { font-size: 1.2rem; margin-bottom: 4px; }
+      .supervisor-card p { font-size: 0.85rem; color: var(--text-dim); }
+
+      /* Features */
+      .features { padding: 40px 0; }
+      .features h2 { font-size: 1.5rem; margin-bottom: 24px; text-align: center; }
+      .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+      .feature-card {
+        background: var(--surface); border: 1px solid var(--border);
+        border-radius: 12px; padding: 24px;
+      }
+      .feature-card h3 { font-size: 1.1rem; margin-bottom: 8px; }
+      .feature-card p { font-size: 0.9rem; color: var(--text-dim); }
+      .feature-card .icon { font-size: 1.5rem; margin-bottom: 12px; }
+
+      /* Links */
+      .links { display: flex; justify-content: center; gap: 16px; padding: 40px 0 80px; flex-wrap: wrap; }
+      .link-btn {
+        padding: 12px 28px; border-radius: 8px; text-decoration: none;
+        font-weight: 600; font-size: 0.95rem; transition: all 0.2s;
+      }
+      .link-btn.primary { background: var(--accent); color: white; }
+      .link-btn.primary:hover { opacity: 0.9; }
+      .link-btn.secondary { background: var(--surface); border: 1px solid var(--border); color: var(--text); }
+      .link-btn.secondary:hover { border-color: var(--accent); }
+
+      /* Footer */
+      footer {
+        text-align: center; padding: 24px; color: var(--text-dim);
+        font-size: 0.8rem; border-top: 1px solid var(--border);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <section class="hero">
+        <h1>Nova</h1>
+        <p class="tagline">
+          Autonomous AI agent swarm on Solana. Scans narratives, detects rugs,
+          launches tokens — 24/7. Built on ElizaOS. Self-healing. Always on.
+        </p>
+        <div class="badges">
+          <span class="badge"><span class="dot"></span> Live on Solana</span>
+          <span class="badge">ElizaOS Framework</span>
+          <span class="badge">RugCheck Integrated</span>
+          <span class="badge">pump.fun Native</span>
+          <span class="badge">6-Agent Swarm</span>
+        </div>
+      </section>
+
+      <section class="stats">
+        <div class="stat-card">
+          <div class="number">6</div>
+          <div class="label">Specialized Agents</div>
+        </div>
+        <div class="stat-card">
+          <div class="number">44</div>
+          <div class="label">Autonomous Actions</div>
+        </div>
+        <div class="stat-card">
+          <div class="number">24/7</div>
+          <div class="label">Uptime</div>
+        </div>
+        <div class="stat-card">
+          <div class="number">2</div>
+          <div class="label">Platforms (X + TG)</div>
+        </div>
+      </section>
+
+      <section class="architecture">
+        <h2>The Swarm</h2>
+        <div class="supervisor-card">
+          <div>🧠</div>
+          <h3>Nova (Supervisor)</h3>
+          <p>Orchestrates all sub-agents. Synthesizes intelligence. Makes strategic decisions.</p>
+        </div>
+        <div class="swarm-grid">
+          <div class="agent-card">
+            <div class="icon">🔍</div>
+            <h4>Scout</h4>
+            <p>KOL scanning, narrative detection, social intel</p>
+          </div>
+          <div class="agent-card">
+            <div class="icon">🛡️</div>
+            <h4>Guardian</h4>
+            <p>RugCheck safety, LP monitoring, whale alerts</p>
+          </div>
+          <div class="agent-card">
+            <div class="icon">📊</div>
+            <h4>Analyst</h4>
+            <p>DeFiLlama data, on-chain metrics, narrative scoring</p>
+          </div>
+          <div class="agent-card">
+            <div class="icon">🚀</div>
+            <h4>Launcher</h4>
+            <p>pump.fun token creation, art gen, deploy</p>
+          </div>
+          <div class="agent-card">
+            <div class="icon">💬</div>
+            <h4>Community</h4>
+            <p>TG management, X replies, onboarding</p>
+          </div>
+          <div class="agent-card">
+            <div class="icon">🏥</div>
+            <h4>Health</h4>
+            <p>Self-healing, auto-repair, swarm monitoring</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="features">
+        <h2>What Nova Does</h2>
+        <div class="feature-grid">
+          <div class="feature-card">
+            <div class="icon">📡</div>
+            <h3>Intelligence Engine</h3>
+            <p>Scans 20+ KOLs, DeFiLlama, and on-chain data to detect narrative shifts in real-time.</p>
+          </div>
+          <div class="feature-card">
+            <div class="icon">🛡️</div>
+            <h3>Safety Analysis</h3>
+            <p>RugCheck integration provides instant token safety scores. Flags unlocked LP, whale wallets, and prior rugs.</p>
+          </div>
+          <div class="feature-card">
+            <div class="icon">🚀</div>
+            <h3>Token Launches</h3>
+            <p>Autonomously launches narrative-aligned meme tokens on pump.fun with AI-generated art and copy.</p>
+          </div>
+          <div class="feature-card">
+            <div class="icon">🤖</div>
+            <h3>Multi-Agent Swarm</h3>
+            <p>6 specialized agents — Scout, Guardian, Analyst, Launcher, Community, and Health — all reporting to the Nova Supervisor.</p>
+          </div>
+          <div class="feature-card">
+            <div class="icon">📊</div>
+            <h3>Community Intel</h3>
+            <p>Active on X and Telegram. Provides market intelligence, safety reports, and narrative analysis.</p>
+          </div>
+          <div class="feature-card">
+            <div class="icon">⚡</div>
+            <h3>Self-Healing</h3>
+            <p>Health Agent monitors all systems with a two-tier repair engine. Auto-fixes failures and reports status 24/7.</p>
+          </div>
+        </div>
+      </section>
+
+      <div class="links">
+        <!-- UPDATE THESE URLs with actual handles/links -->
+        <a href="https://x.com/nova_on_sol" class="link-btn primary">Follow on X</a>
+        <a href="https://t.me/nova_community" class="link-btn secondary">Telegram</a>
+        <a href="https://github.com/nova-agent" class="link-btn secondary">GitHub</a>
+      </div>
+    </div>
+
+    <footer>
+      Nova — Built on ElizaOS · Running on Solana · 6-Agent Autonomous Swarm · Always On
+    </footer>
+  </body>
+</html>

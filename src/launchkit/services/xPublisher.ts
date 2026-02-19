@@ -1,4 +1,5 @@
 import { logger } from '@elizaos/core';
+import { getHealthbeat } from '../health/singleton';
 import { TwitterApi } from 'twitter-api-v2';
 import { LaunchPackStore } from '../db/launchPackRepository.ts';
 import { getEnv } from '../env.ts';
@@ -286,6 +287,7 @@ class StandaloneTwitterClient {
         errors: error?.data?.errors,
         message: error?.message,
       }));
+      getHealthbeat()?.reportError({ errorType: 'X_TWEET_FAILED', errorMessage: error?.message || 'Tweet failed', stackTrace: error?.stack, severity: 'critical', context: { task: 'tweet_post', code: error?.code, status: error?.data?.status } }).catch(() => {});
       
       // Parse Twitter API errors into cleaner messages
       const code = error?.code || error?.data?.status || 0;
@@ -329,6 +331,7 @@ class StandaloneTwitterClient {
       return mediaId;
     } catch (error: any) {
       logger.error('[StandaloneTwitter] Media upload failed:', error?.message || error);
+      getHealthbeat()?.reportError({ errorType: 'X_MEDIA_UPLOAD_FAILED', errorMessage: error?.message || 'Media upload failed', severity: 'error', context: { task: 'media_upload' } }).catch(() => {});
       return null;
     }
   }

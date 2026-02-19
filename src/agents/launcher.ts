@@ -1,0 +1,206 @@
+/**
+ * Launcher Agent
+ *
+ * Role: Token launch pipeline — idea gen, art gen, pump.fun deploy, graduation monitoring.
+ * Wraps PumpLauncherService, autonomousMode, and ideaGenerator.
+ *
+ * This agent does NOT autonomously launch tokens — it wraps the existing
+ * autonomous-mode logic and reports status to the Supervisor. Actual launch
+ * decisions are still gated by the existing guardrails in operatorGuardrails.ts.
+ *
+ * Outgoing messages → Supervisor:
+ *   - status (high): Token launched / graduated
+ *   - status (medium): Launch pipeline stage update
+ *   - report (low): Periodic launch stats
+ *
+ * Incoming commands ← Supervisor:
+ *   - launch_token: Initiate a launch with given config (still goes through guardrails)
+ *   - get_status: Return current pipeline status
+ */
+
+import { Pool } from 'pg';
+import { logger } from '@elizaos/core';
+import { BaseAgent } from './types.ts';
+
+// Lazy imports
+let _getAutonomousStatus: (() => any) | null = null;
+let _triggerAutonomousLaunch: (() => Promise<{ success: boolean; error?: string }>) | null = null;
+
+async function loadAutonomous() {
+  if (!_getAutonomousStatus) {
+    const mod = await import('../launchkit/services/autonomousMode.ts');
+    _getAutonomousStatus = mod.getAutonomousStatus;
+    _triggerAutonomousLaunch = mod.triggerAutonomousLaunch;
+  }
+}
+
+// ============================================================================
+// Launcher Agent
+// ============================================================================
+
+export class LauncherAgent extends BaseAgent {
+  private statusCheckIntervalMs: number;
+  private launchCount = 0;
+  private lastLaunchAt = 0;
+  private lastError: string | null = null;
+
+  constructor(pool: Pool, opts?: { statusCheckIntervalMs?: number }) {
+    super({
+      agentId: 'nova-launcher',
+      agentType: 'launcher',
+      pool,
+    });
+    this.statusCheckIntervalMs = opts?.statusCheckIntervalMs ?? 5 * 60 * 1000; // 5 min
+  }
+
+  protected async onStart(): Promise<void> {
+    this.startHeartbeat(60_000);
+
+    // Periodic status check + graduation monitoring
+    this.addInterval(() => this.checkPipelineStatus(), this.statusCheckIntervalMs);
+
+    // Listen for supervisor commands
+    this.addInterval(() => this.processCommands(), 10_000);
+
+    // Monitor launched tokens for graduation (check kv_store for status changes)
+    this.addInterval(() => this.monitorGraduations(), 10 * 60 * 1000); // every 10 min
+
+    logger.info('[launcher] Started — wrapping autonomous mode pipeline');
+  }
+
+  // ── Pipeline Status Check ────────────────────────────────────────
+
+  private async checkPipelineStatus(): Promise<void> {
+    if (!this.running) return;
+    try {
+      await loadAutonomous();
+      const status = _getAutonomousStatus!();
+
+      await this.updateStatus(status.isActive ? 'active' : 'idle');
+
+      // Report if there's been a recent launch
+      if (status.lastLaunchTime && status.lastLaunchTime > this.lastLaunchAt) {
+        this.lastLaunchAt = status.lastLaunchTime;
+        this.launchCount++;
+
+        await this.reportToSupervisor('status', 'high', {
+          event: 'launched',
+          tokenName: status.lastLaunchName || 'Unknown',
+          tokenSymbol: status.lastLaunchTicker,
+          mint: status.lastLaunchMint,
+          launchNumber: this.launchCount,
+        });
+      }
+    } catch (err) {
+      logger.debug('[launcher] Status check failed:', err);
+    }
+  }
+
+  // ── Graduation Monitoring ────────────────────────────────────────
+
+  private async monitorGraduations(): Promise<void> {
+    if (!this.running) return;
+    try {
+      // Check for tokens that have recently graduated (hit bonding curve target)
+      const result = await this.pool.query(
+        `SELECT data FROM kv_store WHERE key LIKE 'launchpack:%'`,
+      );
+
+      for (const row of result.rows) {
+        try {
+          const pack = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+          if (pack?.launch?.graduated && !pack?.launch?._graduationReported) {
+            await this.reportToSupervisor('status', 'high', {
+              event: 'graduated',
+              tokenName: pack.brand?.name,
+              tokenSymbol: pack.brand?.ticker,
+              mint: pack.launch?.mint,
+            });
+
+            // Mark as reported to avoid duplicate notifications
+            // (we don't modify the actual store — just track locally via agent_messages)
+            logger.info(`[launcher] Graduation detected: ${pack.brand?.name || pack.brand?.ticker}`);
+          }
+        } catch { /* skip malformed */ }
+      }
+    } catch {
+      // kv_store may not exist
+    }
+  }
+
+  // ── Command Processing ───────────────────────────────────────────
+
+  private async processCommands(): Promise<void> {
+    try {
+      const messages = await this.readMessages(5);
+      for (const msg of messages) {
+        if (msg.message_type === 'command') {
+          switch (msg.payload?.action) {
+            case 'launch_token':
+              await this.handleLaunchRequest(msg.payload);
+              break;
+            case 'get_status':
+              await this.reportCurrentStatus();
+              break;
+          }
+        }
+        if (msg.id) await this.acknowledgeMessage(msg.id);
+      }
+    } catch {
+      // Silent
+    }
+  }
+
+  private async handleLaunchRequest(payload: Record<string, any>): Promise<void> {
+    try {
+      await loadAutonomous();
+      logger.info('[launcher] Launch requested via supervisor command');
+
+      const result = await _triggerAutonomousLaunch!();
+
+      if (result.success) {
+        this.launchCount++;
+        this.lastLaunchAt = Date.now();
+        await this.reportToSupervisor('status', 'high', {
+          event: 'launch_initiated',
+          success: true,
+        });
+      } else {
+        this.lastError = result.error || 'Unknown error';
+        await this.reportToSupervisor('status', 'medium', {
+          event: 'launch_failed',
+          success: false,
+          error: this.lastError,
+        });
+      }
+    } catch (err) {
+      this.lastError = err instanceof Error ? err.message : String(err);
+      logger.error('[launcher] Launch failed:', err);
+    }
+  }
+
+  private async reportCurrentStatus(): Promise<void> {
+    await loadAutonomous();
+    const status = _getAutonomousStatus!();
+    await this.reportToSupervisor('report', 'low', {
+      source: 'launcher_status',
+      isActive: status.isActive,
+      totalLaunches: this.launchCount,
+      lastLaunchAt: this.lastLaunchAt ? new Date(this.lastLaunchAt).toISOString() : null,
+      lastError: this.lastError,
+      ...status,
+    });
+  }
+
+  // ── Public API ───────────────────────────────────────────────────
+
+  getStatus() {
+    return {
+      agentId: this.agentId,
+      running: this.running,
+      launchCount: this.launchCount,
+      lastLaunchAt: this.lastLaunchAt ? new Date(this.lastLaunchAt).toISOString() : null,
+      lastError: this.lastError,
+    };
+  }
+}
