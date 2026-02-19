@@ -2744,6 +2744,15 @@ export async function postDailyRecap(): Promise<void> {
     logger.info('[NovaPersonalBrand] Already posted recap today');
     return;
   }
+
+  // Skip portfolio recap threads in dry run — nothing meaningful to report
+  const env_ = getEnv();
+  if (env_.autonomousDryRun) {
+    logger.info('[NovaPersonalBrand] Dry run active — skipping portfolio recap (no real launches to report)');
+    state.lastRecapDate = today; // Mark as done so we don't retry
+    await saveStateToPostgres();
+    return;
+  }
   
   const stats = await getNovaStats();
   
@@ -2799,6 +2808,15 @@ export async function postWeeklySummary(): Promise<void> {
   
   if (state.lastWeeklySummaryDate === weekKey) {
     logger.info('[NovaPersonalBrand] Already posted weekly summary this week');
+    return;
+  }
+
+  // Skip weekly summary in dry run — no meaningful portfolio data to summarize
+  const env_ = getEnv();
+  if (env_.autonomousDryRun) {
+    logger.info('[NovaPersonalBrand] Dry run active — skipping weekly summary');
+    state.lastWeeklySummaryDate = weekKey;
+    await saveStateToPostgres();
     return;
   }
   
@@ -3356,13 +3374,24 @@ export function startNovaPersonalScheduler(): void {
       // Daily recap (within 15 min window of configured time)
       const recapTime = env.NOVA_RECAP_POST_TIME || '22:00';
       if (isWithinWindow(currentTime, recapTime, 15)) {
-        await postDailyRecap();
+        if (env.autonomousDryRun) {
+          // Dry run mode: skip portfolio recap threads (repetitive with no real launches).
+          // Post a builder insight or market commentary instead — more valuable content.
+          logger.info('[NovaPersonalBrand] Dry run active — skipping portfolio recap, posting builder insight instead');
+          await postNovaTease();
+        } else {
+          await postDailyRecap();
+        }
       }
       
       // Weekly summary (on configured day, around recap time)
       const summaryDay = env.NOVA_WEEKLY_SUMMARY_DAY || 0;
       if (now.getUTCDay() === summaryDay && isWithinWindow(currentTime, recapTime, 15)) {
-        await postWeeklySummary();
+        if (!env.autonomousDryRun) {
+          await postWeeklySummary();
+        } else {
+          logger.info('[NovaPersonalBrand] Dry run active — skipping weekly summary');
+        }
       }
       
       // Builder insight post - once a day at 12:00 UTC

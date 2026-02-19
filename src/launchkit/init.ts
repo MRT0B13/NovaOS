@@ -72,6 +72,7 @@ export async function initLaunchKit(
 
   // Initialize Health Agent system (heartbeat + monitor)
   const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+  let pool: InstanceType<typeof Pool> | null = null;
   if (databaseUrl) {
     try {
       const { heartbeat, monitor } = initHealthSystem(databaseUrl);
@@ -104,7 +105,6 @@ export async function initLaunchKit(
     }
 
     // Initialize Nova Agent Swarm (5 agents + Supervisor)
-    let pool: InstanceType<typeof Pool> | null = null;
     try {
       pool = new Pool({ connectionString: databaseUrl });
       _swarmHandle = await initSwarm(pool, {
@@ -200,6 +200,7 @@ export async function initLaunchKit(
       runtime,
       copyService,
       pumpService,
+      pool,
     });
   } catch (err) {
     if (closeStore) await closeStore();

@@ -1,6 +1,8 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { URL } from 'node:url';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { z } from 'zod';
 import { IAgentRuntime } from '@elizaos/core';
 import {
@@ -20,9 +22,15 @@ import { processUpdate as processBanUpdate } from '../services/telegramBanHandle
 import { recordMessageReceived } from '../services/telegramHealthMonitor.ts';
 import { verifyWebhookSignature, isWebhookSecurityEnabled, initTelegramSecurity } from '../services/telegramSecurity.ts';
 import { processReactionUpdate, processTextReply } from '../services/communityVoting.ts';
-import { trackMessage } from '../services/groupHealthMonitor.ts';
+import { trackMessage, getActivityStats } from '../services/groupHealthMonitor.ts';
 import { getEnv } from '../env.ts';
 import { checkDatabaseReadiness, logDbReadinessSummary, type DbReadiness } from '../db/railwayReady.ts';
+import { getPnLSummary, getActivePositions, getRecentTrades, getAllPositions } from '../services/pnlTracker.ts';
+import { getPumpWalletBalance, getFundingWalletBalance } from '../services/fundingWallet.ts';
+import { getMetrics } from '../services/systemReporter.ts';
+import { getActiveTrends, getTrendMonitorStatus, getPooledTrends } from '../services/trendMonitor.ts';
+import { getTokenPrice, getTokenPrices } from '../services/priceService.ts';
+import type { Pool } from 'pg';
 
 // Cached DB readiness status for /health endpoint
 let cachedDbReadiness: DbReadiness | null = null;
@@ -36,6 +44,7 @@ export interface LaunchKitServerOptions {
   pumpService?: PumpLauncherService;
   telegramPublisher?: TelegramPublisherService;
   xPublisher?: XPublisherService;
+  pool?: InstanceType<typeof Pool> | null;
 }
 
 interface JsonError {
@@ -198,6 +207,7 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
     );
   const telegramPublisher = options.telegramPublisher || new TelegramPublisherService(store);
   const xPublisher = options.xPublisher || new XPublisherService(store);
+  const pool = options.pool || null;
 
   // Initialize Telegram security (admin IDs, webhook secret)
   initTelegramSecurity();
@@ -668,6 +678,464 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
       methodNotAllowed(res);
       return;
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  DASHBOARD API ENDPOINTS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ─── Swarm Status ────────────────────────────────────────────────────
+    // GET /v1/swarm/status — agent registry + heartbeats (swarm_status view)
+    if (pathname === '/v1/swarm/status' && req.method === 'GET') {
+      if (!pool) {
+        sendJson(res, 503, { error: { code: 'NO_DB', message: 'Database pool not available' } });
+        return;
+      }
+      try {
+        const { rows } = await pool.query(`
+          SELECT * FROM swarm_status ORDER BY last_heartbeat DESC NULLS LAST
+        `);
+        sendJson(res, 200, { data: rows });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Query failed';
+        sendJson(res, 500, { error: { code: 'QUERY_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // GET /v1/swarm/messages — recent agent-to-agent messages
+    if (pathname === '/v1/swarm/messages' && req.method === 'GET') {
+      if (!pool) {
+        sendJson(res, 503, { error: { code: 'NO_DB', message: 'Database pool not available' } });
+        return;
+      }
+      try {
+        const limit = Math.min(Number(url.searchParams.get('limit')) || 50, 200);
+        const agentFilter = url.searchParams.get('agent');
+        const typeFilter = url.searchParams.get('type');
+        let query = `SELECT * FROM agent_messages`;
+        const params: any[] = [];
+        const conditions: string[] = [];
+        if (agentFilter) {
+          params.push(agentFilter);
+          conditions.push(`(sender = $${params.length} OR recipient = $${params.length})`);
+        }
+        if (typeFilter) {
+          params.push(typeFilter);
+          conditions.push(`type = $${params.length}`);
+        }
+        if (conditions.length) query += ` WHERE ${conditions.join(' AND ')}`;
+        params.push(limit);
+        query += ` ORDER BY created_at DESC LIMIT $${params.length}`;
+        const { rows } = await pool.query(query, params);
+        sendJson(res, 200, { data: rows });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Query failed';
+        sendJson(res, 500, { error: { code: 'QUERY_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ─── Health & Errors ─────────────────────────────────────────────────
+    // GET /v1/health/errors — recent errors from the swarm
+    if (pathname === '/v1/health/errors' && req.method === 'GET') {
+      if (!pool) {
+        sendJson(res, 503, { error: { code: 'NO_DB', message: 'Database pool not available' } });
+        return;
+      }
+      try {
+        const limit = Math.min(Number(url.searchParams.get('limit')) || 50, 200);
+        const { rows } = await pool.query(
+          `SELECT * FROM recent_errors LIMIT $1`, [limit]
+        );
+        sendJson(res, 200, { data: rows });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Query failed';
+        sendJson(res, 500, { error: { code: 'QUERY_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // GET /v1/health/repairs — pending code repairs
+    if (pathname === '/v1/health/repairs' && req.method === 'GET') {
+      if (!pool) {
+        sendJson(res, 503, { error: { code: 'NO_DB', message: 'Database pool not available' } });
+        return;
+      }
+      try {
+        const { rows } = await pool.query(`SELECT * FROM pending_repairs`);
+        sendJson(res, 200, { data: rows });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Query failed';
+        sendJson(res, 500, { error: { code: 'QUERY_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // GET /v1/health/report — latest health report
+    if (pathname === '/v1/health/report' && req.method === 'GET') {
+      if (!pool) {
+        sendJson(res, 503, { error: { code: 'NO_DB', message: 'Database pool not available' } });
+        return;
+      }
+      try {
+        const { rows } = await pool.query(
+          `SELECT * FROM health_reports ORDER BY created_at DESC LIMIT 1`
+        );
+        sendJson(res, 200, { data: rows[0] || null });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Query failed';
+        sendJson(res, 500, { error: { code: 'QUERY_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ─── System Metrics ──────────────────────────────────────────────────
+    // GET /v1/metrics/system — in-memory metrics + system_metrics.json
+    if (pathname === '/v1/metrics/system' && req.method === 'GET') {
+      try {
+        const liveMetrics = getMetrics();
+        // Also read persisted metrics file for banned users, etc.
+        let fileMetrics: any = null;
+        try {
+          const raw = fs.readFileSync(path.resolve('./data/system_metrics.json'), 'utf-8');
+          fileMetrics = JSON.parse(raw);
+        } catch { /* file may not exist */ }
+
+        sendJson(res, 200, {
+          data: {
+            live: liveMetrics,
+            persisted: fileMetrics,
+            process: {
+              uptimeSeconds: process.uptime(),
+              memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+              pid: process.pid,
+            },
+          },
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to gather metrics';
+        sendJson(res, 500, { error: { code: 'METRICS_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // GET /v1/metrics/x-usage — X/Twitter API usage stats
+    if (pathname === '/v1/metrics/x-usage' && req.method === 'GET') {
+      try {
+        let usage: any = null;
+        try {
+          const raw = fs.readFileSync(path.resolve('./data/x_usage.json'), 'utf-8');
+          usage = JSON.parse(raw);
+        } catch { /* file may not exist */ }
+
+        let schedules: any = null;
+        try {
+          const raw = fs.readFileSync(path.resolve('./data/x_scheduled_tweets.json'), 'utf-8');
+          schedules = JSON.parse(raw);
+        } catch { /* file may not exist */ }
+
+        let marketing: any = null;
+        try {
+          const raw = fs.readFileSync(path.resolve('./data/x_marketing_schedules.json'), 'utf-8');
+          marketing = JSON.parse(raw);
+        } catch { /* file may not exist */ }
+
+        sendJson(res, 200, {
+          data: {
+            usage,
+            scheduledTweets: schedules,
+            marketingSchedules: marketing,
+          },
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to read X usage';
+        sendJson(res, 500, { error: { code: 'X_USAGE_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // GET /v1/metrics/engagement — engagement log aggregates
+    if (pathname === '/v1/metrics/engagement' && req.method === 'GET') {
+      if (!pool) {
+        sendJson(res, 503, { error: { code: 'NO_DB', message: 'Database pool not available' } });
+        return;
+      }
+      try {
+        // Aggregate engagement stats from the last 24h and 7d
+        const [day, week, recent] = await Promise.all([
+          pool.query(`
+            SELECT COUNT(*) as total,
+                   COUNT(DISTINCT user_id) as unique_users,
+                   AVG(CASE WHEN sentiment_score IS NOT NULL THEN sentiment_score END) as avg_sentiment
+            FROM engagement_log
+            WHERE created_at > NOW() - INTERVAL '24 hours'
+          `),
+          pool.query(`
+            SELECT COUNT(*) as total,
+                   COUNT(DISTINCT user_id) as unique_users
+            FROM engagement_log
+            WHERE created_at > NOW() - INTERVAL '7 days'
+          `),
+          pool.query(`
+            SELECT * FROM engagement_log
+            ORDER BY created_at DESC LIMIT 20
+          `),
+        ]);
+        sendJson(res, 200, {
+          data: {
+            last24h: day.rows[0] || {},
+            last7d: week.rows[0] || {},
+            recent: recent.rows,
+          },
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Query failed';
+        sendJson(res, 500, { error: { code: 'QUERY_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ─── Intelligence Feed ───────────────────────────────────────────────
+    // GET /v1/intelligence/feed — recent scout intel from agent_messages
+    if (pathname === '/v1/intelligence/feed' && req.method === 'GET') {
+      if (!pool) {
+        sendJson(res, 503, { error: { code: 'NO_DB', message: 'Database pool not available' } });
+        return;
+      }
+      try {
+        const limit = Math.min(Number(url.searchParams.get('limit')) || 30, 100);
+        const { rows } = await pool.query(`
+          SELECT * FROM agent_messages
+          WHERE sender IN ('scout', 'guardian', 'analyst')
+          ORDER BY created_at DESC
+          LIMIT $1
+        `, [limit]);
+        sendJson(res, 200, { data: rows });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Query failed';
+        sendJson(res, 500, { error: { code: 'QUERY_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // GET /v1/intelligence/trends — active trends + trend pool
+    if (pathname === '/v1/intelligence/trends' && req.method === 'GET') {
+      try {
+        const activeTrends = getActiveTrends();
+        const monitorStatus = getTrendMonitorStatus();
+        const pooledTrends = getPooledTrends();
+
+        // Also read trend_pool.json for persisted data
+        let trendPoolFile: any = null;
+        try {
+          const raw = fs.readFileSync(path.resolve('./data/trend_pool.json'), 'utf-8');
+          trendPoolFile = JSON.parse(raw);
+        } catch { /* file may not exist */ }
+
+        sendJson(res, 200, {
+          data: {
+            active: activeTrends,
+            pooled: pooledTrends,
+            monitor: monitorStatus,
+            persistedPool: trendPoolFile,
+          },
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to get trends';
+        sendJson(res, 500, { error: { code: 'TRENDS_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ─── Portfolio & PnL ─────────────────────────────────────────────────
+    // GET /v1/portfolio/summary — PnL summary + active positions
+    if (pathname === '/v1/portfolio/summary' && req.method === 'GET') {
+      try {
+        const [pnl, positions, trades] = await Promise.all([
+          getPnLSummary(),
+          getActivePositions(),
+          getRecentTrades(20),
+        ]);
+        sendJson(res, 200, {
+          data: {
+            pnl,
+            activePositions: positions,
+            recentTrades: trades,
+          },
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'PnL query failed';
+        sendJson(res, 500, { error: { code: 'PNL_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // GET /v1/portfolio/positions — all positions (including closed)
+    if (pathname === '/v1/portfolio/positions' && req.method === 'GET') {
+      try {
+        const activeOnly = url.searchParams.get('active') === 'true';
+        const positions = activeOnly ? await getActivePositions() : await getAllPositions();
+        sendJson(res, 200, { data: positions });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Position query failed';
+        sendJson(res, 500, { error: { code: 'POSITIONS_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ─── Wallet ──────────────────────────────────────────────────────────
+    // GET /v1/wallet/balance — SOL balances for pump + funding wallets
+    if (pathname === '/v1/wallet/balance' && req.method === 'GET') {
+      try {
+        const [pumpBalance, fundingInfo] = await Promise.all([
+          getPumpWalletBalance().catch(() => null),
+          getFundingWalletBalance().catch(() => null),
+        ]);
+        sendJson(res, 200, {
+          data: {
+            pumpWallet: {
+              balance: pumpBalance,
+              address: env.PUMP_PORTAL_WALLET_ADDRESS || null,
+            },
+            fundingWallet: fundingInfo ? {
+              balance: fundingInfo.balance,
+              address: fundingInfo.address,
+            } : null,
+            treasuryEnabled: env.treasuryEnabled,
+          },
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Wallet query failed';
+        sendJson(res, 500, { error: { code: 'WALLET_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ─── Token Prices ────────────────────────────────────────────────────
+    // GET /v1/prices/:mint — get token price data
+    const priceMatch = pathname.match(/^\/v1\/prices\/([A-Za-z0-9]+)$/);
+    if (priceMatch && req.method === 'GET') {
+      try {
+        const priceData = await getTokenPrice(priceMatch[1]);
+        if (!priceData) {
+          sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'Token price not found' } });
+          return;
+        }
+        sendJson(res, 200, { data: priceData });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Price query failed';
+        sendJson(res, 500, { error: { code: 'PRICE_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ─── Factory / Agent Registry ────────────────────────────────────────
+    // GET /v1/factory/agents — list factory-spawned agents
+    if (pathname === '/v1/factory/agents' && req.method === 'GET') {
+      if (!pool) {
+        sendJson(res, 503, { error: { code: 'NO_DB', message: 'Database pool not available' } });
+        return;
+      }
+      try {
+        const { rows } = await pool.query(`
+          SELECT * FROM agent_registry ORDER BY registered_at DESC
+        `);
+        sendJson(res, 200, { data: rows });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Query failed';
+        sendJson(res, 500, { error: { code: 'QUERY_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ─── Community ───────────────────────────────────────────────────────
+    // GET /v1/community/stats/:chatId — group health stats
+    const communityMatch = pathname.match(/^\/v1\/community\/stats\/(-?\d+)$/);
+    if (communityMatch && req.method === 'GET') {
+      try {
+        const stats = getActivityStats(communityMatch[1]);
+        sendJson(res, 200, { data: stats });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Stats query failed';
+        sendJson(res, 500, { error: { code: 'STATS_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // GET /v1/community/voting — current voting data
+    if (pathname === '/v1/community/voting' && req.method === 'GET') {
+      try {
+        let votingData: any = null;
+        try {
+          const raw = fs.readFileSync(path.resolve('./data/community_voting.json'), 'utf-8');
+          votingData = JSON.parse(raw);
+        } catch { /* file may not exist */ }
+        sendJson(res, 200, { data: votingData });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to read voting data';
+        sendJson(res, 500, { error: { code: 'VOTING_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ─── Telegram Schedules ──────────────────────────────────────────────
+    // GET /v1/schedules/telegram — scheduled TG posts
+    if (pathname === '/v1/schedules/telegram' && req.method === 'GET') {
+      try {
+        let schedules: any = null;
+        try {
+          const raw = fs.readFileSync(path.resolve('./data/tg_scheduled_posts.json'), 'utf-8');
+          schedules = JSON.parse(raw);
+        } catch { /* file may not exist */ }
+        sendJson(res, 200, { data: schedules });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to read TG schedules';
+        sendJson(res, 500, { error: { code: 'SCHEDULE_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ─── Config & Status ─────────────────────────────────────────────────
+    // GET /v1/config/status — non-sensitive environment flags summary
+    if (pathname === '/v1/config/status' && req.method === 'GET') {
+      try {
+        sendJson(res, 200, {
+          data: {
+            launchkit: env.launchkitEnabled,
+            treasury: {
+              enabled: env.treasuryEnabled,
+              autoWithdraw: env.autoWithdrawEnabled,
+              autoSell: env.autoSellEnabled,
+              autoSellMode: env.AUTO_SELL_MODE || 'disabled',
+            },
+            autonomous: {
+              enabled: !!process.env.AUTONOMOUS_ENABLE,
+              schedule: process.env.AUTONOMOUS_SCHEDULE || null,
+              maxPerDay: process.env.AUTONOMOUS_MAX_PER_DAY || null,
+              minSol: process.env.AUTONOMOUS_MIN_SOL || null,
+              dryRun: process.env.AUTONOMOUS_DRY_RUN === 'true',
+            },
+            channels: {
+              novaChannelEnabled: !!process.env.NOVA_CHANNEL_ENABLE,
+              novaChannelId: process.env.NOVA_CHANNEL_ID || null,
+              farcasterEnabled: process.env.FARCASTER_ENABLE === 'true',
+            },
+            database: cachedDbReadiness ? {
+              mode: cachedDbReadiness.mode,
+              ready: cachedDbReadiness.ready,
+              vectorEnabled: cachedDbReadiness.vectorEnabled,
+            } : null,
+            swarmPoolAvailable: !!pool,
+          },
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Config query failed';
+        sendJson(res, 500, { error: { code: 'CONFIG_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
 
     notFound(res);
   });
