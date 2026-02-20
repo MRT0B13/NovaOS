@@ -1958,11 +1958,27 @@ export const kickSpammerAction: Action = {
     const userIdToKick = finalUserId || searchedUserId;
     
     // Get scam detection result (set during validate)
-    const scamDetection = (message as any)._scamDetection as { isScam: boolean; reason: string; severity: 'warn' | 'kick' } | undefined;
+    let scamDetection = (message as any)._scamDetection as { isScam: boolean; reason: string; severity: 'warn' | 'kick' } | undefined;
     
+    // If the LLM chose KICK_SPAMMER but validate didn't run detectScam
+    // (e.g. the model picked the action from context), re-run detection now
+    if (!scamDetection) {
+      const text = String(message.content?.text ?? '');
+      const recheck = detectScam(text);
+      if (recheck) {
+        scamDetection = recheck;
+        console.log(`[KICK_SPAMMER] Re-detected scam in handler: ${recheck.reason} (severity: ${recheck.severity})`);
+      }
+    }
+
     // Determine whether to warn or kick based on severity and history
     let shouldKick = false;
     let warningCount = 0;
+    
+    // Check if this is an explicit admin kick/ban command (not LLM judgment)
+    const messageText = String(message.content?.text ?? '').toLowerCase();
+    const isExplicitKickCommand = /\b(?:kick|ban|remove)\b.*\b(?:spam|scam|user|member)\b/i.test(messageText) 
+      || /\b(?:spam|scam).*\b(?:kick|ban|remove)\b/i.test(messageText);
     
     if (scamDetection && userIdToKick) {
       if (scamDetection.severity === 'kick') {
@@ -1995,8 +2011,36 @@ export const kickSpammerAction: Action = {
           };
         }
       }
+    } else if (!scamDetection && isExplicitKickCommand) {
+      // Explicit admin kick/ban command with no scam pattern match - kick immediately
+      shouldKick = true;
+    } else if (!scamDetection && userIdToKick) {
+      // LLM chose KICK_SPAMMER but no scam pattern matched — treat as warn-severity
+      // This prevents instant bans for borderline messages the LLM flagged
+      const warningResult = trackScamWarning(chatId, userIdToKick, 'LLM-flagged suspicious message', message.entityId as string);
+      warningCount = warningResult.warningCount;
+      shouldKick = warningResult.shouldKick;
+      
+      if (!shouldKick) {
+        console.log(`[KICK_SPAMMER] LLM-flagged, warning user (${warningCount}/${WARNING_THRESHOLD})`);
+        
+        await callback({
+          text: `⚠️ **WARNING ${warningCount}/${WARNING_THRESHOLD}** to ${finalName}\n\n` +
+            `that message looks suspicious ser 🚫\n\n` +
+            `this is your ${warningCount === 1 ? 'first' : 'final'} warning. ` +
+            `${warningCount >= WARNING_THRESHOLD - 1 ? 'next offense = instant ban 🔨' : 'keep it clean or get rugged fren'}\n\n` +
+            `we're here for legit community vibes only 💎`,
+          actions: [],
+        });
+        
+        return {
+          text: `Warned user ${finalName} (${warningCount}/${WARNING_THRESHOLD})`,
+          success: true,
+          data: { warned: true, userId: userIdToKick, userName: finalName, warningCount, reason: 'LLM-flagged suspicious message' }
+        };
+      }
     } else if (!scamDetection) {
-      // No scam detection - this is an explicit kick request
+      // No scam detection AND no user ID — can't do anything meaningful
       shouldKick = true;
     }
     
