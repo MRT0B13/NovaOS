@@ -82,17 +82,47 @@ export async function initLaunchKit(
       // Handle degradation commands from Health Agent
       heartbeat.onCommand(async (action, params) => {
         switch (action) {
-          case 'reduce_frequency':
-            logger.warn(`[Nova] Health Agent: reducing reply frequency to ${params.newMaxRepliesPerHour}/hr`);
-            setTimeout(() => {
-              logger.info('[Nova] Reply frequency cooldown expired');
-            }, params.resumeAfterMs || 900_000);
+          case 'reduce_frequency': {
+            const newMax = params.newMaxRepliesPerHour ?? 2;
+            const resumeMs = params.resumeAfterMs ?? 900_000;
+            logger.warn(`[Nova] Health Agent: reducing reply frequency to ${newMax}/hr for ${Math.round(resumeMs / 60_000)}min`);
+            try {
+              // Dynamically update REPLY_RULES (mutable export)
+              const { REPLY_RULES } = await import('./reply-rules.ts');
+              const originalMax = REPLY_RULES.maxTotalRepliesPerHour;
+              REPLY_RULES.maxTotalRepliesPerHour = newMax;
+              setTimeout(() => {
+                REPLY_RULES.maxTotalRepliesPerHour = originalMax;
+                logger.info(`[Nova] Reply frequency restored to ${originalMax}/hr`);
+              }, resumeMs);
+            } catch {
+              logger.warn('[Nova] Could not update reply rules');
+            }
+            break;
+          }
+          case 'wait_and_retry':
+            // Twitter 503 — nothing to do actally; the reply engine will
+            // naturally back off because canPost checks will fail on the
+            // X API.  Log for visibility.
+            logger.warn(`[Nova] Health Agent: Twitter API 503 — will retry after ${Math.round((params.retryAfterMs || 300_000) / 60_000)}min`);
             break;
           case 'rotate_rpc':
-            logger.warn(`[Nova] Health Agent: RPC rotation requested → ${params.backupRPCs?.[0]}`);
+            // Already handled directly in monitor.ts via rotateRpc()
+            logger.info(`[Nova] Health Agent: RPC rotation applied`);
             break;
           case 'switch_model':
-            logger.warn(`[Nova] Health Agent: model switch applied → repair engine now using ${params.fallback}`);
+            // Already handled directly in monitor.ts via switchProvider()
+            logger.info(`[Nova] Health Agent: model switch applied → ${params.fallback}`);
+            break;
+          case 'emergency_reconnect':
+            logger.warn(`[Nova] Health Agent: DB reconnection requested`);
+            // Pool auto-reconnects on next query; log to surface the issue
+            break;
+          case 'disable_agent':
+            logger.warn(`[Nova] Health Agent: disabling agent — manual intervention needed`);
+            break;
+          case 'restart_agent':
+            logger.warn(`[Nova] Health Agent: agent restart requested`);
             break;
           default:
             logger.info(`[Nova] Health Agent command: ${action}`);

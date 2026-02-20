@@ -180,13 +180,13 @@ export abstract class BaseAgent {
     });
   }
 
-  /** Read pending messages addressed to this agent */
+  /** Read pending messages addressed to this agent (or broadcast) */
   protected async readMessages(limit: number = 10): Promise<AgentMessage[]> {
     try {
       const result = await this.pool.query(
         `SELECT id, from_agent, to_agent, message_type, priority, payload, created_at
          FROM agent_messages
-         WHERE to_agent = $1 AND acknowledged = false
+         WHERE (to_agent = $1 OR to_agent = 'broadcast') AND acknowledged = false
            AND (expires_at IS NULL OR expires_at > NOW())
          ORDER BY
            CASE priority
