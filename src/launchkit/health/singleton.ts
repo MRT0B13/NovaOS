@@ -36,7 +36,7 @@ export function initHealthSystem(databaseUrl: string): {
     idleTimeoutMillis: 30_000,
   });
 
-  _heartbeat = new HeartbeatClient(_pool, 'nova-main', '1.0.0');
+  _heartbeat = new HeartbeatClient(_pool, 'nova', '1.0.0');
   _db = new HealthDB(_pool);
   _monitor = new HealthMonitor(_pool, {
     repairEnabled: process.env.REPAIR_ENABLED !== 'false',

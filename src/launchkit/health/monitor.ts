@@ -330,13 +330,13 @@ export class HealthMonitor {
     // Apply switch_model directly to the repair engine (no message bus roundtrip needed)
     if (rule.action === 'switch_model' && rule.params?.fallback) {
       const fallback = rule.params.fallback as 'anthropic' | 'openai';
-      // Skip if already on the target provider (avoids redundant switch after restart)
+      // Skip entirely if already on the target provider — no notification, no broadcast
       if (this.repair.getProvider() === fallback) {
-        console.log(`[HealthAgent] Repair engine already on ${fallback}, skipping switch`);
-      } else {
-        this.repair.switchProvider(fallback);
-        console.log(`[HealthAgent] ✅ Repair engine switched to ${fallback}`);
+        console.log(`[HealthAgent] Repair engine already on ${fallback}, skipping`);
+        return;
       }
+      this.repair.switchProvider(fallback);
+      console.log(`[HealthAgent] ✅ Repair engine switched to ${fallback}`);
     }
 
     // Apply rotate_rpc — cycle to the next backup Solana RPC

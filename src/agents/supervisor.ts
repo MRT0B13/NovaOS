@@ -305,16 +305,77 @@ export class Supervisor extends BaseAgent {
 
     // ── Community Reports ──
     this.handlers.set('nova-community:report', async (msg) => {
-      const { summary, engagementSpike } = msg.payload;
+      const { summary, engagementSpike, engagementDrop, pendingVotes, tweetsSentToday, tgPostsSentToday, newBans } = msg.payload;
+
       if (engagementSpike && msg.priority === 'high') {
-        logger.info(`[supervisor] Community engagement spike: ${summary}`);
-        // Could adjust reply frequency or trigger a community post
+        // Engagement surge — notify channel and ramp up activity
+        const content = `📈 Community Surge: ${summary}`;
+        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+        logger.info(`[supervisor] Community engagement spike posted: ${summary}`);
+      } else if (engagementDrop && msg.priority === 'high') {
+        // Engagement drop — log and potentially trigger content
+        logger.warn(`[supervisor] Community engagement drop: ${summary}`);
       }
+
+      // Log ban activity for awareness
+      if (newBans && newBans > 3) {
+        const banMsg = `🛡️ Moderation: ${newBans} bans in last 30min`;
+        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(banMsg);
+      }
+    });
+
+    // ── Launcher Reports (pipeline status, PnL) ──
+    this.handlers.set('nova-launcher:report', async (msg) => {
+      const { source, enabled, dryRun, totalLaunches, launchesToday, pnl, lastError } = msg.payload;
+      logger.info(`[supervisor] Launcher report: enabled=${enabled}, dryRun=${dryRun}, launches=${totalLaunches}, today=${launchesToday}${pnl ? `, PnL=${pnl.totalPnl?.toFixed(4)} SOL` : ''}${lastError ? `, lastErr=${lastError}` : ''}`);
     });
 
     // ── Wildcard: any agent status update ──
     this.handlers.set('*:status', async (msg) => {
-      logger.debug(`[supervisor] Agent ${msg.from_agent} status: ${JSON.stringify(msg.payload)}`);
+      // Token child deactivation — log it
+      if (msg.from_agent.startsWith('child-') && (msg.payload?.event === 'deactivated' || msg.payload?.event === 'auto_deactivated')) {
+        logger.info(`[supervisor] Token child ${msg.payload.tokenSymbol || msg.from_agent} deactivated: ${msg.payload.reason || 'unknown'}`);
+      } else {
+        logger.debug(`[supervisor] Agent ${msg.from_agent} status: ${JSON.stringify(msg.payload)}`);
+      }
+    });
+
+    // ── Wildcard: any agent alert (catches token child alerts) ──
+    this.handlers.set('*:alert', async (msg) => {
+      // Primarily handles token child alerts (price spikes, crashes, mcap milestones)
+      // Specific agent alerts (guardian, etc.) have their own handlers and won't hit this
+      const { event, tokenSymbol, tokenAddress, changePercent, milestone, currentMcap } = msg.payload;
+
+      if (event === 'price_spike') {
+        const content = `🚀 $${tokenSymbol} surged +${changePercent}%!${tokenAddress ? ` CA: ${tokenAddress.slice(0, 8)}...` : ''}`;
+        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+        if (this.callbacks.onPostToX) await this.callbacks.onPostToX(content);
+        logger.info(`[supervisor] Token child price spike: ${content}`);
+      } else if (event === 'price_crash') {
+        const content = `⚠️ $${tokenSymbol} dropped ${changePercent}%${tokenAddress ? ` — CA: ${tokenAddress.slice(0, 8)}...` : ''}`;
+        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+        logger.warn(`[supervisor] Token child price crash: ${content}`);
+      } else if (event === 'mcap_milestone') {
+        const formatMcap = (v: number) => v >= 1e6 ? `$${(v / 1e6).toFixed(1)}M` : `$${(v / 1e3).toFixed(0)}K`;
+        const content = `🎯 $${tokenSymbol} hit ${formatMcap(milestone)} market cap!`;
+        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+        if (this.callbacks.onPostToX) await this.callbacks.onPostToX(content);
+        logger.info(`[supervisor] Token child mcap milestone: ${content}`);
+      } else {
+        // Generic alert from unknown agent
+        logger.info(`[supervisor] Alert from ${msg.from_agent}: ${JSON.stringify(msg.payload).slice(0, 200)}`);
+      }
+    });
+
+    // ── Wildcard: any agent report (catches token child metrics) ──
+    this.handlers.set('*:report', async (msg) => {
+      // Token child periodic metrics — just track, don't post
+      if (msg.from_agent.startsWith('child-')) {
+        const { tokenSymbol, metrics } = msg.payload;
+        logger.debug(`[supervisor] Token child ${tokenSymbol}: price=$${metrics?.price || 0}, vol=$${metrics?.volume24h || 0}, mcap=$${metrics?.mcap || 0}`);
+      } else {
+        logger.debug(`[supervisor] Report from ${msg.from_agent}: ${msg.payload?.source || msg.message_type}`);
+      }
     });
 
     // ── Health Agent Commands ──

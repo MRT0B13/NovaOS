@@ -260,5 +260,5 @@ export const MONITORED_APIS: Array<{ name: string; endpoint: string; method: str
   { name: 'Anthropic',     endpoint: 'https://api.anthropic.com/v1/messages',                                     method: 'POST', timeoutMs: 10_000 },
   { name: 'Solana RPC',    endpoint: 'https://api.mainnet-beta.solana.com',                                       method: 'POST', timeoutMs: 5_000  },
   { name: 'DeFiLlama',     endpoint: 'https://api.llama.fi/protocols',                                            method: 'GET',  timeoutMs: 10_000 },
-  { name: 'RugCheck',      endpoint: 'https://api.rugcheck.xyz/v1/stats',                                         method: 'GET',  timeoutMs: 10_000 },
+  { name: 'RugCheck',      endpoint: 'https://api.rugcheck.xyz/v1/tokens/JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN/report/summary', method: 'GET',  timeoutMs: 10_000 },
 ];

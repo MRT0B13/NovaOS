@@ -205,12 +205,14 @@ export class GuardianAgent extends BaseAgent {
   private async rescanWatchList(): Promise<void> {
     if (!this.running) return;
 
+    // Re-discover newly launched tokens from DB every cycle
+    // (tokens launched after Guardian started would otherwise be missed)
+    await this.loadWatchListFromDB();
+
     // Always log status even when no tokens to watch
     if (this.watchList.size === 0) {
-      // Retry loading from DB in case tokens were added since startup
-      await this.loadWatchListFromDB();
-      logger.info(`[guardian] Watch list: ${this.watchList.size} tokens, ${this.scanCount} total scans`);
-      if (this.watchList.size === 0) return;
+      logger.info(`[guardian] Watch list: 0 tokens, ${this.scanCount} total scans`);
+      return;
     }
 
     await this.updateStatus('scanning');
