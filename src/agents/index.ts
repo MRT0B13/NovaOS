@@ -25,6 +25,7 @@ export { GuardianAgent } from './guardian.ts';
 export { AnalystAgent } from './analyst.ts';
 export { LauncherAgent } from './launcher.ts';
 export { CommunityAgent } from './community-agent.ts';
+export { CFOAgent } from './cfo.ts';
 export { TokenChildAgent, type TokenChildConfig } from './token-child.ts';
 export { AgentFactory, type AgentSpec, type CapabilityType, type AgentSpecStatus } from './factory.ts';
 
@@ -36,6 +37,7 @@ import { GuardianAgent } from './guardian.ts';
 import { AnalystAgent } from './analyst.ts';
 import { LauncherAgent } from './launcher.ts';
 import { CommunityAgent } from './community-agent.ts';
+import { CFOAgent } from './cfo.ts';
 
 // ============================================================================
 // Swarm Bootstrap
@@ -48,6 +50,7 @@ export interface SwarmHandle {
   analyst: AnalystAgent;
   launcher: LauncherAgent;
   community: CommunityAgent;
+  cfo: CFOAgent;
 }
 
 /**
@@ -69,11 +72,12 @@ export async function initSwarm(
   const analyst = new AnalystAgent(pool);
   const launcher = new LauncherAgent(pool);
   const community = new CommunityAgent(pool);
+  const cfo = new CFOAgent(pool);
 
   if (callbacks) supervisor.setCallbacks(callbacks);
 
   // Start all agents (non-blocking, each registers + starts loops)
-  const agents = [supervisor, scout, guardian, analyst, launcher, community];
+  const agents = [supervisor, scout, guardian, analyst, launcher, community, cfo];
 
   for (const agent of agents) {
     try {
@@ -83,9 +87,9 @@ export async function initSwarm(
     }
   }
 
-  logger.info(`[swarm] ✅ ${agents.length} agents started (Scout, Guardian, Analyst, Launcher, Community + Supervisor)`);
+  logger.info(`[swarm] ✅ ${agents.length} agents started (Scout, Guardian, Analyst, Launcher, Community, CFO + Supervisor)`);
 
-  return { supervisor, scout, guardian, analyst, launcher, community };
+  return { supervisor, scout, guardian, analyst, launcher, community, cfo };
 }
 
 /**
@@ -95,6 +99,7 @@ export async function stopSwarm(swarm: SwarmHandle): Promise<void> {
   logger.info('[swarm] Stopping agent swarm...');
 
   const agents = [
+    swarm.cfo,        // Stop CFO first (financial ops)
     swarm.community,
     swarm.launcher,
     swarm.analyst,

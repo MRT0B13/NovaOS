@@ -257,7 +257,7 @@ export class TelegramSetupService {
           success: true,
           chatId: String(chat.id),
           chatTitle: chat.title,
-          botStatus: 'unknown',
+          botStatus: 'member' as TelegramChatMember['status'],
           isAdmin: false, // Can't determine
           canPost: true, // Assume yes since we can see the chat
           canPin: false, // Can't determine
@@ -375,7 +375,7 @@ export class TelegramSetupService {
     try {
       const env = getEnv();
       if (env.TG_WEBHOOK_URL) {
-        logger.debug('[TelegramSetup] Skipping getUpdates — webhook mode active');
+        console.debug('[TelegramSetup] Skipping getUpdates — webhook mode active');
         return [];
       }
     } catch { /* env not available, proceed cautiously */ }

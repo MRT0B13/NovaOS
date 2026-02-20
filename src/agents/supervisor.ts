@@ -170,6 +170,17 @@ export class Supervisor extends BaseAgent {
         logger.info(`[supervisor] High-priority intel posted: ${source}`);
       }
       // Low-priority intel is stored in messages table — used for future content generation
+
+      // Forward all scout intel to CFO for trading decisions
+      try {
+        await this.sendMessage('nova-cfo', 'intel', msg.priority, {
+          ...msg.payload,
+          forwardedBy: 'supervisor',
+          originalFrom: 'nova-scout',
+        });
+      } catch (err) {
+        logger.debug(`[supervisor] Failed to forward intel to CFO (non-fatal):`, err);
+      }
     });
 
     // ── Guardian Alerts ──
@@ -183,6 +194,17 @@ export class Supervisor extends BaseAgent {
         if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(warning);
         if (this.callbacks.onPostToFarcaster) await this.callbacks.onPostToFarcaster(warning, 'defi');
         logger.warn(`[supervisor] CRITICAL safety alert posted for ${tokenName || tokenAddress}`);
+
+        // Forward critical alerts to CFO for emergency exit evaluation
+        await this.sendMessage('nova-cfo', 'alert', 'critical', {
+          command: 'market_crash',
+          source: 'guardian',
+          tokenAddress,
+          tokenName,
+          score,
+          alerts,
+          message: `Guardian CRITICAL: ${tokenName || tokenAddress} — ${(alerts || []).join(', ')}`,
+        });
       } else if (msg.priority === 'high') {
         // HIGH: Post to TG channel only
         if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(warning);
@@ -256,12 +278,26 @@ export class Supervisor extends BaseAgent {
           await this.callbacks.onPostToChannel(content);
         }
         logger.info(`[supervisor] Analyst DeFi snapshot posted: ${tvlParts.join(', ')}`);
+
+        // Forward DeFi metrics to CFO for yield/allocation decisions
+        await this.sendMessage('nova-cfo', 'intel', 'low', {
+          command: 'defi_snapshot',
+          solanaTvl, chainTvl, dexVolume24h, chainVolume,
+          topProtocols, topDexes, tokenPrices,
+        });
       }
       if (source === 'volume_spike') {
         // Volume spike — high priority intel, post to channel + X
         const content = `🚀 ${msg.payload.summary}`;
         if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
         if (this.callbacks.onPostToX) await this.callbacks.onPostToX(content);
+
+        // Forward to CFO — volume spikes can signal hedging/allocation changes
+        await this.sendMessage('nova-cfo', 'intel', 'medium', {
+          command: 'narrative_update',
+          source: 'volume_spike',
+          summary: msg.payload.summary,
+        });
       }
       if (source === 'price_alert') {
         // Significant price move — post to channel + X
@@ -269,6 +305,13 @@ export class Supervisor extends BaseAgent {
         if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
         if (this.callbacks.onPostToX) await this.callbacks.onPostToX(msg.payload.summary);
         logger.info(`[supervisor] Price alert posted: ${msg.payload.summary}`);
+
+        // Forward to CFO — price moves impact SOL treasury/hedge decisions
+        await this.sendMessage('nova-cfo', 'intel', 'medium', {
+          command: 'narrative_update',
+          source: 'price_alert',
+          summary: msg.payload.summary,
+        });
       }
     });
 
@@ -328,6 +371,32 @@ export class Supervisor extends BaseAgent {
     this.handlers.set('nova-launcher:report', async (msg) => {
       const { source, enabled, dryRun, totalLaunches, launchesToday, pnl, lastError } = msg.payload;
       logger.info(`[supervisor] Launcher report: enabled=${enabled}, dryRun=${dryRun}, launches=${totalLaunches}, today=${launchesToday}${pnl ? `, PnL=${pnl.totalPnl?.toFixed(4)} SOL` : ''}${lastError ? `, lastErr=${lastError}` : ''}`);
+    });
+
+    // ── CFO Reports ──
+    this.handlers.set('nova-cfo:report', async (msg) => {
+      const { source, summary } = msg.payload;
+      if (source === 'daily_digest' && summary) {
+        // CFO daily digest — could post to channel or just log
+        logger.info(`[supervisor] CFO daily digest received: ${typeof summary === 'string' ? summary.slice(0, 200) : 'object'}`);
+      } else if (source === 'emergency_exit') {
+        // CFO triggered emergency exit — notify admin prominently
+        const content = `🚨 CFO Emergency: ${msg.payload.message || 'Positions being closed'}`;
+        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+        logger.warn(`[supervisor] CFO emergency exit: ${content}`);
+      } else {
+        logger.debug(`[supervisor] CFO report: ${source || 'unknown'}`);
+      }
+    });
+
+    // ── CFO Alerts ──
+    this.handlers.set('nova-cfo:alert', async (msg) => {
+      const { source, message } = msg.payload;
+      if (msg.priority === 'critical') {
+        const content = `🏦 CFO Alert: ${message || JSON.stringify(msg.payload).slice(0, 200)}`;
+        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+        logger.warn(`[supervisor] CFO critical alert: ${content}`);
+      }
     });
 
     // ── Wildcard: any agent status update ──

@@ -2982,7 +2982,7 @@ export const pinMessageAction: Action = {
       }
       
       // Send and pin the message (chatId already defined above via getChatId)
-      const tgService = new TelegramSetupService(store as any);
+      const tgService = new TelegramSetupService();
       
       // Use the community service to send and pin
       const { TelegramCommunityService } = await import('../services/telegramCommunity.ts');

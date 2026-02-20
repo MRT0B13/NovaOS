@@ -175,8 +175,8 @@ async function findLaunchPackFromContext(runtime: IAgentRuntime, message: Memory
  * Find LaunchPack linked to room OR any pack with telegram_chat_id configured
  * Used for PUBLISH_TELEGRAM to find the right pack to send messages to
  */
-async function findTelegramLinkedPack(runtime: IAgentRuntime, message: Memory, store: any): Promise<string | null> {
-  if (!store) return null;
+async function findTelegramLinkedPack(runtime: IAgentRuntime, message: Memory, store: any): Promise<string | undefined> {
+  if (!store) return undefined;
   
   const roomId = String(message.roomId);
   const packs = await store.list();
@@ -203,7 +203,7 @@ async function findTelegramLinkedPack(runtime: IAgentRuntime, message: Memory, s
     return sorted[0].id;
   }
   
-  return null;
+  return undefined;
 }
 
 function deriveNameAndTicker(text: string): { name: string; ticker: string } {
@@ -1174,12 +1174,7 @@ export const publishXAction: Action = {
     const kit = requireLaunchKit(runtime);
     const xPublisher = requireService<XPublisherService>(kit.xPublisher, 'X_SERVICE_UNAVAILABLE', 'X publisher unavailable');
 
-    // Get Twitter client from plugin
-    const twitterService = runtime.getService('twitter') as any;
-    if (!twitterService?.twitterClient) {
-      throw new Error('Twitter plugin not available. Ensure @elizaos/plugin-twitter is loaded and configured.');
-    }
-    xPublisher.setTwitterClient(twitterService.twitterClient);
+    // Twitter client is managed internally by XPublisherService singleton
 
     const updated = await xPublisher.publish(launchPackId, { force: Boolean(parsed.force) });
     await callback({
@@ -1612,8 +1607,7 @@ export const deleteLaunchPackAction: Action = {
   ],
 };
 
-// Import rate limiter for X quota action
-import { getQuota, getPostingAdvice, getUsageSummary } from '../services/xRateLimiter.ts';
+// Rate limiter already imported at top of file
 
 /**
  * CHECK_X_QUOTA - Check X/Twitter rate limit status

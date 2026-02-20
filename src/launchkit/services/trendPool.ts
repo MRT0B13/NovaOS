@@ -109,7 +109,7 @@ async function loadPoolFromPostgres(): Promise<TrendPoolState | null> {
     const data = await pgRepo.getTrendPool();
     if (data) {
       logger.info(`[TrendPool] Loaded ${data.trends.length} trends from PostgreSQL`);
-      return data as TrendPoolState;
+      return data as unknown as TrendPoolState;
     }
   } catch (err) {
     logger.warn('[TrendPool] Failed to load from PostgreSQL:', err);
@@ -122,7 +122,7 @@ function savePool(state: TrendPoolState): void {
   
   // If PostgreSQL is available, also save async
   if (usePostgres && pgRepo) {
-    pgRepo.saveTrendPool(state as TrendPoolData).catch(err => {
+    pgRepo.saveTrendPool(state as unknown as TrendPoolData).catch(err => {
       logger.warn('[TrendPool] Failed to save to PostgreSQL:', err);
     });
   }
@@ -515,7 +515,7 @@ export async function initPoolAsync(customConfig?: Partial<TrendPoolConfig>): Pr
         // Fall back to file and migrate to PostgreSQL
         poolState = loadPool();
         if (poolState.trends.length > 0) {
-          await pgRepo.saveTrendPool(poolState as TrendPoolData);
+          await pgRepo.saveTrendPool(poolState as unknown as TrendPoolData);
           logger.info(`[TrendPool] Migrated ${poolState.trends.length} trends to PostgreSQL`);
         }
       }

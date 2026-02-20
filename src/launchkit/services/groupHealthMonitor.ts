@@ -16,7 +16,7 @@ interface ChatInfo {
   description?: string;
 }
 
-interface GroupHealth {
+export interface GroupHealth {
   memberCount: number;
   activeMembers24h: number;
   messagesPerDay: number;
@@ -26,6 +26,7 @@ interface GroupHealth {
   lastUpdated: string;
   trend: 'growing' | 'stable' | 'declining';
   memberChange24h: number;
+  [key: string]: unknown;
 }
 
 interface MessageActivity {

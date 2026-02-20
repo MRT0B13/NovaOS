@@ -60,7 +60,7 @@ async function uploadToCatbox(imageBuffer: Buffer): Promise<string | null> {
     const ext = detected.format === 'jpeg' ? 'jpg' : detected.format;
     const form = new FormData();
     form.append('reqtype', 'fileupload');
-    form.append('fileToUpload', new File([imageBuffer], `logo.${ext}`, { type: detected.mime }));
+    form.append('fileToUpload', new File([new Uint8Array(imageBuffer)], `logo.${ext}`, { type: detected.mime }));
     
     const response = await fetch('https://catbox.moe/user/api.php', {
       method: 'POST',
@@ -111,7 +111,7 @@ async function uploadToIPFS(
     
     // Create form data with correct MIME type
     const form = new FormData();
-    const blob = new Blob([imageBuffer], { type: detected.mime });
+    const blob = new Blob([new Uint8Array(imageBuffer)], { type: detected.mime });
     const ext = detected.format === 'jpeg' ? 'jpg' : detected.format;
     form.append('image', new File([blob], `logo.${ext}`, { type: detected.mime }));
     

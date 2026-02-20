@@ -215,9 +215,9 @@ export class HeartbeatClient {
   // HELPERS
   // ============================================================
 
-  private extractFilePath(stack?: string): string | null {
-    if (!stack) return null;
+  private extractFilePath(stack?: string): string | undefined {
+    if (!stack) return undefined;
     const match = stack.match(/(?:at\s+.*?\s+\()(\/[^:)]+\.(?:ts|js)):?(\d+)?/);
-    return match ? match[1] : null;
+    return match ? match[1] : undefined;
   }
 }

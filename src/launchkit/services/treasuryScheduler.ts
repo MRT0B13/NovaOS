@@ -199,11 +199,10 @@ async function runScheduledCheck(): Promise<void> {
       try {
         const { notifyWithdrawal } = await import('./adminNotify.ts');
         await notifyWithdrawal({
-          amount: result.result.withdrawn,
-          destination: result.result.destination,
-          destinationType: result.result.destinationType,
-          txSignature: result.result.signature,
-          remainingBalance: result.checkResult?.newBalance,
+          balance: result.checkResult.currentBalance,
+          available: result.result.withdrawn,
+          suggestedAmount: result.result.withdrawn,
+          walletAddress: result.result.destination,
         });
       } catch {
         // Non-fatal
@@ -239,11 +238,12 @@ async function runScheduledCheck(): Promise<void> {
       // Notify admin of critical failure
       try {
         const { notifyError } = await import('./adminNotify.ts');
-        await notifyError(
-          'TreasuryScheduler',
-          `Too many consecutive errors (${MAX_CONSECUTIVE_ERRORS}). Scheduler stopped.`,
-          error
-        );
+        await notifyError({
+          source: 'TreasuryScheduler',
+          error: `Too many consecutive errors (${MAX_CONSECUTIVE_ERRORS}). Scheduler stopped.`,
+          context: String(error),
+          severity: 'critical',
+        });
       } catch {
         // Non-fatal
       }

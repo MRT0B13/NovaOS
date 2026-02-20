@@ -41,7 +41,7 @@ async function inspectWithPglite() {
     [TABLE]
   );
 
-  if (exists.rowCount === 0) {
+  if ((exists as any).rowCount === 0) {
     console.log(`table '${TABLE}' not found`);
     return;
   }

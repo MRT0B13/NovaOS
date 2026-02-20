@@ -149,8 +149,10 @@ export async function initLaunchKit(
     // Initialize engagement tracker (creates engagement_log table)
     try {
       const { initEngagementTracker } = await import('./engagement-tracker');
-      await initEngagementTracker(pool);
-      logger.info('[LaunchKit] 📊 Engagement tracker initialized');
+      if (pool) {
+        await initEngagementTracker(pool);
+        logger.info('[LaunchKit] 📊 Engagement tracker initialized');
+      }
     } catch (engErr) {
       logger.warn({ error: engErr }, '[LaunchKit] Engagement tracker init failed (non-fatal)');
     }

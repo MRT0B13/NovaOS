@@ -287,6 +287,62 @@ const EnvSchema = z.object({
   // CryptoNews API key for trending headlines & top mentions
   // Get from: https://cryptonews-api.com/register
   CRYPTONEWS_API_KEY: z.string().optional(),
+
+  // ==========================================
+  // CFO Agent — Autonomous Financial Operator
+  // ==========================================
+  CFO_ENABLE: z.string().optional(),
+  CFO_DRY_RUN: z.string().optional(),
+  CFO_DAILY_REPORT_HOUR: z.string().optional(),
+
+  // EVM wallets
+  CFO_EVM_PRIVATE_KEY: z.string().optional(),
+  CFO_POLYGON_RPC_URL: z.string().optional(),
+  CFO_ARBITRUM_RPC_URL: z.string().optional(),
+
+  // Polymarket (Polygon prediction markets)
+  CFO_POLYMARKET_ENABLE: z.string().optional(),
+  CFO_POLYMARKET_API_KEY: z.string().optional(),
+  CFO_POLYMARKET_API_SECRET: z.string().optional(),
+  CFO_POLYMARKET_PASSPHRASE: z.string().optional(),
+  CFO_MAX_POLYMARKET_USD: z.string().optional(),
+  CFO_MAX_SINGLE_BET_USD: z.string().optional(),
+  CFO_KELLY_FRACTION: z.string().optional(),
+  CFO_MIN_EDGE: z.string().optional(),
+
+  // Hyperliquid (Arbitrum perpetual futures)
+  CFO_HYPERLIQUID_ENABLE: z.string().optional(),
+  CFO_HYPERLIQUID_API_WALLET_KEY: z.string().optional(),
+  CFO_HYPERLIQUID_TESTNET: z.string().optional(),
+  CFO_MAX_HYPERLIQUID_USD: z.string().optional(),
+  CFO_MAX_HYPERLIQUID_LEVERAGE: z.string().optional(),
+
+  // Kamino (Solana lending / vaults)
+  CFO_KAMINO_ENABLE: z.string().optional(),
+  CFO_MAX_KAMINO_USD: z.string().optional(),
+  CFO_KAMINO_MAX_LTV_PCT: z.string().optional(),
+
+  // Jito (Solana liquid staking)
+  CFO_JITO_ENABLE: z.string().optional(),
+  CFO_MAX_JITO_SOL: z.string().optional(),
+
+  // Wormhole / LI.FI (cross-chain bridging)
+  CFO_WORMHOLE_ENABLE: z.string().optional(),
+  CFO_LIFI_ENABLE: z.string().optional(),
+  CFO_MAX_BRIDGE_USD: z.string().optional(),
+
+  // x402 micropayments (sell intel for USDC)
+  CFO_X402_ENABLE: z.string().optional(),
+  CFO_X402_PRICE_RUGCHECK: z.string().optional(),
+  CFO_X402_PRICE_SIGNAL: z.string().optional(),
+  CFO_X402_PRICE_TREND: z.string().optional(),
+  CFO_X402_BASE_URL: z.string().optional(),
+
+  // Helius (on-chain analytics + webhooks)
+  CFO_HELIUS_API_KEY: z.string().optional(),
+
+  // Pyth (price oracle)
+  CFO_PYTH_ENABLE: z.string().optional(),
 });
 
 export type LaunchkitEnv = z.infer<typeof EnvSchema> & {

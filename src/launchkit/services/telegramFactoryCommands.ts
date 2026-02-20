@@ -219,6 +219,96 @@ export async function registerFactoryCommands(
       }
     });
 
+    // ── /cfo <subcommand> — CFO Agent controls (admin only) ────────
+    bot.command('cfo', async (ctx: any) => {
+      try {
+        if (!isAdmin(ctx.chat.id)) return;
+        const text = (ctx.message?.text || '').trim();
+        const parts = text.split(/\s+/).slice(1);  // remove "/cfo"
+        const sub = (parts[0] || 'status').toLowerCase();
+
+        const sendToCFO = async (command: string, extra: Record<string, any> = {}) => {
+          await pool.query(
+            `INSERT INTO agent_messages (sender, recipient, type, priority, payload) VALUES ($1, $2, $3, $4, $5)`,
+            ['admin-tg', 'nova-cfo', 'command', 'high', JSON.stringify({ command, ...extra })]
+          );
+        };
+
+        switch (sub) {
+          case 'status':
+            await sendToCFO('cfo_status');
+            await ctx.reply('📊 CFO status request sent — check admin chat for report.');
+            break;
+          case 'scan':
+            await sendToCFO('cfo_scan');
+            await ctx.reply('🔍 CFO opportunity scan triggered.');
+            break;
+          case 'stop':
+            await sendToCFO('cfo_stop');
+            await ctx.reply('⛔ CFO paused — no new trades.');
+            break;
+          case 'start':
+            await sendToCFO('cfo_start');
+            await ctx.reply('▶️ CFO resumed.');
+            break;
+          case 'close': {
+            const target = (parts[1] || '').toLowerCase();
+            if (target === 'poly' || target === 'polymarket') {
+              await sendToCFO('cfo_close_poly');
+              await ctx.reply('🚨 Closing all Polymarket positions.');
+            } else if (target === 'hl' || target === 'hyperliquid') {
+              await sendToCFO('cfo_close_hl');
+              await ctx.reply('🚨 Closing all Hyperliquid positions.');
+            } else if (target === 'all') {
+              await sendToCFO('cfo_close_all');
+              await ctx.reply('🚨 EMERGENCY: Closing ALL positions + pausing CFO.');
+            } else {
+              await ctx.reply('Usage: /cfo close <poly|hl|all>');
+            }
+            break;
+          }
+          case 'stake': {
+            const amount = Number(parts[1]);
+            if (!amount || amount <= 0) { await ctx.reply('Usage: /cfo stake <SOL amount>'); break; }
+            await sendToCFO('cfo_stake', { amount });
+            await ctx.reply(`⏳ Staking ${amount} SOL via Jito...`);
+            break;
+          }
+          case 'hedge': {
+            const usd = Number(parts[1]);
+            const leverage = Number(parts[2]) || 3;
+            if (!usd || usd <= 0) { await ctx.reply('Usage: /cfo hedge <USD> [leverage]'); break; }
+            await sendToCFO('cfo_hedge', { solExposureUsd: usd, leverage });
+            await ctx.reply(`⏳ Opening SOL hedge: SHORT $${usd} @ ${leverage}x...`);
+            break;
+          }
+          case 'approve': {
+            const approvalId = parts[1];
+            if (!approvalId) { await ctx.reply('Usage: /cfo approve <approvalId>'); break; }
+            await sendToCFO('cfo_approve', { approvalId });
+            await ctx.reply(`✅ Approval sent for ${approvalId}.`);
+            break;
+          }
+          default:
+            await ctx.reply(
+              `🏦 *CFO Commands:*\n` +
+              `/cfo status — Portfolio report\n` +
+              `/cfo scan — Trigger opportunity scan\n` +
+              `/cfo stop — Pause all trading\n` +
+              `/cfo start — Resume trading\n` +
+              `/cfo close poly|hl|all — Emergency close\n` +
+              `/cfo stake <SOL> — Stake via Jito\n` +
+              `/cfo hedge <USD> [leverage] — SOL hedge\n` +
+              `/cfo approve <id> — Approve pending trade`,
+              { parse_mode: 'Markdown' }
+            );
+        }
+      } catch (err: any) {
+        logger.warn('[factory-tg] /cfo error:', err.message);
+        await ctx.reply('❌ Error processing CFO command.').catch(() => {});
+      }
+    });
+
     isRegistered = true;
     return true;
   } catch (err: any) {
