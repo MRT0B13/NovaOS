@@ -48,6 +48,9 @@ export class HealthMonitor {
     console.log('[HealthAgent] 🏥 Starting Nova Health Agent...');
     console.log(`[HealthAgent] Code repair: ${this.config.repairEnabled ? 'ENABLED' : 'DISABLED'}`);
 
+    // Load persisted LLM provider preference before anything else
+    this.repair.loadPersistedProvider().catch(() => {});
+
     // Register self
     this.db.upsertHeartbeat({ agentName: 'health-agent', status: 'alive', currentTask: 'monitoring' });
 
@@ -323,8 +326,13 @@ export class HealthMonitor {
     // Apply switch_model directly to the repair engine (no message bus roundtrip needed)
     if (rule.action === 'switch_model' && rule.params?.fallback) {
       const fallback = rule.params.fallback as 'anthropic' | 'openai';
-      this.repair.switchProvider(fallback);
-      console.log(`[HealthAgent] ✅ Repair engine switched to ${fallback}`);
+      // Skip if already on the target provider (avoids redundant switch after restart)
+      if (this.repair.getProvider() === fallback) {
+        console.log(`[HealthAgent] Repair engine already on ${fallback}, skipping switch`);
+      } else {
+        this.repair.switchProvider(fallback);
+        console.log(`[HealthAgent] ✅ Repair engine switched to ${fallback}`);
+      }
     }
 
     // Send degradation command to affected agents

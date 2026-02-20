@@ -45,11 +45,30 @@ export class CodeRepairEngine {
     this.projectRoot = projectRoot;
   }
 
+  /** Load persisted LLM provider preference from DB (call once after construction) */
+  async loadPersistedProvider(): Promise<void> {
+    try {
+      const saved = await this.db.getSetting('llm_provider');
+      if (saved === 'anthropic' || saved === 'openai') {
+        this.llmProvider = saved;
+        console.log(`[Repair] Loaded persisted LLM provider: ${saved}`);
+      }
+    } catch {
+      // First run or DB not ready — keep default
+    }
+  }
+
   /** Switch the LLM provider used for Tier 2 code repairs */
   switchProvider(provider: 'anthropic' | 'openai'): void {
     const prev = this.llmProvider;
+    if (prev === provider) {
+      console.log(`[Repair] LLM provider already set to ${provider}, skipping switch`);
+      return;
+    }
     this.llmProvider = provider;
     console.log(`[Repair] LLM provider switched: ${prev} → ${provider}`);
+    // Persist to DB so it survives restarts
+    this.db.setSetting('llm_provider', provider).catch(() => {});
   }
 
   /** Get the currently active LLM provider */

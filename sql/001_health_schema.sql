@@ -161,6 +161,15 @@ CREATE TABLE IF NOT EXISTS agent_registry (
 );
 
 -- ============================================================
+-- 9. HEALTH CONFIG — persistent key-value settings
+-- ============================================================
+CREATE TABLE IF NOT EXISTS health_config (
+  key               TEXT PRIMARY KEY,
+  value             TEXT NOT NULL,
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================
 -- VIEWS
 -- ============================================================
 

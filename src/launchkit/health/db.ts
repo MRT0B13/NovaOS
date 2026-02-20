@@ -381,6 +381,50 @@ export class HealthDB {
   }
 
   // ============================================================
+  // HEALTH CONFIG (persistent key-value settings)
+  // ============================================================
+
+  private configTableChecked = false;
+
+  /** Ensure health_config table exists (auto-creates on first use) */
+  private async ensureConfigTable(): Promise<void> {
+    if (this.configTableChecked) return;
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS health_config (
+        key         TEXT PRIMARY KEY,
+        value       TEXT NOT NULL,
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    this.configTableChecked = true;
+  }
+
+  /** Get a persistent setting by key (returns null if not set) */
+  async getSetting(key: string): Promise<string | null> {
+    try {
+      await this.ensureConfigTable();
+      const { rows } = await this.pool.query(
+        `SELECT value FROM health_config WHERE key = $1`,
+        [key]
+      );
+      return rows.length > 0 ? rows[0].value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Persist a setting (upsert) */
+  async setSetting(key: string, value: string): Promise<void> {
+    await this.ensureConfigTable();
+    await this.pool.query(
+      `INSERT INTO health_config (key, value, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+      [key, value]
+    );
+  }
+
+  // ============================================================
   // HELPERS
   // ============================================================
 
