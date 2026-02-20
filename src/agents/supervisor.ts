@@ -213,23 +213,62 @@ export class Supervisor extends BaseAgent {
 
     // ── Analyst DeFi Snapshots (low/medium priority) ──
     this.handlers.set('nova-analyst:intel', async (msg) => {
-      const { source, solanaTvl, dexVolume24h, topProtocols, topDexes } = msg.payload;
-      if (source === 'defi_snapshot' && solanaTvl) {
-        // Post a concise DeFi update to the channel
+      const { source, solanaTvl, chainTvl, dexVolume24h, chainVolume, topProtocols, topDexes, tokenPrices } = msg.payload;
+      if (source === 'defi_snapshot' && (solanaTvl || chainTvl)) {
+        // Post a concise multi-chain DeFi update to the channel
         const formatUSD = (v: number) => v >= 1e9 ? `$${(v/1e9).toFixed(2)}B` : v >= 1e6 ? `$${(v/1e6).toFixed(1)}M` : `$${(v/1e3).toFixed(0)}K`;
-        const protos = topProtocols?.length > 0 ? `\nTop: ${topProtocols.join(', ')}` : '';
-        const dexes = topDexes?.length > 0 ? `\nDEXs: ${topDexes.join(', ')}` : '';
-        const content = `📈 <b>Solana DeFi Pulse</b>\n\nTVL: ${formatUSD(solanaTvl)}${dexVolume24h ? ` | 24h Vol: ${formatUSD(dexVolume24h)}` : ''}${protos}${dexes}`;
+
+        // Chain TVL line
+        const tvlParts: string[] = [];
+        if (chainTvl) {
+          for (const [chain, tvl] of Object.entries(chainTvl as Record<string, number>)) {
+            if (tvl > 0) tvlParts.push(`${chain}: ${formatUSD(tvl)}`);
+          }
+        } else if (solanaTvl) {
+          tvlParts.push(`Solana: ${formatUSD(solanaTvl)}`);
+        }
+        const tvlLine = tvlParts.length > 0 ? `TVL: ${tvlParts.join(' | ')}` : '';
+
+        // Volume line
+        const volParts: string[] = [];
+        if (chainVolume) {
+          for (const [chain, vol] of Object.entries(chainVolume as Record<string, number>)) {
+            if (vol > 0) volParts.push(`${chain}: ${formatUSD(vol)}`);
+          }
+        } else if (dexVolume24h) {
+          volParts.push(`Solana: ${formatUSD(dexVolume24h)}`);
+        }
+        const volLine = volParts.length > 0 ? `\n24h Vol: ${volParts.join(' | ')}` : '';
+
+        // Token prices line
+        let pricesLine = '';
+        if (tokenPrices && Object.keys(tokenPrices).length > 0) {
+          const priceParts = Object.entries(tokenPrices as Record<string, number>)
+            .slice(0, 5)
+            .map(([sym, p]) => `${sym}=$${p < 1 ? p.toFixed(6) : p.toFixed(2)}`);
+          pricesLine = `\n💰 ${priceParts.join(', ')}`;
+        }
+
+        const protos = topProtocols?.length > 0 ? `\nTop: ${topProtocols.slice(0, 5).join(', ')}` : '';
+        const dexes = topDexes?.length > 0 ? `\nDEXs: ${topDexes.slice(0, 5).join(', ')}` : '';
+        const content = `📈 <b>DeFi Pulse</b>\n\n${tvlLine}${volLine}${pricesLine}${protos}${dexes}`;
         if (this.callbacks.onPostToChannel) {
           await this.callbacks.onPostToChannel(content);
         }
-        logger.info(`[supervisor] Analyst DeFi snapshot posted: TVL=${formatUSD(solanaTvl)}`);
+        logger.info(`[supervisor] Analyst DeFi snapshot posted: ${tvlParts.join(', ')}`);
       }
       if (source === 'volume_spike') {
         // Volume spike — high priority intel, post to channel + X
         const content = `🚀 ${msg.payload.summary}`;
         if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
         if (this.callbacks.onPostToX) await this.callbacks.onPostToX(content);
+      }
+      if (source === 'price_alert') {
+        // Significant price move — post to channel + X
+        const content = `📊 <b>Price Alert</b>\n${msg.payload.summary}`;
+        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+        if (this.callbacks.onPostToX) await this.callbacks.onPostToX(msg.payload.summary);
+        logger.info(`[supervisor] Price alert posted: ${msg.payload.summary}`);
       }
     });
 
