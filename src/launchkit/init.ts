@@ -304,8 +304,17 @@ export async function initLaunchKit(
           }
         },
         onPostToChannel: async (content: string) => {
-          // Nova channel posting is handled by novaChannel service
-          logger.info(`[swarm] Supervisor channel post: ${content.slice(0, 80)}...`);
+          try {
+            const { announceSystem } = await import('./services/novaChannel.ts');
+            const sent = await announceSystem('info', content);
+            if (sent) {
+              logger.info(`[swarm] Supervisor → Channel: ${content.slice(0, 80)}...`);
+            } else {
+              logger.debug(`[swarm] Supervisor → Channel skipped (novaChannel disabled or filtered)`);
+            }
+          } catch (err) {
+            logger.warn('[swarm] Supervisor → Channel post failed:', err);
+          }
         },
         onPostToFarcaster: farcasterPost,
       });

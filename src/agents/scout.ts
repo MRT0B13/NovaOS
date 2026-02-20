@@ -26,12 +26,27 @@ let _runResearchCycle: (() => Promise<void>) | null = null;
 let _quickSearch: ((query: string) => Promise<string | null>) | null = null;
 let _getReplyIntel: ((text: string) => Promise<string | null>) | null = null;
 
+// Lazy imports — trend data
+let _getPoolStats: (() => { totalInPool: number; available: number; topTrends: Array<{ topic: string; score: number; sources: string[] }> }) | null = null;
+let _getActiveTrends: (() => any[]) | null = null;
+
 async function loadResearch() {
   if (!_runResearchCycle) {
     const mod = await import('../launchkit/services/novaResearch.ts');
     _runResearchCycle = mod.runResearchCycle;
     _quickSearch = mod.quickSearch;
     _getReplyIntel = mod.getReplyIntel;
+  }
+}
+
+async function loadTrendData() {
+  if (!_getPoolStats) {
+    try {
+      const pool = await import('../launchkit/services/trendPool.ts');
+      const monitor = await import('../launchkit/services/trendMonitor.ts');
+      _getPoolStats = pool.getPoolStats;
+      _getActiveTrends = monitor.getActiveTrends;
+    } catch { /* TrendPool may not be init yet */ }
   }
 }
 
@@ -106,8 +121,9 @@ export class ScoutAgent extends BaseAgent {
     if (!this.running) return;
     try {
       await loadResearch();
+      await loadTrendData();
 
-      // Search for narrative shifts in key topics
+      // ── 1. Tavily web searches for narrative shifts ──
       const topics = [
         'AI agents crypto narrative shift',
         'Solana meme coin trending',
@@ -120,18 +136,44 @@ export class ScoutAgent extends BaseAgent {
         if (result) results.push(result);
       }
 
+      // ── 2. Cross-reference with trend pool + active trends ──
+      let trendSummary = '';
+      if (_getPoolStats && _getActiveTrends) {
+        try {
+          const poolStats = _getPoolStats();
+          const activeTrends = _getActiveTrends();
+          const topTopics = poolStats.topTrends.slice(0, 3).map(t => t.topic).join(', ');
+          trendSummary = `Pool: ${poolStats.available} trends (top: ${topTopics || 'none'}) | Active signals: ${activeTrends.length}`;
+          
+          // If a trend from the pool matches Tavily results, flag as high-conviction
+          for (const trend of poolStats.topTrends) {
+            const trendTopic = trend.topic.toLowerCase();
+            for (const result of results) {
+              if (result.toLowerCase().includes(trendTopic.split(' ')[0])) {
+                results.push(`CROSS-CONFIRMED: "${trend.topic}" seen in both pool(${trend.sources.join(',')}) and web search`);
+                break;
+              }
+            }
+          }
+        } catch { /* trend pool not ready */ }
+      }
+
       this.lastQuickScanAt = Date.now();
+
+      // Log scan results visibly
+      logger.info(`[scout] Quick scan: ${topics.length} topics, ${results.length} intel${trendSummary ? ` | ${trendSummary}` : ''}`);
 
       // If we found significant intel, report it
       if (results.length > 0) {
         const isSignificant = results.some(
-          r => r.includes('narrative') || r.includes('surge') || r.includes('breaking') || r.includes('viral')
+          r => r.includes('narrative') || r.includes('surge') || r.includes('breaking') || r.includes('viral') || r.includes('CROSS-CONFIRMED')
         );
 
         await this.reportToSupervisor('intel', isSignificant ? 'high' : 'low', {
           source: isSignificant ? 'narrative_shift' : 'quick_scan',
           summary: results.slice(0, 3).join(' | '),
           resultsCount: results.length,
+          trendPool: trendSummary || undefined,
         });
       }
 

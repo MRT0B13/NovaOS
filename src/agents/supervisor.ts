@@ -56,6 +56,12 @@ export class Supervisor extends BaseAgent {
   // Track agent status for dashboard
   private agentStatuses: Map<string, { status: string; lastSeen: Date; lastMessage?: string }> = new Map();
 
+  // ── Intel Accumulator (for periodic briefings) ────────────
+  private intelBuffer: Array<{ from: string; source: string; summary: string; priority: string; at: Date }> = [];
+  private briefingIntervalMs = 4 * 60 * 60 * 1000; // 4 hours
+  private lastBriefingAt = 0;
+  private messagesProcessed = 0;
+
   constructor(pool: Pool, pollIntervalMs: number = 5_000) {
     super({
       agentId: 'nova',
@@ -71,7 +77,9 @@ export class Supervisor extends BaseAgent {
     this.addInterval(() => this.pollMessages(), this.pollIntervalMs);
     // Also periodically check agent health (separate from Health Agent's deeper checks)
     this.addInterval(() => this.checkAgentStatuses(), 5 * 60 * 1000); // every 5 min
-    logger.info(`[supervisor] Polling every ${this.pollIntervalMs}ms`);
+    // Periodic swarm briefing — digest of all agent activity
+    this.addInterval(() => this.publishBriefing(), this.briefingIntervalMs);
+    logger.info(`[supervisor] Polling every ${this.pollIntervalMs}ms, briefing every ${this.briefingIntervalMs / 3600000}h`);
   }
 
   protected async onStop(): Promise<void> {
@@ -107,12 +115,26 @@ export class Supervisor extends BaseAgent {
   }
 
   private async handleMessage(msg: AgentMessage): Promise<void> {
+    this.messagesProcessed++;
+
     // Update agent status tracking
     this.agentStatuses.set(msg.from_agent, {
       status: 'active',
       lastSeen: new Date(),
       lastMessage: msg.message_type,
     });
+
+    // Accumulate intel for periodic briefing
+    const summary = msg.payload?.summary || msg.payload?.source || msg.message_type;
+    this.intelBuffer.push({
+      from: msg.from_agent,
+      source: msg.payload?.source || msg.message_type,
+      summary: typeof summary === 'string' ? summary.slice(0, 120) : String(summary),
+      priority: msg.priority,
+      at: new Date(),
+    });
+    // Keep buffer bounded
+    if (this.intelBuffer.length > 200) this.intelBuffer = this.intelBuffer.slice(-100);
 
     // Find handler: try specific (agent:type), then wildcard (*:type)
     const key = `${msg.from_agent}:${msg.message_type}`;
@@ -180,11 +202,34 @@ export class Supervisor extends BaseAgent {
 
     // ── Analyst Reports ──
     this.handlers.set('nova-analyst:report', async (msg) => {
-      const { source, summary } = msg.payload;
+      const { source, summary, anomalies } = msg.payload;
       if (msg.priority === 'high' && summary) {
+        // Anomaly detected — post to channel immediately
         if (this.callbacks.onPostToChannel) {
-          await this.callbacks.onPostToChannel(`📊 ${summary}`);
+          await this.callbacks.onPostToChannel(`📊 Market Alert: ${summary}`);
         }
+      }
+    });
+
+    // ── Analyst DeFi Snapshots (low/medium priority) ──
+    this.handlers.set('nova-analyst:intel', async (msg) => {
+      const { source, solanaTvl, dexVolume24h, topProtocols, topDexes } = msg.payload;
+      if (source === 'defi_snapshot' && solanaTvl) {
+        // Post a concise DeFi update to the channel
+        const formatUSD = (v: number) => v >= 1e9 ? `$${(v/1e9).toFixed(2)}B` : v >= 1e6 ? `$${(v/1e6).toFixed(1)}M` : `$${(v/1e3).toFixed(0)}K`;
+        const protos = topProtocols?.length > 0 ? `\nTop: ${topProtocols.join(', ')}` : '';
+        const dexes = topDexes?.length > 0 ? `\nDEXs: ${topDexes.join(', ')}` : '';
+        const content = `📈 <b>Solana DeFi Pulse</b>\n\nTVL: ${formatUSD(solanaTvl)}${dexVolume24h ? ` | 24h Vol: ${formatUSD(dexVolume24h)}` : ''}${protos}${dexes}`;
+        if (this.callbacks.onPostToChannel) {
+          await this.callbacks.onPostToChannel(content);
+        }
+        logger.info(`[supervisor] Analyst DeFi snapshot posted: TVL=${formatUSD(solanaTvl)}`);
+      }
+      if (source === 'volume_spike') {
+        // Volume spike — high priority intel, post to channel + X
+        const content = `🚀 ${msg.payload.summary}`;
+        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+        if (this.callbacks.onPostToX) await this.callbacks.onPostToX(content);
       }
     });
 
@@ -354,5 +399,99 @@ export class Supervisor extends BaseAgent {
 
   private formatScanReport(report: Record<string, any>): string {
     return `🛡️ RugCheck Report: ${report.tokenName || 'Unknown'}\nScore: ${report.score || '?'}/100\n${report.summary || 'Scan complete.'}`;
+  }
+
+  // ── Swarm Briefing ───────────────────────────────────────────────
+
+  /** Publish a periodic digest of all swarm activity to the channel */
+  private async publishBriefing(): Promise<void> {
+    try {
+      const now = Date.now();
+      const periodHours = this.lastBriefingAt
+        ? Math.round((now - this.lastBriefingAt) / 3600000)
+        : 4;
+      this.lastBriefingAt = now;
+
+      // Gather agent status
+      await this.checkAgentStatuses();
+      const activeAgents = Array.from(this.agentStatuses.entries())
+        .filter(([, v]) => v.status === 'active' || v.status === 'alive')
+        .map(([name]) => name.replace('nova-', ''));
+
+      // Summarize recent intel
+      const recentIntel = this.intelBuffer.filter(
+        i => i.at.getTime() > now - (periodHours * 3600000 + 60000),
+      );
+      const byAgent: Record<string, number> = {};
+      const highlights: string[] = [];
+      for (const item of recentIntel) {
+        const agent = item.from.replace('nova-', '');
+        byAgent[agent] = (byAgent[agent] || 0) + 1;
+        if (item.priority === 'high' || item.priority === 'critical') {
+          highlights.push(`• ${item.summary}`);
+        }
+      }
+
+      const agentActivity = Object.entries(byAgent)
+        .map(([name, count]) => `${name}: ${count} msgs`)
+        .join(', ') || 'No messages';
+
+      // ── Pull live data from Nova data pools ──
+      let trendLine = '';
+      let pnlLine = '';
+      let metricsLine = '';
+      try {
+        const { getPoolStats } = await import('../launchkit/services/trendPool.ts');
+        const stats = getPoolStats();
+        const topNames = stats.topTrends.slice(0, 3).map(t => t.topic.slice(0, 25)).join(', ');
+        trendLine = `🔥 Trends: ${stats.available} available${topNames ? ` (${topNames})` : ''}`;
+      } catch { /* not init */ }
+      try {
+        const { getPnLSummary } = await import('../launchkit/services/pnlTracker.ts');
+        const pnl = await getPnLSummary();
+        if (pnl.activePositions > 0 || pnl.totalTrades > 0) {
+          pnlLine = `💰 PnL: ${pnl.totalPnl >= 0 ? '+' : ''}${pnl.totalPnl.toFixed(4)} SOL | ${pnl.activePositions} positions | ${(pnl.winRate * 100).toFixed(0)}% win rate`;
+        }
+      } catch { /* not init */ }
+      try {
+        const { getMetrics } = await import('../launchkit/services/systemReporter.ts');
+        const m = getMetrics();
+        metricsLine = `📱 Today: ${m.tweetsSentToday || 0} tweets, ${m.tgPostsSentToday || 0} TG posts, ${m.trendsDetectedToday || 0} trends`;
+      } catch { /* not init */ }
+
+      // Build briefing
+      const lines: string[] = [
+        `🐝 <b>Nova Swarm Briefing</b> (${periodHours}h)`,
+        '',
+        `⏱ Agents online: ${activeAgents.length > 0 ? activeAgents.join(', ') : 'checking...'}`,
+        `📨 Messages processed: ${this.messagesProcessed}`,
+        `📊 Activity: ${agentActivity}`,
+        `👶 Child agents: ${this.children.size}`,
+      ];
+
+      if (trendLine) lines.push(trendLine);
+      if (pnlLine) lines.push(pnlLine);
+      if (metricsLine) lines.push(metricsLine);
+
+      if (highlights.length > 0) {
+        lines.push('', '🔥 <b>Key Intel:</b>');
+        lines.push(...highlights.slice(0, 5));
+      }
+
+      const briefing = lines.join('\n');
+
+      // Post to channel
+      if (this.callbacks.onPostToChannel) {
+        await this.callbacks.onPostToChannel(briefing);
+      }
+
+      // Always log
+      logger.info(`[supervisor] 🐝 Swarm Briefing: ${activeAgents.length} agents, ${this.messagesProcessed} msgs, ${recentIntel.length} intel items, ${highlights.length} highlights`);
+
+      // Clear processed count (keeps rolling)
+      this.messagesProcessed = 0;
+    } catch (err) {
+      logger.warn('[supervisor] Briefing failed:', err);
+    }
   }
 }

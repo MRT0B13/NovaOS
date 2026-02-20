@@ -25,6 +25,7 @@ import { BaseAgent } from './types.ts';
 // Lazy imports
 let _getAutonomousStatus: (() => any) | null = null;
 let _triggerAutonomousLaunch: (() => Promise<{ success: boolean; error?: string }>) | null = null;
+let _getPnLSummary: ((prices?: Record<string, number>) => Promise<any>) | null = null;
 
 async function loadAutonomous() {
   if (!_getAutonomousStatus) {
@@ -32,6 +33,15 @@ async function loadAutonomous() {
     _getAutonomousStatus = mod.getAutonomousStatus;
     _triggerAutonomousLaunch = mod.triggerAutonomousLaunch;
   }
+}
+
+async function loadPnL() {
+  try {
+    if (!_getPnLSummary) {
+      const mod = await import('../launchkit/services/pnlTracker.ts');
+      _getPnLSummary = mod.getPnLSummary;
+    }
+  } catch { /* not init */ }
 }
 
 // ============================================================================
@@ -43,6 +53,7 @@ export class LauncherAgent extends BaseAgent {
   private launchCount = 0;
   private lastLaunchAt = 0;
   private lastError: string | null = null;
+  private lastKnownLaunchesToday = 0;
 
   constructor(pool: Pool, opts?: { statusCheckIntervalMs?: number }) {
     super({
@@ -75,21 +86,30 @@ export class LauncherAgent extends BaseAgent {
     try {
       await loadAutonomous();
       const status = _getAutonomousStatus!();
+      const totalLaunches = (status.launchesToday || 0) + (status.reactiveLaunchesToday || 0);
 
-      await this.updateStatus(status.isActive ? 'active' : 'idle');
+      await this.updateStatus(status.enabled ? 'active' : 'idle');
 
-      // Report if there's been a recent launch
-      if (status.lastLaunchTime && status.lastLaunchTime > this.lastLaunchAt) {
-        this.lastLaunchAt = status.lastLaunchTime;
-        this.launchCount++;
+      const nextStr = status.nextScheduledTime
+        ? new Date(status.nextScheduledTime).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' })
+        : 'none';
+      logger.info(`[launcher] Pipeline: enabled=${status.enabled}, dryRun=${status.dryRun}, launches today=${totalLaunches}, next=${nextStr} UTC`);
+
+      // Detect new launches by comparing today's count
+      if (totalLaunches > this.lastKnownLaunchesToday) {
+        const newLaunches = totalLaunches - this.lastKnownLaunchesToday;
+        this.lastKnownLaunchesToday = totalLaunches;
+        this.launchCount += newLaunches;
+        this.lastLaunchAt = Date.now();
 
         await this.reportToSupervisor('status', 'high', {
           event: 'launched',
-          tokenName: status.lastLaunchName || 'Unknown',
-          tokenSymbol: status.lastLaunchTicker,
-          mint: status.lastLaunchMint,
+          tokenName: status.pendingIdea?.name || 'Unknown',
           launchNumber: this.launchCount,
+          dryRun: status.dryRun,
         });
+      } else {
+        this.lastKnownLaunchesToday = totalLaunches;
       }
     } catch (err) {
       logger.debug('[launcher] Status check failed:', err);
@@ -186,14 +206,28 @@ export class LauncherAgent extends BaseAgent {
 
   private async reportCurrentStatus(): Promise<void> {
     await loadAutonomous();
+    await loadPnL();
     const status = _getAutonomousStatus!();
+
+    let pnl: { totalPnl: number; activePositions: number; winRate: number } | undefined;
+    try {
+      if (_getPnLSummary) {
+        const summary = await _getPnLSummary();
+        pnl = { totalPnl: summary.totalPnl, activePositions: summary.activePositions, winRate: summary.winRate };
+      }
+    } catch { /* ok */ }
+
     await this.reportToSupervisor('report', 'low', {
       source: 'launcher_status',
-      isActive: status.isActive,
+      enabled: status.enabled,
+      dryRun: status.dryRun,
       totalLaunches: this.launchCount,
+      launchesToday: status.launchesToday,
+      reactiveLaunchesToday: status.reactiveLaunchesToday,
       lastLaunchAt: this.lastLaunchAt ? new Date(this.lastLaunchAt).toISOString() : null,
       lastError: this.lastError,
-      ...status,
+      nextScheduled: status.nextScheduledTime,
+      pnl,
     });
   }
 

@@ -25,6 +25,25 @@ import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent } from './types.ts';
 
+// Lazy imports — data pools
+let _getPendingVotes: (() => any[]) | null = null;
+let _getMetrics: (() => any) | null = null;
+
+async function loadCommunityData() {
+  try {
+    if (!_getPendingVotes) {
+      const cv = await import('../launchkit/services/communityVoting.ts');
+      _getPendingVotes = cv.getPendingVotes;
+    }
+  } catch { /* not init */ }
+  try {
+    if (!_getMetrics) {
+      const sr = await import('../launchkit/services/systemReporter.ts');
+      _getMetrics = sr.getMetrics;
+    }
+  } catch { /* not init */ }
+}
+
 // ============================================================================
 // Community Agent
 // ============================================================================
@@ -69,9 +88,31 @@ export class CommunityAgent extends BaseAgent {
     if (!this.running) return;
     try {
       await this.updateStatus('analyzing');
+      await loadCommunityData();
 
       const summary = await this.getEngagementData();
       this.reportCount++;
+
+      // ── Gather community voting + system metrics ──
+      let pendingVotes = 0;
+      let tweetsSentToday = 0;
+      let tgPostsSentToday = 0;
+
+      try {
+        if (_getPendingVotes) {
+          const votes = _getPendingVotes();
+          pendingVotes = votes.filter((v: any) => v.status === 'pending').length;
+        }
+      } catch { /* ok */ }
+      try {
+        if (_getMetrics) {
+          const m = _getMetrics();
+          tweetsSentToday = m.tweetsSentToday || 0;
+          tgPostsSentToday = m.tgPostsSentToday || 0;
+        }
+      } catch { /* ok */ }
+
+      logger.info(`[community] Summary #${this.reportCount}: ${summary?.totalEngagements || 0} engagements (2h), ${summary?.repliesSent || 0} X replies, ${summary?.tgMessages || 0} TG msgs | Voting: ${pendingVotes} pending | Today: ${tweetsSentToday} tweets, ${tgPostsSentToday} TG posts`);
 
       if (summary) {
         // Detect engagement spikes/drops
@@ -91,6 +132,9 @@ export class CommunityAgent extends BaseAgent {
             : isDrop
             ? `Engagement drop: ${currentRate.toFixed(1)} interactions/hr (was ${(this.lastEngagementRate * 3.3).toFixed(1)})`
             : `Normal engagement: ${currentRate.toFixed(1)} interactions/hr`,
+          pendingVotes,
+          tweetsSentToday,
+          tgPostsSentToday,
           ...summary,
         });
       }
@@ -109,6 +153,8 @@ export class CommunityAgent extends BaseAgent {
     try {
       // Quick check: banned users count, active groups, reply engine status
       const pulse = await this.getQuickPulse();
+
+      logger.info(`[community] Pulse: ${pulse.activeGroups} groups, ${pulse.newBans} bans (30m), reply engine: ${pulse.replyEngineActive ? 'ON' : 'OFF'}`);
 
       if (pulse.newBans > 0) {
         await this.reportToSupervisor('report', 'medium', {

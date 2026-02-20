@@ -23,6 +23,32 @@ import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent } from './types.ts';
 
+// Lazy imports — data pools
+let _getPoolStats: (() => any) | null = null;
+let _getPnLSummary: ((prices?: Record<string, number>) => Promise<any>) | null = null;
+let _getMetrics: (() => any) | null = null;
+
+async function loadDataPools() {
+  try {
+    if (!_getPoolStats) {
+      const tp = await import('../launchkit/services/trendPool.ts');
+      _getPoolStats = tp.getPoolStats;
+    }
+  } catch { /* not init */ }
+  try {
+    if (!_getPnLSummary) {
+      const pnl = await import('../launchkit/services/pnlTracker.ts');
+      _getPnLSummary = pnl.getPnLSummary;
+    }
+  } catch { /* not init */ }
+  try {
+    if (!_getMetrics) {
+      const sr = await import('../launchkit/services/systemReporter.ts');
+      _getMetrics = sr.getMetrics;
+    }
+  } catch { /* not init */ }
+}
+
 // ============================================================================
 // DeFiLlama API (public endpoints)
 // ============================================================================
@@ -160,6 +186,7 @@ export class AnalystAgent extends BaseAgent {
     if (!this.running) return;
     try {
       await this.updateStatus('analyzing');
+      await loadDataPools();
 
       const [tvl, volumes] = await Promise.all([
         fetchSolanaTVL(),
@@ -171,6 +198,30 @@ export class AnalystAgent extends BaseAgent {
       if (volumes) this.lastVolumes = volumes;
       this.cycleCount++;
 
+      // ── Gather Nova data pool metrics ──
+      let trendStats: { available: number; topTrends: Array<{ topic: string; score: number }> } | undefined;
+      let pnlSummary: { totalPnl: number; activePositions: number; winRate: number } | undefined;
+      let systemMetrics: { tweetsSentToday: number; tgPostsSentToday: number; errors24h: number } | undefined;
+
+      try {
+        if (_getPoolStats) {
+          const ps = _getPoolStats();
+          trendStats = { available: ps.available, topTrends: ps.topTrends.slice(0, 3) };
+        }
+      } catch { /* ok */ }
+      try {
+        if (_getPnLSummary) {
+          const pnl = await _getPnLSummary();
+          pnlSummary = { totalPnl: pnl.totalPnl, activePositions: pnl.activePositions, winRate: pnl.winRate };
+        }
+      } catch { /* ok */ }
+      try {
+        if (_getMetrics) {
+          const m = _getMetrics();
+          systemMetrics = { tweetsSentToday: m.tweetsSentToday, tgPostsSentToday: m.tgPostsSentToday, errors24h: m.errors24h };
+        }
+      } catch { /* ok */ }
+
       // Check for significant moves
       const anomalies = this.detectAnomalies(tvl, volumes);
 
@@ -181,20 +232,29 @@ export class AnalystAgent extends BaseAgent {
           summary: anomalies.join(' | '),
           solanaTvl: tvl?.solanaTvl,
           dexVolume24h: volumes?.solana24h,
+          trendStats,
+          pnlSummary,
         });
       } else {
-        // Regular snapshot — low priority
+        // Regular snapshot — includes full Nova data landscape
         await this.reportToSupervisor('intel', 'low', {
           source: 'defi_snapshot',
           solanaTvl: tvl?.solanaTvl,
           topProtocols: tvl?.topProtocols?.slice(0, 3).map(p => p.name),
           dexVolume24h: volumes?.solana24h,
           topDexes: volumes?.topDexes?.slice(0, 3).map(d => d.name),
+          trendStats,
+          pnlSummary,
+          systemMetrics,
         });
       }
 
+      // Enhanced logging with Nova data pools
+      const trendStr = trendStats ? `, Trends=${trendStats.available}` : '';
+      const pnlStr = pnlSummary ? `, PnL=${pnlSummary.totalPnl.toFixed(4)} SOL` : '';
+      const sysStr = systemMetrics ? `, Tweets=${systemMetrics.tweetsSentToday}` : '';
       await this.updateStatus('alive');
-      logger.info(`[analyst] Snapshot #${this.cycleCount}: Solana TVL=$${this.formatUSD(tvl?.solanaTvl || 0)}, DEX Vol=$${this.formatUSD(volumes?.solana24h || 0)}`);
+      logger.info(`[analyst] Snapshot #${this.cycleCount}: Solana TVL=$${this.formatUSD(tvl?.solanaTvl || 0)}, DEX Vol=$${this.formatUSD(volumes?.solana24h || 0)}${trendStr}${pnlStr}${sysStr}`);
     } catch (err) {
       logger.error('[analyst] Snapshot failed:', err);
       await this.updateStatus('error');

@@ -114,7 +114,8 @@ export class GuardianAgent extends BaseAgent {
       for (const row of result.rows) {
         try {
           const pack = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-          if (pack?.launch?.mint && pack?.launch?.status === 'launched') {
+          // Watch any token with a mint address (launched, graduated, or in-progress)
+          if (pack?.launch?.mint) {
             this.addToWatchList(pack.launch.mint, pack.brand?.ticker || pack.brand?.name);
           }
         } catch { /* skip malformed */ }
@@ -202,7 +203,15 @@ export class GuardianAgent extends BaseAgent {
   // ── Periodic Re-scan ─────────────────────────────────────────────
 
   private async rescanWatchList(): Promise<void> {
-    if (!this.running || this.watchList.size === 0) return;
+    if (!this.running) return;
+
+    // Always log status even when no tokens to watch
+    if (this.watchList.size === 0) {
+      // Retry loading from DB in case tokens were added since startup
+      await this.loadWatchListFromDB();
+      logger.info(`[guardian] Watch list: ${this.watchList.size} tokens, ${this.scanCount} total scans`);
+      if (this.watchList.size === 0) return;
+    }
 
     await this.updateStatus('scanning');
     let scanned = 0;
