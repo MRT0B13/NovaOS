@@ -2,6 +2,7 @@ import { logger } from '@elizaos/core';
 import { getHealthbeat } from '../health/singleton';
 import bs58 from 'bs58';
 import { Keypair, Connection, PublicKey } from '@solana/web3.js';
+import { getRpcUrl } from './solanaRpc.ts';
 import { nowIso } from './time.ts';
 import { appendAudit } from './audit.ts';
 import { LaunchPack, LaunchPackUpdateInput } from '../model/launchPack.ts';
@@ -21,7 +22,7 @@ import { recordBuy } from './pnlTracker.ts';
  */
 async function getOnChainTokenBalance(mintAddress: string): Promise<number> {
   const env = getEnv();
-  const rpcUrl = env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const rpcUrl = getRpcUrl();
   const walletAddress = env.PUMP_PORTAL_WALLET_ADDRESS;
   
   if (!walletAddress) {

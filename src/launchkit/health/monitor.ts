@@ -16,6 +16,7 @@ import {
   MONITORED_APIS,
   Severity,
 } from './types';
+import { rotateRpc, getRpcUrl } from '../services/solanaRpc';
 
 export class HealthMonitor {
   private db: HealthDB;
@@ -136,6 +137,9 @@ export class HealthMonitor {
       if (api.name === 'OpenAI' && !process.env.OPENAI_API_KEY) continue;
       if (api.name === 'Twitter API' && !process.env.TWITTER_BEARER_TOKEN && !process.env.TWITTER_API_KEY) continue;
 
+      // Use the active RPC URL for Solana health checks (not the static one in MONITORED_APIS)
+      const endpoint = api.name === 'Solana RPC' ? getRpcUrl() : api.endpoint;
+
       try {
         const start = Date.now();
         const controller = new AbortController();
@@ -165,7 +169,7 @@ export class HealthMonitor {
           (fetchOptions.headers as Record<string, string>)['Content-Type'] = 'application/json';
         }
 
-        const response = await fetch(api.endpoint, fetchOptions);
+        const response = await fetch(endpoint, fetchOptions);
         clearTimeout(timeout);
 
         const elapsed = Date.now() - start;
@@ -177,7 +181,7 @@ export class HealthMonitor {
 
         await this.db.upsertApiHealth({
           apiName: api.name,
-          endpoint: api.endpoint,
+          endpoint: endpoint,
           status: status as any,
           responseTimeMs: elapsed,
           consecutiveFailures: status === 'down' ? 1 : 0, // Will be incremented in DB on conflict
@@ -189,7 +193,7 @@ export class HealthMonitor {
       } catch (err: any) {
         await this.db.upsertApiHealth({
           apiName: api.name,
-          endpoint: api.endpoint,
+          endpoint: endpoint,
           status: 'down',
           responseTimeMs: api.timeoutMs,
           consecutiveFailures: 1,
@@ -332,6 +336,16 @@ export class HealthMonitor {
       } else {
         this.repair.switchProvider(fallback);
         console.log(`[HealthAgent] ✅ Repair engine switched to ${fallback}`);
+      }
+    }
+
+    // Apply rotate_rpc — cycle to the next backup Solana RPC
+    if (rule.action === 'rotate_rpc') {
+      const newRpc = rotateRpc();
+      if (newRpc) {
+        console.log(`[HealthAgent] ✅ Solana RPC rotated to ${newRpc}`);
+      } else {
+        console.log(`[HealthAgent] ⚠️ RPC rotation skipped (cooldown or no backups)`);
       }
     }
 

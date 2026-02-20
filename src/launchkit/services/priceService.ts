@@ -1,4 +1,5 @@
 import { logger } from '@elizaos/core';
+import { getRpcUrl } from './solanaRpc.ts';
 
 /**
  * Price Service
@@ -72,7 +73,7 @@ async function getSolanaWeb3() {
 }
 
 async function getRpcConnection() {
-  const rpcUrl = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const rpcUrl = getRpcUrl();
   if (!_rpcConnection || _rpcUrl !== rpcUrl) {
     const { Connection } = await getSolanaWeb3();
     _rpcConnection = new Connection(rpcUrl, 'confirmed');

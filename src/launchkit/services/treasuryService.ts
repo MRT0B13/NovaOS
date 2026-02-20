@@ -14,6 +14,7 @@ import { logger } from '@elizaos/core';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { getEnv } from '../env.ts';
+import { getRpcUrl } from './solanaRpc.ts';
 import { nowIso } from './time.ts';
 import { appendAudit } from './audit.ts';
 import {

@@ -2,6 +2,7 @@ import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transa
 import bs58 from 'bs58';
 import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
+import { getRpcUrl } from './solanaRpc.ts';
 import { recordBuy, recordSell, recordDeposit, recordWithdrawal } from './pnlTracker.ts';
 
 /**
@@ -44,7 +45,7 @@ export async function depositToPumpWallet(amountSol: number): Promise<{ signatur
     throw new Error('PUMP_PORTAL_WALLET_ADDRESS not configured');
   }
   
-  const rpcUrl = env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const rpcUrl = getRpcUrl();
   const connection = new Connection(rpcUrl, 'confirmed');
   
   // Load funding wallet keypair
@@ -161,7 +162,7 @@ export async function getPumpWalletBalance(): Promise<number> {
     throw new Error('PUMP_PORTAL_WALLET_ADDRESS not configured');
   }
   
-  const rpcUrl = env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const rpcUrl = getRpcUrl();
   const connection = new Connection(rpcUrl, 'confirmed');
   const pumpWalletPubkey = new PublicKey(env.PUMP_PORTAL_WALLET_ADDRESS);
   
@@ -179,7 +180,7 @@ export async function getFundingWalletBalance(): Promise<{ address: string; bala
     throw new Error('AGENT_FUNDING_WALLET_SECRET not configured');
   }
   
-  const rpcUrl = env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const rpcUrl = getRpcUrl();
   const connection = new Connection(rpcUrl, 'confirmed');
   const fundingKeypair = Keypair.fromSecretKey(bs58.decode(env.AGENT_FUNDING_WALLET_SECRET));
   
@@ -209,7 +210,7 @@ export async function withdrawFromPumpWallet(
     throw new Error('AGENT_FUNDING_WALLET_SECRET not configured - no destination for withdrawal');
   }
   
-  const rpcUrl = env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const rpcUrl = getRpcUrl();
   const connection = new Connection(rpcUrl, 'confirmed');
   
   // Load both keypairs
@@ -361,7 +362,7 @@ export async function sellToken(
     throw new Error('PUMP_PORTAL_WALLET_SECRET not configured - cannot sell tokens');
   }
   
-  const rpcUrl = env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const rpcUrl = getRpcUrl();
   const connection = new Connection(rpcUrl, 'confirmed');
   
   // Load pump wallet keypair
@@ -511,7 +512,7 @@ export async function getPumpWalletTokens(): Promise<Array<{
     throw new Error('PUMP_PORTAL_WALLET_SECRET not configured');
   }
   
-  const rpcUrl = env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const rpcUrl = getRpcUrl();
   const connection = new Connection(rpcUrl, 'confirmed');
   
   const pumpKeypair = Keypair.fromSecretKey(bs58.decode(env.PUMP_PORTAL_WALLET_SECRET));
@@ -586,7 +587,7 @@ export async function buyToken(
     throw new Error('Buy amount too small. Minimum: 0.001 SOL');
   }
   
-  const rpcUrl = env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const rpcUrl = getRpcUrl();
   const connection = new Connection(rpcUrl, 'confirmed');
   
   // Load pump wallet keypair
@@ -700,7 +701,7 @@ export async function withdrawToDestination(
     throw new Error('Cannot withdraw to the pump wallet itself');
   }
   
-  const rpcUrl = env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const rpcUrl = getRpcUrl();
   const connection = new Connection(rpcUrl, 'confirmed');
   
   // Load pump keypair
