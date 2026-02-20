@@ -36,11 +36,24 @@ export class CodeRepairEngine {
   private recentRepairs: Map<string, number> = new Map();
   private repairStats = { tier1: 0, tier2: 0, skipped: 0, failed: 0 };
 
+  // Active LLM provider for Tier 2 repairs (switchable at runtime)
+  private llmProvider: 'anthropic' | 'openai' = 'anthropic';
+
   constructor(db: HealthDB, config: HealthConfig, projectRoot: string) {
     this.db = db;
     this.config = config;
     this.projectRoot = projectRoot;
   }
+
+  /** Switch the LLM provider used for Tier 2 code repairs */
+  switchProvider(provider: 'anthropic' | 'openai'): void {
+    const prev = this.llmProvider;
+    this.llmProvider = provider;
+    console.log(`[Repair] LLM provider switched: ${prev} → ${provider}`);
+  }
+
+  /** Get the currently active LLM provider */
+  getProvider(): string { return this.llmProvider; }
 
   // ============================================================
   // MAIN ENTRY POINT
@@ -251,26 +264,8 @@ MINIMUM change only. Respond with JSON only:
 \`\`\``;
 
     try {
-      const apiKey = process.env.ANTHROPIC_API_KEY;
-      if (!apiKey) throw new Error('No ANTHROPIC_API_KEY');
-
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: this.config.repairModel,
-          max_tokens: 2000,
-          temperature: 0.1,
-          messages: [{ role: 'user', content: prompt }],
-        }),
-      });
-      if (!res.ok) throw new Error(`Anthropic ${res.status}`);
-      const data: any = await res.json();
-      const response = data.content?.[0]?.text || '';
+      const { response: llmResponse, text: responseText } = await this.callLLM(prompt);
+      const response = responseText;
 
       const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/) || response.match(/\{[\s\S]*\}/);
       if (!jsonMatch) return { result: null, prompt, response };
@@ -295,6 +290,70 @@ MINIMUM change only. Respond with JSON only:
   // ============================================================
   // UTILITIES
   // ============================================================
+
+  /**
+   * Call the active LLM provider (Anthropic or OpenAI).
+   * Automatically falls back to the other provider on failure.
+   */
+  private async callLLM(prompt: string): Promise<{ response: any; text: string }> {
+    const providers: Array<'anthropic' | 'openai'> = this.llmProvider === 'anthropic'
+      ? ['anthropic', 'openai']
+      : ['openai', 'anthropic'];
+
+    for (const provider of providers) {
+      try {
+        if (provider === 'anthropic') {
+          const apiKey = process.env.ANTHROPIC_API_KEY;
+          if (!apiKey) continue;
+          const res = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': apiKey,
+              'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+              model: this.config.repairModel,
+              max_tokens: 2000,
+              temperature: 0.1,
+              messages: [{ role: 'user', content: prompt }],
+            }),
+          });
+          if (!res.ok) throw new Error(`Anthropic ${res.status}`);
+          const data: any = await res.json();
+          const text = data.content?.[0]?.text || '';
+          return { response: data, text };
+        } else {
+          const apiKey = process.env.OPENAI_API_KEY;
+          if (!apiKey) continue;
+          const res = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({
+              model: 'gpt-5.2',
+              max_tokens: 2000,
+              temperature: 0.1,
+              messages: [{ role: 'user', content: prompt }],
+            }),
+          });
+          if (!res.ok) throw new Error(`OpenAI ${res.status}`);
+          const data: any = await res.json();
+          const text = data.choices?.[0]?.message?.content || '';
+          if (provider !== this.llmProvider) {
+            console.log(`[Repair] ⚠️ Primary ${this.llmProvider} failed, used ${provider} fallback`);
+          }
+          return { response: data, text };
+        }
+      } catch (err: any) {
+        console.log(`[Repair] ${provider} call failed: ${err.message}`);
+        continue;
+      }
+    }
+    throw new Error('All LLM providers failed');
+  }
 
   classifyError(error: AgentError): RepairCategory | null {
     const m = `${error.errorType} ${error.errorMessage} ${error.stackTrace || ''}`.toLowerCase();

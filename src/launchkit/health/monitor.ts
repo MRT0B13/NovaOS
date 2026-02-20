@@ -320,6 +320,13 @@ export class HealthMonitor {
 
     console.log(`[HealthAgent] 🔄 Applying degradation rule: ${ruleKey} → ${rule.action}`);
 
+    // Apply switch_model directly to the repair engine (no message bus roundtrip needed)
+    if (rule.action === 'switch_model' && rule.params?.fallback) {
+      const fallback = rule.params.fallback as 'anthropic' | 'openai';
+      this.repair.switchProvider(fallback);
+      console.log(`[HealthAgent] ✅ Repair engine switched to ${fallback}`);
+    }
+
     // Send degradation command to affected agents
     await this.db.sendMessage('health-agent', 'broadcast', 'command', {
       action: rule.action,

@@ -92,7 +92,7 @@ export async function initLaunchKit(
             logger.warn(`[Nova] Health Agent: RPC rotation requested → ${params.backupRPCs?.[0]}`);
             break;
           case 'switch_model':
-            logger.warn(`[Nova] Health Agent: model switch requested → ${params.fallback}`);
+            logger.warn(`[Nova] Health Agent: model switch applied → repair engine now using ${params.fallback}`);
             break;
           default:
             logger.info(`[Nova] Health Agent command: ${action}`);
