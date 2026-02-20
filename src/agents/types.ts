@@ -173,7 +173,7 @@ export abstract class BaseAgent {
     priority: MessagePriority,
     payload: Record<string, any>,
   ): Promise<void> {
-    await this.sendMessage('nova-supervisor', type, priority, {
+    await this.sendMessage('nova', type, priority, {
       ...payload,
       source: this.agentId,
       timestamp: new Date().toISOString(),

@@ -269,11 +269,12 @@ export class AnalystAgent extends BaseAgent {
       // Quick volume check — lighter than full snapshot
       const volumes = await fetchDexVolumes();
       if (volumes) {
+        // Save previous value BEFORE updating (otherwise spike detection always sees ratio=1)
+        const prevSolanaVol = this.lastVolumes?.solana24h || 0;
         this.lastVolumes = volumes;
 
         // Detect volume spikes (compared to last snapshot)
         if (this.lastSnapshot && volumes.solana24h > 0) {
-          const prevSolanaVol = this.lastVolumes?.solana24h || 0;
           if (prevSolanaVol > 0) {
             const changeRatio = volumes.solana24h / prevSolanaVol;
             if (changeRatio > 2.0) {

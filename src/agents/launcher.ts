@@ -54,6 +54,7 @@ export class LauncherAgent extends BaseAgent {
   private lastLaunchAt = 0;
   private lastError: string | null = null;
   private lastKnownLaunchesToday = 0;
+  private reportedGraduations: Set<string> = new Set();
 
   constructor(pool: Pool, opts?: { statusCheckIntervalMs?: number }) {
     super({
@@ -134,16 +135,16 @@ export class LauncherAgent extends BaseAgent {
       for (const row of result.rows) {
         try {
           const pack = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-          if (pack?.launch?.graduated && !pack?.launch?._graduationReported) {
+          const mint = pack?.launch?.mint;
+          if (pack?.launch?.graduated && mint && !this.reportedGraduations.has(mint)) {
+            this.reportedGraduations.add(mint);
             await this.reportToSupervisor('status', 'high', {
               event: 'graduated',
               tokenName: pack.brand?.name,
               tokenSymbol: pack.brand?.ticker,
-              mint: pack.launch?.mint,
+              mint,
             });
 
-            // Mark as reported to avoid duplicate notifications
-            // (we don't modify the actual store — just track locally via agent_messages)
             logger.info(`[launcher] Graduation detected: ${pack.brand?.name || pack.brand?.ticker}`);
           }
         } catch { /* skip malformed */ }
