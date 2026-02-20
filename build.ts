@@ -50,6 +50,15 @@ async function build() {
             '@electric-sql/pglite',
             'pg',
             'zod',
+            // CFO heavy deps — resolved from node_modules at runtime
+            // @solana/rpc-parsed-types is types-only (empty JS) which breaks Bun bundler
+            '@solana/*',
+            '@kamino-finance/*',
+            '@nktkas/*',
+            '@wormhole-foundation/*',
+            '@lifi/*',
+            '@x402/*',
+            'ethers',
           ],
           naming: {
             entry: '[dir]/[name].[ext]',

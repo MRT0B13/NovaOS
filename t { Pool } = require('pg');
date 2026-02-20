@@ -1,5 +1,0 @@
-  id  | launches_today | reactive_launches_today | last_launch_date | next_scheduled_time | pending_idea | pending_vote_id |         last_updated          
-------+----------------+-------------------------+------------------+---------------------+--------------+-----------------+-------------------------------
- main |              0 |                       5 | 2026-02-02       |       1770127200000 |              |                 | 2026-02-02 14:00:50.159178+00
-(1 row)
-
