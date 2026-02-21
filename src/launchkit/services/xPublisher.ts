@@ -60,6 +60,8 @@ class StandaloneTwitterClient {
   private client: TwitterApi | null = null;
   private initialized = false;
   private cachedUserId: string | null = null;
+  private search403Logged = false;
+  private mentions403Logged = false;
 
   initialize(): boolean {
     const env = getEnv();
@@ -196,9 +198,13 @@ class StandaloneTwitterClient {
         createdAt: t.created_at,
       })) || [];
     } catch (error: any) {
-      // Search requires Basic tier - Free tier won't work
+      // 403 = app not enrolled in a tier that supports search
+      // Pay-per-use DOES support search — if you see this, check your X Developer Portal app settings
       if (error?.code === 403) {
-        logger.warn('[StandaloneTwitter] Search requires Basic API tier (not available on Free)');
+        if (!this.search403Logged) {
+          logger.warn('[StandaloneTwitter] Search 403 — your X app may not have search access. Check developer.x.com → App Settings → "User authentication settings" and ensure your app is on Pay-per-use (not Free)');
+          this.search403Logged = true;
+        }
       } else if (error?.code === 429 || error?.message?.includes('429') || error?.message?.includes('Too Many')) {
         logger.warn('[StandaloneTwitter] Search 429 rate limit hit');
         // Don't call reportReadRateLimit() here — let the caller decide.
@@ -239,7 +245,10 @@ class StandaloneTwitterClient {
       })) || [];
     } catch (error: any) {
       if (error?.code === 403) {
-        logger.warn('[StandaloneTwitter] Mentions requires Basic API tier');
+        if (!this.mentions403Logged) {
+          logger.warn('[StandaloneTwitter] Mentions 403 — check X Developer Portal app access level (Pay-per-use supports mentions)');
+          this.mentions403Logged = true;
+        }
       } else if (error?.code === 429 || error?.message?.includes('429') || error?.message?.includes('Too Many')) {
         logger.warn('[StandaloneTwitter] Mentions 429 rate limit hit');
         // Don't call reportReadRateLimit() here — let the caller (reply engine) decide
