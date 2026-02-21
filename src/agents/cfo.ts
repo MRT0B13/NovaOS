@@ -46,6 +46,7 @@ export class CFOAgent extends BaseAgent {
   private paused = false;
   private scoutIntel: ScoutIntel | null = null;
   private pendingApprovals = new Map<string, PendingApproval>();
+  private approvalCounter = 0;
   private lastOpportunityScanAt = 0;
   private cycleCount = 0;
   private startedAt = Date.now();
@@ -353,50 +354,48 @@ export class CFOAgent extends BaseAgent {
       const { state, decisions, results, report, intel } = await runDecisionCycle(this.pool);
 
       // ── Handle APPROVAL-tier decisions → queue for admin approval ─
+      const approvalIds: Map<string, string> = new Map(); // decision.type → approval id
       for (const r of results) {
         if (r.pendingApproval && r.decision.tier === 'APPROVAL') {
           const d = r.decision;
-          // Create an execution closure that re-runs just this decision
           const action = async () => {
             const { executeDecision } = await import('../launchkit/cfo/decisionEngine.ts');
-            // Force AUTO tier so it actually executes this time
             const overridden = { ...d, tier: 'AUTO' as const };
             const env = getCFOEnv();
             const execResult = await executeDecision(overridden, env);
             if (execResult.success && execResult.executed) {
               logger.info(`[CFO] Approved decision ${d.type} executed successfully (tx: ${execResult.txId ?? 'n/a'})`);
               const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
-              await notifyAdminForce(`✅ Approved ${d.type} executed.\n${d.reasoning}\ntx: ${execResult.txId ?? 'dry-run'}`);
+              await notifyAdminForce(`✅ ${d.type} executed.\ntx: ${execResult.txId ?? 'dry-run'}`);
             } else {
               logger.error(`[CFO] Approved decision ${d.type} failed: ${execResult.error}`);
+              const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+              await notifyAdminForce(`❌ ${d.type} failed: ${execResult.error}`);
             }
           };
-          await this.queueForApproval(
+          const approvalId = await this.queueForApproval(
             `${d.type}: ${d.reasoning}`,
             Math.abs(d.estimatedImpactUsd),
             action,
           );
+          approvalIds.set(`${d.type}-${r.decision.urgency}`, approvalId);
         }
       }
 
-      // ── NOTIFY-tier: report to admin (already executed) ───────
-      const notifyResults = results.filter(
-        (r) => r.decision.tier === 'NOTIFY' && !r.pendingApproval,
-      );
-      if (notifyResults.length > 0) {
-        const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
-        const notifyLines = notifyResults.map(
-          (r) => `🟡 ${r.decision.type}: $${Math.abs(r.decision.estimatedImpactUsd).toFixed(0)} — ${r.executed ? (r.success ? '✅' : '❌') : '📋'}`,
-        );
-        await notifyAdminForce(
-          `🟡 *CFO NOTIFY* — ${notifyResults.length} decision(s) auto-executed:\n${notifyLines.join('\n')}`,
-        );
-      }
-
-      // ── Report full cycle to admin if any decisions were made ──
+      // ── Single combined message to admin ──────────────────────
       if (decisions.length > 0) {
         const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
-        await notifyAdminForce(report);
+        // Append approval buttons to the report
+        let msg = report;
+        if (approvalIds.size > 0) {
+          msg += '\n\n🔐 *Approve:*';
+          for (const [id, a] of this.pendingApprovals) {
+            const shortDesc = a.description.split(':')[0]; // e.g. "OPEN_HEDGE"
+            msg += `\n  /cfo approve ${id}  ← ${shortDesc} ($${a.amountUsd.toFixed(0)})`;
+          }
+          msg += '\n⏰ Expires in 15 min.';
+        }
+        await notifyAdminForce(msg);
       }
 
       // ── Report to Nova supervisor ─────────────────────────────
@@ -507,11 +506,11 @@ export class CFOAgent extends BaseAgent {
 
   // ── Approval system ───────────────────────────────────────────────
 
-  private async queueForApproval(description: string, amountUsd: number, action: () => Promise<void>): Promise<void> {
-    const id = `approval-${Date.now()}`;
+  private async queueForApproval(description: string, amountUsd: number, action: () => Promise<void>): Promise<string> {
+    this.approvalCounter++;
+    const id = `a-${this.approvalCounter}`;
     this.pendingApprovals.set(id, { id, description, amountUsd, action, expiresAt: Date.now() + 15 * 60_000 });
-    const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
-    await notifyAdminForce(`🔐 CFO requires approval:\n${description}\n$${amountUsd.toFixed(2)}\nReply: /cfo approve ${id}\nExpires in 15 min.`);
+    return id;  // caller includes the approve button in the combined report
   }
 
   private expirePendingApprovals(): void {

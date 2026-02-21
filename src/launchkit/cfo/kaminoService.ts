@@ -36,10 +36,10 @@ import { getRpcUrl } from '../services/solanaRpc.ts';
 import { getCFOEnv } from './cfoEnv.ts';
 
 // ============================================================================
-// Constants
+// Constants (string-based to avoid module-level PublicKey TDZ in Bun)
 // ============================================================================
 
-const KAMINO_MAIN_MARKET = new PublicKey('7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF');
+const KAMINO_MAIN_MARKET_ADDR = '7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF';
 
 const KAMINO_RESERVES: Record<string, string> = {
   USDC: 'H9gBUJs5Kc5zyiKRTzZcYom4Hpj9VPHLy4VzExTVPgTL',
@@ -106,6 +106,12 @@ function getConnection(): Connection {
   return new Connection(getRpcUrl(), 'confirmed');
 }
 
+/** Create a Solana v2 RPC client (required by klend-sdk v7+) */
+function getRpcV2(): any {
+  const { createSolanaRpc } = require('@solana/kit');
+  return createSolanaRpc(getRpcUrl());
+}
+
 // ============================================================================
 // APY data (public endpoint — no auth)
 // ============================================================================
@@ -113,7 +119,7 @@ function getConnection(): Connection {
 async function fetchKaminoApys(): Promise<KaminoMarketApy> {
   try {
     const resp = await fetch(
-      `https://api.kamino.finance/kamino-market/${KAMINO_MAIN_MARKET.toBase58()}/reserves`,
+      `https://api.kamino.finance/kamino-market/${KAMINO_MAIN_MARKET_ADDR}/reserves`,
       { signal: AbortSignal.timeout(5000) },
     );
     if (!resp.ok) throw new Error(`Kamino API ${resp.status}`);
@@ -183,11 +189,12 @@ export async function deposit(asset: 'USDC' | 'SOL', amount: number): Promise<Ka
     const klend = await loadKlend();
     const wallet = loadWallet();
     const connection = getConnection();
+    const rpc = getRpcV2();
 
     const market = await klend.KaminoMarket.load(
-      connection as any,
-      KAMINO_MAIN_MARKET as any,
-      0, // slot override — let it fetch current
+      rpc,
+      KAMINO_MAIN_MARKET_ADDR,
+      400, // recent slot duration ms
     );
 
     const reserveAddress = new PublicKey(KAMINO_RESERVES[asset]);
@@ -257,8 +264,9 @@ export async function withdraw(asset: 'USDC' | 'SOL', amount: number): Promise<K
     const klend = await loadKlend();
     const wallet = loadWallet();
     const connection = getConnection();
+    const rpc = getRpcV2();
 
-    const market = await klend.KaminoMarket.load(connection as any, KAMINO_MAIN_MARKET as any, 0);
+    const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
     const reserveAddress = new PublicKey(KAMINO_RESERVES[asset]);
     const reserve = market!.getReserveByAddress(reserveAddress as any);
     if (!reserve) throw new Error(`Reserve ${asset} not found`);
@@ -308,40 +316,72 @@ export async function getPosition(): Promise<KaminoPosition> {
   try {
     const klend = await loadKlend();
     const wallet = loadWallet();
-    const connection = getConnection();
+    const rpc = getRpcV2();
 
-    const market = await klend.KaminoMarket.load(connection as any, KAMINO_MAIN_MARKET as any, 0);
-    const obligations = await (market as any).getObligationByWallet(wallet.publicKey);
-
-    if (!obligations) {
+    const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
+    if (!market) {
       return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.75 };
     }
 
-    const obligation = Array.isArray(obligations) ? obligations[0] : obligations;
-    const apys = await fetchKaminoApys();
+    // klend-sdk v7 uses getUserVanillaObligation (throws if no obligation exists)
+    let obligation: any;
+    try {
+      obligation = await market.getUserVanillaObligation(wallet.publicKey.toBase58());
+    } catch {
+      // No obligation found — wallet hasn't deposited yet
+      return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.75 };
+    }
 
+    const apys = await fetchKaminoApys();
     const deposits: KaminoPosition['deposits'] = [];
     const borrows: KaminoPosition['borrows'] = [];
 
-    for (const [mintStr, deposit] of Object.entries(obligation.state.deposits as Record<string, any>)) {
-      const asset = mintStr.includes(KAMINO_RESERVES.USDC) ? 'USDC' : 'SOL';
-      const amount = Number(deposit.depositedAmount ?? 0);
-      const valueUsd = Number(deposit.marketValueRefreshed ?? 0);
-      deposits.push({ asset, amount, valueUsd, apy: apys[asset as 'USDC' | 'SOL']?.supplyApy ?? 0.08 });
+    // Extract deposits from obligation
+    if (obligation.deposits && typeof obligation.deposits[Symbol.iterator] === 'function') {
+      for (const deposit of obligation.deposits) {
+        const mint = deposit.mintAddress?.toString?.() ?? '';
+        const asset = mint === KAMINO_RESERVES.USDC ? 'USDC' : 'SOL';
+        const amount = Number(deposit.amount ?? 0);
+        const valueUsd = Number(deposit.marketValueSf ?? deposit.marketValue ?? 0);
+        if (amount > 0 || valueUsd > 0) {
+          deposits.push({ asset, amount, valueUsd, apy: apys[asset as 'USDC' | 'SOL']?.supplyApy ?? 0.08 });
+        }
+      }
+    } else if (obligation.state?.deposits) {
+      // Fallback: old-style state object
+      for (const [mintStr, deposit] of Object.entries(obligation.state.deposits as Record<string, any>)) {
+        const asset = mintStr.includes(KAMINO_RESERVES.USDC) ? 'USDC' : 'SOL';
+        const amount = Number(deposit.depositedAmount ?? 0);
+        const valueUsd = Number(deposit.marketValueRefreshed ?? 0);
+        deposits.push({ asset, amount, valueUsd, apy: apys[asset as 'USDC' | 'SOL']?.supplyApy ?? 0.08 });
+      }
     }
 
-    for (const [mintStr, borrow] of Object.entries(obligation.state.borrows as Record<string, any>)) {
-      const asset = mintStr.includes(KAMINO_RESERVES.USDC) ? 'USDC' : 'SOL';
-      const amount = Number(borrow.borrowedAmountSf ?? 0);
-      const valueUsd = Number(borrow.marketValueRefreshed ?? 0);
-      borrows.push({ asset, amount, valueUsd, apy: apys[asset as 'USDC' | 'SOL']?.borrowApy ?? 0.12 });
+    // Extract borrows from obligation
+    if (obligation.borrows && typeof obligation.borrows[Symbol.iterator] === 'function') {
+      for (const borrow of obligation.borrows) {
+        const mint = borrow.mintAddress?.toString?.() ?? '';
+        const asset = mint === KAMINO_RESERVES.USDC ? 'USDC' : 'SOL';
+        const amount = Number(borrow.amount ?? 0);
+        const valueUsd = Number(borrow.marketValueSf ?? borrow.marketValue ?? 0);
+        if (amount > 0 || valueUsd > 0) {
+          borrows.push({ asset, amount, valueUsd, apy: apys[asset as 'USDC' | 'SOL']?.borrowApy ?? 0.12 });
+        }
+      }
+    } else if (obligation.state?.borrows) {
+      for (const [mintStr, borrow] of Object.entries(obligation.state.borrows as Record<string, any>)) {
+        const asset = mintStr.includes(KAMINO_RESERVES.USDC) ? 'USDC' : 'SOL';
+        const amount = Number(borrow.borrowedAmountSf ?? 0);
+        const valueUsd = Number(borrow.marketValueRefreshed ?? 0);
+        borrows.push({ asset, amount, valueUsd, apy: apys[asset as 'USDC' | 'SOL']?.borrowApy ?? 0.12 });
+      }
     }
 
     const depositValueUsd = deposits.reduce((s, d) => s + d.valueUsd, 0);
     const borrowValueUsd = borrows.reduce((s, b) => s + b.valueUsd, 0);
     const netValueUsd = depositValueUsd - borrowValueUsd;
     const ltv = depositValueUsd > 0 ? borrowValueUsd / depositValueUsd : 0;
-    const healthFactor = ltv > 0 ? 0.75 / ltv : 999; // 75% max LTV in Kamino
+    const healthFactor = ltv > 0 ? 0.75 / ltv : 999;
 
     return { deposits, borrows, netValueUsd, healthFactor, ltv, maxLtv: 0.75 };
   } catch (err) {

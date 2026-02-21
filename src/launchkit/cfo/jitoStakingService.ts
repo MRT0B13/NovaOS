@@ -38,17 +38,26 @@ import { getRpcUrl } from '../services/solanaRpc.ts';
 import { getCFOEnv } from './cfoEnv.ts';
 
 // ============================================================================
-// Constants
+// Constants — lazy-init PublicKey to avoid Bun TDZ issues with dynamic imports
 // ============================================================================
 
-const JITO_STAKE_POOL = new PublicKey('Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Posko');
-const JITOSOL_MINT = new PublicKey('J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn');
+const JITO_STAKE_POOL_STR = 'Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Posko';
+const JITOSOL_MINT_STR = 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn';
+const JITO_RESERVE_STAKE_STR = '5XKK8PpbCBA3PemF2PTRPgMiixfpjYtqQBPKGbz8DSq7';
+const JITO_FEE_ACCOUNT_STR = '6igCMGoWdBBdBYs6L5hLCfSRJGa7fNhzMJWnoZ7QqV2r';
 
-// Reserve stake account for Jito pool (receives SOL deposits)
-const JITO_RESERVE_STAKE = new PublicKey('5XKK8PpbCBA3PemF2PTRPgMiixfpjYtqQBPKGbz8DSq7');
+let _JITO_STAKE_POOL: PublicKey | null = null;
+let _JITOSOL_MINT: PublicKey | null = null;
+let _JITO_RESERVE_STAKE: PublicKey | null = null;
+let _JITO_FEE_ACCOUNT: PublicKey | null = null;
 
-// Jito pool fee account
-const JITO_FEE_ACCOUNT = new PublicKey('6igCMGoWdBBdBYs6L5hLCfSRJGa7fNhzMJWnoZ7QqV2r');
+function getJitoStakePool(): PublicKey { return _JITO_STAKE_POOL ??= new PublicKey(JITO_STAKE_POOL_STR); }
+function getJitoSolMint(): PublicKey { return _JITOSOL_MINT ??= new PublicKey(JITOSOL_MINT_STR); }
+function getJitoReserveStake(): PublicKey { return _JITO_RESERVE_STAKE ??= new PublicKey(JITO_RESERVE_STAKE_STR); }
+function getJitoFeeAccount(): PublicKey { return _JITO_FEE_ACCOUNT ??= new PublicKey(JITO_FEE_ACCOUNT_STR); }
+
+// Re-exported as string for consumers (portfolioService passes to getTokenBalance which takes string)
+const JITOSOL_MINT = JITOSOL_MINT_STR;
 
 // Minimum stake amount (Jito enforces 0.01 SOL minimum)
 const MIN_STAKE_SOL = 0.01;
@@ -112,7 +121,8 @@ interface JitoStats {
   exchange_rate: number;  // SOL per JitoSOL
 }
 
-let _statsCache: { data: JitoStats; at: number } | null = null;
+// Use `var` to avoid Bun temporal-dead-zone issues when module is loaded via dynamic import
+var _statsCache: { data: JitoStats; at: number } | null = null;
 
 async function getJitoStats(): Promise<JitoStats> {
   if (_statsCache && Date.now() - _statsCache.at < 5 * 60_000) return _statsCache.data;
@@ -146,7 +156,7 @@ async function getOrCreateJitoSolTokenAccount(
     const ata = await splToken.getOrCreateAssociatedTokenAccount(
       connection,
       wallet,
-      JITOSOL_MINT,
+      getJitoSolMint(),
       wallet.publicKey,
     );
     return ata.address;
@@ -210,7 +220,7 @@ export async function stakeSol(solAmount: number): Promise<JitoStakeResult> {
 
     const { instructions, signers } = await stakePoolLib.depositSol(
       connection as any,
-      JITO_STAKE_POOL as any,
+      getJitoStakePool() as any,
       wallet.publicKey as any,
       lamports as any,
       jitoSolAta as any,     // destinationTokenAccount
@@ -259,9 +269,9 @@ export async function instantUnstake(jitoSolAmount: number): Promise<JitoUnstake
     const { getQuote, executeSwap } = await import('./jupiterService.ts');
     const { MINTS } = await import('./jupiterService.ts');
 
-    const JITOSOL_MINT_STR = JITOSOL_MINT.toBase58();
+    const JITOSOL_MINT_STR_VAL = getJitoSolMint().toBase58();
 
-    const quote = await getQuote(JITOSOL_MINT_STR, MINTS.SOL, jitoSolAmount, 100); // 1% slippage
+    const quote = await getQuote(JITOSOL_MINT_STR_VAL, MINTS.SOL, jitoSolAmount, 100); // 1% slippage
     if (!quote) {
       return { success: false, jitoSolBurned: 0, solReceived: 0, method: 'instant', error: 'Failed to get swap quote' };
     }
@@ -301,7 +311,7 @@ export async function getStakePosition(solPriceUsd: number): Promise<JitoStakePo
 
     // Get JitoSOL token account balance
     const tokenAccounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, {
-      mint: JITOSOL_MINT,
+      mint: getJitoSolMint(),
     });
 
     const jitoSolBalance = tokenAccounts.value.length > 0

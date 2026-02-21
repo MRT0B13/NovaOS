@@ -382,21 +382,21 @@ export class Supervisor extends BaseAgent {
         // CFO daily digest — could post to channel or just log
         logger.info(`[supervisor] CFO daily digest received: ${typeof summary === 'string' ? summary.slice(0, 200) : 'object'}`);
       } else if (source === 'emergency_exit') {
-        // CFO triggered emergency exit — notify admin prominently
+        // CFO triggered emergency exit — notify admin only (not community)
         const content = `🚨 CFO Emergency: ${msg.payload.message || 'Positions being closed'}`;
-        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+        if (this.callbacks.onPostToAdmin) await this.callbacks.onPostToAdmin(content);
         logger.warn(`[supervisor] CFO emergency exit: ${content}`);
       } else {
         logger.debug(`[supervisor] CFO report: ${source || 'unknown'}`);
       }
     });
 
-    // ── CFO Alerts ──
+    // ── CFO Alerts (admin-only — never post financial alerts to community) ──
     this.handlers.set('nova-cfo:alert', async (msg) => {
       const { source, message } = msg.payload;
       if (msg.priority === 'critical') {
         const content = `🏦 CFO Alert: ${message || JSON.stringify(msg.payload).slice(0, 200)}`;
-        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+        if (this.callbacks.onPostToAdmin) await this.callbacks.onPostToAdmin(content);
         logger.warn(`[supervisor] CFO critical alert: ${content}`);
       }
     });

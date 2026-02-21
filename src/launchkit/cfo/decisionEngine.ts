@@ -939,70 +939,73 @@ export function formatDecisionReport(
   dryRun: boolean,
   intel?: SwarmIntel,
 ): string {
-  const lines: string[] = [];
-  const tierBadge = { AUTO: '🟢', NOTIFY: '🟡', APPROVAL: '🔴' };
+  const L: string[] = [];
 
-  lines.push(`🧠 *CFO Decision Report*${dryRun ? ' (DRY RUN)' : ''}\n`);
+  // ── Header ──
+  L.push(`🧠 *CFO Report*${dryRun ? ' (DRY RUN)' : ''}`);
 
-  // Swarm intelligence summary
+  // ── Intel (one compact line) ──
   if (intel && (intel.scoutReceivedAt || intel.guardianReceivedAt || intel.analystReceivedAt)) {
-    lines.push(`*Swarm Intel* (risk ×${intel.riskMultiplier.toFixed(2)} — ${intel.marketCondition}):`);
-    if (intel.scoutReceivedAt) {
-      lines.push(`  🔭 Scout: ${intel.scoutBullish ? '🟢 bullish' : '🔴 bearish'}${intel.scoutNarratives?.length ? ` | ${intel.scoutNarratives.slice(0, 3).join(', ')}` : ''}`);
-    }
-    if (intel.guardianReceivedAt) {
-      lines.push(`  🛡️ Guardian: ${intel.guardianCritical ? '🚨 CRITICAL' : `${intel.guardianAlerts?.length ?? 0} alert(s)`}`);
-    }
-    if (intel.analystReceivedAt) {
-      lines.push(`  📊 Analyst: ${intel.analystVolumeSpike ? 'volume spike' : 'normal'}${intel.analystSolanaTvl ? ` | TVL: $${(intel.analystSolanaTvl / 1e9).toFixed(1)}B` : ''}`);
-    }
-    lines.push('');
+    const parts: string[] = [`risk ×${intel.riskMultiplier.toFixed(1)} ${intel.marketCondition}`];
+    if (intel.scoutReceivedAt) parts.push(`Scout: ${intel.scoutBullish ? '🟢' : '🔴'}`);
+    if (intel.guardianReceivedAt) parts.push(`Guard: ${intel.guardianCritical ? '🚨' : '✅'}`);
+    if (intel.analystReceivedAt) parts.push(`Analyst: ${intel.analystVolumeSpike ? '📈' : '📊'}`);
+    L.push(`📡 ${parts.join(' | ')}`);
   }
 
-  // Portfolio snapshot
-  lines.push(`*Portfolio:* $${state.totalPortfolioUsd.toFixed(0)}`);
-  lines.push(`  SOL: ${state.solBalance.toFixed(2)} ($${state.solExposureUsd.toFixed(0)}) @ $${state.solPriceUsd.toFixed(0)}`);
-  if (state.jitoSolBalance > 0) {
-    lines.push(`  JitoSOL: ${state.jitoSolBalance.toFixed(4)} ($${state.jitoSolValueUsd.toFixed(0)})`);
-  }
-  if (state.hlEquity > 0) {
-    lines.push(`  HL: $${state.hlEquity.toFixed(0)} equity | ${state.hlPositions.length} pos | PnL: ${state.hlTotalPnl >= 0 ? '+' : ''}$${state.hlTotalPnl.toFixed(2)}`);
-  }
-  if (state.polyDeployedUsd > 0 || state.polyPositionCount > 0) {
-    lines.push(`  Poly: $${state.polyDeployedUsd.toFixed(0)} deployed | ${state.polyPositionCount} pos | $${state.polyUsdcBalance.toFixed(0)} USDC avail`);
-  }
-  lines.push(`  Hedge ratio: ${(state.hedgeRatio * 100).toFixed(0)}%\n`);
+  // ── Portfolio (compact) ──
+  const bal: string[] = [`SOL: ${state.solBalance.toFixed(2)} ($${state.solExposureUsd.toFixed(0)})`];
+  if (state.jitoSolBalance > 0) bal.push(`JitoSOL: $${state.jitoSolValueUsd.toFixed(0)}`);
+  if (state.hlEquity > 0) bal.push(`HL: $${state.hlEquity.toFixed(0)}`);
+  if (state.polyDeployedUsd > 0 || state.polyPositionCount > 0) bal.push(`Poly: $${state.polyDeployedUsd.toFixed(0)}`);
+  L.push(`💰 *$${state.totalPortfolioUsd.toFixed(0)}* — ${bal.join(' · ')}`);
+  L.push(`🛡️ Hedge: ${(state.hedgeRatio * 100).toFixed(0)}% | SOL @ $${state.solPriceUsd.toFixed(0)}`);
 
+  // ── Decisions ──
   if (results.length === 0) {
-    lines.push('✅ No action needed — portfolio within targets.');
+    L.push(`\n✅ All good — no action needed.`);
   } else {
-    lines.push(`*Decisions (${results.length}):*`);
+    L.push(`\n*${results.length} Decision(s):*`);
     for (const r of results) {
-      const badge = tierBadge[r.decision.tier] ?? '⚪';
-      const icon = r.pendingApproval
-        ? '⏳'
-        : r.success ? (r.executed ? '✅' : '📋') : '❌';
+      const d = r.decision;
+      const icon = r.pendingApproval ? '⏳' : r.success ? (r.executed ? '✅' : '📋') : '❌';
+      const tierIcon = d.tier === 'APPROVAL' ? '🔴' : d.tier === 'NOTIFY' ? '🟡' : '🟢';
       const status = r.pendingApproval
-        ? 'AWAITING APPROVAL'
-        : r.dryRun
-          ? '(dry run)'
-          : r.executed
-            ? (r.success ? 'executed' : `failed: ${r.error}`)
-            : `skipped: ${r.error ?? 'not executed'}`;
+        ? 'NEEDS APPROVAL'
+        : r.dryRun ? 'dry run'
+          : r.executed ? (r.success ? 'done' : `failed`) : 'skipped';
 
-      lines.push(`\n${icon} ${badge} *${r.decision.type}* [${r.decision.urgency}/${r.decision.tier}] ${status}`);
-      if (r.decision.estimatedImpactUsd) {
-        lines.push(`  💰 Impact: $${Math.abs(r.decision.estimatedImpactUsd).toFixed(0)}`);
-      }
-      lines.push(`  ${r.decision.reasoning}`);
-      if (r.decision.intelUsed && r.decision.intelUsed.length > 0) {
-        lines.push(`  🤖 Intel from: ${r.decision.intelUsed.join(', ')}`);
-      }
-      if (r.txId) lines.push(`  tx: \`${r.txId}\``);
+      L.push(`${icon} ${tierIcon} *${d.type}* [${d.tier}] ${status}`);
+      L.push(`   💰 $${Math.abs(d.estimatedImpactUsd).toFixed(0)} | ${_shortReason(d)}`);
+      if (r.error && !r.success) L.push(`   ❌ ${r.error}`);
+      if (r.txId) L.push(`   🔗 tx: ${r.txId}`);
     }
   }
 
-  return lines.join('\n');
+  return L.join('\n');
+}
+
+/** Shorten reasoning to one clean line */
+function _shortReason(d: Decision): string {
+  const t = d.type;
+  const p = d.params ?? {};
+  switch (t) {
+    case 'OPEN_HEDGE':
+      return `SHORT $${p.solExposureUsd ?? d.estimatedImpactUsd} SOL-PERP (target ${p.targetHedgeRatio ? (p.targetHedgeRatio * 100).toFixed(0) + '%' : '?'})`;
+    case 'CLOSE_HEDGE':
+      return `Close hedge — reduce exposure`;
+    case 'AUTO_STAKE':
+      return `Stake ${p.amount?.toFixed(2) ?? '?'} SOL → JitoSOL (~7% APY)`;
+    case 'UNSTAKE':
+      return `Unstake ${p.amount?.toFixed(2) ?? '?'} JitoSOL → SOL`;
+    case 'POLY_BET':
+      return `"${(p.marketQuestion ?? '').slice(0, 50)}" — edge ${((p.edge ?? 0) * 100).toFixed(0)}%`;
+    case 'POLY_EXIT':
+      return `Exit prediction position`;
+    default:
+      // Fallback: truncate the raw reasoning
+      return d.reasoning.length > 80 ? d.reasoning.slice(0, 77) + '...' : d.reasoning;
+  }
 }
 
 // ============================================================================

@@ -15,11 +15,14 @@ import { getCFOEnv } from './cfoEnv.ts';
 // Constants
 // ============================================================================
 
-/** USDC.e on Polygon (6 decimals) */
-const USDC_POLYGON = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+/** USDC.e (bridged) on Polygon (6 decimals) — used by Polymarket CTF */
+const USDC_BRIDGED = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+
+/** Native USDC on Polygon PoS (6 decimals) — Circle native issuance */
+const USDC_NATIVE = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
 
 /** Polymarket CTF Exchange on Polygon */
-const CTF_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982e';
+const CTF_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
 
 /** Minimum MATIC balance to alert low gas */
 const MIN_GAS_MATIC = 0.5;
@@ -43,8 +46,10 @@ const ERC20_ABI = [
 export interface EVMWalletStatus {
   address: string;
   maticBalance: number;
-  usdcBalance: number;
-  usdcApproved: number;   // current CTF Exchange allowance in USDC
+  usdcBalance: number;         // total USDC (bridged + native)
+  usdcBridgedBalance: number;  // USDC.e (used by Polymarket)
+  usdcNativeBalance: number;   // native USDC (Circle)
+  usdcApproved: number;        // CTF Exchange allowance (USDC.e)
   gasOk: boolean;
   gasCritical: boolean;
   timestamp: string;
@@ -56,11 +61,12 @@ export interface EVMWalletStatus {
 
 let _provider: any = null;
 let _wallet: any = null;
-let _usdc: any = null;
+let _usdcBridged: any = null;
+let _usdcNative: any = null;
 let _ethers: any = null;
 
-async function loadEthers(): Promise<{ wallet: any; provider: any; usdc: any; ethers: any }> {
-  if (_wallet) return { wallet: _wallet, provider: _provider, usdc: _usdc, ethers: _ethers };
+async function loadEthers(): Promise<{ wallet: any; provider: any; usdcBridged: any; usdcNative: any; ethers: any }> {
+  if (_wallet) return { wallet: _wallet, provider: _provider, usdcBridged: _usdcBridged, usdcNative: _usdcNative, ethers: _ethers };
 
   const mod = await import('ethers');
   _ethers = mod.ethers ?? mod;
@@ -70,10 +76,11 @@ async function loadEthers(): Promise<{ wallet: any; provider: any; usdc: any; et
 
   _provider = new _ethers.JsonRpcProvider(env.polygonRpcUrl);
   _wallet = new _ethers.Wallet(env.evmPrivateKey, _provider);
-  _usdc = new _ethers.Contract(USDC_POLYGON, ERC20_ABI, _wallet);
+  _usdcBridged = new _ethers.Contract(USDC_BRIDGED, ERC20_ABI, _wallet);
+  _usdcNative = new _ethers.Contract(USDC_NATIVE, ERC20_ABI, _wallet);
 
   logger.info(`[EVM] Wallet loaded on Polygon: ${_wallet.address}`);
-  return { wallet: _wallet, provider: _provider, usdc: _usdc, ethers: _ethers };
+  return { wallet: _wallet, provider: _provider, usdcBridged: _usdcBridged, usdcNative: _usdcNative, ethers: _ethers };
 }
 
 // ============================================================================
@@ -84,22 +91,27 @@ async function loadEthers(): Promise<{ wallet: any; provider: any; usdc: any; et
  * Get full wallet status including MATIC, USDC, and CTF Exchange allowance.
  */
 export async function getWalletStatus(): Promise<EVMWalletStatus> {
-  const { wallet, provider, usdc, ethers } = await loadEthers();
+  const { wallet, provider, usdcBridged, usdcNative, ethers } = await loadEthers();
 
-  const [maticBal, usdcRaw, allowanceRaw] = await Promise.all([
+  const [maticBal, usdcBridgedRaw, usdcNativeRaw, allowanceRaw] = await Promise.all([
     provider.getBalance(wallet.address),
-    usdc.balanceOf(wallet.address),
-    usdc.allowance(wallet.address, CTF_EXCHANGE),
+    usdcBridged.balanceOf(wallet.address),
+    usdcNative.balanceOf(wallet.address),
+    usdcBridged.allowance(wallet.address, CTF_EXCHANGE),
   ]);
 
   const maticBalance = Number(ethers.formatEther(maticBal));
-  const usdcBalance = Number(ethers.formatUnits(usdcRaw, 6));
+  const usdcBridgedBalance = Number(ethers.formatUnits(usdcBridgedRaw, 6));
+  const usdcNativeBalance = Number(ethers.formatUnits(usdcNativeRaw, 6));
+  const usdcBalance = usdcBridgedBalance + usdcNativeBalance;
   const usdcApproved = Number(ethers.formatUnits(allowanceRaw, 6));
 
   return {
     address: wallet.address,
     maticBalance,
     usdcBalance,
+    usdcBridgedBalance,
+    usdcNativeBalance,
     usdcApproved,
     gasOk: maticBalance >= MIN_GAS_MATIC,
     gasCritical: maticBalance < CRITICAL_GAS_MATIC,
@@ -111,9 +123,8 @@ export async function getWalletStatus(): Promise<EVMWalletStatus> {
  * Get USDC balance on Polygon.
  */
 export async function getUSDCBalance(): Promise<number> {
-  const { usdc, ethers } = await loadEthers();
-  const raw = await usdc.balanceOf((await loadEthers()).wallet.address);
-  return Number(ethers.formatUnits(raw, 6));
+  const status = await getWalletStatus();
+  return status.usdcBalance;
 }
 
 /**
@@ -150,9 +161,9 @@ export function getWalletAddressFromEnv(): string | undefined {
  * Only sends a transaction if the current allowance is below `minAllowance`.
  */
 export async function ensureCTFApproval(minAllowanceUsdc = 10_000): Promise<boolean> {
-  const { wallet, usdc, ethers } = await loadEthers();
+  const { wallet, usdcBridged, ethers } = await loadEthers();
 
-  const currentAllowance = await usdc.allowance(wallet.address, CTF_EXCHANGE);
+  const currentAllowance = await usdcBridged.allowance(wallet.address, CTF_EXCHANGE);
   const currentUsdc = Number(ethers.formatUnits(currentAllowance, 6));
 
   if (currentUsdc >= minAllowanceUsdc) {
@@ -163,7 +174,7 @@ export async function ensureCTFApproval(minAllowanceUsdc = 10_000): Promise<bool
   logger.info(`[EVM] Approving CTF Exchange (current: ${currentUsdc.toFixed(2)} USDC)...`);
 
   try {
-    const tx = await usdc.approve(CTF_EXCHANGE, ethers.MaxUint256);
+    const tx = await usdcBridged.approve(CTF_EXCHANGE, ethers.MaxUint256);
     await tx.wait(1);
     logger.info(`[EVM] CTF Exchange approved: ${tx.hash}`);
     return true;
@@ -223,11 +234,11 @@ export async function sendUSDC(toAddress: string, amountUsdc: number): Promise<s
     return 'dry-run-hash';
   }
 
-  const { usdc, ethers } = await loadEthers();
+  const { usdcBridged, ethers } = await loadEthers();
 
   try {
     const rawAmount = ethers.parseUnits(amountUsdc.toFixed(6), 6);
-    const tx = await usdc.transfer(toAddress, rawAmount);
+    const tx = await usdcBridged.transfer(toAddress, rawAmount);
     await tx.wait(1);
     logger.info(`[EVM] Sent ${amountUsdc} USDC to ${toAddress}: ${tx.hash}`);
     return tx.hash as string;

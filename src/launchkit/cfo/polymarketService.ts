@@ -39,7 +39,7 @@ const GAMMA_BASE = 'https://gamma-api.polymarket.com';
 const CLOB_BASE = 'https://clob.polymarket.com';
 
 /** Polygon mainnet CTF Exchange contract (verifyingContract for EIP-712) */
-const CTF_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982e';
+const CTF_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
 
 /** USDC.e on Polygon (6 decimals) */
 const USDC_POLYGON = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
@@ -399,8 +399,14 @@ interface GammaMarket {
   closed: boolean;
   volume: number;
   liquidity: number;
+  liquidityNum?: number;
   category: string;
-  tokens: Array<{
+  // Gamma API returns flat arrays instead of nested tokens
+  outcomes: string;          // JSON string e.g. '["Yes","No"]'
+  outcomePrices: string;     // JSON string e.g. '["0.55","0.45"]'
+  clobTokenIds: string;      // JSON string e.g. '["abc...","def..."]'
+  // Legacy: some endpoints still return tokens
+  tokens?: Array<{
     token_id: string;
     outcome: string;
     price: number;
@@ -434,8 +440,11 @@ export async function fetchCryptoMarkets(options?: {
 
     const filtered = raw
       .filter((m) => {
-        if (!m.conditionId || !m.tokens?.length) return false;
-        if ((m.liquidity ?? 0) < minLiq) return false;
+        if (!m.conditionId) return false;
+        // Require either legacy tokens array or Gamma flat fields
+        const hasTokens = m.tokens?.length || m.clobTokenIds;
+        if (!hasTokens) return false;
+        if ((m.liquidity ?? m.liquidityNum ?? 0) < minLiq) return false;
         if (m.closed || !m.active) return false;
 
         // Time-to-resolution filter
@@ -447,22 +456,41 @@ export async function fetchCryptoMarkets(options?: {
         const text = m.question.toLowerCase();
         return CRYPTO_KEYWORDS.some((kw) => text.includes(kw));
       })
-      .map<PolyMarket>((m) => ({
-        conditionId: m.conditionId,
-        question: m.question,
-        endDate: m.endDate,
-        active: m.active,
-        closed: m.closed,
-        volume: m.volume ?? 0,
-        liquidity: m.liquidity ?? 0,
-        category: m.category ?? 'crypto',
-        tokens: m.tokens.map((t) => ({
-          tokenId: t.token_id,
-          outcome: t.outcome === 'Yes' ? 'Yes' : 'No',
-          price: Number(t.price) || 0,
-          winner: t.winner,
-        })),
-      }));
+      .map<PolyMarket>((m) => {
+        // Build tokens from legacy array or Gamma flat fields
+        let tokens: PolyMarket['tokens'];
+        if (m.tokens?.length) {
+          tokens = m.tokens.map((t) => ({
+            tokenId: t.token_id,
+            outcome: t.outcome === 'Yes' ? 'Yes' : 'No',
+            price: Number(t.price) || 0,
+            winner: t.winner,
+          }));
+        } else {
+          // Parse Gamma flat arrays
+          const ids: string[] = JSON.parse(m.clobTokenIds || '[]');
+          const outcomes: string[] = JSON.parse(m.outcomes || '[]');
+          const prices: string[] = JSON.parse(m.outcomePrices || '[]');
+          tokens = ids.map((id, i) => ({
+            tokenId: id,
+            outcome: outcomes[i] === 'Yes' ? 'Yes' : 'No',
+            price: Number(prices[i]) || 0,
+            winner: false,
+          }));
+        }
+
+        return {
+          conditionId: m.conditionId,
+          question: m.question,
+          endDate: m.endDate,
+          active: m.active,
+          closed: m.closed,
+          volume: m.volume ?? 0,
+          liquidity: m.liquidity ?? m.liquidityNum ?? 0,
+          category: m.category ?? 'crypto',
+          tokens,
+        };
+      });
 
     logger.info(`[Polymarket] Found ${filtered.length} crypto markets (filtered from ${raw.length} total)`);
     return filtered;
@@ -889,7 +917,7 @@ export async function fetchPositions(): Promise<PolyPosition[]> {
   try {
     const { wallet } = await loadEthers();
 
-    // Fetch from CLOB positions endpoint
+    // CLOB /data/positions requires user address as query param
     const raw = await clobGet<Array<{
       condition_id: string;
       question?: string;
@@ -898,7 +926,14 @@ export async function fetchPositions(): Promise<PolyPosition[]> {
       size: string;
       entry_price?: string;
       current_price?: string;
-    }>>('/data/positions', true);
+    }>>(`/data/positions?user=${wallet.address}`, true).catch((err: Error) => {
+      // 404 = no positions or endpoint unavailable — not a real error
+      if (err.message.includes('404')) {
+        logger.debug('[Polymarket] No positions (404) — returning empty');
+        return [] as Array<any>;
+      }
+      throw err;
+    });
 
     const positions: PolyPosition[] = [];
 

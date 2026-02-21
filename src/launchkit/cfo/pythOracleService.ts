@@ -18,7 +18,7 @@
  *  SOL/USD  : 0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d
  *  ETH/USD  : 0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace
  *  BTC/USD  : 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43
- *  MATIC/USD: 0xd2c2c1f2bba8e0964f9589e060c2ee97f5e19057267ac3284caef3bd50bd2cb5
+ *  POL/USD  : 0xffd11c5a1cfd42f80afb2df4d9f264c15f956d68153335374ec10722edd70472
  */
 
 import { logger } from '@elizaos/core';
@@ -31,7 +31,8 @@ export const PYTH_PRICE_IDS: Record<string, string> = {
   'SOL/USD':   'ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d',
   'ETH/USD':   'ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace',
   'BTC/USD':   'e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43',
-  'MATIC/USD': 'd2c2c1f2bba8e0964f9589e060c2ee97f5e19057267ac3284caef3bd50bd2cb5',
+  'POL/USD':   'ffd11c5a1cfd42f80afb2df4d9f264c15f956d68153335374ec10722edd70472',
+  'MATIC/USD': 'ffd11c5a1cfd42f80afb2df4d9f264c15f956d68153335374ec10722edd70472', // alias for POL
   'USDC/USD':  'eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a',
 };
 
@@ -94,11 +95,12 @@ interface HermesResponse {
 
 async function fetchFromPyth(symbols: string[]): Promise<Map<string, PriceData>> {
   const result = new Map<string, PriceData>();
-  const ids = symbols.map((s) => PYTH_PRICE_IDS[s]).filter(Boolean);
+  // Deduplicate feed IDs (aliases like MATIC/USD & POL/USD share the same ID)
+  const uniqueIds = [...new Set(symbols.map((s) => PYTH_PRICE_IDS[s]).filter(Boolean))];
 
-  if (!ids.length) return result;
+  if (!uniqueIds.length) return result;
 
-  const params = ids.map((id) => `ids[]=${id}`).join('&');
+  const params = uniqueIds.map((id) => `ids[]=${id}`).join('&');
   const url = `${HERMES_BASE}/v2/updates/price/latest?${params}&parsed=true`;
 
   const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
@@ -107,8 +109,11 @@ async function fetchFromPyth(symbols: string[]): Promise<Map<string, PriceData>>
   const body = await resp.json() as HermesResponse;
 
   for (const p of body.parsed) {
-    const symbol = Object.entries(PYTH_PRICE_IDS).find(([, id]) => id === p.id)?.[0];
-    if (!symbol) continue;
+    // Find ALL symbols that map to this feed ID (handle aliases)
+    const matchingSymbols = Object.entries(PYTH_PRICE_IDS)
+      .filter(([, id]) => id === p.id)
+      .map(([sym]) => sym);
+    if (!matchingSymbols.length) continue;
 
     const expo = p.price.expo;
     const multiplier = Math.pow(10, expo);
@@ -117,19 +122,22 @@ async function fetchFromPyth(symbols: string[]): Promise<Map<string, PriceData>>
     const emaPrice = Number(p.ema_price.price) * Math.pow(10, p.ema_price.expo);
     const age = Math.round(Date.now() / 1000) - p.price.publish_time;
 
-    const data: PriceData = {
-      symbol,
-      price,
-      confidence,
-      emaPrice,
-      publishTime: p.price.publish_time,
-      age,
-      isStale: age > STALE_THRESHOLD_SECONDS,
-      source: 'pyth',
-    };
+    // Store under all matching symbols (e.g. both POL/USD and MATIC/USD)
+    for (const symbol of matchingSymbols) {
+      const data: PriceData = {
+        symbol,
+        price,
+        confidence,
+        emaPrice,
+        publishTime: p.price.publish_time,
+        age,
+        isStale: age > STALE_THRESHOLD_SECONDS,
+        source: 'pyth',
+      };
 
-    result.set(symbol, data);
-    setCache(symbol, data);
+      result.set(symbol, data);
+      setCache(symbol, data);
+    }
   }
 
   return result;
@@ -143,6 +151,7 @@ const COINGECKO_IDS: Record<string, string> = {
   'SOL/USD':   'solana',
   'ETH/USD':   'ethereum',
   'BTC/USD':   'bitcoin',
+  'POL/USD':   'matic-network',
   'MATIC/USD': 'matic-network',
   'USDC/USD':  'usd-coin',
 };
