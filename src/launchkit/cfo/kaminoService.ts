@@ -27,7 +27,7 @@ import {
   Keypair,
   PublicKey,
   Transaction,
-  sendAndConfirmTransaction,
+
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { logger } from '@elizaos/core';
@@ -104,6 +104,30 @@ function loadWallet(): Keypair {
 
 function getConnection(): Connection {
   return new Connection(getRpcUrl(), 'confirmed');
+}
+
+/**
+ * Poll-based transaction confirmation (avoids WebSocket signatureSubscribe).
+ * Alchemy HTTP RPC does not support WS subscriptions.
+ */
+async function pollConfirmation(
+  connection: Connection,
+  signature: string,
+  lastValidBlockHeight: number,
+  maxAttempts = 30,
+): Promise<void> {
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const resp = await connection.getSignatureStatuses([signature]);
+    const status = resp.value[0];
+    if (status) {
+      if (status.err) throw new Error(`Transaction failed: ${JSON.stringify(status.err)}`);
+      if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') return;
+    }
+    const height = await connection.getBlockHeight('confirmed');
+    if (height > lastValidBlockHeight) throw new Error('Transaction expired — blockhash no longer valid');
+  }
+  throw new Error(`Transaction not confirmed after ${maxAttempts} attempts`);
 }
 
 /** Create a Solana v2 RPC client (required by klend-sdk v7+) */
@@ -223,11 +247,17 @@ export async function deposit(asset: 'USDC' | 'SOL', amount: number): Promise<Ka
       tx.add(ix as any);
     }
 
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
     tx.recentBlockhash = blockhash;
     tx.feePayer = wallet.publicKey;
 
-    const signature = await sendAndConfirmTransaction(connection, tx, [wallet]);
+    tx.sign(wallet);
+    const signature = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    logger.info(`[Kamino] Tx sent: ${signature}, polling for confirmation...`);
+    await pollConfirmation(connection, signature, lastValidBlockHeight);
 
     logger.info(`[Kamino] Deposited ${amount} ${asset}: ${signature}`);
     return {
@@ -293,11 +323,17 @@ export async function withdraw(asset: 'USDC' | 'SOL', amount: number): Promise<K
       tx.add(ix as any);
     }
 
-    const { blockhash } = await connection.getLatestBlockhash();
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
     tx.recentBlockhash = blockhash;
     tx.feePayer = wallet.publicKey;
 
-    const signature = await sendAndConfirmTransaction(connection, tx, [wallet]);
+    tx.sign(wallet);
+    const signature = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    logger.info(`[Kamino] Tx sent: ${signature}, polling for confirmation...`);
+    await pollConfirmation(connection, signature, lastValidBlockHeight);
     logger.info(`[Kamino] Withdrew ${amount} ${asset}: ${signature}`);
     return { success: true, txSignature: signature, asset, amountWithdrawn: amount };
   } catch (err) {
