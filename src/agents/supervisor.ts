@@ -77,6 +77,7 @@ export class Supervisor extends BaseAgent {
     this.startHeartbeat(60_000);
     this.addInterval(() => this.pollMessages(), this.pollIntervalMs);
     // Also periodically check agent health (separate from Health Agent's deeper checks)
+    this.checkAgentStatuses(); // immediate first check
     this.addInterval(() => this.checkAgentStatuses(), 5 * 60 * 1000); // every 5 min
     // Periodic swarm briefing — digest of all agent activity
     this.addInterval(() => this.publishBriefing(), this.briefingIntervalMs);

@@ -705,13 +705,17 @@ function collectSwarmStats(): SwarmStats | null {
     return `${Math.round(mins / 60)}h ago`;
   };
 
+  // Helper: resolve status — trust live in-process running state over potentially stale DB heartbeat
+  const resolveStatus = (running: boolean, hb?: { status: string } | null): string =>
+    running ? (hb?.status === 'degraded' ? 'degraded' : 'alive') : (hb?.status || 'dead');
+
   // Supervisor
   try {
     const s = swarmHandle.supervisor.getStatus();
     const hb = agentStatuses.get('nova-supervisor');
     agents.push({
       name: 'supervisor',
-      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      status: resolveStatus(s.running, hb),
       lastSeen: hb?.lastSeen ?? null,
       detail: `${s.messagesProcessed} msgs, ${s.intelBufferSize} intel, ${s.activeChildren} children`,
     });
@@ -724,7 +728,7 @@ function collectSwarmStats(): SwarmStats | null {
     const lastR = s.lastResearchAt ? ago(new Date(s.lastResearchAt)) : 'never';
     agents.push({
       name: 'scout',
-      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      status: resolveStatus(s.running, hb),
       lastSeen: hb?.lastSeen ?? null,
       detail: `${s.cycleCount} cycles, last research ${lastR}`,
     });
@@ -736,7 +740,7 @@ function collectSwarmStats(): SwarmStats | null {
     const hb = agentStatuses.get('nova-guardian');
     agents.push({
       name: 'guardian',
-      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      status: resolveStatus(s.running, hb),
       lastSeen: hb?.lastSeen ?? null,
       detail: `${s.watchListSize} watched, ${s.totalScans} scans, ${s.totalLiquidityAlerts} LP alerts`,
     });
@@ -749,7 +753,7 @@ function collectSwarmStats(): SwarmStats | null {
     const totalTokens = s.coreTokenCount + s.dynamicCoinGeckoCount + s.dynamicDexMintCount;
     agents.push({
       name: 'analyst',
-      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      status: resolveStatus(s.running, hb),
       lastSeen: hb?.lastSeen ?? null,
       detail: `${totalTokens} tokens (${s.coreTokenCount}+${s.dynamicCoinGeckoCount}+${s.dynamicDexMintCount}), ${s.cycleCount} snapshots`,
     });
@@ -761,7 +765,7 @@ function collectSwarmStats(): SwarmStats | null {
     const hb = agentStatuses.get('nova-launcher');
     agents.push({
       name: 'launcher',
-      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      status: resolveStatus(s.running, hb),
       lastSeen: hb?.lastSeen ?? null,
       detail: `${s.launchCount} launches, ${s.graduationCount} graduated`,
     });
@@ -773,7 +777,7 @@ function collectSwarmStats(): SwarmStats | null {
     const hb = agentStatuses.get('nova-community');
     agents.push({
       name: 'community',
-      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      status: resolveStatus(s.running, hb),
       lastSeen: hb?.lastSeen ?? null,
       detail: `${s.lastEngagementRate.toFixed(1)} eng/hr, ${s.reportCount} reports`,
     });
@@ -786,7 +790,7 @@ function collectSwarmStats(): SwarmStats | null {
     const pauseLabel = s.paused ? '⏸️ paused' : 'active';
     agents.push({
       name: 'cfo',
-      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      status: resolveStatus(s.running, hb),
       lastSeen: hb?.lastSeen ?? null,
       detail: `${s.cycleCount} cycles, ${s.pendingApprovals} pending, ${pauseLabel}`,
     });

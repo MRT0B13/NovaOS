@@ -186,16 +186,25 @@ export async function hedgeSolTreasury(params: HedgeParams): Promise<HLOrderResu
     // Get current SOL mark price
     const mids = await info.allMids();
     const solPrice = Number(mids['SOL'] ?? 150);
-    const sizeInSol = params.solExposureUsd / solPrice;
-    const sizeFmt = Math.floor(sizeInSol * 1000) / 1000; // round to 3 decimals
 
-    if (sizeFmt < 0.001) {
-      return { success: false, error: 'Position too small — minimum 0.001 SOL' };
-    }
-
-    // Resolve SOL asset ID from meta (typically 4 for SOL-PERP on Hyperliquid)
+    // Resolve SOL asset info from meta (szDecimals determines size precision)
     const meta = await info.meta();
-    const solAsset = (meta as any).universe?.findIndex((u: any) => u.name === 'SOL') ?? 4;
+    const universe = (meta as any).universe ?? [];
+    const solAsset = universe.findIndex((u: any) => u.name === 'SOL');
+    if (solAsset < 0) return { success: false, error: 'SOL not found in HL meta' };
+    const szDecimals: number = universe[solAsset].szDecimals ?? 1;
+    const szStep = Math.pow(10, szDecimals);
+
+    const sizeInSol = params.solExposureUsd / solPrice;
+    const sizeFmt = Math.floor(sizeInSol * szStep) / szStep; // round DOWN to HL precision
+
+    if (sizeFmt <= 0) {
+      return { success: false, error: `Position too small after rounding to ${szDecimals} decimals` };
+    }
+    // HL minimum notional is ~$10
+    if (sizeFmt * solPrice < 10) {
+      return { success: false, error: `Notional $${(sizeFmt * solPrice).toFixed(2)} below HL minimum $10` };
+    }
 
     // Set leverage first
     await exchange.updateLeverage({
@@ -262,10 +271,15 @@ export async function closePosition(coin: string, sizeInCoin: number, isBuy: boo
     const markPrice = Number(mids[coin] ?? 0);
     if (!markPrice) return { success: false, error: `No mark price for ${coin}` };
 
-    // Resolve asset ID
+    // Resolve asset info
     const meta = await info.meta();
-    const assetIdx = (meta as any).universe?.findIndex((u: any) => u.name === coin) ?? -1;
+    const universe = (meta as any).universe ?? [];
+    const assetIdx = universe.findIndex((u: any) => u.name === coin);
     if (assetIdx < 0) return { success: false, error: `Unknown asset ${coin}` };
+    const szDecimals: number = universe[assetIdx].szDecimals ?? 1;
+    const szStep = Math.pow(10, szDecimals);
+    const sizeRounded = Math.floor(sizeInCoin * szStep) / szStep;
+    if (sizeRounded <= 0) return { success: false, error: `Size too small after rounding to ${szDecimals} decimals` };
 
     // Close at slightly worse price to guarantee fill
     const limitPx = isBuy
@@ -277,7 +291,7 @@ export async function closePosition(coin: string, sizeInCoin: number, isBuy: boo
         a: assetIdx,
         b: isBuy,
         p: limitPx,
-        s: sizeInCoin.toString(),
+        s: sizeRounded.toString(),
         r: true,  // reduce only
         t: { limit: { tif: 'Ioc' as const } },  // Immediate-or-cancel
       }],
@@ -307,7 +321,7 @@ export async function closeAllPositions(): Promise<{ closed: number; errors: str
     const summary = await getAccountSummary();
     for (const pos of summary.positions) {
       const isBuy = pos.side === 'SHORT'; // to close a short, we buy
-      const sizeInCoin = pos.sizeUsd / pos.markPrice;
+      const sizeInCoin = pos.sizeUsd / pos.markPrice; // closePosition handles szDecimals rounding
       const result = await closePosition(pos.coin, sizeInCoin, isBuy);
       if (result.success) closed++;
       else errors.push(`${pos.coin}: ${result.error}`);
