@@ -292,8 +292,10 @@ export async function instantUnstake(jitoSolAmount: number): Promise<JitoUnstake
  * Get current Jito staking position for the agent wallet.
  */
 export async function getStakePosition(solPriceUsd: number): Promise<JitoStakePosition> {
+  const zero: JitoStakePosition = { jitoSolBalance: 0, jitoSolValueSol: 0, jitoSolValueUsd: 0, exchangeRate: 1.05, apy: 7.5, stakingRewardsEarned: 0 };
   try {
-    const wallet = loadWallet();
+    let wallet: ReturnType<typeof loadWallet>;
+    try { wallet = loadWallet(); } catch { return zero; }
     const connection = getConnection();
     const stats = await getJitoStats();
 
@@ -322,7 +324,7 @@ export async function getStakePosition(solPriceUsd: number): Promise<JitoStakePo
     };
   } catch (err) {
     logger.warn('[Jito] getStakePosition error:', err);
-    return { jitoSolBalance: 0, jitoSolValueSol: 0, jitoSolValueUsd: 0, exchangeRate: 1.05, apy: 7.5, stakingRewardsEarned: 0 };
+    return zero;
   }
 }
 

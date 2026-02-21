@@ -898,7 +898,7 @@ export async function fetchPositions(): Promise<PolyPosition[]> {
       size: string;
       entry_price?: string;
       current_price?: string;
-    }>>('/positions', true);
+    }>>('/data/positions', true);
 
     const positions: PolyPosition[] = [];
 
