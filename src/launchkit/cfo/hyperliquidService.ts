@@ -215,7 +215,7 @@ export async function hedgeSolTreasury(params: HedgeParams): Promise<HLOrderResu
         s: sizeFmt.toString(), // size
         r: false,              // reduce only
         t: { limit: { tif: 'Gtc' as const } },
-        c: `0x${Buffer.from(`cfo-hedge-${Date.now()}`).toString('hex').slice(0, 24)}`,
+        c: `0x${Buffer.from(`cfo-hedge-${Date.now()}`).toString('hex').padEnd(32, '0').slice(0, 32)}`,
       }],
       grouping: 'na',
     });
