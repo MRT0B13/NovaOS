@@ -584,7 +584,11 @@ export async function generateDecisions(
         const hedgeNeeded = targetHedgeUsd - currentHedgeUsd;
         const capped = Math.min(hedgeNeeded, env.maxHyperliquidUsd - currentHedgeUsd);
 
-        if (capped > 10 && checkCooldown('OPEN_HEDGE', config.hedgeCooldownMs)) {
+        // Gate: need enough HL margin to open the position (size / leverage)
+        const marginRequired = capped / Math.min(2, env.maxHyperliquidLeverage);
+        if (state.hlAvailableMargin < marginRequired) {
+          logger.debug(`[CFO:Hedge] Skipping OPEN_HEDGE — need $${marginRequired.toFixed(0)} margin but only $${state.hlAvailableMargin.toFixed(0)} available on HL`);
+        } else if (capped > 10 && checkCooldown('OPEN_HEDGE', config.hedgeCooldownMs)) {
           const d: Decision = {
             type: 'OPEN_HEDGE',
             reasoning:

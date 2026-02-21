@@ -41,10 +41,10 @@ import { getCFOEnv } from './cfoEnv.ts';
 // Constants — lazy-init PublicKey to avoid Bun TDZ issues with dynamic imports
 // ============================================================================
 
-const JITO_STAKE_POOL_STR = 'Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Posko';
+const JITO_STAKE_POOL_STR = 'Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Awbb';
 const JITOSOL_MINT_STR = 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn';
-const JITO_RESERVE_STAKE_STR = '5XKK8PpbCBA3PemF2PTRPgMiixfpjYtqQBPKGbz8DSq7';
-const JITO_FEE_ACCOUNT_STR = '6igCMGoWdBBdBYs6L5hLCfSRJGa7fNhzMJWnoZ7QqV2r';
+const JITO_RESERVE_STAKE_STR = 'BgKUXdS29YcHCFrPm5M8oLHiTzZaMDjsebggjoaQ6KFL';
+const JITO_FEE_ACCOUNT_STR = '8yoigZfzZ1nNaadumY9uPVD118225UYHTDpmjpr2nrSa';
 
 let _JITO_STAKE_POOL: PublicKey | null = null;
 let _JITOSOL_MINT: PublicKey | null = null;
