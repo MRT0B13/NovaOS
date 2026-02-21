@@ -19,6 +19,16 @@ async function build() {
   const start = performance.now();
   console.log('🚀 Building project...');
 
+  // Skip build in pre-built runtime (Docker runtime stage has dist/ but no src/)
+  if (!existsSync('./src')) {
+    if (existsSync('./dist/index.js')) {
+      console.log('✓ No src/ directory — using pre-built dist/');
+      return true;
+    }
+    console.error('✗ No src/ directory and no dist/index.js — cannot proceed');
+    return false;
+  }
+
   try {
     // Clean previous build
     await cleanBuild('dist');
