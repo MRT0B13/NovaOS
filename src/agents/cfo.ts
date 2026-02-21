@@ -758,10 +758,10 @@ export class CFOAgent extends BaseAgent {
         const cfoEnv = getCFOEnv();
         const closeOps: Promise<any>[] = [];
         if (cfoEnv.polymarketEnabled) {
-          closeOps.push((await poly()).cancelAllOrders().catch(e => logger.error('[CFO] Emergency poly cancel failed:', e)));
+          closeOps.push((await poly()).cancelAllOrders().catch((e: any) => logger.error('[CFO] Emergency poly cancel failed:', e)));
         }
         if (cfoEnv.hyperliquidEnabled) {
-          closeOps.push((await hl()).closeAllPositions().catch(e => logger.error('[CFO] Emergency HL close failed:', e)));
+          closeOps.push((await hl()).closeAllPositions().catch((e: any) => logger.error('[CFO] Emergency HL close failed:', e)));
         }
         if (closeOps.length > 0) {
           await Promise.allSettled(closeOps);
