@@ -564,11 +564,11 @@ export class Supervisor extends BaseAgent {
 
   private formatSafetyWarning(tokenName: string, score: number, alerts: string[]): string {
     const alertLines = alerts.map(a => `⚠️ ${a}`).join('\n');
-    return `🚨 Safety Alert: ${tokenName}\nRugCheck Score: ${score}/100\n${alertLines}`;
+    return `🚨 Safety Alert: ${tokenName}\nRugCheck Score: ${score}\n${alertLines}`;
   }
 
   private formatScanReport(report: Record<string, any>): string {
-    return `🛡️ RugCheck Report: ${report.tokenName || 'Unknown'}\nScore: ${report.score || '?'}/100\n${report.summary || 'Scan complete.'}`;
+    return `🛡️ RugCheck Report: ${report.tokenName || 'Unknown'}\nScore: ${report.score || '?'}\n${report.summary || 'Scan complete.'}`;
   }
 
   // ── Swarm Briefing ───────────────────────────────────────────────

@@ -250,7 +250,12 @@ export class GuardianAgent extends BaseAgent {
     }
 
     // Critical alerts for dangerous findings
-    if (report.isRugged || report.mintAuthority || report.freezeAuthority) {
+    // SKIP for core tokens — established protocol tokens (JitoSOL, PYTH, JTO, etc.)
+    // naturally have high RugCheck scores due to mint/freeze authorities.
+    // For core tokens we only track score degradation (handled above).
+    const isCore = watched?.source === 'core';
+
+    if (!isCore && (report.isRugged || report.mintAuthority || report.freezeAuthority)) {
       const alerts: string[] = [];
       if (report.isRugged) alerts.push('TOKEN IS RUGGED');
       if (report.mintAuthority) alerts.push('Mint authority still active');
@@ -264,8 +269,8 @@ export class GuardianAgent extends BaseAgent {
         alerts,
         isRugged: report.isRugged,
       });
-    } else if (!safe) {
-      // Non-critical but unsafe
+    } else if (!isCore && !safe) {
+      // Non-critical but unsafe (skip core tokens — they always score high)
       const alerts = report.risks?.map((r: any) => `${r.level}: ${r.name}`) || [];
       await this.reportToSupervisor('alert', 'high', {
         tokenAddress: mint,

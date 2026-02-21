@@ -415,9 +415,13 @@ export class AnalystAgent extends BaseAgent {
       let newMints = 0;
       try {
         const result = await this.pool.query(
-          `SELECT DISTINCT payload FROM agent_messages
-           WHERE (from_agent = 'nova-scout' OR from_agent = 'nova-guardian')
-             AND created_at > NOW() - INTERVAL '6 hours'
+          `SELECT payload FROM (
+             SELECT DISTINCT ON (payload) payload, created_at
+             FROM agent_messages
+             WHERE (from_agent = 'nova-scout' OR from_agent = 'nova-guardian')
+               AND created_at > NOW() - INTERVAL '6 hours'
+             ORDER BY payload, created_at DESC
+           ) sub
            ORDER BY created_at DESC
            LIMIT 50`,
         );

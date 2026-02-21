@@ -86,6 +86,14 @@ export class ScoutAgent extends BaseAgent {
     // Run first quick scan shortly after start (give other systems time to boot)
     setTimeout(() => this.runQuickScan(), 15_000);
 
+    // Run first full research 2 minutes after start (don't wait 8 hours after a deploy)
+    setTimeout(() => {
+      if (this.running && this.cycleCount === 0) {
+        logger.info('[scout] Running initial research cycle (post-deploy catch-up)');
+        this.runFullResearch();
+      }
+    }, 2 * 60 * 1000);
+
     logger.info(`[scout] Research every ${this.researchIntervalMs / 3600000}h, quick scan every ${this.quickScanIntervalMs / 60000}m`);
   }
 
