@@ -52,10 +52,13 @@ RUN mkdir -p /app/.eliza && chown -R node:node /app /home/node
 COPY --from=builder --chown=node:node /app/package.json /app/bun.lock* ./
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/dist ./dist
+COPY --from=builder --chown=node:node /app/src ./src
 COPY --from=builder --chown=node:node /app/index.html ./index.html
 COPY --from=builder --chown=node:node /app/build.ts ./build.ts
+COPY --from=builder --chown=node:node /app/tsconfig.json ./tsconfig.json
 COPY --from=builder --chown=node:node /app/tsconfig.build.json ./tsconfig.build.json
 COPY --from=builder --chown=node:node /app/scripts ./scripts
+COPY --from=builder --chown=node:node /app/patches ./patches
 # Optional: copy .eliza if present (commented out to avoid build failures when missing)
 # COPY --from=builder /app/.eliza ./ .eliza
 
