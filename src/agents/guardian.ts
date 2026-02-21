@@ -1,20 +1,23 @@
 /**
  * Guardian Agent
  *
- * Role: Safety monitoring — RugCheck scans, LP tracking, whale movement alerts.
+ * Role: Safety monitoring — RugCheck scans, LP tracking, whale movement alerts,
+ * liquidity monitoring, and holder concentration analysis.
  * Wraps rugcheck.ts service and adds proactive monitoring loops.
  *
  * Runs on a schedule:
- *   - Watched token re-scan: every 15 minutes
- *   - LP lock checks: every 30 minutes (for tokens with known mint addresses)
+ *   - Watched token re-scan: every 15 minutes (RugCheck safety scores)
+ *   - Liquidity monitor: every 30 minutes (DexScreener LP + volume)
+ *   - Scout token ingestion: every 5 minutes
  *
  * Outgoing messages → Supervisor:
- *   - alert (critical): Rug detected, mint/freeze authority re-enabled, 50%+ supply dump
- *   - alert (high): New risk flag, LP unlocked, score degradation > 20 points
+ *   - alert (critical): Rug detected, mint/freeze authority re-enabled, 50%+ supply dump, LP drained
+ *   - alert (high): New risk flag, LP unlocked, score degradation > 20 points, liquidity drop > 40%
  *   - report (medium): Periodic safety summary, scan result on request
  *
  * Incoming commands ← Supervisor:
  *   - scan_token: Scan a specific token address and report back
+ *   - watch_token: Add a token to the active watch list
  */
 
 import { Pool } from 'pg';
@@ -35,6 +38,68 @@ async function loadRugcheck() {
   }
 }
 
+// ── DexScreener: Liquidity & volume data (public, no auth) ──────
+
+interface LiquiditySnapshot {
+  mint: string;
+  liquidityUsd: number;
+  volume24h: number;
+  priceUsd: number;
+  priceChange24h: number;
+  fdv: number;
+  pairAddress: string;
+}
+
+async function fetchDexScreenerLiquidity(mints: string[]): Promise<Map<string, LiquiditySnapshot>> {
+  const result = new Map<string, LiquiditySnapshot>();
+  if (mints.length === 0) return result;
+  try {
+    const batch = mints.slice(0, 30).join(',');
+    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${batch}`);
+    if (!res.ok) return result;
+    const data = await res.json() as any;
+    const seen = new Set<string>();
+    for (const pair of (data.pairs || [])) {
+      const addr = pair.baseToken?.address;
+      if (addr && !seen.has(addr)) {
+        seen.add(addr);
+        result.set(addr, {
+          mint: addr,
+          liquidityUsd: pair.liquidity?.usd || 0,
+          volume24h: pair.volume?.h24 || 0,
+          priceUsd: parseFloat(pair.priceUsd) || 0,
+          priceChange24h: pair.priceChange?.h24 || 0,
+          fdv: pair.fdv || 0,
+          pairAddress: pair.pairAddress || '',
+        });
+      }
+    }
+  } catch {
+    // DexScreener rate limit or down — non-fatal
+  }
+  return result;
+}
+
+// ============================================================================
+// Core Solana tokens — always watched as a baseline
+// ============================================================================
+
+const CORE_WATCH_TOKENS: Array<{ mint: string; ticker: string }> = [
+  { mint: 'So11111111111111111111111111111111111111112',  ticker: 'WSOL' },
+  { mint: 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn', ticker: 'JitoSOL' },
+  { mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', ticker: 'BONK' },
+  { mint: 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', ticker: 'WIF' },
+  { mint: 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',  ticker: 'JUP' },
+  { mint: 'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3', ticker: 'PYTH' },
+  { mint: 'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL',  ticker: 'JTO' },
+  { mint: '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R', ticker: 'RAY' },
+  { mint: 'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE',  ticker: 'ORCA' },
+  { mint: 'DriFtupJYLTosbwoN8koMbEYSx54aFAVLddWsbksjwg7', ticker: 'DRIFT' },
+  { mint: '85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ', ticker: 'W' },
+  { mint: '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr', ticker: 'POPCAT' },
+  { mint: 'rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof',  ticker: 'RENDER' },
+];
+
 // ============================================================================
 // Guardian Agent
 // ============================================================================
@@ -45,41 +110,67 @@ interface WatchedToken {
   lastScore: number;
   lastCheckedAt: number;
   addedAt: number;
+  source: 'core' | 'launched' | 'scout' | 'manual';
+  // Liquidity tracking
+  lastLiquidityUsd?: number;
+  lastVolume24h?: number;
+  lastPriceUsd?: number;
+  lastLiquidityCheckAt?: number;
 }
 
 export class GuardianAgent extends BaseAgent {
   private watchList: Map<string, WatchedToken> = new Map();
   private rescanIntervalMs: number;
+  private liquidityCheckIntervalMs: number;
   private scanCount = 0;
+  private liquidityAlertCount = 0;
 
-  constructor(pool: Pool, opts?: { rescanIntervalMs?: number }) {
+  constructor(pool: Pool, opts?: { rescanIntervalMs?: number; liquidityCheckIntervalMs?: number }) {
     super({
       agentId: 'nova-guardian',
       agentType: 'guardian',
       pool,
     });
     this.rescanIntervalMs = opts?.rescanIntervalMs ?? 15 * 60 * 1000; // 15 min
+    this.liquidityCheckIntervalMs = opts?.liquidityCheckIntervalMs ?? 30 * 60 * 1000; // 30 min
   }
 
   protected async onStart(): Promise<void> {
     this.startHeartbeat(60_000);
 
-    // Periodic re-scan of watched tokens
+    // Periodic re-scan of watched tokens (RugCheck safety)
     this.addInterval(() => this.rescanWatchList(), this.rescanIntervalMs);
+
+    // Liquidity monitoring (DexScreener — LP + volume)
+    this.addInterval(() => this.monitorLiquidity(), this.liquidityCheckIntervalMs);
 
     // Listen for supervisor commands (scan requests)
     this.addInterval(() => this.processCommands(), 10_000);
 
-    // Load initial watch list from DB (launched tokens)
+    // Ingest scout intel for new tokens every 5 minutes
+    this.addInterval(() => this.ingestScoutTokens(), 5 * 60 * 1000);
+
+    // 1. Load core ecosystem tokens — always-on baseline
+    for (const t of CORE_WATCH_TOKENS) {
+      this.addToWatchList(t.mint, t.ticker, 'core');
+    }
+
+    // 2. Load launched tokens from DB (launchpacks)
     await this.loadWatchListFromDB();
 
-    logger.info(`[guardian] Monitoring ${this.watchList.size} tokens, re-scan every ${this.rescanIntervalMs / 60000}m`);
+    // 3. Ingest any tokens from scout intel
+    await this.ingestScoutTokens();
+
+    // 4. First liquidity snapshot (baseline, no alerts)
+    await this.monitorLiquidity(true);
+
+    logger.info(`[guardian] Monitoring ${this.watchList.size} tokens (${CORE_WATCH_TOKENS.length} core + DB + scout), re-scan every ${this.rescanIntervalMs / 60000}m, liquidity every ${this.liquidityCheckIntervalMs / 60000}m`);
   }
 
   // ── Watch List Management ────────────────────────────────────────
 
   /** Add a token to the watch list */
-  addToWatchList(mint: string, ticker?: string): void {
+  addToWatchList(mint: string, ticker?: string, source: WatchedToken['source'] = 'manual'): void {
     if (!this.watchList.has(mint)) {
       this.watchList.set(mint, {
         mint,
@@ -87,8 +178,9 @@ export class GuardianAgent extends BaseAgent {
         lastScore: -1,
         lastCheckedAt: 0,
         addedAt: Date.now(),
+        source,
       });
-      logger.info(`[guardian] Added ${ticker || mint.slice(0, 8)} to watch list`);
+      logger.info(`[guardian] Added ${ticker || mint.slice(0, 8)} to watch list (${source})`);
     }
   }
 
@@ -116,7 +208,7 @@ export class GuardianAgent extends BaseAgent {
           const pack = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
           // Watch any token with a mint address (launched, graduated, or in-progress)
           if (pack?.launch?.mint) {
-            this.addToWatchList(pack.launch.mint, pack.brand?.ticker || pack.brand?.name);
+            this.addToWatchList(pack.launch.mint, pack.brand?.ticker || pack.brand?.name, 'launched');
           }
         } catch { /* skip malformed */ }
       }
@@ -211,7 +303,7 @@ export class GuardianAgent extends BaseAgent {
 
     // Always log status even when no tokens to watch
     if (this.watchList.size === 0) {
-      logger.info(`[guardian] Watch list: 0 tokens, ${this.scanCount} total scans`);
+      logger.info(`[guardian] Watch list: 0 tokens, ${this.scanCount} total scans — waiting for tokens from scout/launches`);
       return;
     }
 
@@ -243,6 +335,167 @@ export class GuardianAgent extends BaseAgent {
     await this.updateStatus('alive');
   }
 
+  // ── Liquidity Monitoring ────────────────────────────────────────
+
+  /**
+   * Check DexScreener for liquidity changes across all watched tokens.
+   * Alerts on: LP drain > 40%, volume spike > 5x, massive price crash > 30%.
+   * @param baseline If true, just snapshot current values without alerting.
+   */
+  private async monitorLiquidity(baseline = false): Promise<void> {
+    if (!this.running) return;
+
+    // Only check non-core tokens that have actual DEX pairs (skip WSOL, etc.)
+    const mintsToCheck = Array.from(this.watchList.entries())
+      .filter(([, t]) => t.source !== 'core' || t.lastLiquidityUsd !== undefined)
+      .map(([mint]) => mint);
+
+    // Also include core tokens if we want to detect market-wide LP events
+    const coreMints = CORE_WATCH_TOKENS
+      .filter(t => !['WSOL'].includes(t.ticker))
+      .map(t => t.mint);
+
+    const allMints = [...new Set([...mintsToCheck, ...coreMints])];
+    if (allMints.length === 0) return;
+
+    try {
+      const snapshots = await fetchDexScreenerLiquidity(allMints);
+      let lpAlerts = 0;
+
+      for (const [mint, snapshot] of snapshots) {
+        const token = this.watchList.get(mint);
+        if (!token) continue;
+
+        const prevLiq = token.lastLiquidityUsd;
+        const prevVol = token.lastVolume24h;
+        const prevPrice = token.lastPriceUsd;
+
+        // Update snapshot
+        token.lastLiquidityUsd = snapshot.liquidityUsd;
+        token.lastVolume24h = snapshot.volume24h;
+        token.lastPriceUsd = snapshot.priceUsd;
+        token.lastLiquidityCheckAt = Date.now();
+
+        // Skip alerts during baseline capture
+        if (baseline || prevLiq === undefined) continue;
+
+        const name = token.ticker || mint.slice(0, 8);
+
+        // LP DRAIN: liquidity dropped > 40%
+        if (prevLiq > 1000 && snapshot.liquidityUsd < prevLiq * 0.6) {
+          const dropPct = Math.round((1 - snapshot.liquidityUsd / prevLiq) * 100);
+          await this.reportToSupervisor('alert', dropPct > 80 ? 'critical' : 'high', {
+            tokenAddress: mint,
+            tokenName: name,
+            alerts: [`LP drained ${dropPct}%: $${this.formatUSD(prevLiq)} → $${this.formatUSD(snapshot.liquidityUsd)}`],
+            liquidityUsd: snapshot.liquidityUsd,
+            previousLiquidityUsd: prevLiq,
+            type: 'lp_drain',
+          });
+          lpAlerts++;
+        }
+
+        // VOLUME SPIKE: 5x the previous volume (potential pump or dump)
+        if (prevVol && prevVol > 100 && snapshot.volume24h > prevVol * 5) {
+          await this.reportToSupervisor('alert', 'high', {
+            tokenAddress: mint,
+            tokenName: name,
+            alerts: [`Volume surged ${Math.round(snapshot.volume24h / prevVol)}x: $${this.formatUSD(snapshot.volume24h)}`],
+            volume24h: snapshot.volume24h,
+            previousVolume24h: prevVol,
+            type: 'volume_spike',
+          });
+          lpAlerts++;
+        }
+
+        // PRICE CRASH: > 30% drop since last check
+        if (prevPrice && prevPrice > 0 && snapshot.priceUsd < prevPrice * 0.7) {
+          const crashPct = Math.round((1 - snapshot.priceUsd / prevPrice) * 100);
+          await this.reportToSupervisor('alert', crashPct > 50 ? 'critical' : 'high', {
+            tokenAddress: mint,
+            tokenName: name,
+            alerts: [`Price crashed ${crashPct}%: $${prevPrice.toFixed(6)} → $${snapshot.priceUsd.toFixed(6)}`],
+            priceUsd: snapshot.priceUsd,
+            previousPriceUsd: prevPrice,
+            type: 'price_crash',
+          });
+          lpAlerts++;
+        }
+      }
+
+      this.liquidityAlertCount += lpAlerts;
+      const checkedCount = snapshots.size;
+      if (checkedCount > 0 && !baseline) {
+        logger.info(`[guardian] Liquidity check: ${checkedCount} tokens, ${lpAlerts} alerts (${this.liquidityAlertCount} total)`);
+      }
+    } catch (err) {
+      logger.debug('[guardian] Liquidity monitoring failed:', err);
+    }
+  }
+
+  private formatUSD(value: number): string {
+    if (value >= 1e6) return `${(value / 1e6).toFixed(1)}M`;
+    if (value >= 1e3) return `${(value / 1e3).toFixed(0)}K`;
+    return value.toFixed(0);
+  }
+
+  // ── Scout Intel Ingestion ──────────────────────────────────────
+
+  /** Read scout intel messages for token addresses to watch */
+  private async ingestScoutTokens(): Promise<void> {
+    try {
+      // Read recent scout reports forwarded through supervisor
+      const result = await this.pool.query(
+        `SELECT payload FROM agent_messages
+         WHERE to_agent = 'nova-guardian'
+           AND message_type = 'intel'
+           AND created_at > NOW() - INTERVAL '1 hour'
+         ORDER BY created_at DESC
+         LIMIT 20`,
+      );
+
+      let added = 0;
+      for (const row of result.rows) {
+        const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+        // Scout sends token addresses in various formats
+        const mint = payload?.tokenAddress || payload?.mint || payload?.contract;
+        const ticker = payload?.ticker || payload?.symbol || payload?.tokenName;
+        if (mint && typeof mint === 'string' && mint.length >= 32 && mint.length <= 44) {
+          if (!this.watchList.has(mint)) {
+            this.addToWatchList(mint, ticker, 'scout');
+            added++;
+          }
+        }
+      }
+
+      // Also check for tokens sent via broadcast from supervisor
+      const broadcasts = await this.pool.query(
+        `SELECT payload FROM agent_messages
+         WHERE to_agent = 'nova-guardian'
+           AND message_type = 'command'
+           AND payload::text LIKE '%watch_token%'
+           AND created_at > NOW() - INTERVAL '1 hour'
+         ORDER BY created_at DESC
+         LIMIT 10`,
+      );
+      for (const row of broadcasts.rows) {
+        const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+        if (payload?.action === 'watch_token' && payload?.tokenAddress) {
+          if (!this.watchList.has(payload.tokenAddress)) {
+            this.addToWatchList(payload.tokenAddress, payload.ticker, 'scout');
+            added++;
+          }
+        }
+      }
+
+      if (added > 0) {
+        logger.info(`[guardian] Ingested ${added} new tokens from scout/swarm intel (total: ${this.watchList.size})`);
+      }
+    } catch {
+      // Silently continue — table may not exist yet
+    }
+  }
+
   // ── Command Processing ───────────────────────────────────────────
 
   private async processCommands(): Promise<void> {
@@ -254,6 +507,13 @@ export class GuardianAgent extends BaseAgent {
           logger.info(`[guardian] Scan requested for ${tokenAddress}`);
           await this.scanAndAssess(tokenAddress, requestedBy);
         }
+        // Accept watch_token commands from any agent
+        if (msg.message_type === 'command' && msg.payload?.action === 'watch_token') {
+          const { tokenAddress, ticker } = msg.payload;
+          if (tokenAddress) {
+            this.addToWatchList(tokenAddress, ticker, 'scout');
+          }
+        }
         if (msg.id) await this.acknowledgeMessage(msg.id);
       }
     } catch {
@@ -264,15 +524,25 @@ export class GuardianAgent extends BaseAgent {
   // ── Public API ───────────────────────────────────────────────────
 
   getStatus() {
+    // Count by source
+    const bySource: Record<string, number> = {};
+    for (const t of this.watchList.values()) {
+      bySource[t.source] = (bySource[t.source] || 0) + 1;
+    }
     return {
       agentId: this.agentId,
       running: this.running,
       watchListSize: this.watchList.size,
+      watchListSources: bySource,
       totalScans: this.scanCount,
+      totalLiquidityAlerts: this.liquidityAlertCount,
       watchedTokens: Array.from(this.watchList.values()).map(t => ({
         mint: t.mint.slice(0, 8) + '...',
         ticker: t.ticker,
         score: t.lastScore,
+        source: t.source,
+        liquidityUsd: t.lastLiquidityUsd,
+        volume24h: t.lastVolume24h,
         lastChecked: t.lastCheckedAt ? new Date(t.lastCheckedAt).toISOString() : null,
       })),
     };

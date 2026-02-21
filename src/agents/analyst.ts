@@ -62,10 +62,40 @@ const COINGECKO_BASE = 'https://api.coingecko.com/api/v3';
 
 // ── Major tokens tracked on every pulse ──
 const TRACKED_TOKENS: Record<string, string> = {
-  solana: 'SOL',
-  ethereum: 'ETH',
+  // ── Layer 1 Majors ──
   bitcoin: 'BTC',
+  ethereum: 'ETH',
+  solana: 'SOL',
+  sui: 'SUI',
+  'avalanche-2': 'AVAX',
+
+  // ── Solana DeFi ──
+  'jupiter-exchange-solana': 'JUP',
+  raydium: 'RAY',
+  orca: 'ORCA',
+  'drift-protocol': 'DRIFT',
+  'jito-governance-token': 'JTO',
+  'pyth-network': 'PYTH',
+  marinade: 'MNDE',
+
+  // ── Solana Meme / Culture ──
+  bonk: 'BONK',
+  dogwifcoin: 'WIF',
+  popcat: 'POPCAT',
+
+  // ── Solana Infra ──
+  'render-token': 'RENDER',
+  helium: 'HNT',
+  wormhole: 'W',
+
+  // ── Key Cross-Chain ──
+  chainlink: 'LINK',
+  aave: 'AAVE',
+  uniswap: 'UNI',
 };
+
+// Subset shown in compact log lines (rest still tracked + alerted on)
+const LOG_HEADER_TOKENS = ['BTC', 'ETH', 'SOL', 'JUP', 'BONK', 'WIF'];
 
 // ── Chains tracked for TVL / DEX volume ──
 const TRACKED_CHAINS = ['Solana', 'Ethereum', 'Base'] as const;
@@ -156,6 +186,26 @@ async function fetchDexScreenerPrices(mintAddresses: string[]): Promise<TokenPri
     logger.debug('[analyst] DexScreener price fetch failed:', err);
   }
   return prices;
+}
+
+// ── CoinGecko: Trending tokens (dynamic discovery) ─────────────────
+
+async function fetchCoinGeckoTrending(): Promise<Record<string, string>> {
+  try {
+    const res = await fetch(`${COINGECKO_BASE}/search/trending`);
+    if (!res.ok) return {};
+    const data = await res.json() as any;
+    const tokens: Record<string, string> = {};
+    for (const item of (data.coins || []).slice(0, 10)) {
+      const coin = item.item;
+      if (coin?.id && coin?.symbol) {
+        tokens[coin.id] = coin.symbol.toUpperCase();
+      }
+    }
+    return tokens;
+  } catch {
+    return {};
+  }
 }
 
 // ── DeFiLlama: Multi-Chain TVL ────────────────────────────────────
@@ -268,6 +318,8 @@ export class AnalystAgent extends BaseAgent {
   private lastPrices: Map<string, TokenPrice> = new Map();          // id → latest
   private previousPrices: Map<string, TokenPrice> = new Map();      // id → previous
   private launchedTokenMints: string[] = [];                         // Nova-launched token addresses
+  private dynamicCoinGeckoIds: Map<string, string> = new Map();     // id → symbol (discovered dynamically)
+  private dynamicDexMints: string[] = [];                            // Solana mints from swarm (guardian/scout)
 
   constructor(pool: Pool, opts?: { snapshotIntervalMs?: number; pulseIntervalMs?: number; priceCheckIntervalMs?: number }) {
     super({
@@ -295,15 +347,22 @@ export class AnalystAgent extends BaseAgent {
     // Listen for supervisor commands
     this.addInterval(() => this.processCommands(), 10_000);
 
+    // Dynamic token discovery — refresh every 30 minutes
+    this.addInterval(() => this.discoverDynamicTokens(), 30 * 60 * 1000);
+
     // Load launched tokens for tracking
     await this.loadLaunchedTokens();
+
+    // First dynamic discovery
+    await this.discoverDynamicTokens();
 
     // First snapshot shortly after start
     setTimeout(() => this.takeSnapshot(), 30_000);
     // First price check after 15s
     setTimeout(() => this.priceCheck(), 15_000);
 
-    logger.info(`[analyst] Snapshot every ${this.snapshotIntervalMs / 3600000}h, pulse every ${this.pulseIntervalMs / 60000}m, prices every ${this.priceCheckIntervalMs / 60000}m`);
+    const totalTracked = Object.keys(TRACKED_TOKENS).length + this.dynamicCoinGeckoIds.size;
+    logger.info(`[analyst] Tracking ${totalTracked} tokens (${Object.keys(TRACKED_TOKENS).length} core + ${this.dynamicCoinGeckoIds.size} trending), snapshot every ${this.snapshotIntervalMs / 3600000}h, pulse every ${this.pulseIntervalMs / 60000}m, prices every ${this.priceCheckIntervalMs / 60000}m`);
   }
 
   /** Load Nova-launched token mint addresses from kv_store for price tracking */
@@ -330,6 +389,86 @@ export class AnalystAgent extends BaseAgent {
       }
     } catch {
       // kv_store may not exist
+    }
+  }
+
+  /**
+   * Discover tokens dynamically from:
+   * 1. CoinGecko trending — what's hot globally
+   * 2. Swarm intel — tokens mentioned by scout/guardian in agent_messages
+   * 3. Guardian watchlist mints — tokens being safety-monitored
+   */
+  private async discoverDynamicTokens(): Promise<void> {
+    try {
+      // 1. CoinGecko trending
+      const trending = await fetchCoinGeckoTrending();
+      let newCoinGecko = 0;
+      for (const [id, symbol] of Object.entries(trending)) {
+        // Don't duplicate core tracked tokens
+        if (!TRACKED_TOKENS[id] && !this.dynamicCoinGeckoIds.has(id)) {
+          this.dynamicCoinGeckoIds.set(id, symbol);
+          newCoinGecko++;
+        }
+      }
+
+      // 2. Swarm intel — scout/guardian token addresses from agent_messages
+      let newMints = 0;
+      try {
+        const result = await this.pool.query(
+          `SELECT DISTINCT payload FROM agent_messages
+           WHERE (from_agent = 'nova-scout' OR from_agent = 'nova-guardian')
+             AND created_at > NOW() - INTERVAL '6 hours'
+           ORDER BY created_at DESC
+           LIMIT 50`,
+        );
+        const existingMints = new Set([...this.launchedTokenMints, ...this.dynamicDexMints]);
+        for (const row of result.rows) {
+          const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+          const mint = payload?.tokenAddress || payload?.mint || payload?.contract;
+          if (mint && typeof mint === 'string' && mint.length >= 32 && mint.length <= 44 && !existingMints.has(mint)) {
+            this.dynamicDexMints.push(mint);
+            existingMints.add(mint);
+            newMints++;
+          }
+        }
+      } catch { /* DB not ready */ }
+
+      // 3. Guardian watchlist — read from guardian's status or messages
+      try {
+        const guardianResult = await this.pool.query(
+          `SELECT payload FROM agent_messages
+           WHERE from_agent = 'nova-guardian'
+             AND message_type = 'alert'
+             AND created_at > NOW() - INTERVAL '24 hours'
+           LIMIT 30`,
+        );
+        const existingMints = new Set([...this.launchedTokenMints, ...this.dynamicDexMints]);
+        for (const row of guardianResult.rows) {
+          const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+          const mint = payload?.tokenAddress;
+          if (mint && typeof mint === 'string' && mint.length >= 32 && mint.length <= 44 && !existingMints.has(mint)) {
+            this.dynamicDexMints.push(mint);
+            existingMints.add(mint);
+            newMints++;
+          }
+        }
+      } catch { /* DB not ready */ }
+
+      // Cap dynamic lists to prevent unbounded growth
+      if (this.dynamicCoinGeckoIds.size > 30) {
+        // Keep only the 20 most recent — clear and re-add
+        const entries = Array.from(this.dynamicCoinGeckoIds.entries());
+        this.dynamicCoinGeckoIds = new Map(entries.slice(-20));
+      }
+      if (this.dynamicDexMints.length > 30) {
+        this.dynamicDexMints = this.dynamicDexMints.slice(-20);
+      }
+
+      if (newCoinGecko > 0 || newMints > 0) {
+        logger.info(`[analyst] Dynamic discovery: +${newCoinGecko} trending CoinGecko, +${newMints} swarm mints (total: ${this.dynamicCoinGeckoIds.size} CG + ${this.dynamicDexMints.length} DEX)`);
+      }
+    } catch (err) {
+      logger.debug('[analyst] Dynamic token discovery failed:', err);
     }
   }
 
@@ -429,12 +568,22 @@ export class AnalystAgent extends BaseAgent {
   private async priceCheck(): Promise<void> {
     if (!this.running) return;
     try {
-      // 1. Major tokens via CoinGecko
-      const majorIds = Object.keys(TRACKED_TOKENS);
-      const majorPrices = await fetchTokenPrices(majorIds);
+      // 1. Core + dynamic CoinGecko tokens
+      const coreIds = Object.keys(TRACKED_TOKENS);
+      const dynamicIds = Array.from(this.dynamicCoinGeckoIds.keys());
+      const allCoinGeckoIds = [...new Set([...coreIds, ...dynamicIds])];
+      const majorPrices = await fetchTokenPrices(allCoinGeckoIds);
 
-      // 2. Nova-launched tokens via DexScreener
-      const novaPrices = await fetchDexScreenerPrices(this.launchedTokenMints);
+      // Ensure dynamic tokens get their symbols in the price data
+      for (const p of majorPrices) {
+        if (!TRACKED_TOKENS[p.id] && this.dynamicCoinGeckoIds.has(p.id)) {
+          p.symbol = this.dynamicCoinGeckoIds.get(p.id) || p.symbol;
+        }
+      }
+
+      // 2. Nova-launched + dynamic swarm mints via DexScreener
+      const allMints = [...new Set([...this.launchedTokenMints, ...this.dynamicDexMints])];
+      const novaPrices = await fetchDexScreenerPrices(allMints);
 
       // 3. Combine and detect alerts
       const allPrices = [...majorPrices, ...novaPrices];
@@ -446,9 +595,10 @@ export class AnalystAgent extends BaseAgent {
         if (prev) this.previousPrices.set(price.id, prev);
         this.lastPrices.set(price.id, price);
 
-        // Alert thresholds: 5% for majors, 10% for Nova tokens
-        const isMajor = majorIds.includes(price.id);
-        const threshold = isMajor ? 5 : 10;
+        // Alert thresholds: 5% for core CoinGecko, 8% for dynamic CG, 10% for DEX mints
+        const isCoreToken = coreIds.includes(price.id);
+        const isDynamicCG = dynamicIds.includes(price.id);
+        const threshold = isCoreToken ? 5 : isDynamicCG ? 8 : 10;
         const prevPrice = this.previousPrices.get(price.id);
 
         if (prevPrice && prevPrice.usd > 0) {
@@ -462,9 +612,18 @@ export class AnalystAgent extends BaseAgent {
         }
       }
 
-      // Log all tracked prices
-      const priceLog = allPrices.map(p => `${p.symbol}=$${p.usd < 1 ? p.usd.toFixed(6) : p.usd.toFixed(2)}`).join(', ');
-      logger.info(`[analyst] Prices: ${priceLog || 'none fetched'}`);
+      // Log tracked prices (header tokens in detail, count for the rest)
+      const headerPrices: string[] = [];
+      let otherCount = 0;
+      for (const p of allPrices) {
+        if (LOG_HEADER_TOKENS.includes(p.symbol)) {
+          headerPrices.push(`${p.symbol}=$${p.usd < 1 ? p.usd.toFixed(6) : p.usd.toFixed(2)}`);
+        } else {
+          otherCount++;
+        }
+      }
+      const otherStr = otherCount > 0 ? ` (+${otherCount} more)` : '';
+      logger.info(`[analyst] Prices: ${headerPrices.join(', ') || 'none fetched'}${otherStr}`);
 
       // Report price alerts to supervisor
       if (alerts.length > 0) {
@@ -498,10 +657,11 @@ export class AnalystAgent extends BaseAgent {
   /** One-line price summary for logging */
   private getPriceLogLine(): string {
     const parts: string[] = [];
-    // Only include majors in the log line
-    for (const [id, symbol] of Object.entries(TRACKED_TOKENS)) {
-      const p = this.lastPrices.get(id);
-      if (p) parts.push(`${symbol}=$${p.usd.toFixed(2)}`);
+    // Show key tokens in log line (others still tracked + alerted on)
+    for (const [, price] of this.lastPrices) {
+      if (LOG_HEADER_TOKENS.includes(price.symbol)) {
+        parts.push(`${price.symbol}=$${price.usd < 1 ? price.usd.toFixed(6) : price.usd.toFixed(2)}`);
+      }
     }
     return parts.length > 0 ? `, ${parts.join(', ')}` : '';
   }
@@ -609,9 +769,15 @@ export class AnalystAgent extends BaseAgent {
       agentId: this.agentId,
       running: this.running,
       cycleCount: this.cycleCount,
+      coreTokenCount: Object.keys(TRACKED_TOKENS).length,
+      dynamicCoinGeckoCount: this.dynamicCoinGeckoIds.size,
+      dynamicDexMintCount: this.dynamicDexMints.length,
+      trackedPriceCount: this.lastPrices.size,
+      launchedTokenCount: this.launchedTokenMints.length,
+      lastSnapshotAt: this.lastSnapshot?.timestamp ?? 0,
       trackedChains: [...TRACKED_CHAINS],
       trackedTokens: Object.values(TRACKED_TOKENS),
-      launchedTokensTracked: this.launchedTokenMints.length,
+      dynamicCoinGeckoTokens: Array.from(this.dynamicCoinGeckoIds.values()),
       lastSnapshot: this.lastSnapshot
         ? {
             chainTvl: this.lastSnapshot.chainTvl,
@@ -659,11 +825,13 @@ export class AnalystAgent extends BaseAgent {
       if (volParts) parts.push(`DEX Vol [${volParts}]`);
     }
 
-    // Major token prices
+    // Major token prices (all tracked)
     const priceParts: string[] = [];
-    for (const [id, symbol] of Object.entries(TRACKED_TOKENS)) {
-      const p = this.lastPrices.get(id);
-      if (p) priceParts.push(`${symbol}=$${p.usd.toFixed(2)}`);
+    for (const [, price] of this.lastPrices) {
+      // Include all tokens with known symbols
+      if (TRACKED_TOKENS[price.id] || this.dynamicCoinGeckoIds.has(price.id) || LOG_HEADER_TOKENS.includes(price.symbol)) {
+        priceParts.push(`${price.symbol}=$${price.usd < 1 ? price.usd.toFixed(6) : price.usd.toFixed(2)}`);
+      }
     }
     if (priceParts.length > 0) parts.push(priceParts.join(', '));
 

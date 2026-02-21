@@ -10,12 +10,16 @@ Nova is a fully autonomous multi-agent AI swarm that launches meme tokens on pum
 
 - **8 Specialized Agents**: Scout, Guardian, Analyst, Launcher, Community, Health, CFO — each with dedicated responsibilities
 - **Supervisor Orchestration**: Nova Supervisor synthesizes intelligence from all agents, routes tasks, and makes strategic decisions
+- **Dual Briefing System**: Admin briefing (full ops breakdown, agent-by-agent status, deduplicated intel by severity) + Community briefing (friendly vibe-check style with max 2 highlights)
 - **Message Bus**: Typed inter-agent communication (intel, alert, task, health, status) with priority routing
+- **Intel Deduplication**: Set-based deduplication prevents repeated intel items across briefings
 - **Self-Healing**: Health Agent monitors heartbeats, detects failures, auto-restarts crashed agents with exponential backoff
 - **Token Child Agents**: Dynamically spawned per-token agents with mascot personas for Telegram groups
 - **Agent Factory**: Create, list, and manage child agents via Telegram commands (`/spawn`, `/factory_list`, `/factory_kill`)
 - **Graceful Shutdown**: All agents coordinate shutdown via AbortController, persist state to DB
 - **Inter-Agent CFO Flows**: Guardian → CFO emergency exit on market crash, Analyst → CFO DeFi snapshots and volume spikes
+- **System Status Reports**: 4-hourly status reports with full swarm agent status (heartbeats, per-agent detail lines), wallet balances, PnL, security
+- **Daily Summary**: Automated daily summary at 9 AM UTC with activity, PnL, swarm performance, health — catch-up on startup after missed deploys
 
 ### 🚀 Token Launch & Management
 
@@ -67,7 +71,21 @@ Nova is a fully autonomous multi-agent AI swarm that launches meme tokens on pum
 
 ### 💰 CFO Agent — Autonomous Financial Operator
 
-The CFO Agent manages Nova's treasury across DeFi protocols and prediction markets with full position tracking and risk controls.
+The CFO Agent manages Nova's treasury across DeFi protocols and prediction markets with full position tracking, autonomous decision-making, and risk controls.
+
+#### Decision Engine (Autonomous Brain)
+
+- **Autonomous Decision Cycle**: Runs every 30 minutes — gathers portfolio state, consults swarm intel, assesses risk, executes within caps, reports results
+- **3-Tier Approval System**: AUTO (<$50 auto-execute), NOTIFY (<$200 execute + tell admin), APPROVAL (>=$200 queue for `/cfo approve`)
+- **Swarm Intel Integration**: Scout sentiment adjusts risk multiplier (±0.2), Guardian critical alerts trigger danger mode (+0.5), Analyst volume spikes add defensiveness (+0.15)
+- **Risk Multiplier**: Composite 0.5–2.0 score that dynamically adjusts hedge targets, stop-loss thresholds, and tier classifications
+- **Market Conditions**: Bullish / Neutral / Bearish / Danger — determined from swarm intel, directly affects all financial decisions
+- **9 Decision Types**: OPEN_HEDGE, CLOSE_HEDGE, CLOSE_LOSING, AUTO_STAKE, UNSTAKE_JITO, REBALANCE_HEDGE, POLY_BET, POLY_EXIT, SKIP
+- **Safety Rails**: Max 3 decisions/cycle, cooldowns (hedge 4h, stake 6h, close 1h, poly 2h), critical bypass for stop-loss/liquidation
+- **Audit Trail**: Every decision cycle persisted to `kv_store` with full portfolio state, swarm intel, decisions, and results
+- **Dry Run Mode**: Full pipeline simulation without real transactions — logs all decisions but executes none
+
+#### 10 Integrated Services
 
 - **Polymarket Trading**: Prediction market positions on Polygon — Kelly criterion sizing, CLOB order building, multi-outcome portfolio tracking
 - **Hyperliquid Perpetuals**: Leveraged hedging on Arbitrum — SOL/ETH perps with configurable max leverage, cross-margin support
@@ -77,19 +95,46 @@ The CFO Agent manages Nova's treasury across DeFi protocols and prediction marke
 - **x402 Micropayments**: Sell Nova intelligence (RugCheck reports, signals, trend data) for USDC via x402 protocol
 - **Pyth Oracle Feeds**: Real-time SOL, ETH, MATIC pricing from Pyth Hermes + CoinGecko fallback — no hardcoded prices
 - **Helius Analytics**: On-chain transaction history and webhook-driven position updates
+- **Jupiter Aggregator**: SOL balance checks and token swaps on Solana
+- **EVM Wallet Service**: Polygon USDC/MATIC management, gas checks, CTF approval for Polymarket
+
+#### Portfolio & Risk Management
+
 - **Portfolio Aggregation**: Cross-chain portfolio view spanning Solana, Polygon, Arbitrum with live valuations
 - **Position Manager**: Full lifecycle tracking for Polymarket, Hyperliquid, Kamino, and Jito positions
 - **Risk Caps**: Per-protocol max exposure limits (maxPolymarketUSD, maxHyperliquidUSD, maxKaminoUSD, maxJitoSOL, maxBridgeUSD)
-- **Dry Run Mode**: Full CFO pipeline simulation without real transactions — logs all trades but executes none
-- **Daily Reports**: Automated daily P&L summary at configurable hour (default 08:00 UTC)
+- **Hedge Ratio Management**: Automatic SOL treasury hedging via HL SHORT positions — configurable target ratio with rebalance threshold
+- **Emergency Commands**: `/cfo_close_poly`, `/cfo_close_hl`, `/cfo_close_all` — instant emergency position exits
+- **Daily Digest**: Automated daily P&L summary at configurable hour — portfolio breakdown, PnL by strategy, service status
+- **Life-Sign Logging**: 5-minute heartbeat logs with uptime, cycles, services, scout intel status
 - **PostgreSQL Persistence**: Positions, transactions, and daily snapshots stored in `cfo_positions`, `cfo_transactions`, `cfo_daily_snapshots` tables
 
 ### 📊 Data-Driven Intelligence
 
 - **Real-Time Portfolio Tracking**: P&L per token, total holdings value in SOL and USD
 - **Token Snapshots**: Periodic price/volume snapshots stored in PostgreSQL
-- **System Metrics**: Uptime, tweets sent, TG posts, trends detected, error rates
+- **System Metrics**: Uptime, tweets sent, TG posts, trends detected, error rates — tracked across restarts via PostgreSQL + file persistence
 - **Fee Revenue Reports**: PumpSwap creator fee earnings per token and aggregate
+
+### 🔍 Dynamic Analyst Agent
+
+- **22 Core Tokens**: BTC, ETH, SOL, SUI, AVAX, JUP, RAY, ORCA, DRIFT, JTO, PYTH, MNDE, BONK, WIF, POPCAT, RENDER, HNT, W, LINK, AAVE, UNI — tracked via CoinGecko
+- **Dynamic Token Discovery**: Auto-discovers trending tokens from CoinGecko trending API, swarm intel DB (launched tokens), and guardian alerts
+- **3-Tier Alert Thresholds**: 5% for core tokens, 8% for CoinGecko trending, 10% for DEX mints — prevents alert fatigue
+- **DeFiLlama Integration**: TVL snapshots across Solana, Ethereum, Base — top protocols and chain-level metrics
+- **DEX Volume Tracking**: 24h DEX volume by chain with top-5 DEX breakdown
+- **Nova-Launched Token Prices**: DexScreener integration for real-time pricing of Nova's own launched tokens
+- **Auto-Cap**: Max 30 dynamic tokens to prevent API overload
+
+### 🛡️ Guardian Agent — Expanded Safety
+
+- **13 Core Watched Tokens**: SOL, BONK, WIF, JUP, PYTH, RENDER, JTO, RAY, HNT, MNDE, W, ORCA, DRIFT — always monitored
+- **Scout Token Ingestion**: Auto-adds tokens discovered by Scout via `agent_messages` every 5 minutes
+- **Launched Token Tracking**: Automatically watches all Nova-launched tokens from `kv_store`
+- **RugCheck Safety Scans**: Periodic safety scoring with mint/freeze authority checks
+- **Liquidity Monitoring**: 30-minute LP health checks via DexScreener — detects LP drain >40%, volume spike >5x, price crash >30%
+- **Baseline Capture**: First liquidity check captures baseline (no false alerts), subsequent checks compare against it
+- **Dynamic Watch Commands**: `/watch_token` Telegram command to add tokens on-the-fly
 
 ### 📡 Dashboard API
 
@@ -319,8 +364,8 @@ elizaos dev
 │                          🧠 Supervisor (Nova)                               │
 │                  Orchestrates │ Routes │ Synthesizes                        │
 ├──────┬──────┬──────┬──────┬──────┬──────┬───────────────────────────────────┤
-│  🔍  │  🛡️  │  📊  │  🚀  │  💬  │  🏥  │        Message Bus               │
-│Scout │Guard │Analy │Launch│Commu │Health│  intel│alert│task│health│status   │
+│  🔍  │  🛡️  │  📊  │  🚀  │  💬  │  🏥  │  🏦  │  Message Bus          │
+│Scout │Guard │Analy │Launch│Commu │Health│ CFO  │  intel│alert│task│status   │
 ├──────┴──────┴──────┴──────┴──────┴──────┴───────────────────────────────────┤
 │ Character: Nova (Default) / Token Mascots (child agents in TG groups)      │
 ├──────────────────┬─────────────────────┬────────────────────────────────────┤
@@ -340,29 +385,31 @@ elizaos dev
 │ • Farcaster      │ • FarcasterPublish  │ • Health Reports & Repairs         │
 │ • Agent Factory  │ • TokenChildAgent   │ • PumpSwap Fees                    │
 │ • Dashboard API  │ • TrendMonitor      │ • Weekly Thread Data               │
-│ • CFO Commands   │ • CFO Agent (8 svc) │ • CFO Positions & Transactions     │
+│ • CFO Commands   │ • CFO Agent (10 svc)│ • CFO Positions & Transactions     │
+│ • Decision Engine│ • DecisionEngine    │ • Decision Audit Trail (kv_store)  │
 └──────────────────┴─────────────────────┴────────────────────────────────────┘
 │                                                                             │
 │  Dashboard API (port 8787) — 33+ endpoints behind admin auth                │
+│  SystemReporter — 4h status reports + daily summary with full swarm stats    │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Service Layer (60+ services)
 
-| Category             | Services                                                                                                                                                                                           |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Token Launch**     | pumpLauncher, copyGenerator, ideaGenerator, logoGenerator, memeGenerator                                                                                                                           |
-| **Wallet & Finance** | fundingWallet, treasuryService, treasuryScheduler, pnlTracker, pumpswapFees                                                                                                                        |
-| **X/Twitter**        | xPublisher, xReplyEngine, xMarketing, xScheduler, xRateLimiter                                                                                                                                     |
-| **Personal Brand**   | novaPersonalBrand, weeklyThread, novaChannel                                                                                                                                                       |
-| **Farcaster**        | farcasterPublisher — multi-channel casting via Neynar SDK with smart channel routing                                                                                                               |
-| **Telegram**         | telegramPublisher, telegramCommunity, telegramMarketing, telegramScheduler, telegramSetup, telegramSecurity, telegramBanHandler, telegramUserCache, telegramHealthMonitor                          |
-| **Safety & Data**    | rugcheck, priceService, operatorGuardrails, autoSellPolicy                                                                                                                                         |
-| **Intelligence**     | trendMonitor, trendPool, groupHealthMonitor, communityVoting, engagementTracker, communityTargets, replyRules                                                                                      |
-| **Agent Swarm**      | supervisor, scout, guardian, analyst, launcher, communityAgent, healthAgent, cfoAgent, tokenChildAgent, agentFactory                                                                               |
-| **CFO Agent**        | polymarketService, hyperliquidService, kaminoService, jitoStakingService, wormholeService, x402Service, pythOracleService, heliusService, portfolioService, positionManager, postgresCFORepository |
-| **Dashboard API**    | server (33+ endpoints), swarm status views, health/error/repair views                                                                                                                              |
-| **Infrastructure**   | systemReporter, adminNotify, audit, redact, secrets, time, groupTracker                                                                                                                            |
+| Category             | Services                                                                                                                                                                                                                                             |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Token Launch**     | pumpLauncher, copyGenerator, ideaGenerator, logoGenerator, memeGenerator                                                                                                                                                                             |
+| **Wallet & Finance** | fundingWallet, treasuryService, treasuryScheduler, pnlTracker, pumpswapFees                                                                                                                                                                          |
+| **X/Twitter**        | xPublisher, xReplyEngine, xMarketing, xScheduler, xRateLimiter                                                                                                                                                                                       |
+| **Personal Brand**   | novaPersonalBrand, weeklyThread, novaChannel                                                                                                                                                                                                         |
+| **Farcaster**        | farcasterPublisher — multi-channel casting via Neynar SDK with smart channel routing                                                                                                                                                                 |
+| **Telegram**         | telegramPublisher, telegramCommunity, telegramMarketing, telegramScheduler, telegramSetup, telegramSecurity, telegramBanHandler, telegramUserCache, telegramHealthMonitor                                                                            |
+| **Safety & Data**    | rugcheck, priceService, operatorGuardrails, autoSellPolicy                                                                                                                                                                                           |
+| **Intelligence**     | trendMonitor, trendPool, groupHealthMonitor, communityVoting, engagementTracker, communityTargets, replyRules                                                                                                                                        |
+| **Agent Swarm**      | supervisor (dual briefings, intel dedup), scout, guardian (liquidity monitor), analyst (dynamic discovery), launcher, communityAgent, healthAgent, cfoAgent (decisionEngine), tokenChildAgent, agentFactory                                          |
+| **CFO Agent**        | polymarketService, hyperliquidService, kaminoService, jitoStakingService, wormholeService, x402Service, pythOracleService, heliusService, jupiterService, evmWalletService, portfolioService, positionManager, decisionEngine, postgresCFORepository |
+| **Dashboard API**    | server (33+ endpoints), swarm status views, health/error/repair views                                                                                                                                                                                |
+| **Infrastructure**   | systemReporter (swarm stats, daily summary, PnL), adminNotify, audit, redact, secrets, time, groupTracker                                                                                                                                            |
 
 ## Key Technical Features
 

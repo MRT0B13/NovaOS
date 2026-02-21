@@ -1,8 +1,19 @@
 /**
- * CFO Agent — Nova's Autonomous Financial Operator (Complete)
+ * CFO Agent — Nova's Autonomous Financial Operator
+ *
+ * The CFO is a fully autonomous financial agent. It doesn't wait for orders —
+ * it reads the portfolio, assesses risk, makes decisions, executes trades,
+ * and reports results back to Nova.
  *
  * All 8 services integrated:
  *  polymarket, hyperliquid, kamino, jito, wormhole/lifi, x402, pyth, helius
+ *
+ * Autonomous decision engine (decisionEngine.ts):
+ *  - Runs on a configurable interval (default: 30 min)
+ *  - Gathers portfolio state across all chains
+ *  - Applies rule-based risk assessment
+ *  - Executes hedge/stake/close decisions within caps
+ *  - Reports all actions to supervisor + admin Telegram
  */
 
 import { Pool } from 'pg';
@@ -11,6 +22,7 @@ import { BaseAgent } from './types.ts';
 import { getCFOEnv } from '../launchkit/cfo/cfoEnv.ts';
 import { PostgresCFORepository } from '../launchkit/cfo/postgresCFORepository.ts';
 import { PositionManager } from '../launchkit/cfo/positionManager.ts';
+import { getDecisionConfig, runDecisionCycle, classifyTier } from '../launchkit/cfo/decisionEngine.ts';
 import type { PlacedOrder, MarketOpportunity } from '../launchkit/cfo/polymarketService.ts';
 
 // Lazy service loaders
@@ -36,6 +48,7 @@ export class CFOAgent extends BaseAgent {
   private pendingApprovals = new Map<string, PendingApproval>();
   private lastOpportunityScanAt = 0;
   private cycleCount = 0;
+  private startedAt = Date.now();
 
   constructor(pool: Pool) {
     super({ agentId: 'nova-cfo', agentType: 'cfo' as any, pool });
@@ -70,7 +83,24 @@ export class CFOAgent extends BaseAgent {
     this.addInterval(() => this.processCommands(),       10_000);
     this.addInterval(() => this.checkDailyDigest(),       5 * 60_000);
     this.addInterval(() => this.expirePendingApprovals(), 2 * 60_000);
+    this.addInterval(() => this.logLifeSign(),            5 * 60_000);   // visible heartbeat every 5m
     setTimeout(() => this.runOpportunityScan(), 90_000);
+
+    // ── Autonomous Decision Engine ───────────────────────────────
+    const dConfig = getDecisionConfig();
+    if (dConfig.enabled) {
+      const intervalMs = dConfig.intervalMinutes * 60_000;
+      this.addInterval(() => this.runAutonomousDecisionCycle(), intervalMs);
+      // First decision cycle after 2 minutes (let services warm up)
+      setTimeout(() => this.runAutonomousDecisionCycle(), 2 * 60_000);
+      logger.info(
+        `[CFO] 🧠 Decision engine ON — interval: ${dConfig.intervalMinutes}m | ` +
+        `hedge: ${dConfig.autoHedge} (target ${(dConfig.hedgeTargetRatio * 100).toFixed(0)}%) | ` +
+        `stake: ${dConfig.autoStake} | dryRun: ${env.dryRun}`,
+      );
+    } else {
+      logger.info('[CFO] Decision engine OFF — set CFO_AUTO_DECISIONS=true to enable autonomous trading');
+    }
 
     logger.info(
       `[CFO] Started — poly:${env.polymarketEnabled} hl:${env.hyperliquidEnabled} ` +
@@ -126,6 +156,8 @@ export class CFOAgent extends BaseAgent {
   }
 
   // ── Polymarket scan + execution ───────────────────────────────────
+  // Polymarket bets now go through the decision engine (tier-gated).
+  // This scan just triggers a decision cycle which includes Polymarket scanning.
 
   private async runOpportunityScan(): Promise<void> {
     if (!this.running || this.paused) return;
@@ -135,6 +167,15 @@ export class CFOAgent extends BaseAgent {
     this.cycleCount++;
     this.lastOpportunityScanAt = Date.now();
 
+    // Decision engine handles Polymarket bets now (with tier gating + scout intel)
+    const config = getDecisionConfig();
+    if (config.enabled) {
+      logger.info('[CFO] Polymarket scan → routing through decision engine (tier-gated)');
+      await this.runAutonomousDecisionCycle();
+      return;
+    }
+
+    // Fallback: legacy direct scan if decision engine is off
     try {
       await this.updateStatus('scanning');
       const evmMod = await evm();
@@ -299,6 +340,139 @@ export class CFOAgent extends BaseAgent {
     }
   }
 
+  // ── Autonomous Decision Engine ────────────────────────────────────
+
+  private async runAutonomousDecisionCycle(): Promise<void> {
+    if (!this.running || this.paused) return;
+
+    const config = getDecisionConfig();
+    if (!config.enabled) return;
+
+    try {
+      await this.updateStatus('deciding');
+      const { state, decisions, results, report, intel } = await runDecisionCycle(this.pool);
+
+      // ── Handle APPROVAL-tier decisions → queue for admin approval ─
+      for (const r of results) {
+        if (r.pendingApproval && r.decision.tier === 'APPROVAL') {
+          const d = r.decision;
+          // Create an execution closure that re-runs just this decision
+          const action = async () => {
+            const { executeDecision } = await import('../launchkit/cfo/decisionEngine.ts');
+            // Force AUTO tier so it actually executes this time
+            const overridden = { ...d, tier: 'AUTO' as const };
+            const env = getCFOEnv();
+            const execResult = await executeDecision(overridden, env);
+            if (execResult.success && execResult.executed) {
+              logger.info(`[CFO] Approved decision ${d.type} executed successfully (tx: ${execResult.txId ?? 'n/a'})`);
+              const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+              await notifyAdminForce(`✅ Approved ${d.type} executed.\n${d.reasoning}\ntx: ${execResult.txId ?? 'dry-run'}`);
+            } else {
+              logger.error(`[CFO] Approved decision ${d.type} failed: ${execResult.error}`);
+            }
+          };
+          await this.queueForApproval(
+            `${d.type}: ${d.reasoning}`,
+            Math.abs(d.estimatedImpactUsd),
+            action,
+          );
+        }
+      }
+
+      // ── NOTIFY-tier: report to admin (already executed) ───────
+      const notifyResults = results.filter(
+        (r) => r.decision.tier === 'NOTIFY' && !r.pendingApproval,
+      );
+      if (notifyResults.length > 0) {
+        const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+        const notifyLines = notifyResults.map(
+          (r) => `🟡 ${r.decision.type}: $${Math.abs(r.decision.estimatedImpactUsd).toFixed(0)} — ${r.executed ? (r.success ? '✅' : '❌') : '📋'}`,
+        );
+        await notifyAdminForce(
+          `🟡 *CFO NOTIFY* — ${notifyResults.length} decision(s) auto-executed:\n${notifyLines.join('\n')}`,
+        );
+      }
+
+      // ── Report full cycle to admin if any decisions were made ──
+      if (decisions.length > 0) {
+        const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+        await notifyAdminForce(report);
+      }
+
+      // ── Report to Nova supervisor ─────────────────────────────
+      const executedCount = results.filter((r) => r.executed && r.success).length;
+      const failedCount = results.filter((r) => r.executed && !r.success).length;
+      const pendingCount = results.filter((r) => r.pendingApproval).length;
+
+      if (decisions.length > 0) {
+        await this.reportToSupervisor(
+          'report',
+          results.some((r) => r.decision.urgency === 'critical') ? 'high' : 'medium',
+          {
+            event: 'cfo_autonomous_decision',
+            decisions: decisions.map((d) => ({
+              type: d.type,
+              urgency: d.urgency,
+              tier: d.tier,
+              reasoning: d.reasoning,
+              impactUsd: d.estimatedImpactUsd,
+              intelUsed: d.intelUsed,
+            })),
+            executed: executedCount,
+            failed: failedCount,
+            pendingApproval: pendingCount,
+            dryRun: getCFOEnv().dryRun,
+            swarmIntel: {
+              marketCondition: intel.marketCondition,
+              riskMultiplier: intel.riskMultiplier,
+            },
+            portfolio: {
+              totalUsd: state.totalPortfolioUsd,
+              solBalance: state.solBalance,
+              solPriceUsd: state.solPriceUsd,
+              hedgeRatio: state.hedgeRatio,
+              hlEquity: state.hlEquity,
+              hlPnl: state.hlTotalPnl,
+            },
+          },
+        );
+      }
+
+      // Persist decision cycle to DB for audit trail
+      if (this.repo && decisions.length > 0) {
+        try {
+          await this.pool.query(
+            `INSERT INTO kv_store (key, data) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET data = $2`,
+            [
+              `cfo_decision_${Date.now()}`,
+              JSON.stringify({
+                timestamp: new Date().toISOString(),
+                state: {
+                  solBalance: state.solBalance,
+                  solPriceUsd: state.solPriceUsd,
+                  hedgeRatio: state.hedgeRatio,
+                  totalPortfolioUsd: state.totalPortfolioUsd,
+                },
+                swarmIntel: {
+                  marketCondition: intel.marketCondition,
+                  riskMultiplier: intel.riskMultiplier,
+                },
+                decisions: decisions.map((d) => ({ type: d.type, urgency: d.urgency, tier: d.tier, impactUsd: d.estimatedImpactUsd, intelUsed: d.intelUsed })),
+                results: results.map((r) => ({ type: r.decision.type, tier: r.decision.tier, executed: r.executed, success: r.success, pendingApproval: r.pendingApproval, error: r.error })),
+                dryRun: getCFOEnv().dryRun,
+              }),
+            ],
+          );
+        } catch { /* non-fatal */ }
+      }
+
+      await this.updateStatus('idle');
+    } catch (err) {
+      logger.error('[CFO] Decision cycle error:', err);
+      await this.updateStatus('degraded');
+    }
+  }
+
   // ── Hyperliquid monitor ───────────────────────────────────────────
 
   private async monitorHyperliquid(): Promise<void> {
@@ -345,6 +519,33 @@ export class CFOAgent extends BaseAgent {
     for (const [id, a] of this.pendingApprovals) {
       if (now > a.expiresAt) { this.pendingApprovals.delete(id); logger.info(`[CFO] Approval expired: ${id}`); }
     }
+  }
+
+  // ── Visible life-sign (so logs show CFO is alive) ────────────────
+
+  private async logLifeSign(): Promise<void> {
+    if (!this.running) return;
+    const env = getCFOEnv();
+    const uptime = Math.floor((Date.now() - this.startedAt) / 60_000);
+    const services: string[] = [];
+    if (env.polymarketEnabled) services.push('poly');
+    if (env.hyperliquidEnabled) services.push('hl');
+    if (env.kaminoEnabled) services.push('kamino');
+    if (env.jitoEnabled) services.push('jito');
+    if (env.heliusEnabled) services.push('helius');
+    if (env.x402Enabled) services.push('x402');
+
+    const pending = this.pendingApprovals.size;
+    const intel = this.scoutIntel
+      ? `scout:${this.scoutIntel.cryptoBullish ? '🟢' : '🔴'}(${Math.floor((Date.now() - this.scoutIntel.receivedAt) / 60_000)}m ago)`
+      : 'scout:⚪';
+
+    logger.info(
+      `[CFO] 💓 alive | uptime: ${uptime}m | cycles: ${this.cycleCount} | ` +
+      `paused: ${this.paused} | dryRun: ${env.dryRun} | ` +
+      `services: [${services.join(',')}] | ${intel}` +
+      (pending > 0 ? ` | ⏳ ${pending} pending approval(s)` : ''),
+    );
   }
 
   // ── Daily digest ──────────────────────────────────────────────────
@@ -505,6 +706,7 @@ export class CFOAgent extends BaseAgent {
 
       case 'cfo_status': await this.sendStatusReport(); break;
       case 'cfo_scan': setTimeout(() => this.runOpportunityScan(), 100); break;
+      case 'cfo_decide': setTimeout(() => this.runAutonomousDecisionCycle(), 100); break;
 
       case 'cfo_approve': {
         const a = this.pendingApprovals.get(payload.approvalId);
@@ -590,4 +792,17 @@ export class CFOAgent extends BaseAgent {
   isPaused() { return this.paused; }
   getCycleCount() { return this.cycleCount; }
   setScoutIntel(intel: Omit<ScoutIntel, 'receivedAt'>) { this.scoutIntel = { ...intel, receivedAt: Date.now() }; }
+
+  getStatus() {
+    return {
+      agentId: this.agentId,
+      running: this.running,
+      cycleCount: this.cycleCount,
+      paused: this.paused,
+      pendingApprovals: this.pendingApprovals.size,
+      hasPositionManager: this.positionManager !== null,
+      hasRepo: this.repo !== null,
+      uptimeMs: Date.now() - this.startedAt,
+    };
+  }
 }

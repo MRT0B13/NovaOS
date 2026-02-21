@@ -343,6 +343,33 @@ const EnvSchema = z.object({
 
   // Pyth (price oracle)
   CFO_PYTH_ENABLE: z.string().optional(),
+
+  // Decision Engine (autonomous financial decisions)
+  CFO_AUTO_DECISIONS: z.string().optional(),
+  CFO_DECISION_INTERVAL: z.string().optional(),
+  CFO_AUTO_HEDGE: z.string().optional(),
+  CFO_HEDGE_TARGET_RATIO: z.string().optional(),
+  CFO_HEDGE_MIN_SOL_USD: z.string().optional(),
+  CFO_HEDGE_REBALANCE_THRESHOLD: z.string().optional(),
+  CFO_AUTO_STAKE: z.string().optional(),
+  CFO_STAKE_RESERVE_SOL: z.string().optional(),
+  CFO_STAKE_MIN_SOL: z.string().optional(),
+  CFO_HL_STOP_LOSS_PCT: z.string().optional(),
+  CFO_HL_LIQUIDATION_WARNING_PCT: z.string().optional(),
+  CFO_MAX_DECISIONS_PER_CYCLE: z.string().optional(),
+  CFO_HEDGE_COOLDOWN_HOURS: z.string().optional(),
+  CFO_STAKE_COOLDOWN_HOURS: z.string().optional(),
+  CFO_CLOSE_COOLDOWN_HOURS: z.string().optional(),
+
+  // Decision tier gating
+  CFO_AUTO_TIER_USD: z.string().optional(),
+  CFO_NOTIFY_TIER_USD: z.string().optional(),
+  CFO_APPROVAL_EXPIRY_MINUTES: z.string().optional(),
+  CFO_CRITICAL_BYPASS_APPROVAL: z.string().optional(),
+
+  // Polymarket autonomous
+  CFO_AUTO_POLYMARKET: z.string().optional(),
+  CFO_POLY_BET_COOLDOWN_HOURS: z.string().optional(),
 });
 
 export type LaunchkitEnv = z.infer<typeof EnvSchema> & {

@@ -38,6 +38,7 @@ export interface SupervisorCallbacks {
   onPostToTelegram?: (chatId: string, content: string) => Promise<void>;
   onLaunchToken?: (config: any) => Promise<void>;
   onPostToChannel?: (content: string) => Promise<void>;
+  onPostToAdmin?: (content: string) => Promise<void>;
   onPostToFarcaster?: (content: string, channel: string) => Promise<void>;
 }
 
@@ -572,7 +573,7 @@ export class Supervisor extends BaseAgent {
 
   // ── Swarm Briefing ───────────────────────────────────────────────
 
-  /** Publish a periodic digest of all swarm activity to the channel */
+  /** Publish periodic digest — admin gets detailed ops, community gets friendly summary */
   private async publishBriefing(): Promise<void> {
     try {
       const now = Date.now();
@@ -581,24 +582,34 @@ export class Supervisor extends BaseAgent {
         : 4;
       this.lastBriefingAt = now;
 
-      // Gather agent status
+      // ── Gather data ──
       await this.checkAgentStatuses();
       const activeAgents = Array.from(this.agentStatuses.entries())
         .filter(([, v]) => v.status === 'active' || v.status === 'alive')
         .map(([name]) => name.replace('nova-', ''));
 
-      // Summarize recent intel
       const recentIntel = this.intelBuffer.filter(
         i => i.at.getTime() > now - (periodHours * 3600000 + 60000),
       );
+
       const byAgent: Record<string, number> = {};
-      const highlights: string[] = [];
+      const highlightSet = new Set<string>();          // deduplicate
+      const criticalItems: string[] = [];
+      const highItems: string[] = [];
+      const lowItems: string[] = [];
+
       for (const item of recentIntel) {
         const agent = item.from.replace('nova-', '');
         byAgent[agent] = (byAgent[agent] || 0) + 1;
-        if (item.priority === 'high' || item.priority === 'critical') {
-          highlights.push(`• ${item.summary}`);
-        }
+
+        // Deduplicate: normalise text, skip if already seen
+        const normSummary = item.summary.trim().slice(0, 100);
+        if (highlightSet.has(normSummary)) continue;
+        highlightSet.add(normSummary);
+
+        if (item.priority === 'critical') criticalItems.push(`🔴 ${normSummary}`);
+        else if (item.priority === 'high') highItems.push(`🟡 ${normSummary}`);
+        else lowItems.push(normSummary);
       }
 
       const agentActivity = Object.entries(byAgent)
@@ -609,11 +620,14 @@ export class Supervisor extends BaseAgent {
       let trendLine = '';
       let pnlLine = '';
       let metricsLine = '';
+      let trendCount = 0;
+      let topTrendNames = '';
       try {
         const { getPoolStats } = await import('../launchkit/services/trendPool.ts');
         const stats = getPoolStats();
-        const topNames = stats.topTrends.slice(0, 3).map(t => t.topic.slice(0, 25)).join(', ');
-        trendLine = `🔥 Trends: ${stats.available} available${topNames ? ` (${topNames})` : ''}`;
+        trendCount = stats.available;
+        topTrendNames = stats.topTrends.slice(0, 3).map(t => t.topic.slice(0, 25)).join(', ');
+        trendLine = `🔥 Trends: ${stats.available} available${topTrendNames ? ` (${topTrendNames})` : ''}`;
       } catch { /* not init */ }
       try {
         const { getPnLSummary } = await import('../launchkit/services/pnlTracker.ts');
@@ -628,39 +642,115 @@ export class Supervisor extends BaseAgent {
         metricsLine = `📱 Today: ${m.tweetsSentToday || 0} tweets, ${m.tgPostsSentToday || 0} TG posts, ${m.trendsDetectedToday || 0} trends`;
       } catch { /* not init */ }
 
-      // Build briefing
-      const lines: string[] = [
-        `🐝 <b>Nova Swarm Briefing</b> (${periodHours}h)`,
+      // ================================================================
+      // 1. ADMIN BRIEFING — detailed ops + routed intel
+      // ================================================================
+      const adminLines: string[] = [
+        `🐝 <b>Nova Admin Briefing</b> (${periodHours}h)`,
         '',
-        `⏱ Agents online: ${activeAgents.length > 0 ? activeAgents.join(', ') : 'checking...'}`,
-        `📨 Messages processed: ${this.messagesProcessed}`,
+        `<b>Swarm Status</b>`,
+        `⏱ Online: ${activeAgents.length > 0 ? activeAgents.join(', ') : 'checking...'}`,
+        `📨 Messages: ${this.messagesProcessed}`,
         `📊 Activity: ${agentActivity}`,
         `👶 Child agents: ${this.children.size}`,
       ];
 
-      if (trendLine) lines.push(trendLine);
-      if (pnlLine) lines.push(pnlLine);
-      if (metricsLine) lines.push(metricsLine);
+      if (trendLine) adminLines.push(trendLine);
+      if (pnlLine) adminLines.push(pnlLine);
+      if (metricsLine) adminLines.push(metricsLine);
 
-      if (highlights.length > 0) {
-        lines.push('', '🔥 <b>Key Intel:</b>');
-        lines.push(...highlights.slice(0, 5));
+      // Agent-level breakdown
+      adminLines.push('', '<b>Agent Details</b>');
+      for (const [name, info] of this.agentStatuses) {
+        const shortName = name.replace('nova-', '');
+        const ago = Math.round((now - info.lastSeen.getTime()) / 60000);
+        const status = ago < 5 ? '🟢' : ago < 15 ? '🟡' : '🔴';
+        adminLines.push(`${status} ${shortName}: ${info.status} (${ago}m ago)${info.lastMessage ? ` — ${info.lastMessage}` : ''}`);
       }
 
-      const briefing = lines.join('\n');
+      // Key Intel — deduplicated, grouped by severity
+      if (criticalItems.length > 0 || highItems.length > 0) {
+        adminLines.push('', '<b>Key Intel</b>');
+        if (criticalItems.length > 0) adminLines.push(...criticalItems.slice(0, 5));
+        if (highItems.length > 0) adminLines.push(...highItems.slice(0, 5));
+      }
 
-      // Post to channel
+      // Low-priority summary (just count, don't list)
+      if (lowItems.length > 0) {
+        adminLines.push(`ℹ️ ${lowItems.length} routine updates processed`);
+      }
+
+      const adminBriefing = adminLines.join('\n');
+
+      // Send admin briefing via adminNotify (goes to ADMIN_CHAT_ID directly)
+      if (this.callbacks.onPostToAdmin) {
+        await this.callbacks.onPostToAdmin(adminBriefing);
+      }
+
+      // ================================================================
+      // 2. COMMUNITY BRIEFING — friendly, vibe-check style
+      // ================================================================
+      const greetings = ['🐝 Bzz! Nova hive check-in', '🐝 Hive update!', '🐝 The swarm is busy', '🐝 Nova checking in'];
+      const greeting = greetings[Math.floor(Math.random() * greetings.length)];
+
+      const communityLines: string[] = [
+        `${greeting} 🍯`,
+        '',
+      ];
+
+      // Agent count in friendly language
+      const agentCount = activeAgents.length;
+      if (agentCount >= 6) communityLines.push(`✅ All ${agentCount} agents are online and working`);
+      else if (agentCount >= 4) communityLines.push(`✅ ${agentCount} agents active`);
+      else communityLines.push(`⚠️ Only ${agentCount} agents online — some may be resting`);
+
+      // Trends in casual language
+      if (trendCount > 0) {
+        communityLines.push(`👀 Watching ${trendCount} trends${topTrendNames ? ` — hot: ${topTrendNames}` : ''}`);
+      }
+
+      // Performance blurb
+      if (pnlLine) communityLines.push(pnlLine);
+
+      // Activity numbers in friendly format
+      if (metricsLine) communityLines.push(metricsLine);
+
+      // Highlight only the most interesting intel for community (1-2 items max)
+      const communityHighlights = [...criticalItems, ...highItems].slice(0, 2);
+      if (communityHighlights.length > 0) {
+        communityLines.push('', '📡 <b>What we noticed:</b>');
+        communityLines.push(...communityHighlights);
+      }
+
+      communityLines.push('', '🔗 Stay tuned for more updates from the swarm!');
+
+      const communityBriefing = communityLines.join('\n');
+
+      // Post community briefing to channel
       if (this.callbacks.onPostToChannel) {
-        await this.callbacks.onPostToChannel(briefing);
+        await this.callbacks.onPostToChannel(communityBriefing);
       }
 
-      // Always log
-      logger.info(`[supervisor] 🐝 Swarm Briefing: ${activeAgents.length} agents, ${this.messagesProcessed} msgs, ${recentIntel.length} intel items, ${highlights.length} highlights`);
+      // Log
+      logger.info(`[supervisor] 🐝 Briefings sent: admin (${criticalItems.length + highItems.length} intel) + community | ${activeAgents.length} agents, ${this.messagesProcessed} msgs`);
 
-      // Clear processed count (keeps rolling)
+      // Reset
       this.messagesProcessed = 0;
     } catch (err) {
       logger.warn('[supervisor] Briefing failed:', err);
     }
+  }
+
+  // ── Public API ───────────────────────────────────────────────────
+
+  getStatus() {
+    return {
+      agentId: this.agentId,
+      running: this.running,
+      messagesProcessed: this.messagesProcessed,
+      lastBriefingAt: this.lastBriefingAt,
+      intelBufferSize: this.intelBuffer.length,
+      activeChildren: this.children.size,
+    };
   }
 }

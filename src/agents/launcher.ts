@@ -241,6 +241,7 @@ export class LauncherAgent extends BaseAgent {
       launchCount: this.launchCount,
       lastLaunchAt: this.lastLaunchAt ? new Date(this.lastLaunchAt).toISOString() : null,
       lastError: this.lastError,
+      graduationCount: this.reportedGraduations.size,
     };
   }
 }

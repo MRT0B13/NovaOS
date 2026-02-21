@@ -17,7 +17,7 @@ import { initializeFromStore as initGroupTracker } from './services/groupTracker
 import { processScheduledTweets, getPendingTweets, recoverMarketingFromStore, syncMarketingToStore, startXScheduler, stopXScheduler } from './services/xScheduler.ts';
 import { startAutonomousMode, stopAutonomousMode } from './services/autonomousMode.ts';
 import { startTGScheduler, stopTGScheduler } from './services/telegramScheduler.ts';
-import { startSystemReporter, stopSystemReporter } from './services/systemReporter.ts';
+import { startSystemReporter, stopSystemReporter, registerSwarmHandle } from './services/systemReporter.ts';
 import { initCommunityVoting } from './services/communityVoting.ts';
 import { initHealthSystem, stopHealthSystem, getHealthbeat } from './health/singleton';
 import { registerHealthCommands } from './services/telegramHealthCommands.ts';
@@ -335,6 +335,14 @@ export async function initLaunchKit(
             logger.warn('[swarm] Supervisor → TG post failed:', err);
           }
         },
+        onPostToAdmin: async (content: string) => {
+          try {
+            const { notifyAdminForce } = await import('./services/adminNotify.ts');
+            await notifyAdminForce(content);
+          } catch (err) {
+            logger.warn('[swarm] Supervisor → Admin post failed:', err);
+          }
+        },
         onPostToChannel: async (content: string) => {
           try {
             const { sendToCommunity } = await import('./services/novaChannel.ts');
@@ -379,6 +387,11 @@ export async function initLaunchKit(
   // Start system reporter FIRST (initializes PostgreSQL for metric tracking)
   // Must be before TG/X schedulers so recordTGPostSent()/recordTweetSent() can use PostgreSQL
   await startSystemReporter();
+
+  // Register swarm handle so status reports include agent data
+  if (_swarmHandle) {
+    registerSwarmHandle(_swarmHandle);
+  }
 
   // Start TG marketing scheduler
   if (env.TG_ENABLE === 'true') {

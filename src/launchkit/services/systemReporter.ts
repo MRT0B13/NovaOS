@@ -1,5 +1,5 @@
 import { logger } from '@elizaos/core';
-import { notifySystem, notifyAdmin } from './adminNotify.ts';
+import { notifySystem, notifyAdmin, notifyAdminForce } from './adminNotify.ts';
 import { getTelegramHealthStatus, recordMessageSent } from './telegramHealthMonitor.ts';
 import { getAutonomousStatus } from './autonomousMode.ts';
 import { getPumpWalletBalance, getFundingWalletBalance } from './fundingWallet.ts';
@@ -8,8 +8,21 @@ import { getFailedAttempts, isAdminSecurityEnabled, isWebhookSecurityEnabled } f
 import { getPnLSummary, getActivePositions, initPnLTracker, type PnLSummary } from './pnlTracker.ts';
 import { getTokenPrice, getTokenPrices } from './priceService.ts';
 import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
+import type { SwarmHandle } from '../../agents/index.ts';
 import * as fs from 'fs';
 import * as path from 'path';
+
+// ── Swarm handle (registered by init.ts after swarm starts) ──
+let swarmHandle: SwarmHandle | null = null;
+
+/**
+ * Register the swarm handle so status reports can include agent data.
+ * Called from init.ts after initSwarm() completes.
+ */
+export function registerSwarmHandle(handle: SwarmHandle): void {
+  swarmHandle = handle;
+  logger.info('[SystemReporter] Swarm handle registered — agent stats enabled');
+}
 
 // PostgreSQL support
 let pgRepo: PostgresScheduleRepository | null = null;
@@ -65,6 +78,22 @@ interface SystemStats {
   uptimeHours: number;
   errors24h: number;
   warnings24h: number;
+
+  // Swarm agents
+  swarm: SwarmStats | null;
+}
+
+interface SwarmAgentInfo {
+  name: string;
+  status: string;
+  lastSeen: Date | null;
+  detail: string;   // compact one-liner
+}
+
+interface SwarmStats {
+  agents: SwarmAgentInfo[];
+  totalAgents: number;
+  aliveCount: number;
 }
 
 // Banned user record
@@ -652,7 +681,120 @@ async function collectStats(): Promise<SystemStats> {
     uptimeHours,
     errors24h: metrics.errors24h,
     warnings24h: metrics.warnings24h,
+    
+    // Swarm agents
+    swarm: collectSwarmStats(),
   };
+}
+
+/**
+ * Collect swarm agent stats from the registered SwarmHandle
+ */
+function collectSwarmStats(): SwarmStats | null {
+  if (!swarmHandle) return null;
+
+  const agents: SwarmAgentInfo[] = [];
+  const agentStatuses = swarmHandle.supervisor.getAgentStatuses();
+
+  // Helper: time ago string
+  const ago = (d: Date | null): string => {
+    if (!d) return '?';
+    const mins = Math.round((Date.now() - d.getTime()) / 60000);
+    if (mins < 1) return 'now';
+    if (mins < 60) return `${mins}m ago`;
+    return `${Math.round(mins / 60)}h ago`;
+  };
+
+  // Supervisor
+  try {
+    const s = swarmHandle.supervisor.getStatus();
+    const hb = agentStatuses.get('nova-supervisor');
+    agents.push({
+      name: 'supervisor',
+      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      lastSeen: hb?.lastSeen ?? null,
+      detail: `${s.messagesProcessed} msgs, ${s.intelBufferSize} intel, ${s.activeChildren} children`,
+    });
+  } catch { agents.push({ name: 'supervisor', status: 'error', lastSeen: null, detail: 'failed to read' }); }
+
+  // Scout
+  try {
+    const s = swarmHandle.scout.getStatus();
+    const hb = agentStatuses.get('nova-scout');
+    const lastR = s.lastResearchAt ? ago(new Date(s.lastResearchAt)) : 'never';
+    agents.push({
+      name: 'scout',
+      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      lastSeen: hb?.lastSeen ?? null,
+      detail: `${s.cycleCount} cycles, last research ${lastR}`,
+    });
+  } catch { agents.push({ name: 'scout', status: 'error', lastSeen: null, detail: 'failed to read' }); }
+
+  // Guardian
+  try {
+    const s = swarmHandle.guardian.getStatus();
+    const hb = agentStatuses.get('nova-guardian');
+    agents.push({
+      name: 'guardian',
+      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      lastSeen: hb?.lastSeen ?? null,
+      detail: `${s.watchListSize} watched, ${s.totalScans} scans, ${s.totalLiquidityAlerts} LP alerts`,
+    });
+  } catch { agents.push({ name: 'guardian', status: 'error', lastSeen: null, detail: 'failed to read' }); }
+
+  // Analyst
+  try {
+    const s = swarmHandle.analyst.getStatus();
+    const hb = agentStatuses.get('nova-analyst');
+    const totalTokens = s.coreTokenCount + s.dynamicCoinGeckoCount + s.dynamicDexMintCount;
+    agents.push({
+      name: 'analyst',
+      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      lastSeen: hb?.lastSeen ?? null,
+      detail: `${totalTokens} tokens (${s.coreTokenCount}+${s.dynamicCoinGeckoCount}+${s.dynamicDexMintCount}), ${s.cycleCount} snapshots`,
+    });
+  } catch { agents.push({ name: 'analyst', status: 'error', lastSeen: null, detail: 'failed to read' }); }
+
+  // Launcher
+  try {
+    const s = swarmHandle.launcher.getStatus();
+    const hb = agentStatuses.get('nova-launcher');
+    agents.push({
+      name: 'launcher',
+      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      lastSeen: hb?.lastSeen ?? null,
+      detail: `${s.launchCount} launches, ${s.graduationCount} graduated`,
+    });
+  } catch { agents.push({ name: 'launcher', status: 'error', lastSeen: null, detail: 'failed to read' }); }
+
+  // Community
+  try {
+    const s = swarmHandle.community.getStatus();
+    const hb = agentStatuses.get('nova-community');
+    agents.push({
+      name: 'community',
+      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      lastSeen: hb?.lastSeen ?? null,
+      detail: `${s.lastEngagementRate.toFixed(1)} eng/hr, ${s.reportCount} reports`,
+    });
+  } catch { agents.push({ name: 'community', status: 'error', lastSeen: null, detail: 'failed to read' }); }
+
+  // CFO
+  try {
+    const s = swarmHandle.cfo.getStatus();
+    const hb = agentStatuses.get('nova-cfo');
+    const pauseLabel = s.paused ? '⏸️ paused' : 'active';
+    agents.push({
+      name: 'cfo',
+      status: hb?.status || (s.running ? 'alive' : 'dead'),
+      lastSeen: hb?.lastSeen ?? null,
+      detail: `${s.cycleCount} cycles, ${s.pendingApprovals} pending, ${pauseLabel}`,
+    });
+  } catch { agents.push({ name: 'cfo', status: 'error', lastSeen: null, detail: 'failed to read' }); }
+
+  const aliveCount = agents.filter(a => a.status === 'alive').length;
+
+  return { agents, totalAgents: agents.length, aliveCount };
 }
 
 /**
@@ -804,13 +946,28 @@ async function sendStatusReport(): Promise<void> {
   }
   message += '\n';
   
+  // Swarm agents
+  if (stats.swarm) {
+    const sw = stats.swarm;
+    const statusEmoji = (s: string) => s === 'alive' ? '🟢' : s === 'degraded' ? '🟡' : s === 'error' ? '🔴' : '⚫';
+    message += `<b>🧠 Agent Swarm (${sw.aliveCount}/${sw.totalAgents}):</b>\n`;
+    for (const a of sw.agents) {
+      const lastSeenStr = a.lastSeen ? (() => {
+        const mins = Math.round((Date.now() - a.lastSeen!.getTime()) / 60000);
+        return mins < 1 ? 'now' : mins < 60 ? `${mins}m` : `${Math.round(mins / 60)}h`;
+      })() : '?';
+      message += `  ${statusEmoji(a.status)} <b>${a.name}</b> (${lastSeenStr}) — ${a.detail}\n`;
+    }
+    message += '\n';
+  }
+  
   // System health
   message += `<b>⚙️ System:</b>\n`;
   message += `  Uptime: ${formatUptime(stats.uptimeHours)}\n`;
   message += `  Errors (24h): ${stats.errors24h}\n`;
   message += `  Warnings (24h): ${stats.warnings24h}\n`;
   
-  await notifyAdmin(message, 'system');
+  await notifyAdminForce(message);
   metrics.lastReportTime = Date.now();
   
   logger.info('[SystemReporter] Sent status report to admin');
@@ -842,6 +999,31 @@ async function sendDailySummary(): Promise<void> {
   }
   message += '\n';
   
+  // PnL
+  if (stats.pnl) {
+    const p = stats.pnl;
+    const realizedSign = p.totalRealizedPnl >= 0 ? '+' : '';
+    message += `<b>📈 PnL:</b>\n`;
+    message += `  • Realized: ${realizedSign}${p.totalRealizedPnl.toFixed(4)} SOL\n`;
+    message += `  • Active: ${p.activePositions} positions, ${p.totalTrades} trades\n`;
+    if (p.winningTrades + p.losingTrades > 0) {
+      message += `  • Win rate: ${p.winRate.toFixed(0)}% (${p.winningTrades}W/${p.losingTrades}L)\n`;
+    }
+    message += `  • Net flow: ${p.netSolFlow >= 0 ? '+' : ''}${p.netSolFlow.toFixed(4)} SOL\n`;
+    message += '\n';
+  }
+  
+  // Swarm performance
+  if (stats.swarm) {
+    const sw = stats.swarm;
+    message += `<b>🧠 Swarm (${sw.aliveCount}/${sw.totalAgents} online):</b>\n`;
+    for (const a of sw.agents) {
+      const emoji = a.status === 'alive' ? '✅' : a.status === 'degraded' ? '⚠️' : '❌';
+      message += `  ${emoji} ${a.name}: ${a.detail}\n`;
+    }
+    message += '\n';
+  }
+  
   // Health
   message += `<b>🏥 Health:</b>\n`;
   message += `  • Telegram: ${stats.telegramHealthy ? '✅ Connected' : '⚠️ Check connection'}\n`;
@@ -859,19 +1041,8 @@ async function sendDailySummary(): Promise<void> {
   
   message += `<i>Nova is working hard for you! 💪</i>`;
   
-  // All-time stats (cumulative, never reset)
-  const allTime = getAllTimeStats();
-  
-  await notifySystem({
-    event: 'daily_summary',
-    message,
-    stats: {
-      launches: allTime.launches,
-      tweets: allTime.tweets,
-      tgPosts: allTime.tgPosts,
-      uptime: formatUptime(stats.uptimeHours),
-    },
-  });
+  // Send directly to admin (bypass alert-type gating)
+  await notifyAdminForce(message);
   
   // Note: Counter reset is handled by checkMidnightReset() which runs hourly
   // Just update the daily report date to prevent duplicate reports
@@ -882,18 +1053,21 @@ async function sendDailySummary(): Promise<void> {
 }
 
 /**
- * Check if it's time for daily report
+ * Check if it's time for daily report.
+ * Uses >= instead of === so we catch up if the hourly check
+ * missed the exact target hour (e.g. after a Railway redeploy).
  */
 function checkDailyReport(): void {
   const now = new Date();
   const today = now.toISOString().split('T')[0];
   
-  // Only send once per day at the configured hour
+  // Only send once per day, on or after the configured hour
   if (metrics.lastDailyReportDate === today) {
     return;
   }
   
-  if (now.getUTCHours() === DAILY_REPORT_HOUR_UTC) {
+  if (now.getUTCHours() >= DAILY_REPORT_HOUR_UTC) {
+    logger.info(`[SystemReporter] Triggering daily summary (hour=${now.getUTCHours()}, target=${DAILY_REPORT_HOUR_UTC})`);
     sendDailySummary().catch(err => {
       logger.error('[SystemReporter] Failed to send daily summary:', err);
     });
@@ -989,7 +1163,12 @@ export async function startSystemReporter(): Promise<void> {
     logger.error('[SystemReporter] Failed initial midnight check:', err);
   });
   
-  logger.info(`[SystemReporter] ✅ Started (reports every ${STATUS_REPORT_INTERVAL_MS / (60 * 60 * 1000)}h, daily summary at ${DAILY_REPORT_HOUR_UTC}:00 UTC, midnight reset check hourly)`);
+  // Also check daily report on startup (catches missed summaries after redeploy)
+  setTimeout(() => {
+    checkDailyReport();
+  }, 60 * 1000); // 1 minute after startup
+  
+  logger.info(`[SystemReporter] ✅ Started (reports every ${STATUS_REPORT_INTERVAL_MS / (60 * 60 * 1000)}h, daily summary at >=${DAILY_REPORT_HOUR_UTC}:00 UTC, midnight reset check hourly)`);
 
   // ── Auto-track errors & warnings by patching the ElizaOS logger ──
   // This ensures ALL logger.error() and logger.warn() calls in the codebase
