@@ -53,6 +53,9 @@ COPY --from=builder --chown=node:node /app/package.json /app/bun.lock* ./
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/dist ./dist
 COPY --from=builder --chown=node:node /app/index.html ./index.html
+COPY --from=builder --chown=node:node /app/build.ts ./build.ts
+COPY --from=builder --chown=node:node /app/tsconfig.build.json ./tsconfig.build.json
+COPY --from=builder --chown=node:node /app/scripts ./scripts
 # Optional: copy .eliza if present (commented out to avoid build failures when missing)
 # COPY --from=builder /app/.eliza ./ .eliza
 

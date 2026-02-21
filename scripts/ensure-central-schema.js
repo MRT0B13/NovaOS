@@ -61,6 +61,7 @@ async function main() {
     `);
     
     // Add foreign key for channel_id if central_channels table exists
+    // First clean up orphan rows that would violate the constraint
     await client.query(`
       DO $$
       BEGIN
@@ -69,6 +70,10 @@ async function main() {
             SELECT 1 FROM information_schema.table_constraints 
             WHERE constraint_name = 'central_messages_channel_id_fkey'
           ) THEN
+            -- Remove orphan messages whose channel_id doesn't exist in central_channels
+            DELETE FROM central_messages 
+            WHERE channel_id NOT IN (SELECT id FROM central_channels);
+            
             ALTER TABLE central_messages 
             ADD CONSTRAINT central_messages_channel_id_fkey 
             FOREIGN KEY (channel_id) REFERENCES central_channels(id) ON DELETE CASCADE;
