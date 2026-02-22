@@ -177,6 +177,7 @@ export class Supervisor extends BaseAgent {
       try {
         await this.sendMessage('nova-cfo', 'intel', msg.priority, {
           ...msg.payload,
+          command: 'scout_intel',
           forwardedBy: 'supervisor',
           originalFrom: 'nova-scout',
         });

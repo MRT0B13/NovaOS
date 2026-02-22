@@ -745,9 +745,30 @@ export class CFOAgent extends BaseAgent {
       }
 
       case 'scout_intel':
-      case 'narrative_update':
-        this.scoutIntel = { cryptoBullish: payload.cryptoBullish, btcEstimate: payload.btcPriceEstimate, narratives: payload.topNarratives ?? [], receivedAt: Date.now() };
+      case 'narrative_update': {
+        // Accept both structured CFO format AND raw Scout format
+        const narratives: string[] = payload.topNarratives
+          ?? (payload.summary ? payload.summary.split(' | ') : [])
+          ?? [];
+        // If cryptoBullish is explicitly set, use it; otherwise infer from summary text
+        let bullish = payload.cryptoBullish;
+        if (bullish === undefined && payload.summary) {
+          const lower = (payload.summary as string).toLowerCase();
+          const bullWords = ['surge', 'bullish', 'rally', 'breakout', 'pump', 'trending', 'viral', 'moon', 'ath'];
+          const bearWords = ['crash', 'bearish', 'dump', 'fear', 'sell-off', 'capitulation', 'plunge'];
+          const bullHits = bullWords.filter(w => lower.includes(w)).length;
+          const bearHits = bearWords.filter(w => lower.includes(w)).length;
+          bullish = bullHits >= bearHits; // default to neutral-bullish if no signal
+        }
+        this.scoutIntel = {
+          cryptoBullish: bullish ?? true,
+          btcEstimate: payload.btcPriceEstimate,
+          narratives,
+          receivedAt: Date.now(),
+        };
+        logger.info(`[CFO] 📡 Scout intel received: ${bullish ? '🟢 bullish' : '🔴 bearish'} | narratives: ${narratives.length} | source: ${payload.source ?? 'unknown'}`);
         break;
+      }
 
       case 'market_crash':
       case 'emergency_exit': {
@@ -768,6 +789,10 @@ export class CFOAgent extends BaseAgent {
         await notify(`🚨 CFO PAUSED — emergency from ${msg.from_agent}: ${payload.message}`);
         break;
       }
+
+      default:
+        if (cmd) logger.debug(`[CFO] Unhandled message command: ${cmd} from ${msg.from_agent}`);
+        break;
     }
   }
 
