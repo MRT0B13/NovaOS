@@ -23,7 +23,9 @@ import { getCFOEnv } from '../launchkit/cfo/cfoEnv.ts';
 import { PostgresCFORepository } from '../launchkit/cfo/postgresCFORepository.ts';
 import { PositionManager } from '../launchkit/cfo/positionManager.ts';
 import { getDecisionConfig, runDecisionCycle, classifyTier } from '../launchkit/cfo/decisionEngine.ts';
+import type { DecisionResult } from '../launchkit/cfo/decisionEngine.ts';
 import type { PlacedOrder, MarketOpportunity } from '../launchkit/cfo/polymarketService.ts';
+import type { TransactionType, PositionStrategy } from '../launchkit/cfo/postgresCFORepository.ts';
 
 // Lazy service loaders
 let _poly:    any = null; const poly    = async () => _poly    ??= await import('../launchkit/cfo/polymarketService.ts');
@@ -267,6 +269,186 @@ export class CFOAgent extends BaseAgent {
     });
   }
 
+  // ── Persist ALL decision engine results ───────────────────────────
+  //
+  // Every executed decision (POLY_BET, OPEN_HEDGE, CLOSE_HEDGE, AUTO_STAKE,
+  // UNSTAKE_JITO, CLOSE_LOSING, POLY_EXIT) gets a position record + transaction
+  // record in the DB so the CFO has a full audit trail and accurate P&L.
+
+  private async persistDecisionResults(results: DecisionResult[]): Promise<void> {
+    if (!this.positionManager || !this.repo) return;
+
+    for (const r of results) {
+      if (!r.executed || !r.success) continue;
+      const d = r.decision;
+      const p = d.params;
+      const now = new Date().toISOString();
+
+      try {
+        switch (d.type) {
+          // ── Polymarket BUY ─────────────────────────────────────
+          case 'POLY_BET': {
+            const pos = await this.positionManager.openPolymarketPosition({
+              conditionId: p.conditionId,
+              question: p.marketQuestion ?? p.conditionId,
+              tokenId: p.tokenId,
+              outcome: (p.side ?? 'Yes') as 'Yes' | 'No',
+              orderId: r.txId ?? `de-${Date.now()}`,
+              sizeUsd: p.sizeUsd,
+              entryPrice: p.pricePerShare,
+              txHash: r.txId,
+            });
+            await this.repo.insertTransaction({
+              id: `tx-poly-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'polygon', strategyTag: 'polymarket', txType: 'prediction_buy',
+              tokenIn: 'USDC', amountIn: p.sizeUsd,
+              tokenOut: p.tokenId, amountOut: p.sizeUsd / (p.pricePerShare || 0.01),
+              feeUsd: 0, txHash: r.txId, walletAddress: '', positionId: pos.id,
+              status: 'confirmed',
+              metadata: { conditionId: p.conditionId, outcome: p.side, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted POLY_BET: ${pos.id} — ${p.side} "${(p.marketQuestion ?? '').slice(0, 50)}" $${p.sizeUsd}`);
+            break;
+          }
+
+          // ── Polymarket EXIT ────────────────────────────────────
+          case 'POLY_EXIT': {
+            // Try to find the DB position by tokenId and close it
+            const dbPos = p.tokenId
+              ? await this.repo.getPositionByExternalId(p.tokenId)
+              : null;
+            const receivedUsd = p.sizeUsd ?? 0;
+            if (dbPos) {
+              await this.positionManager.closePosition(
+                dbPos.id, 0, r.txId ?? '', receivedUsd,
+              );
+              logger.info(`[CFO] Persisted POLY_EXIT: closed ${dbPos.id}`);
+            }
+            await this.repo.insertTransaction({
+              id: `tx-poly-exit-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'polygon', strategyTag: 'polymarket', txType: 'prediction_sell',
+              tokenIn: p.tokenId, amountIn: p.sizeUsd ?? 0,
+              tokenOut: 'USDC', amountOut: receivedUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '',
+              positionId: dbPos?.id, status: 'confirmed',
+              metadata: { reasoning: d.reasoning },
+            });
+            break;
+          }
+
+          // ── Hyperliquid OPEN hedge ─────────────────────────────
+          case 'OPEN_HEDGE': {
+            const sizeUsd = p.solExposureUsd ?? d.estimatedImpactUsd;
+            const leverage = p.leverage ?? 1;
+            // Fetch current SOL price for entry
+            let entryPrice = 0;
+            try {
+              const pyth = await import('../launchkit/cfo/pythOracleService.ts');
+              entryPrice = await (await pyth.createPythOracle()).getSolPrice();
+            } catch { /* non-fatal */ }
+            await this.positionManager.openHyperliquidPosition({
+              coin: 'SOL', side: 'SHORT', sizeUsd, entryPrice, leverage,
+              orderId: r.txId ? Number(r.txId) : undefined, txHash: r.txId,
+            });
+            await this.repo.insertTransaction({
+              id: `tx-hl-hedge-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'arbitrum', strategyTag: 'hyperliquid', txType: 'swap',
+              tokenIn: 'USDC', amountIn: sizeUsd / leverage,
+              tokenOut: 'SOL-PERP-SHORT', amountOut: sizeUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { leverage, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted OPEN_HEDGE: SHORT SOL $${sizeUsd} @ ${leverage}x`);
+            break;
+          }
+
+          // ── Hyperliquid CLOSE hedge ────────────────────────────
+          case 'CLOSE_HEDGE': {
+            const reduceUsd = p.reduceUsd ?? d.estimatedImpactUsd;
+            // Find matching open HL position and close it
+            const openHL = await this.repo.getOpenPositions('hyperliquid' as PositionStrategy);
+            const solShort = openHL.find(pos =>
+              (pos.metadata as any)?.coin === 'SOL' && (pos.metadata as any)?.side === 'SHORT',
+            );
+            if (solShort) {
+              const pnl = reduceUsd - solShort.costBasisUsd;
+              await this.positionManager.closePosition(solShort.id, 0, r.txId ?? '', reduceUsd);
+              logger.info(`[CFO] Persisted CLOSE_HEDGE: closed ${solShort.id} PnL $${pnl.toFixed(2)}`);
+            }
+            await this.repo.insertTransaction({
+              id: `tx-hl-close-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'arbitrum', strategyTag: 'hyperliquid', txType: 'swap',
+              tokenIn: 'SOL-PERP-SHORT', amountIn: reduceUsd,
+              tokenOut: 'USDC', amountOut: reduceUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '',
+              positionId: solShort?.id, status: 'confirmed',
+              metadata: { reasoning: d.reasoning },
+            });
+            break;
+          }
+
+          // ── Hyperliquid CLOSE losing position ──────────────────
+          case 'CLOSE_LOSING': {
+            const openHL = await this.repo.getOpenPositions('hyperliquid' as PositionStrategy);
+            const match = openHL.find(pos =>
+              (pos.metadata as any)?.coin === p.coin && (pos.metadata as any)?.side === p.side,
+            );
+            if (match) {
+              await this.positionManager.closePosition(match.id, 0, r.txId ?? '', 0);
+              logger.info(`[CFO] Persisted CLOSE_LOSING: closed ${match.id} (${p.coin} ${p.side})`);
+            }
+            await this.repo.insertTransaction({
+              id: `tx-hl-stop-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'arbitrum', strategyTag: 'hyperliquid', txType: 'swap',
+              tokenIn: `${p.coin}-PERP-${p.side}`, amountIn: d.estimatedImpactUsd,
+              tokenOut: 'USDC', amountOut: 0,
+              feeUsd: 0, txHash: r.txId, walletAddress: '',
+              positionId: match?.id, status: 'confirmed',
+              metadata: { reason: 'stop_loss', reasoning: d.reasoning },
+            });
+            break;
+          }
+
+          // ── Jito STAKE ─────────────────────────────────────────
+          case 'AUTO_STAKE': {
+            const stakeAmount = p.amount ?? d.estimatedImpactUsd;
+            await this.repo.insertTransaction({
+              id: `tx-jito-stake-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'jito', txType: 'stake',
+              tokenIn: 'SOL', amountIn: stakeAmount,
+              tokenOut: 'JitoSOL', amountOut: stakeAmount,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted AUTO_STAKE: ${stakeAmount} SOL → JitoSOL`);
+            break;
+          }
+
+          // ── Jito UNSTAKE ───────────────────────────────────────
+          case 'UNSTAKE_JITO': {
+            const unstakeAmount = p.amount ?? d.estimatedImpactUsd;
+            await this.repo.insertTransaction({
+              id: `tx-jito-unstake-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'jito', txType: 'unstake',
+              tokenIn: 'JitoSOL', amountIn: unstakeAmount,
+              tokenOut: 'SOL', amountOut: unstakeAmount,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted UNSTAKE_JITO: ${unstakeAmount} JitoSOL → SOL`);
+            break;
+          }
+
+          // SKIP / REBALANCE_HEDGE — nothing to persist
+          default:
+            break;
+        }
+      } catch (err) {
+        logger.warn(`[CFO] Failed to persist ${d.type} (non-fatal):`, err);
+      }
+    }
+  }
+
   // ── Position monitor ──────────────────────────────────────────────
 
   private async monitorPositions(): Promise<void> {
@@ -369,6 +551,8 @@ export class CFOAgent extends BaseAgent {
             const execResult = await executeDecision(overridden, env);
             if (execResult.success && execResult.executed) {
               logger.info(`[CFO] Approved decision ${d.type} executed successfully (tx: ${execResult.txId ?? 'n/a'})`);
+              // Persist the approved+executed decision
+              await this.persistDecisionResults([execResult]);
               const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
               await notifyAdminForce(`✅ ${d.type} executed.\ntx: ${execResult.txId ?? 'dry-run'}`);
             } else {
@@ -401,6 +585,9 @@ export class CFOAgent extends BaseAgent {
         }
         await notifyAdminForce(msg);
       }
+
+      // ── Persist ALL successful decisions to DB ────────────────────
+      await this.persistDecisionResults(results);
 
       // ── Report to Nova supervisor ─────────────────────────────
       const executedCount = results.filter((r) => r.executed && r.success).length;
