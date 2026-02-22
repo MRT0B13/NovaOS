@@ -50,6 +50,13 @@ export class Supervisor extends BaseAgent {
   private handlers: Map<string, MessageHandler> = new Map();
   private pollIntervalMs: number;
   public callbacks: SupervisorCallbacks = {};
+  private lastNarrativePostAt = 0;
+  private static NARRATIVE_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours between narrative posts
+
+  // ── X Post Dedup ─────────────────────────────────────────────
+  // Track recently posted content to avoid duplicate X tweets
+  private recentXPostHashes: Set<string> = new Set();
+  private static MAX_X_POST_HISTORY = 20;
 
   // Active token child agents
   private children: Map<string, TokenChildAgent> = new Map();
@@ -162,17 +169,50 @@ export class Supervisor extends BaseAgent {
       const intelSource = intel_type ?? source; // intel_type is the canonical field; source is legacy/agent-id
 
       if (intelSource === 'narrative_shift' && msg.priority === 'high') {
-        // Significant narrative shift — post to X + TG channel + Farcaster
-        const content = `📡 Narrative shift detected: ${summary || narratives?.summary || 'Check thread for details'}`;
-        if (this.callbacks.onPostToX) await this.callbacks.onPostToX(content);
-        if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
-        if (this.callbacks.onPostToFarcaster) {
-          await this.callbacks.onPostToFarcaster(content, 'ai-agents');
-          await this.callbacks.onPostToFarcaster(content, 'solana');
+        // Rate-limit narrative posts — max once per 2 hours
+        const now = Date.now();
+        if (now - this.lastNarrativePostAt < Supervisor.NARRATIVE_COOLDOWN_MS) {
+          logger.debug(`[supervisor] Skipping narrative post (cooldown: ${Math.round((Supervisor.NARRATIVE_COOLDOWN_MS - (now - this.lastNarrativePostAt)) / 60_000)}m remaining)`);
+        } else {
+          const content = `📡 Narrative shift detected: ${summary || narratives?.summary || 'Check thread for details'}`;
+
+          // Content dedup — don't post same/similar content to X twice
+          const contentHash = content.toLowerCase().replace(/[^a-z ]/g, '').trim().slice(0, 150);
+          if (this.recentXPostHashes.has(contentHash)) {
+            logger.debug(`[supervisor] Skipping duplicate narrative post (same content already posted)`);
+          } else {
+            if (this.callbacks.onPostToX) await this.callbacks.onPostToX(content);
+            if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+            if (this.callbacks.onPostToFarcaster) {
+              await this.callbacks.onPostToFarcaster(content, 'ai-agents');
+              await this.callbacks.onPostToFarcaster(content, 'solana');
+            }
+            this.recentXPostHashes.add(contentHash);
+            // Keep set bounded
+            if (this.recentXPostHashes.size > Supervisor.MAX_X_POST_HISTORY) {
+              const first = this.recentXPostHashes.values().next().value;
+              if (first) this.recentXPostHashes.delete(first);
+            }
+            this.lastNarrativePostAt = now;
+            logger.info(`[supervisor] High-priority intel posted: ${intelSource}`);
+          }
         }
-        logger.info(`[supervisor] High-priority intel posted: ${source}`);
       }
       // Low-priority intel is stored in messages table — used for future content generation
+
+      // ── Intel Digest (batched summary from scout — every 2h) ──
+      if (intelSource === 'intel_digest') {
+        const { periodHours, totalIntelItems, crossConfirmedCount, scansInPeriod } = msg.payload;
+        logger.info(
+          `[supervisor] 📋 Scout digest: ${totalIntelItems} items from ${scansInPeriod} scans ` +
+          `(${crossConfirmedCount} cross-confirmed) | ${periodHours}h window`
+        );
+        // Don't post digests to community/X — they're operational intel for CFO + admin only
+        if (this.callbacks.onPostToAdmin && totalIntelItems > 0) {
+          const digestMsg = `📋 <b>Scout Digest</b> (${periodHours}h)\n\n${summary || 'No notable signals'}`;
+          await this.callbacks.onPostToAdmin(digestMsg);
+        }
+      }
 
       // Forward all scout intel to CFO for trading decisions
       try {
@@ -548,7 +588,7 @@ export class Supervisor extends BaseAgent {
       const result = await this.pool.query(
         `SELECT agent_name, status, last_beat, current_task
          FROM agent_heartbeats
-         WHERE agent_name != 'health-agent'
+         WHERE agent_name NOT IN ('health-agent', 'health-monitor', 'nova-main')
          ORDER BY agent_name`,
       );
       for (const row of result.rows) {

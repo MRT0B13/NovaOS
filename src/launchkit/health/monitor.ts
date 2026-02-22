@@ -52,8 +52,8 @@ export class HealthMonitor {
     // Load persisted LLM provider preference before anything else
     this.repair.loadPersistedProvider().catch(() => {});
 
-    // Register self
-    this.db.upsertHeartbeat({ agentName: 'health-agent', status: 'alive', currentTask: 'monitoring' });
+    // Register self (uses 'health-monitor' to disambiguate from standalone pm2 health-agent)
+    this.db.upsertHeartbeat({ agentName: 'health-monitor', status: 'alive', currentTask: 'monitoring' });
 
     // Start monitoring loops
     this.intervals.push(
@@ -86,11 +86,21 @@ export class HealthMonitor {
     try {
       const heartbeats = await this.db.getAllHeartbeats();
       const now = Date.now();
+      const ghostThreshold = 24 * 3600_000; // 24h — remove truly dead ghosts
 
       for (const hb of heartbeats) {
         if (hb.status === 'disabled') continue;
 
         const silentMs = now - hb.lastBeat.getTime();
+
+        // GHOST: dead for >24h — remove stale row entirely (old runs, examples, etc.)
+        if (silentMs > ghostThreshold && hb.status === 'dead') {
+          console.log(`[HealthAgent] 🗑️ Removing ghost agent: ${hb.agentName} (silent ${Math.round(silentMs / 3600_000)}h)`);
+          try {
+            await this.db.getPool().query(`DELETE FROM agent_heartbeats WHERE agent_name = $1`, [hb.agentName]);
+          } catch { /* non-fatal */ }
+          continue;
+        }
 
         // DEAD: no heartbeat beyond threshold
         if (silentMs > this.config.heartbeatDeadThresholdMs) {
@@ -459,7 +469,15 @@ export class HealthMonitor {
   // ============================================================
 
   async generateReport(): Promise<HealthReport> {
-    const agents = await this.db.getAllHeartbeats();
+    const allAgents = await this.db.getAllHeartbeats();
+    // Filter out ghost agents (dead for >24h — stale rows from old runs)
+    const ghostThreshold = Date.now() - 24 * 3600_000;
+    const agents = allAgents.filter(a => {
+      if (a.status === 'dead' && a.lastBeat.getTime() < ghostThreshold) {
+        return false; // Exclude ghosts like nova-main, old health-agent entries
+      }
+      return true;
+    });
     const apis = await this.db.getAllApiHealth();
     const metrics = await this.db.get24hMetrics();
 
@@ -546,12 +564,13 @@ export class HealthMonitor {
 
   // ============================================================
   // SELF HEARTBEAT — Health Agent monitors itself too
-  // ============================================================
+  // Uses 'health-monitor' name (not 'health-agent') to disambiguate the in-process
+  // health monitor from the optional standalone pm2 health-agent process.
 
   private async selfHeartbeat(): Promise<void> {
     const memUsage = process.memoryUsage();
     await this.db.upsertHeartbeat({
-      agentName: 'health-agent',
+      agentName: 'health-monitor',
       status: 'alive',
       memoryMb: Math.round(memUsage.heapUsed / 1024 / 1024),
       currentTask: 'monitoring',

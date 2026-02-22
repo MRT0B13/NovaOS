@@ -218,8 +218,22 @@ export abstract class BaseAgent {
     }
   }
 
-  /** Add a recurring interval (tracked for cleanup) */
+  /** Add a recurring interval (tracked for cleanup).
+   *  Wraps async callbacks with .catch() to prevent unhandled rejections
+   *  from crashing the Node process (Node 15+ terminates on unhandled rejection). */
   protected addInterval(fn: () => void | Promise<void>, ms: number): void {
-    this.intervals.push(setInterval(fn, ms));
+    this.intervals.push(setInterval(() => {
+      try {
+        const result = fn();
+        // If fn returns a promise, swallow any rejection
+        if (result && typeof (result as Promise<void>).catch === 'function') {
+          (result as Promise<void>).catch((err) => {
+            logger.warn(`[${this.agentId}] Interval callback rejected:`, err);
+          });
+        }
+      } catch (err) {
+        logger.warn(`[${this.agentId}] Interval callback threw:`, err);
+      }
+    }, ms));
   }
 }

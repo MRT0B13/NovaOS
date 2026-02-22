@@ -746,7 +746,8 @@ export class CFOAgent extends BaseAgent {
 
       case 'scout_intel':
       case 'narrative_update': {
-        // Accept both structured CFO format AND raw Scout format
+        // Accept structured CFO format, raw Scout format, AND batched intel_digest
+        const isDigest = payload.intel_type === 'intel_digest';
         const narratives: string[] = payload.topNarratives
           ?? (payload.summary ? payload.summary.split(' | ') : [])
           ?? [];
@@ -760,13 +761,20 @@ export class CFOAgent extends BaseAgent {
           const bearHits = bearWords.filter(w => lower.includes(w)).length;
           bullish = bullHits >= bearHits; // default to neutral-bullish if no signal
         }
+        // For digests with cross-confirmed items, weight bullish signal higher
+        if (isDigest && (payload.crossConfirmedCount ?? 0) > 0) {
+          logger.info(`[CFO] 📋 Digest has ${payload.crossConfirmedCount} cross-confirmed signals — higher confidence`);
+        }
         this.scoutIntel = {
           cryptoBullish: bullish ?? true,
           btcEstimate: payload.btcPriceEstimate,
           narratives,
           receivedAt: Date.now(),
         };
-        logger.info(`[CFO] 📡 Scout intel received: ${bullish ? '🟢 bullish' : '🔴 bearish'} | narratives: ${narratives.length} | source: ${payload.source ?? 'unknown'}`);
+        const sourceLabel = isDigest
+          ? `digest (${payload.totalIntelItems ?? '?'} items, ${payload.crossConfirmedCount ?? 0} confirmed)`
+          : (payload.source ?? payload.intel_type ?? 'unknown');
+        logger.info(`[CFO] 📡 Scout intel received: ${bullish ? '🟢 bullish' : '🔴 bearish'} | narratives: ${narratives.length} | source: ${sourceLabel}`);
         break;
       }
 
