@@ -912,6 +912,17 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
               `[CFO:POLY_BET] tokenId mismatch — stored=${decision.params.tokenId}, ` +
               `resolved via outcome='${decision.params.side}' → tokenId=${token.tokenId}`,
             );
+            // If resolved token has no price, use scan-time price from decision params
+            if (!token.price || token.price <= 0) {
+              const scanPrice = decision.params.pricePerShare;
+              if (scanPrice && scanPrice > 0 && scanPrice < 1) {
+                logger.warn(
+                  `[CFO:POLY_BET] Resolved token has price=${token.price}, ` +
+                  `using scan-time price=${scanPrice}`,
+                );
+                token = { ...token, price: scanPrice };
+              }
+            }
           }
         }
         if (!token) {

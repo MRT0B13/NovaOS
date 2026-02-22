@@ -542,52 +542,86 @@ export async function fetchCryptoMarkets(options?: {
 
 /**
  * Fetch a single market by condition ID.
- * Gamma API path-lookup uses internal `id`, not `conditionId`.
- * Use conditionId query param to find the correct market.
+ *
+ * Primary: CLOB API `/markets/{conditionId}` — reliable, returns correct
+ * tokens with live prices and matching conditionId every time.
+ * Fallback: Gamma API `?slug=` lookup (requires slug, not always available).
+ *
+ * NOTE: Gamma `?condition_id=` is broken (returns unrelated market).
  */
 export async function fetchMarket(conditionId: string): Promise<PolyMarket | null> {
   try {
-    // Try query-param lookup first (reliable — conditionId is what we store)
-    const resp = await fetch(`${GAMMA_BASE}/markets?condition_id=${conditionId}&limit=1`);
-    if (!resp.ok) return null;
+    // ── Primary: CLOB API — reliable conditionId lookup with live prices ──
+    const clobResp = await fetch(`${CLOB_BASE}/markets/${conditionId}`);
+    if (clobResp.ok) {
+      const c = await clobResp.json() as any;
+      if (c && (c.condition_id === conditionId || c.conditionId === conditionId) && c.tokens?.length) {
+        const tokens: PolyMarket['tokens'] = c.tokens.map((t: any) => ({
+          tokenId: t.token_id,
+          outcome: t.outcome === 'Yes' ? 'Yes' : 'No',
+          price: Number(t.price) || 0,
+          winner: t.winner ?? false,
+        }));
 
-    const arr = await resp.json();
-    const m = Array.isArray(arr) ? arr[0] : arr;
-    if (!m || !m.conditionId) return null;
-
-    // Build tokens from legacy array or Gamma flat fields
-    let tokens: PolyMarket['tokens'];
-    if (m.tokens?.length) {
-      tokens = m.tokens.map((t: any) => ({
-        tokenId: t.token_id,
-        outcome: t.outcome === 'Yes' ? 'Yes' : 'No',
-        price: Number(t.price) || 0,
-        winner: t.winner,
-      }));
-    } else {
-      const ids: string[] = JSON.parse(m.clobTokenIds || '[]');
-      const outcomes: string[] = JSON.parse(m.outcomes || '[]');
-      const prices: string[] = JSON.parse(m.outcomePrices || '[]');
-      tokens = ids.map((id: string, i: number) => ({
-        tokenId: id,
-        outcome: outcomes[i] === 'Yes' ? 'Yes' : 'No',
-        price: Number(prices[i]) || 0,
-        winner: false,
-      }));
+        return {
+          conditionId: c.condition_id ?? c.conditionId,
+          question: c.question ?? c.market_slug ?? '',
+          endDate: c.end_date_iso ?? c.endDate ?? '',
+          active: c.active ?? true,
+          closed: c.closed ?? false,
+          volume: c.volume ?? 0,
+          liquidity: c.liquidity ?? 0,
+          category: 'crypto',
+          tokens,
+        };
+      }
     }
 
-    return {
-      conditionId: m.conditionId,
-      question: m.question,
-      endDate: m.endDate,
-      active: m.active,
-      closed: m.closed,
-      volume: m.volume ?? 0,
-      liquidity: m.liquidity ?? m.liquidityNum ?? 0,
-      category: m.category ?? 'crypto',
-      tokens,
-    };
-  } catch {
+    // ── Fallback: Gamma list with client-side conditionId match ──
+    // condition_id query param is unreliable so we fetch a larger set and filter
+    const gammaResp = await fetch(`${GAMMA_BASE}/markets?active=true&closed=false&limit=100&order=volume&ascending=false`);
+    if (gammaResp.ok) {
+      const arr = (await gammaResp.json()) as any[];
+      const m = arr.find((item: any) => item.conditionId === conditionId);
+      if (m) {
+        let tokens: PolyMarket['tokens'];
+        if (m.tokens?.length) {
+          tokens = m.tokens.map((t: any) => ({
+            tokenId: t.token_id,
+            outcome: t.outcome === 'Yes' ? 'Yes' : 'No',
+            price: Number(t.price) || 0,
+            winner: t.winner ?? false,
+          }));
+        } else {
+          const ids: string[] = JSON.parse(m.clobTokenIds || '[]');
+          const outcomes: string[] = JSON.parse(m.outcomes || '[]');
+          const prices: string[] = JSON.parse(m.outcomePrices || '[]');
+          tokens = ids.map((id: string, i: number) => ({
+            tokenId: id,
+            outcome: outcomes[i] === 'Yes' ? 'Yes' : 'No',
+            price: Number(prices[i]) || 0,
+            winner: false,
+          }));
+        }
+
+        return {
+          conditionId: m.conditionId,
+          question: m.question,
+          endDate: m.endDate,
+          active: m.active,
+          closed: m.closed,
+          volume: m.volume ?? 0,
+          liquidity: m.liquidity ?? m.liquidityNum ?? 0,
+          category: m.category ?? 'crypto',
+          tokens,
+        };
+      }
+    }
+
+    logger.warn(`[Polymarket] fetchMarket: no result for conditionId=${conditionId.slice(0, 20)}…`);
+    return null;
+  } catch (err) {
+    logger.error(`[Polymarket] fetchMarket error:`, err);
     return null;
   }
 }
@@ -1091,6 +1125,11 @@ async function buildSignedOrder(params: OrderParams): Promise<SignedOrder> {
   let makerAmountRaw: number;
   let takerAmountRaw: number;
 
+  // Safety: prevent division-by-zero → Infinity → BigInt parse failure
+  if (!params.pricePerShare || params.pricePerShare <= 0) {
+    throw new Error(`Invalid pricePerShare: ${params.pricePerShare}`);
+  }
+
   if (params.side === 0) {
     // BUY: maker spends USDC, gets outcome tokens
     //   makerAmount = USDC amount
@@ -1156,6 +1195,13 @@ export async function placeBuyOrder(
     status: 'ERROR',
     createdAt: new Date().toISOString(),
   };
+
+  // Guard: refuse to place order with zero or invalid price
+  if (!token.price || token.price <= 0 || token.price >= 1) {
+    result.errorMessage = `Invalid token price: ${token.price} (must be 0 < price < 1)`;
+    logger.error(`[Polymarket] ${result.errorMessage} for "${market.question}"`);
+    return result;
+  }
 
   if (env.dryRun) {
     logger.info(
