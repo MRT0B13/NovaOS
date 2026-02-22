@@ -64,6 +64,9 @@ export class CFOAgent extends BaseAgent {
       return;
     }
 
+    // Restore persisted counters from DB (survive restarts)
+    await this.restorePersistedState();
+
     const dbUrl = process.env.DATABASE_URL;
     if (dbUrl) {
       try {
@@ -167,6 +170,7 @@ export class CFOAgent extends BaseAgent {
 
     this.cycleCount++;
     this.lastOpportunityScanAt = Date.now();
+    await this.persistState();
 
     // Decision engine handles Polymarket bets now (with tier gating + scout intel)
     const config = getDecisionConfig();
@@ -837,6 +841,27 @@ export class CFOAgent extends BaseAgent {
   isPaused() { return this.paused; }
   getCycleCount() { return this.cycleCount; }
   setScoutIntel(intel: Omit<ScoutIntel, 'receivedAt'>) { this.scoutIntel = { ...intel, receivedAt: Date.now() }; }
+
+  // ── State Persistence (survive restarts) ─────────────────────────
+
+  private async persistState(): Promise<void> {
+    await this.saveState({
+      cycleCount: this.cycleCount,
+      startedAt: this.startedAt,
+    });
+  }
+
+  private async restorePersistedState(): Promise<void> {
+    const s = await this.restoreState<{
+      cycleCount?: number;
+      startedAt?: number;
+    }>();
+    if (!s) return;
+    if (s.cycleCount) this.cycleCount = s.cycleCount;
+    // Keep startedAt from the previous session to show total uptime across restarts
+    if (s.startedAt)  this.startedAt = s.startedAt;
+    logger.info(`[cfo] Restored: ${this.cycleCount} cycles, started=${new Date(this.startedAt).toISOString()}`);
+  }
 
   getStatus() {
     return {

@@ -81,6 +81,9 @@ export class Supervisor extends BaseAgent {
   }
 
   protected async onStart(): Promise<void> {
+    // Restore persisted state from DB (survive restarts)
+    await this.restorePersistedState();
+
     this.startHeartbeat(60_000);
     this.addInterval(() => this.pollMessages(), this.pollIntervalMs);
     // Also periodically check agent health (separate from Health Agent's deeper checks)
@@ -118,6 +121,8 @@ export class Supervisor extends BaseAgent {
         await this.handleMessage(msg);
         if (msg.id) await this.acknowledgeMessage(msg.id);
       }
+      // Persist counters after processing a batch (survive restarts)
+      if (messages.length > 0) await this.persistState();
     } catch (err) {
       logger.error('[supervisor] Poll failed:', err);
     }
@@ -786,6 +791,26 @@ export class Supervisor extends BaseAgent {
     } catch (err) {
       logger.warn('[supervisor] Briefing failed:', err);
     }
+  }
+
+  // ── State Persistence (survive restarts) ─────────────────────────
+
+  async persistState(): Promise<void> {
+    await this.saveState({
+      messagesProcessed: this.messagesProcessed,
+      lastBriefingAt: this.lastBriefingAt,
+    });
+  }
+
+  private async restorePersistedState(): Promise<void> {
+    const s = await this.restoreState<{
+      messagesProcessed?: number;
+      lastBriefingAt?: number;
+    }>();
+    if (!s) return;
+    if (s.messagesProcessed) this.messagesProcessed = s.messagesProcessed;
+    if (s.lastBriefingAt)    this.lastBriefingAt = s.lastBriefingAt;
+    logger.info(`[supervisor] Restored: ${this.messagesProcessed} msgs processed, lastBriefing=${this.lastBriefingAt ? new Date(this.lastBriefingAt).toISOString() : 'never'}`);
   }
 
   // ── Public API ───────────────────────────────────────────────────

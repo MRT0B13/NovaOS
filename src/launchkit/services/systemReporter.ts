@@ -709,10 +709,10 @@ function collectSwarmStats(): SwarmStats | null {
   const resolveStatus = (running: boolean, hb?: { status: string } | null): string =>
     running ? (hb?.status === 'degraded' ? 'degraded' : 'alive') : (hb?.status || 'dead');
 
-  // Supervisor
+  // Supervisor (agentId is 'nova', not 'nova-supervisor')
   try {
     const s = swarmHandle.supervisor.getStatus();
-    const hb = agentStatuses.get('nova-supervisor');
+    const hb = agentStatuses.get('nova');
     agents.push({
       name: 'supervisor',
       status: resolveStatus(s.running, hb),

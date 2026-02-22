@@ -333,6 +333,9 @@ export class AnalystAgent extends BaseAgent {
   }
 
   protected async onStart(): Promise<void> {
+    // Restore persisted counters from DB (survive restarts)
+    await this.restorePersistedState();
+
     this.startHeartbeat(60_000);
 
     // Full DeFi snapshot (multi-chain TVL + volume + data pools)
@@ -493,6 +496,9 @@ export class AnalystAgent extends BaseAgent {
       if (tvl) this.lastSnapshot = tvl;
       if (volumes) this.lastVolumes = volumes;
       this.cycleCount++;
+
+      // Persist counters to DB (survive restarts)
+      this.persistState();
 
       // ── Gather Nova data pool metrics ──
       let trendStats: { available: number; topTrends: Array<{ topic: string; score: number }> } | undefined;
@@ -755,6 +761,21 @@ export class AnalystAgent extends BaseAgent {
     } catch {
       // Silent
     }
+  }
+
+  // ── State Persistence (survive restarts) ─────────────────────────
+
+  private async persistState(): Promise<void> {
+    await this.saveState({
+      cycleCount: this.cycleCount,
+    });
+  }
+
+  private async restorePersistedState(): Promise<void> {
+    const s = await this.restoreState<{ cycleCount?: number }>();
+    if (!s) return;
+    if (s.cycleCount) this.cycleCount = s.cycleCount;
+    logger.info(`[analyst] Restored: ${this.cycleCount} cycles`);
   }
 
   // ── Helpers ──────────────────────────────────────────────────────

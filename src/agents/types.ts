@@ -64,6 +64,7 @@ export abstract class BaseAgent {
   protected agentType: AgentType;
   protected running = false;
   protected intervals: NodeJS.Timeout[] = [];
+  private _stateColumnEnsured = false;
 
   constructor(config: AgentConfig) {
     this.pool = config.pool;
@@ -143,6 +144,60 @@ export abstract class BaseAgent {
       setInterval(() => this.updateStatus('alive'), intervalMs),
     );
     this.updateStatus('alive');
+  }
+
+  // ── State Persistence (survive restarts) ────────────────────────
+
+  /** Ensure the state_json column exists (idempotent, runs once per agent lifecycle) */
+  private async ensureStateColumn(): Promise<void> {
+    if (this._stateColumnEnsured) return;
+    try {
+      await this.pool.query(
+        `ALTER TABLE agent_heartbeats ADD COLUMN IF NOT EXISTS state_json JSONB DEFAULT '{}'`,
+      );
+      this._stateColumnEnsured = true;
+    } catch {
+      // Column might already exist or table might not exist yet — both fine
+      this._stateColumnEnsured = true;
+    }
+  }
+
+  /**
+   * Save agent state to DB so it survives restarts.
+   * Call this periodically (e.g. after each cycle) or in heartbeat.
+   * Subclasses override `getPersistedState()` to define what to persist.
+   */
+  protected async saveState(state: Record<string, any>): Promise<void> {
+    try {
+      await this.ensureStateColumn();
+      await this.pool.query(
+        `UPDATE agent_heartbeats SET state_json = $2 WHERE agent_name = $1`,
+        [this.agentId, JSON.stringify(state)],
+      );
+    } catch (err) {
+      logger.warn(`[${this.agentId}] Failed to save state:`, err);
+    }
+  }
+
+  /**
+   * Restore agent state from DB after a restart.
+   * Returns the saved state or null if none exists.
+   */
+  protected async restoreState<T = Record<string, any>>(): Promise<T | null> {
+    try {
+      await this.ensureStateColumn();
+      const { rows } = await this.pool.query(
+        `SELECT state_json FROM agent_heartbeats WHERE agent_name = $1`,
+        [this.agentId],
+      );
+      if (rows.length > 0 && rows[0].state_json && Object.keys(rows[0].state_json).length > 0) {
+        logger.info(`[${this.agentId}] Restored state from DB`);
+        return rows[0].state_json as T;
+      }
+    } catch (err) {
+      logger.warn(`[${this.agentId}] Failed to restore state:`, err);
+    }
+    return null;
   }
 
   // ── Message Bus ───────────────────────────────────────────────────

@@ -114,6 +114,9 @@ export class ScoutAgent extends BaseAgent {
   }
 
   protected async onStart(): Promise<void> {
+    // Restore persisted state from DB (survive restarts)
+    await this.restorePersistedState();
+
     this.startHeartbeat(60_000);
 
     // Full research cycle (deep — 8h)
@@ -164,6 +167,7 @@ export class ScoutAgent extends BaseAgent {
       });
 
       await this.updateStatus('alive');
+      await this.persistState();
       logger.info(`[scout] Research cycle #${this.cycleCount} complete`);
     } catch (err) {
       logger.error('[scout] Research cycle failed:', err);
@@ -250,6 +254,9 @@ export class ScoutAgent extends BaseAgent {
 
       this.lastScanAt = now;
       this.scanCount++;
+
+      // Persist counters to DB (survive restarts)
+      await this.persistState();
 
       logger.info(
         `[scout] Scan #${this.scanCount}: ${topics.length} topics, ${results.length} new intel, ` +
@@ -389,6 +396,38 @@ export class ScoutAgent extends BaseAgent {
     } catch {
       // Silent
     }
+  }
+
+  // ── State Persistence (survive restarts) ─────────────────────────
+
+  private async persistState(): Promise<void> {
+    await this.saveState({
+      cycleCount: this.cycleCount,
+      scanCount: this.scanCount,
+      lastResearchAt: this.lastResearchAt,
+      lastScanAt: this.lastScanAt,
+      lastDigestAt: this.lastDigestAt,
+      seenHashes: [...this.seenHashes].slice(-100), // cap to avoid bloat
+    });
+  }
+
+  private async restorePersistedState(): Promise<void> {
+    const s = await this.restoreState<{
+      cycleCount?: number;
+      scanCount?: number;
+      lastResearchAt?: number;
+      lastScanAt?: number;
+      lastDigestAt?: number;
+      seenHashes?: string[];
+    }>();
+    if (!s) return;
+    if (s.cycleCount)      this.cycleCount = s.cycleCount;
+    if (s.scanCount)       this.scanCount = s.scanCount;
+    if (s.lastResearchAt)  this.lastResearchAt = s.lastResearchAt;
+    if (s.lastScanAt)      this.lastScanAt = s.lastScanAt;
+    if (s.lastDigestAt)    this.lastDigestAt = s.lastDigestAt;
+    if (s.seenHashes)      this.seenHashes = new Set(s.seenHashes);
+    logger.info(`[scout] Restored: ${this.cycleCount} cycles, ${this.scanCount} scans, seenHashes=${this.seenHashes.size}`);
   }
 
   // ── Public API (for direct use if needed) ────────────────────────

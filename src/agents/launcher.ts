@@ -66,6 +66,9 @@ export class LauncherAgent extends BaseAgent {
   }
 
   protected async onStart(): Promise<void> {
+    // Restore persisted counters from DB (survive restarts)
+    await this.restorePersistedState();
+
     this.startHeartbeat(60_000);
 
     // Periodic status check + graduation monitoring
@@ -187,6 +190,7 @@ export class LauncherAgent extends BaseAgent {
       if (result.success) {
         this.launchCount++;
         this.lastLaunchAt = Date.now();
+        await this.persistState();
         await this.reportToSupervisor('status', 'high', {
           event: 'launch_initiated',
           success: true,
@@ -230,6 +234,29 @@ export class LauncherAgent extends BaseAgent {
       nextScheduled: status.nextScheduledTime,
       pnl,
     });
+  }
+
+  // ── State Persistence (survive restarts) ─────────────────────────
+
+  private async persistState(): Promise<void> {
+    await this.saveState({
+      launchCount: this.launchCount,
+      lastLaunchAt: this.lastLaunchAt,
+      reportedGraduations: [...this.reportedGraduations],
+    });
+  }
+
+  private async restorePersistedState(): Promise<void> {
+    const s = await this.restoreState<{
+      launchCount?: number;
+      lastLaunchAt?: number;
+      reportedGraduations?: string[];
+    }>();
+    if (!s) return;
+    if (s.launchCount)           this.launchCount = s.launchCount;
+    if (s.lastLaunchAt)          this.lastLaunchAt = s.lastLaunchAt;
+    if (s.reportedGraduations)   this.reportedGraduations = new Set(s.reportedGraduations);
+    logger.info(`[launcher] Restored: ${this.launchCount} launches, ${this.reportedGraduations.size} graduations`);
   }
 
   // ── Public API ───────────────────────────────────────────────────

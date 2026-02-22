@@ -542,13 +542,40 @@ export async function fetchCryptoMarkets(options?: {
 
 /**
  * Fetch a single market by condition ID.
+ * Gamma API path-lookup uses internal `id`, not `conditionId`.
+ * Use conditionId query param to find the correct market.
  */
 export async function fetchMarket(conditionId: string): Promise<PolyMarket | null> {
   try {
-    const resp = await fetch(`${GAMMA_BASE}/markets/${conditionId}`);
+    // Try query-param lookup first (reliable — conditionId is what we store)
+    const resp = await fetch(`${GAMMA_BASE}/markets?condition_id=${conditionId}&limit=1`);
     if (!resp.ok) return null;
 
-    const m = await resp.json() as GammaMarket;
+    const arr = await resp.json();
+    const m = Array.isArray(arr) ? arr[0] : arr;
+    if (!m || !m.conditionId) return null;
+
+    // Build tokens from legacy array or Gamma flat fields
+    let tokens: PolyMarket['tokens'];
+    if (m.tokens?.length) {
+      tokens = m.tokens.map((t: any) => ({
+        tokenId: t.token_id,
+        outcome: t.outcome === 'Yes' ? 'Yes' : 'No',
+        price: Number(t.price) || 0,
+        winner: t.winner,
+      }));
+    } else {
+      const ids: string[] = JSON.parse(m.clobTokenIds || '[]');
+      const outcomes: string[] = JSON.parse(m.outcomes || '[]');
+      const prices: string[] = JSON.parse(m.outcomePrices || '[]');
+      tokens = ids.map((id: string, i: number) => ({
+        tokenId: id,
+        outcome: outcomes[i] === 'Yes' ? 'Yes' : 'No',
+        price: Number(prices[i]) || 0,
+        winner: false,
+      }));
+    }
+
     return {
       conditionId: m.conditionId,
       question: m.question,
@@ -556,14 +583,9 @@ export async function fetchMarket(conditionId: string): Promise<PolyMarket | nul
       active: m.active,
       closed: m.closed,
       volume: m.volume ?? 0,
-      liquidity: m.liquidity ?? 0,
+      liquidity: m.liquidity ?? m.liquidityNum ?? 0,
       category: m.category ?? 'crypto',
-      tokens: (m.tokens ?? []).map((t) => ({
-        tokenId: t.token_id,
-        outcome: t.outcome === 'Yes' ? 'Yes' : 'No',
-        price: Number(t.price) || 0,
-        winner: t.winner,
-      })),
+      tokens,
     };
   } catch {
     return null;

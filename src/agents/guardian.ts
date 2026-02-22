@@ -136,6 +136,9 @@ export class GuardianAgent extends BaseAgent {
   }
 
   protected async onStart(): Promise<void> {
+    // Restore persisted counters from DB (survive restarts)
+    await this.restorePersistedState();
+
     this.startHeartbeat(60_000);
 
     // Periodic re-scan of watched tokens (RugCheck safety)
@@ -229,6 +232,8 @@ export class GuardianAgent extends BaseAgent {
     this.scanCount++;
     const safe = _isSafe!(report);
 
+    // Persist counters after each scan (survive restarts)
+    this.persistState();
     // Update watch list if we're tracking this token
     const watched = this.watchList.get(mint);
     if (watched) {
@@ -524,6 +529,26 @@ export class GuardianAgent extends BaseAgent {
     } catch {
       // Silent
     }
+  }
+
+  // ── State Persistence (survive restarts) ─────────────────────────
+
+  private async persistState(): Promise<void> {
+    await this.saveState({
+      scanCount: this.scanCount,
+      liquidityAlertCount: this.liquidityAlertCount,
+    });
+  }
+
+  private async restorePersistedState(): Promise<void> {
+    const s = await this.restoreState<{
+      scanCount?: number;
+      liquidityAlertCount?: number;
+    }>();
+    if (!s) return;
+    if (s.scanCount)           this.scanCount = s.scanCount;
+    if (s.liquidityAlertCount) this.liquidityAlertCount = s.liquidityAlertCount;
+    logger.info(`[guardian] Restored: ${this.scanCount} scans, ${this.liquidityAlertCount} LP alerts`);
   }
 
   // ── Public API ───────────────────────────────────────────────────

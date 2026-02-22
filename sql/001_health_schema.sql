@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS agent_heartbeats (
   error_count_last_5min INTEGER DEFAULT 0,
   current_task      TEXT,
   version           TEXT,
+  state_json        JSONB DEFAULT '{}',
   created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

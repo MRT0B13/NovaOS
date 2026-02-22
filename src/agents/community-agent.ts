@@ -65,6 +65,9 @@ export class CommunityAgent extends BaseAgent {
   }
 
   protected async onStart(): Promise<void> {
+    // Restore persisted counters from DB (survive restarts)
+    await this.restorePersistedState();
+
     this.startHeartbeat(60_000);
 
     // Periodic engagement summary
@@ -92,6 +95,7 @@ export class CommunityAgent extends BaseAgent {
 
       const summary = await this.getEngagementData();
       this.reportCount++;
+      await this.persistState();
 
       // ── Gather community voting + system metrics ──
       let pendingVotes = 0;
@@ -268,6 +272,26 @@ export class CommunityAgent extends BaseAgent {
     } catch {
       // Silent
     }
+  }
+
+  // ── State Persistence (survive restarts) ─────────────────────────
+
+  private async persistState(): Promise<void> {
+    await this.saveState({
+      reportCount: this.reportCount,
+      lastEngagementRate: this.lastEngagementRate,
+    });
+  }
+
+  private async restorePersistedState(): Promise<void> {
+    const s = await this.restoreState<{
+      reportCount?: number;
+      lastEngagementRate?: number;
+    }>();
+    if (!s) return;
+    if (s.reportCount)        this.reportCount = s.reportCount;
+    if (s.lastEngagementRate) this.lastEngagementRate = s.lastEngagementRate;
+    logger.info(`[community] Restored: ${this.reportCount} reports, engRate=${this.lastEngagementRate}`);
   }
 
   // ── Public API ───────────────────────────────────────────────────

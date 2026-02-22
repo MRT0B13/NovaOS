@@ -1461,7 +1461,7 @@ ${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. Gr
           { role: 'user', content: prompt },
         ],
         max_tokens: platform === 'x' ? 200 : 500, // Give GPT room — we trim to 280 chars after
-        temperature: 0.9,
+        temperature: 0.7,
       }),
     });
     
@@ -1509,7 +1509,8 @@ ${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. Gr
       }
     }
     
-    // Hallucination filter — catch GPT inventing infra or fake metrics
+    // Hallucination filter — catch GPT inventing infra, fake metrics, or fabricated numbers
+    // Phase 1: behind_scenes-specific checks (fake infra, migrations)
     if (type === 'behind_scenes') {
       const fakeInfra = /\b(redis|memcached|kafka|kubernetes|k8s|docker swarm|chainlink|serum|graphql subscription|websocket cluster|mongodb|cassandra|elasticsearch)\b/i;
       const fakeMetrics = /\b(reduced|improved|dropped|cut|decreased|optimized)\b.{0,30}\b(\d+\s*(?:ms|%|seconds?|x faster))\b/i;
@@ -1519,6 +1520,27 @@ ${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. Gr
         logger.warn(`[NovaPersonalBrand] Hallucination filter caught behind_scenes: "${text.substring(0, 80)}..."`);
         return null;
       }
+    }
+
+    // Phase 2: Cross-type filter — catch fabricated large numbers (all post types)
+    // GPT loves inventing impressive metrics like "1,200 mints" or "handled 5,000 transactions"
+    // These comma-formatted thousands are almost never in the prompt context
+    const fabricatedBigNumbers = /\b\d{1,3},\d{3}\b.*\b(mints?|transactions?|holders?|users?|trades?|swaps?|calls?|requests?|scans?|tokens?)\b/i;
+    const fabricatedBigNumbers2 = /\b(mints?|transactions?|holders?|users?|trades?|swaps?|calls?|requests?|scans?|tokens?)\b.*\b\d{1,3},\d{3}\b/i;
+    // Also catch "over/handled/processed X,000" patterns
+    const fabricatedHandled = /\b(handled|processed|served|completed|executed|managed|supported)\b.{0,30}\b\d{1,3},\d{3}\b/i;
+    
+    if (fabricatedBigNumbers.test(text) || fabricatedBigNumbers2.test(text) || fabricatedHandled.test(text)) {
+      logger.warn(`[NovaPersonalBrand] Hallucination filter caught fabricated metric in ${type}: "${text.substring(0, 100)}..."`);
+      return null;
+    }
+
+    // Phase 3: Catch "seamlessly" / "flawlessly" — hype words Nova's persona explicitly avoids
+    const hypeWords = /\b(seamlessly|flawlessly|incredibly|amazingly|game-?changing|revolutionary|groundbreaking)\b/i;
+    if (hypeWords.test(text)) {
+      // Strip the hype word rather than rejecting the whole post
+      text = text.replace(hypeWords, '').replace(/\s{2,}/g, ' ').trim();
+      logger.info(`[NovaPersonalBrand] Stripped hype word from ${type} post`);
     }
     
     logger.info(`[NovaPersonalBrand] Generated AI ${type} post (${text.length} chars): ${text.substring(0, 50)}...`);
@@ -1614,7 +1636,7 @@ RULES:
           { role: 'user', content: fullPrompt },
         ],
         max_tokens: 800,
-        temperature: 0.9,
+        temperature: 0.7,
       }),
     });
 
@@ -1688,7 +1710,7 @@ Keep it under 200 chars. NO "fam", "vibes", "spicy", "alpha", "if you know you k
           { role: 'user', content: prompt },
         ],
         max_tokens: 150,
-        temperature: 0.95,
+        temperature: 0.7,
       }),
     });
 
@@ -1766,7 +1788,7 @@ Tag ${target.handle} naturally in the text. Keep it conversational. NO hashtags.
           { role: 'user', content: prompt },
         ],
         max_tokens: 200,
-        temperature: 0.9,
+        temperature: 0.7,
       }),
     });
 
@@ -3258,7 +3280,7 @@ Write ONLY the reply text, nothing else.`;
           { role: 'user', content: prompt },
         ],
         max_tokens: 120,
-        temperature: 0.9,
+        temperature: 0.7,
       }),
     });
 
