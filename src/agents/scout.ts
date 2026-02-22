@@ -227,15 +227,28 @@ export class ScoutAgent extends BaseAgent {
           if (this.trendSnapshots.length > 10) this.trendSnapshots = this.trendSnapshots.slice(-5);
 
           // Cross-confirm: trend pool topic found in Tavily results
-          // Skip results already confirmed (prevents multi-trend re-tagging)
+          // Use multi-keyword matching (not just first word) to avoid
+          // false-positive cross-confirmations like "the" matching everything.
+          // Limit: 1 cross-confirmation per unique trend topic.
+          const STOP_WORDS = new Set(['the','a','an','is','in','on','at','to','for','of','and','or','by','with','from','has','had','have','this','that','new','latest','today','top','its','are','was','been','will']);
+          const confirmedTrends = new Set<string>();
           for (const trend of poolStats.topTrends) {
-            const keyword = trend.topic.toLowerCase().split(' ')[0];
-            if (!keyword || keyword.length < 3) continue; // skip tiny keywords
+            const trendKey = trend.topic.toLowerCase().trim();
+            if (confirmedTrends.has(trendKey)) continue;
+            // Extract meaningful keywords (3+ chars, not stop words)
+            const keywords = trend.topic.toLowerCase().split(/\s+/)
+              .filter(w => w.length >= 3 && !STOP_WORDS.has(w));
+            if (keywords.length < 2) continue; // need at least 2 real keywords
             for (const r of results) {
-              if (r.crossConfirmed) continue; // already tagged — don't overwrite
-              if (r.result.toLowerCase().includes(keyword)) {
+              if (r.crossConfirmed) continue;
+              const resultLower = r.result.toLowerCase();
+              const matchCount = keywords.filter(kw => resultLower.includes(kw)).length;
+              // Require at least 2 meaningful keywords (or all if fewer)
+              if (matchCount >= Math.min(2, keywords.length)) {
                 r.crossConfirmed = true;
                 r.result = `CROSS-CONFIRMED: "${trend.topic}" seen in pool(${trend.sources.join(',')}) + web search — ${r.result.slice(0, 200)}`;
+                confirmedTrends.add(trendKey);
+                break; // 1 result per trend — move to next trend
               }
             }
           }
@@ -315,10 +328,10 @@ export class ScoutAgent extends BaseAgent {
       const totalItems = this.intelBuffer.length;
       const crossItems = this.intelBuffer.filter(i => i.crossConfirmed);
 
-      // Group by query topic area for summary
+      // Group non-cross-confirmed items by query topic area for summary
+      const nonCrossItems = this.intelBuffer.filter(i => !i.crossConfirmed);
       const byTopic: Record<string, string[]> = {};
-      for (const item of this.intelBuffer) {
-        // Use first 3 words of query as topic key
+      for (const item of nonCrossItems) {
         const topicKey = item.query.split(' ').slice(0, 3).join(' ');
         if (!byTopic[topicKey]) byTopic[topicKey] = [];
         byTopic[topicKey].push(item.result.slice(0, 150));
@@ -327,18 +340,27 @@ export class ScoutAgent extends BaseAgent {
       // Build summary lines (most interesting first)
       const summaryLines: string[] = [];
 
-      // Cross-confirmed items first (highest value)
+      // Cross-confirmed items first (highest value) — dedup by extracted topic
       if (crossItems.length > 0) {
-        summaryLines.push(`🔥 ${crossItems.length} cross-confirmed signal(s):`);
-        for (const item of crossItems.slice(0, 3)) {
+        const seenCrossTopics = new Set<string>();
+        const uniqueCross: typeof crossItems = [];
+        for (const item of crossItems) {
+          const tm = item.result.match(/CROSS-CONFIRMED: "([^"]+)"/);
+          const key = tm ? tm[1].toLowerCase() : item.result.slice(0, 80).toLowerCase();
+          if (!seenCrossTopics.has(key)) {
+            seenCrossTopics.add(key);
+            uniqueCross.push(item);
+          }
+        }
+        summaryLines.push(`🔥 ${uniqueCross.length} cross-confirmed signal(s):`);
+        for (const item of uniqueCross.slice(0, 3)) {
           summaryLines.push(`  • ${item.result.slice(0, 180)}`);
         }
       }
 
-      // Topic-grouped summaries
+      // Topic-grouped summaries (cross-confirmed items already excluded above)
       for (const [topic, items] of Object.entries(byTopic)) {
         if (items.length > 0) {
-          // Pick the most substantive result per topic (longest = most info)
           const best = items.sort((a, b) => b.length - a.length)[0];
           summaryLines.push(`📡 ${topic}: ${best.slice(0, 180)}`);
         }

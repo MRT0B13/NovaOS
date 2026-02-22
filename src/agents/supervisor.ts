@@ -180,9 +180,21 @@ export class Supervisor extends BaseAgent {
           logger.debug(`[supervisor] Skipping narrative post (cooldown: ${Math.round((Supervisor.NARRATIVE_COOLDOWN_MS - (now - this.lastNarrativePostAt)) / 60_000)}m remaining)`);
         } else {
           const rawContent = summary || narratives?.summary || 'Check thread for details';
-          // Truncate to prevent wall-of-text in TG/X (max ~280 chars for the body)
-          const trimmed = rawContent.length > 280 ? rawContent.slice(0, 277) + '...' : rawContent;
-          const content = `📡 Narrative shift detected: ${trimmed}`;
+          // Truncate AFTER accounting for prefix so the total fits 280 chars for X.
+          // Truncate at word boundary to avoid mid-word cuts like "facilita".
+          const prefix = '📡 Narrative shift detected: ';
+          const maxBody = 280 - prefix.length;
+          let trimmed: string;
+          if (rawContent.length > maxBody) {
+            // Find last space before the limit (leave room for '...')
+            const cutoff = maxBody - 3;
+            const lastSpace = rawContent.lastIndexOf(' ', cutoff);
+            const breakAt = lastSpace > cutoff * 0.5 ? lastSpace : cutoff;
+            trimmed = rawContent.slice(0, breakAt) + '...';
+          } else {
+            trimmed = rawContent;
+          }
+          const content = `${prefix}${trimmed}`;
 
           // Content dedup — don't post same/similar content to X twice
           const contentHash = content.toLowerCase().replace(/[^a-z ]/g, '').trim().slice(0, 150);
