@@ -1,7 +1,7 @@
 import { logger } from '@elizaos/core';
 import { getEnv } from '../env.ts';
 import { getTwitterReader, XPublisherService } from './xPublisher.ts';
-import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseReads, reportRateLimit, reportReadRateLimit, canReadMentions, canReadSearch, recordMentionRead, recordSearchRead, mentionsCooldownRemaining, searchCooldownRemaining } from './xRateLimiter.ts';
+import { canWrite, canRead, recordRead, getPostingAdvice, getQuota, isPayPerUseReads, reportRateLimit, reportReadRateLimit, canReadMentions, canReadSearch, recordMentionRead, recordSearchRead, mentionsCooldownRemaining, searchCooldownRemaining, getDailyWritesRemaining } from './xRateLimiter.ts';
 import { canPostToX, recordXPost } from './novaPersonalBrand.ts';
 import { getNovaStats, type TokenMover } from './novaPersonalBrand.ts';
 import { scanToken, formatReportForTweet } from './rugcheck.ts';
@@ -144,7 +144,13 @@ export function startReplyEngine(): void {
   const intervalMs = (env.X_REPLY_INTERVAL_MINUTES || 60) * 60 * 1000;
   
   state.running = true;
-  logger.info(`[ReplyEngine] Started (max ${env.X_REPLY_MAX_PER_DAY}/day, every ${env.X_REPLY_INTERVAL_MINUTES || 60}m)`);
+
+  // Show actual remaining so the startup log is truthful after restarts
+  const dailyRemaining = getDailyWritesRemaining();
+  logger.info(`[ReplyEngine] Started (max ${env.X_REPLY_MAX_PER_DAY}/day, every ${env.X_REPLY_INTERVAL_MINUTES || 60}m) — ${dailyRemaining} tweets remaining in 24h window`);
+  if (dailyRemaining <= 0) {
+    logger.warn(`[ReplyEngine] ⚠️ Daily X quota exhausted (0/${env.X_REPLY_MAX_PER_DAY}). Will resume when oldest tweet ages out of 24h window.`);
+  }
   
   // Delay first round by 16 minutes — exceeds X's 15-min rate window.
   // Previous deploy may have burned the mentions/search quota;
@@ -223,6 +229,13 @@ async function runReplyRound(): Promise<void> {
 }
 async function _runReplyRoundInner(): Promise<void> {
   const env = getEnv();
+
+  // Fast-path: skip entire round if X daily quota is exhausted (24h rolling window)
+  const windowRemaining = getDailyWritesRemaining();
+  if (windowRemaining <= 0 || !canWrite()) {
+    logger.info(`[ReplyEngine] Skipping round — daily quota exhausted (${windowRemaining} remaining)`);
+    return;
+  }
   
   // Reset daily counter
   const today = new Date().toISOString().split('T')[0];

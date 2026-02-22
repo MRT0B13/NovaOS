@@ -324,7 +324,15 @@ export async function initLaunchKit(
 
       _swarmHandle.supervisor.setCallbacks({
         onPostToX: async (content: string) => {
-          try { await xPublisher.tweet(content); } catch (err) {
+          try {
+            // Check quota before attempting — avoids noisy error logs when exhausted
+            const { canWrite, getDailyWritesRemaining } = await import('./services/xRateLimiter.ts');
+            if (!canWrite()) {
+              logger.info(`[swarm] Supervisor → X post skipped: daily quota exhausted (${getDailyWritesRemaining()} remaining)`);
+              return;
+            }
+            await xPublisher.tweet(content);
+          } catch (err) {
             logger.warn('[swarm] Supervisor → X post failed:', err);
           }
         },

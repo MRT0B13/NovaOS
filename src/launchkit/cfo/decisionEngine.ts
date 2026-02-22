@@ -897,8 +897,29 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         if (!market) {
           return { ...base, executed: false, error: 'Polymarket market not found' };
         }
-        const token = market.tokens.find((t: any) => t.tokenId === decision.params.tokenId);
+        // Primary: match by tokenId. Fallback: match by outcome (Yes/No side).
+        // The Gamma API may return different tokenId formats between list and
+        // single-market endpoints (legacy tokens[] vs flat clobTokenIds), so
+        // exact tokenId from scan time may not match at execution time.
+        let token = market.tokens.find((t: any) => t.tokenId === decision.params.tokenId);
+        if (!token && decision.params.side) {
+          const sideNorm = String(decision.params.side).toLowerCase();
+          token = market.tokens.find(
+            (t: any) => t.outcome.toLowerCase() === (sideNorm === 'yes' ? 'yes' : 'no'),
+          );
+          if (token) {
+            logger.warn(
+              `[CFO:POLY_BET] tokenId mismatch — stored=${decision.params.tokenId}, ` +
+              `resolved via outcome='${decision.params.side}' → tokenId=${token.tokenId}`,
+            );
+          }
+        }
         if (!token) {
+          logger.error(
+            `[CFO:POLY_BET] Token not found — conditionId=${decision.params.conditionId}, ` +
+            `storedTokenId=${decision.params.tokenId}, side=${decision.params.side}, ` +
+            `available=[${market.tokens.map((t: any) => `${t.outcome}:${t.tokenId}`).join(', ')}]`,
+          );
           return { ...base, executed: false, error: 'Polymarket token not found in market' };
         }
         const order = await polyMod.placeBuyOrder(market, token, decision.params.sizeUsd);
@@ -956,44 +977,67 @@ export function formatDecisionReport(
 ): string {
   const L: string[] = [];
 
-  // ── Header ──
-  L.push(`🧠 *CFO Report*${dryRun ? ' (DRY RUN)' : ''}`);
+  // ── Human-readable type names ──
+  const typeName: Record<string, string> = {
+    OPEN_HEDGE: 'Open Hedge',
+    CLOSE_HEDGE: 'Close Hedge',
+    REBALANCE_HEDGE: 'Rebalance Hedge',
+    AUTO_STAKE: 'Stake SOL',
+    UNSTAKE_JITO: 'Unstake JitoSOL',
+    POLY_BET: 'Prediction Bet',
+    POLY_EXIT: 'Close Prediction',
+    SKIP: 'No Action',
+  };
 
-  // ── Intel (one compact line) ──
+  // ── Header ──
+  L.push(`🧠 *CFO Report*${dryRun ? '  _(simulation)_' : ''}`);
+
+  // ── Intel (compact, only if present) ──
   if (intel && (intel.scoutReceivedAt || intel.guardianReceivedAt || intel.analystReceivedAt)) {
-    const parts: string[] = [`risk ×${intel.riskMultiplier.toFixed(1)} ${intel.marketCondition}`];
-    if (intel.scoutReceivedAt) parts.push(`Scout: ${intel.scoutBullish ? '🟢' : '🔴'}`);
-    if (intel.guardianReceivedAt) parts.push(`Guard: ${intel.guardianCritical ? '🚨' : '✅'}`);
-    if (intel.analystReceivedAt) parts.push(`Analyst: ${intel.analystVolumeSpike ? '📈' : '📊'}`);
-    L.push(`📡 ${parts.join(' | ')}`);
+    const parts: string[] = [];
+    if (intel.scoutReceivedAt) parts.push(`Scout ${intel.scoutBullish ? 'bullish' : 'bearish'}`);
+    if (intel.guardianReceivedAt) parts.push(`Guard ${intel.guardianCritical ? 'alert' : 'clear'}`);
+    if (intel.analystReceivedAt) parts.push(`Analyst ${intel.analystVolumeSpike ? 'spike' : 'normal'}`);
+    L.push(`📡 ${intel.marketCondition} · risk ×${intel.riskMultiplier.toFixed(1)} · ${parts.join(' · ')}`);
   }
 
-  // ── Portfolio (compact) ──
-  const bal: string[] = [`SOL: ${state.solBalance.toFixed(2)} ($${state.solExposureUsd.toFixed(0)})`];
-  if (state.jitoSolBalance > 0) bal.push(`JitoSOL: $${state.jitoSolValueUsd.toFixed(0)}`);
-  if (state.hlEquity > 0) bal.push(`HL: $${state.hlEquity.toFixed(0)}`);
-  if (state.polyDeployedUsd > 0 || state.polyPositionCount > 0) bal.push(`Poly: $${state.polyDeployedUsd.toFixed(0)}`);
+  // ── Portfolio ──
+  const bal: string[] = [`SOL ${state.solBalance.toFixed(2)} ($${state.solExposureUsd.toFixed(0)})`];
+  if (state.jitoSolBalance > 0) bal.push(`JitoSOL $${state.jitoSolValueUsd.toFixed(0)}`);
+  if (state.hlEquity > 0) bal.push(`HL $${state.hlEquity.toFixed(0)}`);
+  if (state.polyDeployedUsd > 0 || state.polyPositionCount > 0) bal.push(`Poly $${state.polyDeployedUsd.toFixed(0)}`);
   L.push(`💰 *$${state.totalPortfolioUsd.toFixed(0)}* — ${bal.join(' · ')}`);
-  L.push(`🛡️ Hedge: ${(state.hedgeRatio * 100).toFixed(0)}% | SOL @ $${state.solPriceUsd.toFixed(0)}`);
+  L.push(`🛡 Hedge ${(state.hedgeRatio * 100).toFixed(0)}% · SOL @ $${state.solPriceUsd.toFixed(0)}`);
 
   // ── Decisions ──
   if (results.length === 0) {
-    L.push(`\n✅ All good — no action needed.`);
+    L.push(`\n✅ Portfolio balanced — no actions required.`);
   } else {
-    L.push(`\n*${results.length} Decision(s):*`);
+    L.push('');
     for (const r of results) {
       const d = r.decision;
+      const name = typeName[d.type] ?? d.type;
       const icon = r.pendingApproval ? '⏳' : r.success ? (r.executed ? '✅' : '📋') : '❌';
-      const tierIcon = d.tier === 'APPROVAL' ? '🔴' : d.tier === 'NOTIFY' ? '🟡' : '🟢';
-      const status = r.pendingApproval
-        ? 'NEEDS APPROVAL'
-        : r.dryRun ? 'dry run'
-          : r.executed ? (r.success ? 'done' : `failed`) : 'skipped';
 
-      L.push(`${icon} ${tierIcon} *${d.type}* [${d.tier}] ${status}`);
-      L.push(`   💰 $${Math.abs(d.estimatedImpactUsd).toFixed(0)} | ${_shortReason(d)}`);
-      if (r.error && !r.success) L.push(`   ❌ ${r.error}`);
-      if (r.txId) L.push(`   🔗 tx: ${r.txId}`);
+      const status = r.pendingApproval
+        ? 'awaiting approval'
+        : r.dryRun ? 'simulated'
+          : r.executed ? (r.success ? 'complete' : 'failed') : 'skipped';
+
+      L.push(`${icon} *${name}* — ${status}`);
+
+      // Detail line: amount + short reason
+      const reason = _shortReason(d);
+      const amt = Math.abs(d.estimatedImpactUsd);
+      if (amt > 0) {
+        L.push(`     $${amt.toFixed(0)} · ${reason}`);
+      } else {
+        L.push(`     ${reason}`);
+      }
+
+      // Error line (only on failure)
+      if (r.error && !r.success) L.push(`     ⚠️ ${r.error}`);
+      if (r.txId) L.push(`     🔗 ${r.txId}`);
     }
   }
 
@@ -1006,20 +1050,22 @@ function _shortReason(d: Decision): string {
   const p = d.params ?? {};
   switch (t) {
     case 'OPEN_HEDGE':
-      return `SHORT $${p.solExposureUsd ?? d.estimatedImpactUsd} SOL-PERP (target ${p.targetHedgeRatio ? (p.targetHedgeRatio * 100).toFixed(0) + '%' : '?'})`;
+      return `Short SOL-PERP → ${p.targetHedgeRatio ? (p.targetHedgeRatio * 100).toFixed(0) + '% hedge' : 'hedge'}`;
     case 'CLOSE_HEDGE':
-      return `Close hedge — reduce exposure`;
+      return `Reduce hedge exposure`;
     case 'AUTO_STAKE':
-      return `Stake ${p.amount?.toFixed(2) ?? '?'} SOL → JitoSOL (~7% APY)`;
-    case 'UNSTAKE':
-      return `Unstake ${p.amount?.toFixed(2) ?? '?'} JitoSOL → SOL`;
-    case 'POLY_BET':
-      return `"${(p.marketQuestion ?? '').slice(0, 50)}" — edge ${((p.edge ?? 0) * 100).toFixed(0)}%`;
+      return `${p.amount?.toFixed(2) ?? '?'} SOL → JitoSOL (≈7% APY)`;
+    case 'UNSTAKE_JITO':
+      return `${p.amount?.toFixed(2) ?? '?'} JitoSOL → SOL`;
+    case 'POLY_BET': {
+      const q = (p.marketQuestion ?? '').slice(0, 55);
+      const edge = p.edge ? `${(p.edge * 100).toFixed(0)}% edge` : '';
+      return q ? `${q}${edge ? ` · ${edge}` : ''}` : edge || 'Prediction bet';
+    }
     case 'POLY_EXIT':
       return `Exit prediction position`;
     default:
-      // Fallback: truncate the raw reasoning
-      return d.reasoning.length > 80 ? d.reasoning.slice(0, 77) + '...' : d.reasoning;
+      return d.reasoning.length > 80 ? d.reasoning.slice(0, 77) + '…' : d.reasoning;
   }
 }
 

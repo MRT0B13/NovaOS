@@ -109,33 +109,72 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           // Silently ignore caching errors
         }
         
-        // ── Security: scan inbound message for threats ──────────
-        // Checks for phishing links, scam addresses, prompt injection,
-        // and leaked secrets before the message reaches the LLM pipeline.
+        // ── Security: check ban cache + scan inbound threats ────
         try {
           const message = (ctx as any).message || (ctx as any).edited_message;
+          const fromId = message?.from?.id;
+          const chatId = String(message?.chat?.id || '');
+
+          // 1) Fast-path: if user is already banned, delete & skip
+          if (fromId && isUserBanned(fromId)) {
+            console.log(`[BAN_HANDLER] 🚫 Banned user ${fromId} tried to message in ${chatId} — deleting`);
+            try { await ctx.deleteMessage(); } catch { /* no perms */ }
+            // Re-enforce the ban in case TG un-cached it
+            try { await ctx.telegram.banChatMember(Number(chatId), fromId, 0); } catch { /* already banned */ }
+            return;
+          }
+
+          // 2) Content scan for phishing, injection, scam, secrets
           const text = message?.text || message?.caption || '';
           if (text.length > 0) {
             const { ContentFilter } = await import('../../agents/security/index.ts');
             const filter = new ContentFilter(null as any, async () => {});
             const scanResult = filter.scanInbound(
               text,
-              String(message?.from?.id || ''),
-              String(message?.chat?.id || ''),
+              String(fromId || ''),
+              chatId,
             );
             if (!scanResult.clean) {
-              const hasCritical = scanResult.threats.some(t => t.severity === 'critical' || t.severity === 'high');
+              const hasCritical = scanResult.threats.some(
+                (t: any) => t.severity === 'critical' || t.severity === 'high',
+              );
               if (hasCritical) {
-                console.log(`[BAN_HANDLER] 🛡️ BLOCKED message from ${message?.from?.id}: ${scanResult.threats.map(t => t.type).join(', ')}`);
-                // Try to delete the malicious message
-                try {
-                  await ctx.deleteMessage();
-                } catch { /* may not have delete permission */ }
+                const threatTypes = scanResult.threats.map((t: any) => t.type).join(', ');
+                console.log(`[BAN_HANDLER] 🛡️ BLOCKED message from ${fromId}: ${threatTypes}`);
+
+                // Delete the malicious message
+                try { await ctx.deleteMessage(); } catch { /* may not have delete permission */ }
+
+                // Auto-ban the attacker + cross-ban channel ↔ community
+                if (fromId) {
+                  const fromUser = message?.from;
+                  const banReason = `Guardian auto-ban: ${threatTypes}`;
+                  try {
+                    await ctx.telegram.banChatMember(Number(chatId), fromId, 0);
+                    console.log(`[BAN_HANDLER] 🔨 Auto-banned user ${fromId} for ${threatTypes}`);
+                  } catch (banErr: any) {
+                    console.error(`[BAN_HANDLER] Auto-ban failed for ${fromId}:`, banErr.message);
+                  }
+                  // Persist to ban cache (file + PostgreSQL)
+                  recordBannedUser({
+                    id: fromId,
+                    username: fromUser?.username,
+                    firstName: fromUser?.first_name,
+                    chatId,
+                    bannedAt: Date.now(),
+                    bannedBy: 0, // 0 = Guardian auto-ban (not a human admin)
+                    bannedByUsername: 'guardian',
+                    reason: banReason,
+                  });
+                  // Cross-ban from both channel & community
+                  crossBanUser(fromId, { reason: banReason, originChatId: chatId })
+                    .catch(e => console.error('[BAN_HANDLER] Guardian cross-ban error:', e));
+                }
                 // Don't pass to LLM — return early
                 return;
               }
               // Non-critical threats: log but let through
-              console.log(`[BAN_HANDLER] ⚠️ Suspicious message from ${message?.from?.id}: ${scanResult.threats.map(t => t.type).join(', ')}`);
+              console.log(`[BAN_HANDLER] ⚠️ Suspicious message from ${fromId}: ${scanResult.threats.map((t: any) => t.type).join(', ')}`);
             }
           }
         } catch {

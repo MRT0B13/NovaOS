@@ -189,6 +189,15 @@ async function loadUsage(): Promise<void> {
   const dailyRemaining = Math.max(0, DAILY_WRITE_LIMIT - dailyUsed);
   logger.info(`[X-RateLimiter] 24h window: ${dailyUsed} tweets sent, ${dailyRemaining} daily remaining`);
 
+  if (dailyRemaining <= 0) {
+    // Oldest tweet that will age out of the 24h window:
+    const oldestTs = recentWriteTimestamps[0];
+    const resumeAt = oldestTs ? new Date(oldestTs + DAILY_WINDOW_MS).toISOString() : 'unknown';
+    logger.warn(`[X-RateLimiter] ⚠️ DAILY QUOTA EXHAUSTED on restart (${dailyUsed}/${DAILY_WRITE_LIMIT}). All X writes blocked until ${resumeAt}`);
+  } else if (dailyRemaining <= 3) {
+    logger.warn(`[X-RateLimiter] ⚠️ LOW DAILY QUOTA on restart: ${dailyRemaining} tweets remaining`);
+  }
+
   // Reset startup cooldown clock
   startupTime = Date.now();
   logger.info(`[X-RateLimiter] Startup write cooldown active for ${STARTUP_WRITE_COOLDOWN_MS / 1000}s`);

@@ -45,6 +45,9 @@ import {
   type IncidentCallbacks,
 } from './security/index.ts';
 
+// Ban system integration — Guardian reads (and triggers) bans
+import { getBannedUsers, getBannedUsersCount, isUserBanned } from '../launchkit/services/systemReporter.ts';
+
 // Lazy imports
 let _scanToken: ((mint: string) => Promise<any>) | null = null;
 let _isSafe: ((report: any) => boolean) | null = null;
@@ -691,6 +694,13 @@ export class GuardianAgent extends BaseAgent {
 
   /** Get full security status including all modules */
   getSecurityStatus() {
+    // Pull in ban cache stats
+    const bannedCount = getBannedUsersCount();
+    const recentBans = getBannedUsers()
+      .filter(b => Date.now() - b.bannedAt < 24 * 60 * 60 * 1000); // last 24h
+    const guardianBans = getBannedUsers()
+      .filter(b => b.bannedBy === 0 || b.bannedByUsername === 'guardian');
+
     return {
       securityInitialized: this.securityInitialized,
       walletSentinel: this.securityInitialized ? this.walletSentinel.getStatus() : null,
@@ -698,6 +708,18 @@ export class GuardianAgent extends BaseAgent {
       contentFilter: this.securityInitialized ? this.contentFilter.getStatus() : null,
       agentWatchdog: this.securityInitialized ? this.agentWatchdog.getStatus() : null,
       incidentResponse: this.securityInitialized ? this.incidentResponse.getStatus() : null,
+      banCache: {
+        totalBanned: bannedCount,
+        bansLast24h: recentBans.length,
+        guardianAutoBans: guardianBans.length,
+        recentBans: recentBans.slice(-5).map(b => ({
+          userId: b.id,
+          username: b.username,
+          reason: b.reason,
+          bannedAt: new Date(b.bannedAt).toISOString(),
+          bannedBy: b.bannedByUsername || String(b.bannedBy),
+        })),
+      },
     };
   }
 
