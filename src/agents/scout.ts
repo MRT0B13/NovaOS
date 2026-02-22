@@ -223,9 +223,12 @@ export class ScoutAgent extends BaseAgent {
           if (this.trendSnapshots.length > 10) this.trendSnapshots = this.trendSnapshots.slice(-5);
 
           // Cross-confirm: trend pool topic found in Tavily results
+          // Skip results already confirmed (prevents multi-trend re-tagging)
           for (const trend of poolStats.topTrends) {
             const keyword = trend.topic.toLowerCase().split(' ')[0];
+            if (!keyword || keyword.length < 3) continue; // skip tiny keywords
             for (const r of results) {
+              if (r.crossConfirmed) continue; // already tagged — don't overwrite
               if (r.result.toLowerCase().includes(keyword)) {
                 r.crossConfirmed = true;
                 r.result = `CROSS-CONFIRMED: "${trend.topic}" seen in pool(${trend.sources.join(',')}) + web search — ${r.result.slice(0, 200)}`;
@@ -256,12 +259,25 @@ export class ScoutAgent extends BaseAgent {
       // ── IMMEDIATE ALERT: Only CROSS-CONFIRMED intel breaks out of digest ──
       const crossConfirmed = results.filter(r => r.crossConfirmed);
       if (crossConfirmed.length > 0) {
-        const breakingSummary = crossConfirmed.map(r => r.result.slice(0, 200)).join(' | ');
-        logger.info(`[scout] 🚨 CROSS-CONFIRMED signal — sending immediate alert`);
+        // Deduplicate by extracting the quoted topic from each CROSS-CONFIRMED result
+        const seenTopics = new Set<string>();
+        const uniqueItems: string[] = [];
+        for (const r of crossConfirmed) {
+          // Extract topic: CROSS-CONFIRMED: "TopicHere" ...
+          const topicMatch = r.result.match(/CROSS-CONFIRMED: "([^"]+)"/);
+          const key = topicMatch ? topicMatch[1].toLowerCase() : r.result.slice(0, 80).toLowerCase();
+          if (!seenTopics.has(key)) {
+            seenTopics.add(key);
+            uniqueItems.push(r.result.slice(0, 200));
+          }
+        }
+        // Cap at 3 items to prevent wall-of-text
+        const breakingSummary = uniqueItems.slice(0, 3).join(' | ');
+        logger.info(`[scout] 🚨 ${uniqueItems.length} unique CROSS-CONFIRMED signal(s) — sending immediate alert`);
         await this.reportToSupervisor('intel', 'high', {
           intel_type: 'narrative_shift',
           summary: breakingSummary,
-          resultsCount: crossConfirmed.length,
+          resultsCount: uniqueItems.length,
           trendPool: trendSummary || undefined,
           immediate: true,
         });

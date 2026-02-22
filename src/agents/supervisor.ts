@@ -174,7 +174,10 @@ export class Supervisor extends BaseAgent {
         if (now - this.lastNarrativePostAt < Supervisor.NARRATIVE_COOLDOWN_MS) {
           logger.debug(`[supervisor] Skipping narrative post (cooldown: ${Math.round((Supervisor.NARRATIVE_COOLDOWN_MS - (now - this.lastNarrativePostAt)) / 60_000)}m remaining)`);
         } else {
-          const content = `📡 Narrative shift detected: ${summary || narratives?.summary || 'Check thread for details'}`;
+          const rawContent = summary || narratives?.summary || 'Check thread for details';
+          // Truncate to prevent wall-of-text in TG/X (max ~280 chars for the body)
+          const trimmed = rawContent.length > 280 ? rawContent.slice(0, 277) + '...' : rawContent;
+          const content = `📡 Narrative shift detected: ${trimmed}`;
 
           // Content dedup — don't post same/similar content to X twice
           const contentHash = content.toLowerCase().replace(/[^a-z ]/g, '').trim().slice(0, 150);
