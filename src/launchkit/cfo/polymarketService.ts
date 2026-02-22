@@ -303,18 +303,20 @@ function getL2Headers(
 // ============================================================================
 
 let cachedCreds: CLOBCredentials | null = null;
+let envCredsExhausted = false; // true after env creds cause a 401
 
 /**
- * Get CLOB credentials — uses env vars if provided, otherwise derives
- * from wallet via L1 auth.  Result is cached for the process lifetime.
+ * Get CLOB credentials — uses env vars if provided (unless they already
+ * caused a 401), otherwise derives from wallet via L1 auth.
+ * Result is cached for the process lifetime until invalidated.
  */
 export async function getCLOBCredentials(): Promise<CLOBCredentials> {
   if (cachedCreds) return cachedCreds;
 
   const env = getCFOEnv();
 
-  // If all three creds are provided via env, use them
-  if (env.polymarketApiKey && env.polymarketApiSecret && env.polymarketPassphrase) {
+  // Use env-provided creds unless they already failed with 401
+  if (!envCredsExhausted && env.polymarketApiKey && env.polymarketApiSecret && env.polymarketPassphrase) {
     cachedCreds = {
       apiKey: env.polymarketApiKey,
       secret: env.polymarketApiSecret,
@@ -324,7 +326,7 @@ export async function getCLOBCredentials(): Promise<CLOBCredentials> {
     return cachedCreds;
   }
 
-  // Derive credentials via L1 auth
+  // Derive fresh credentials via L1 auth
   logger.info('[Polymarket] Deriving CLOB credentials via L1 auth...');
   const l1Headers = await getL1Headers();
 
@@ -345,14 +347,15 @@ export async function getCLOBCredentials(): Promise<CLOBCredentials> {
   }
 
   cachedCreds = data;
-  logger.info('[Polymarket] CLOB credentials derived successfully');
+  logger.info('[Polymarket] CLOB credentials derived successfully via L1');
   return cachedCreds;
 }
 
-/** Force re-derivation of CLOB credentials (call on auth errors) */
+/** Force re-derivation of CLOB credentials (call on 401 errors) */
 export function invalidateCLOBCredentials(): void {
   cachedCreds = null;
-  logger.warn('[Polymarket] CLOB credentials invalidated — will re-derive on next request');
+  envCredsExhausted = true; // env creds failed; next call will use L1 derivation
+  logger.warn('[Polymarket] CLOB credentials invalidated — will re-derive via L1 on next request');
 }
 
 // ============================================================================
@@ -370,9 +373,19 @@ async function clobGet<T>(path: string, authed = false): Promise<T> {
 
   const resp = await fetch(`${CLOB_BASE}${path}`, { headers });
 
-  if (resp.status === 401) {
+  if (resp.status === 401 && authed) {
+    // Invalidate stale creds, derive fresh via L1, and retry once
     invalidateCLOBCredentials();
-    throw new Error('[Polymarket] CLOB 401 — credentials refreshed, retry');
+    logger.warn(`[Polymarket] CLOB GET ${path} got 401 — retrying with fresh creds`);
+    const freshCreds = await getCLOBCredentials();
+    const freshHeaders = getL2Headers(freshCreds, 'GET', path);
+    Object.assign(headers, freshHeaders);
+    const retry = await fetch(`${CLOB_BASE}${path}`, { headers });
+    if (!retry.ok) {
+      const text = await retry.text();
+      throw new Error(`[Polymarket] CLOB GET ${path} failed after retry (${retry.status}): ${text}`);
+    }
+    return retry.json() as Promise<T>;
   }
 
   if (!resp.ok) {
@@ -395,8 +408,22 @@ async function clobPost<T>(path: string, body: unknown): Promise<T> {
   });
 
   if (resp.status === 401) {
+    // Invalidate stale creds, derive fresh via L1, and retry once
     invalidateCLOBCredentials();
-    throw new Error('[Polymarket] CLOB 401 — credentials refreshed, retry');
+    logger.warn(`[Polymarket] CLOB POST ${path} got 401 — retrying with fresh creds`);
+    const freshCreds = await getCLOBCredentials();
+    const freshBodyStr = JSON.stringify(body); // re-serialize in case body was mutated
+    const freshHeaders = getL2Headers(freshCreds, 'POST', path, freshBodyStr);
+    const retry = await fetch(`${CLOB_BASE}${path}`, {
+      method: 'POST',
+      headers: freshHeaders,
+      body: freshBodyStr,
+    });
+    if (!retry.ok) {
+      const text = await retry.text();
+      throw new Error(`[Polymarket] CLOB POST ${path} failed after retry (${retry.status}): ${text}`);
+    }
+    return retry.json() as Promise<T>;
   }
 
   if (!resp.ok) {
@@ -415,7 +442,15 @@ async function clobDelete<T>(path: string): Promise<T> {
 
   if (resp.status === 401) {
     invalidateCLOBCredentials();
-    throw new Error('[Polymarket] CLOB 401 — credentials refreshed, retry');
+    logger.warn(`[Polymarket] CLOB DELETE ${path} got 401 — retrying with fresh creds`);
+    const freshCreds = await getCLOBCredentials();
+    const freshHeaders = getL2Headers(freshCreds, 'DELETE', path);
+    const retry = await fetch(`${CLOB_BASE}${path}`, { method: 'DELETE', headers: freshHeaders });
+    if (!retry.ok) {
+      const text = await retry.text();
+      throw new Error(`[Polymarket] CLOB DELETE ${path} failed after retry (${retry.status}): ${text}`);
+    }
+    return retry.json() as Promise<T>;
   }
 
   if (!resp.ok) {
