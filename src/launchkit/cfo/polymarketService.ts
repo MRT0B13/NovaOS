@@ -1265,6 +1265,59 @@ async function buildSignedOrder(params: OrderParams): Promise<SignedOrder> {
 }
 
 // ============================================================================
+// USDC Allowance Management
+// ============================================================================
+
+/** Track which exchange contracts have been approved this session */
+const _approvedExchanges = new Set<string>();
+
+/**
+ * Ensure the wallet has approved USDC.e spending for the target exchange contract.
+ * Polymarket uses two exchange contracts: CTF Exchange and NegRisk CTF Exchange.
+ * Orders will fail with "not enough balance / allowance" if the wrong one lacks approval.
+ *
+ * This auto-approves max uint256 on first call per contract per session.
+ */
+async function ensureAllowance(negRisk: boolean): Promise<void> {
+  const exchangeAddr = negRisk ? NEG_RISK_CTF_EXCHANGE : CTF_EXCHANGE;
+  const label = negRisk ? 'NegRisk Exchange' : 'CTF Exchange';
+
+  // Skip if already approved this session
+  if (_approvedExchanges.has(exchangeAddr)) return;
+
+  try {
+    const { wallet, ethers: eth } = await loadEthers();
+    const env = getCFOEnv();
+    const provider = new eth.JsonRpcProvider(env.polygonRpcUrl);
+    const connectedWallet = wallet.connect(provider);
+
+    const erc20 = new eth.Contract(USDC_POLYGON, [
+      'function allowance(address owner, address spender) view returns (uint256)',
+      'function approve(address spender, uint256 amount) returns (bool)',
+    ], connectedWallet);
+
+    const currentAllowance = await erc20.allowance(wallet.address, exchangeAddr);
+    // If allowance is already > 1B USDC (i.e. basically unlimited), skip
+    if (currentAllowance > eth.parseUnits('1000000000', 6)) {
+      _approvedExchanges.add(exchangeAddr);
+      logger.debug(`[Polymarket] ${label} already has sufficient USDC.e allowance`);
+      return;
+    }
+
+    // Approve max uint256
+    logger.info(`[Polymarket] Approving USDC.e for ${label} (${exchangeAddr})...`);
+    const tx = await erc20.approve(exchangeAddr, eth.MaxUint256);
+    logger.info(`[Polymarket] Approval tx: ${tx.hash} — waiting for confirmation...`);
+    await tx.wait(1);
+    logger.info(`[Polymarket] USDC.e approved for ${label} ✓`);
+    _approvedExchanges.add(exchangeAddr);
+  } catch (err) {
+    // Non-fatal: log warning but let the order attempt proceed (it will fail with clear error)
+    logger.warn(`[Polymarket] Failed to auto-approve USDC.e for ${label}: ${(err as Error).message}`);
+  }
+}
+
+// ============================================================================
 // Order Management
 // ============================================================================
 
@@ -1319,6 +1372,9 @@ export async function placeBuyOrder(
       const feeResp = await clobGet<{ base_fee: number }>(`/fee-rate?token_id=${token.tokenId}`);
       feeRateBps = feeResp?.base_fee ?? 0;
     } catch { /* default 0 */ }
+
+    // Ensure USDC.e is approved for the correct exchange contract
+    await ensureAllowance(negRisk);
 
     const tickSize = parseFloat(market.minimumTickSize || '0.01');
     const signedOrder = await buildSignedOrder({
@@ -1539,6 +1595,9 @@ export async function exitPosition(
       const mktResp = await clobGet<{ minimum_tick_size?: string }>(`/markets/${position.conditionId}`);
       tickSize = parseFloat(mktResp?.minimum_tick_size || '0.01');
     } catch { /* default 0.01 */ }
+
+    // Ensure USDC.e is approved for the correct exchange contract
+    await ensureAllowance(negRisk);
 
     const signedOrder = await buildSignedOrder({
       tokenId: position.tokenId,
