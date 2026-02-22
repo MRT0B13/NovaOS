@@ -47,6 +47,9 @@ const NEG_RISK_CTF_EXCHANGE = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
 /** USDC.e on Polygon (6 decimals) */
 const USDC_POLYGON = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
 
+/** ConditionalTokens (ERC-1155) on Polygon — exchanges need setApprovalForAll */
+const CONDITIONAL_TOKENS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
+
 const POLYGON_CHAIN_ID = 137;
 
 /** Keywords that define a "crypto / tech" market — CFO's edge territory */
@@ -1270,20 +1273,28 @@ async function buildSignedOrder(params: OrderParams): Promise<SignedOrder> {
 
 /** Track which exchange contracts have been approved this session */
 const _approvedExchanges = new Set<string>();
+/** Track which exchange contracts have CT (ConditionalTokens) isApprovedForAll this session */
+const _approvedCTExchanges = new Set<string>();
 
 /**
- * Ensure the wallet has approved USDC.e spending for the target exchange contract.
- * Polymarket uses two exchange contracts: CTF Exchange and NegRisk CTF Exchange.
- * Orders will fail with "not enough balance / allowance" if the wrong one lacks approval.
+ * Ensure the wallet has approved BOTH:
+ *   1. USDC.e spending (ERC-20 approve) for the target exchange contract
+ *   2. ConditionalTokens management (ERC-1155 setApprovalForAll) for the target exchange
  *
- * This auto-approves max uint256 on first call per contract per session.
+ * Polymarket uses two exchange contracts: CTF Exchange and NegRisk CTF Exchange.
+ * The CLOB pre-flight check validates both approvals — orders fail with
+ * "not enough balance / allowance" when either is missing.
+ *
+ * Auto-approves max uint256 / true on first call per contract per session.
  */
 async function ensureAllowance(negRisk: boolean): Promise<void> {
   const exchangeAddr = negRisk ? NEG_RISK_CTF_EXCHANGE : CTF_EXCHANGE;
   const label = negRisk ? 'NegRisk Exchange' : 'CTF Exchange';
 
-  // Skip if already approved this session
-  if (_approvedExchanges.has(exchangeAddr)) return;
+  const needsUsdcApproval = !_approvedExchanges.has(exchangeAddr);
+  const needsCTApproval = !_approvedCTExchanges.has(exchangeAddr);
+
+  if (!needsUsdcApproval && !needsCTApproval) return;
 
   try {
     const { wallet, ethers: eth } = await loadEthers();
@@ -1291,29 +1302,50 @@ async function ensureAllowance(negRisk: boolean): Promise<void> {
     const provider = new eth.JsonRpcProvider(env.polygonRpcUrl);
     const connectedWallet = wallet.connect(provider);
 
-    const erc20 = new eth.Contract(USDC_POLYGON, [
-      'function allowance(address owner, address spender) view returns (uint256)',
-      'function approve(address spender, uint256 amount) returns (bool)',
-    ], connectedWallet);
+    // ── 1. USDC.e ERC-20 allowance ──
+    if (needsUsdcApproval) {
+      const erc20 = new eth.Contract(USDC_POLYGON, [
+        'function allowance(address owner, address spender) view returns (uint256)',
+        'function approve(address spender, uint256 amount) returns (bool)',
+      ], connectedWallet);
 
-    const currentAllowance = await erc20.allowance(wallet.address, exchangeAddr);
-    // If allowance is already > 1B USDC (i.e. basically unlimited), skip
-    if (currentAllowance > eth.parseUnits('1000000000', 6)) {
-      _approvedExchanges.add(exchangeAddr);
-      logger.debug(`[Polymarket] ${label} already has sufficient USDC.e allowance`);
-      return;
+      const currentAllowance = await erc20.allowance(wallet.address, exchangeAddr);
+      if (currentAllowance > eth.parseUnits('1000000000', 6)) {
+        _approvedExchanges.add(exchangeAddr);
+        logger.debug(`[Polymarket] ${label} already has sufficient USDC.e allowance`);
+      } else {
+        logger.info(`[Polymarket] Approving USDC.e for ${label} (${exchangeAddr})...`);
+        const tx = await erc20.approve(exchangeAddr, eth.MaxUint256);
+        logger.info(`[Polymarket] USDC.e approval tx: ${tx.hash} — waiting...`);
+        await tx.wait(1);
+        logger.info(`[Polymarket] USDC.e approved for ${label} ✓`);
+        _approvedExchanges.add(exchangeAddr);
+      }
     }
 
-    // Approve max uint256
-    logger.info(`[Polymarket] Approving USDC.e for ${label} (${exchangeAddr})...`);
-    const tx = await erc20.approve(exchangeAddr, eth.MaxUint256);
-    logger.info(`[Polymarket] Approval tx: ${tx.hash} — waiting for confirmation...`);
-    await tx.wait(1);
-    logger.info(`[Polymarket] USDC.e approved for ${label} ✓`);
-    _approvedExchanges.add(exchangeAddr);
+    // ── 2. ConditionalTokens ERC-1155 setApprovalForAll ──
+    if (needsCTApproval) {
+      const ct = new eth.Contract(CONDITIONAL_TOKENS, [
+        'function isApprovedForAll(address owner, address operator) view returns (bool)',
+        'function setApprovalForAll(address operator, bool approved)',
+      ], connectedWallet);
+
+      const isApproved = await ct.isApprovedForAll(wallet.address, exchangeAddr);
+      if (isApproved) {
+        _approvedCTExchanges.add(exchangeAddr);
+        logger.debug(`[Polymarket] ${label} already has ConditionalTokens approval`);
+      } else {
+        logger.info(`[Polymarket] Setting ConditionalTokens approval for ${label} (${exchangeAddr})...`);
+        const tx = await ct.setApprovalForAll(exchangeAddr, true);
+        logger.info(`[Polymarket] CT approval tx: ${tx.hash} — waiting...`);
+        await tx.wait(1);
+        logger.info(`[Polymarket] ConditionalTokens approved for ${label} ✓`);
+        _approvedCTExchanges.add(exchangeAddr);
+      }
+    }
   } catch (err) {
     // Non-fatal: log warning but let the order attempt proceed (it will fail with clear error)
-    logger.warn(`[Polymarket] Failed to auto-approve USDC.e for ${label}: ${(err as Error).message}`);
+    logger.warn(`[Polymarket] Failed to ensure approvals for ${label}: ${(err as Error).message}`);
   }
 }
 
@@ -1402,6 +1434,12 @@ export async function placeBuyOrder(
       orderType: 'GTC' as const,
       deferExec: false,
     };
+
+    logger.debug(
+      `[Polymarket] Order payload: negRisk=${negRisk} tick=${tickSize} ` +
+      `price=${token.price} maker=${signedOrder.makerAmount} taker=${signedOrder.takerAmount} ` +
+      `fee=${feeRateBps} exchange=${negRisk ? 'NegRisk' : 'CTF'}`,
+    );
 
     const response = await clobPost<{ orderID: string; status: string; transactionsHashes?: string[] }>(
       '/order',
