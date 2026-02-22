@@ -50,6 +50,10 @@ const USDC_POLYGON = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
 /** ConditionalTokens (ERC-1155) on Polygon — exchanges need setApprovalForAll */
 const CONDITIONAL_TOKENS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
 
+/** NegRisk Adapter — neg-risk markets route USDC through this contract.
+ *  Requires BOTH USDC.e approve AND CT setApprovalForAll (in addition to NegRisk Exchange). */
+const NEG_RISK_ADAPTER = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296';
+
 const POLYGON_CHAIN_ID = 137;
 
 /** Keywords that define a "crypto / tech" market — CFO's edge territory */
@@ -1277,13 +1281,17 @@ const _approvedExchanges = new Set<string>();
 const _approvedCTExchanges = new Set<string>();
 
 /**
- * Ensure the wallet has approved BOTH:
- *   1. USDC.e spending (ERC-20 approve) for the target exchange contract
- *   2. ConditionalTokens management (ERC-1155 setApprovalForAll) for the target exchange
+ * Ensure the wallet has all required approvals for the target exchange.
  *
- * Polymarket uses two exchange contracts: CTF Exchange and NegRisk CTF Exchange.
- * The CLOB pre-flight check validates both approvals — orders fail with
- * "not enough balance / allowance" when either is missing.
+ * Polymarket requires approvals on up to 3 contracts per exchange:
+ *   1. USDC.e ERC-20 approve → Exchange contract
+ *   2. ConditionalTokens ERC-1155 setApprovalForAll → Exchange contract
+ *   3. (Neg-risk only) USDC.e approve + CT setApprovalForAll → NegRisk Adapter
+ *
+ * The NegRisk Adapter (`0xd91E...5296`) is a separate contract that routes
+ * USDC.e deposits for neg-risk (multi-outcome) markets.  Without it, neg-risk
+ * orders fail with "not enough balance / allowance" even when the Exchange
+ * itself is approved.
  *
  * Auto-approves max uint256 / true on first call per contract per session.
  */
@@ -1291,10 +1299,17 @@ async function ensureAllowance(negRisk: boolean): Promise<void> {
   const exchangeAddr = negRisk ? NEG_RISK_CTF_EXCHANGE : CTF_EXCHANGE;
   const label = negRisk ? 'NegRisk Exchange' : 'CTF Exchange';
 
-  const needsUsdcApproval = !_approvedExchanges.has(exchangeAddr);
-  const needsCTApproval = !_approvedCTExchanges.has(exchangeAddr);
+  // For neg-risk markets we also need the NegRisk Adapter approved
+  const targets = [exchangeAddr];
+  const labels = [label];
+  if (negRisk) {
+    targets.push(NEG_RISK_ADAPTER);
+    labels.push('NegRisk Adapter');
+  }
 
-  if (!needsUsdcApproval && !needsCTApproval) return;
+  // Quick-check: skip entirely if all targets are already approved this session
+  const allApproved = targets.every(t => _approvedExchanges.has(t) && _approvedCTExchanges.has(t));
+  if (allApproved) return;
 
   try {
     const { wallet, ethers: eth } = await loadEthers();
@@ -1302,45 +1317,50 @@ async function ensureAllowance(negRisk: boolean): Promise<void> {
     const provider = new eth.JsonRpcProvider(env.polygonRpcUrl);
     const connectedWallet = wallet.connect(provider);
 
-    // ── 1. USDC.e ERC-20 allowance ──
-    if (needsUsdcApproval) {
-      const erc20 = new eth.Contract(USDC_POLYGON, [
-        'function allowance(address owner, address spender) view returns (uint256)',
-        'function approve(address spender, uint256 amount) returns (bool)',
-      ], connectedWallet);
+    const erc20 = new eth.Contract(USDC_POLYGON, [
+      'function allowance(address owner, address spender) view returns (uint256)',
+      'function approve(address spender, uint256 amount) returns (bool)',
+    ], connectedWallet);
 
-      const currentAllowance = await erc20.allowance(wallet.address, exchangeAddr);
-      if (currentAllowance > eth.parseUnits('1000000000', 6)) {
-        _approvedExchanges.add(exchangeAddr);
-        logger.debug(`[Polymarket] ${label} already has sufficient USDC.e allowance`);
-      } else {
-        logger.info(`[Polymarket] Approving USDC.e for ${label} (${exchangeAddr})...`);
-        const tx = await erc20.approve(exchangeAddr, eth.MaxUint256);
-        logger.info(`[Polymarket] USDC.e approval tx: ${tx.hash} — waiting...`);
-        await tx.wait(1);
-        logger.info(`[Polymarket] USDC.e approved for ${label} ✓`);
-        _approvedExchanges.add(exchangeAddr);
+    const ct = new eth.Contract(CONDITIONAL_TOKENS, [
+      'function isApprovedForAll(address owner, address operator) view returns (bool)',
+      'function setApprovalForAll(address operator, bool approved)',
+    ], connectedWallet);
+
+    for (let i = 0; i < targets.length; i++) {
+      const addr = targets[i];
+      const lbl = labels[i];
+
+      // ── USDC.e ERC-20 allowance ──
+      if (!_approvedExchanges.has(addr)) {
+        const currentAllowance = await erc20.allowance(wallet.address, addr);
+        if (currentAllowance > eth.parseUnits('1000000000', 6)) {
+          _approvedExchanges.add(addr);
+          logger.debug(`[Polymarket] ${lbl} already has sufficient USDC.e allowance`);
+        } else {
+          logger.info(`[Polymarket] Approving USDC.e for ${lbl} (${addr})...`);
+          const tx = await erc20.approve(addr, eth.MaxUint256);
+          logger.info(`[Polymarket] USDC.e approval tx: ${tx.hash} — waiting...`);
+          await tx.wait(1);
+          logger.info(`[Polymarket] USDC.e approved for ${lbl} ✓`);
+          _approvedExchanges.add(addr);
+        }
       }
-    }
 
-    // ── 2. ConditionalTokens ERC-1155 setApprovalForAll ──
-    if (needsCTApproval) {
-      const ct = new eth.Contract(CONDITIONAL_TOKENS, [
-        'function isApprovedForAll(address owner, address operator) view returns (bool)',
-        'function setApprovalForAll(address operator, bool approved)',
-      ], connectedWallet);
-
-      const isApproved = await ct.isApprovedForAll(wallet.address, exchangeAddr);
-      if (isApproved) {
-        _approvedCTExchanges.add(exchangeAddr);
-        logger.debug(`[Polymarket] ${label} already has ConditionalTokens approval`);
-      } else {
-        logger.info(`[Polymarket] Setting ConditionalTokens approval for ${label} (${exchangeAddr})...`);
-        const tx = await ct.setApprovalForAll(exchangeAddr, true);
-        logger.info(`[Polymarket] CT approval tx: ${tx.hash} — waiting...`);
-        await tx.wait(1);
-        logger.info(`[Polymarket] ConditionalTokens approved for ${label} ✓`);
-        _approvedCTExchanges.add(exchangeAddr);
+      // ── ConditionalTokens ERC-1155 setApprovalForAll ──
+      if (!_approvedCTExchanges.has(addr)) {
+        const isApproved = await ct.isApprovedForAll(wallet.address, addr);
+        if (isApproved) {
+          _approvedCTExchanges.add(addr);
+          logger.debug(`[Polymarket] ${lbl} already has ConditionalTokens approval`);
+        } else {
+          logger.info(`[Polymarket] Setting ConditionalTokens approval for ${lbl} (${addr})...`);
+          const tx = await ct.setApprovalForAll(addr, true);
+          logger.info(`[Polymarket] CT approval tx: ${tx.hash} — waiting...`);
+          await tx.wait(1);
+          logger.info(`[Polymarket] ConditionalTokens approved for ${lbl} ✓`);
+          _approvedCTExchanges.add(addr);
+        }
       }
     }
   } catch (err) {
