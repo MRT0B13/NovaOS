@@ -158,9 +158,10 @@ export class Supervisor extends BaseAgent {
   private registerDefaultHandlers(): void {
     // ── Scout Intel ──
     this.handlers.set('nova-scout:intel', async (msg) => {
-      const { source, narratives, summary } = msg.payload;
+      const { intel_type, source, narratives, summary } = msg.payload;
+      const intelSource = intel_type ?? source; // intel_type is the canonical field; source is legacy/agent-id
 
-      if (source === 'narrative_shift' && msg.priority === 'high') {
+      if (intelSource === 'narrative_shift' && msg.priority === 'high') {
         // Significant narrative shift — post to X + TG channel + Farcaster
         const content = `📡 Narrative shift detected: ${summary || narratives?.summary || 'Check thread for details'}`;
         if (this.callbacks.onPostToX) await this.callbacks.onPostToX(content);

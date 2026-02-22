@@ -110,7 +110,7 @@ export class ScoutAgent extends BaseAgent {
 
       // Report completion to supervisor
       await this.reportToSupervisor('intel', 'medium', {
-        source: 'research_cycle',
+        intel_type: 'research_cycle',
         cycleNumber: this.cycleCount,
         completedAt: new Date().toISOString(),
       });
@@ -178,7 +178,7 @@ export class ScoutAgent extends BaseAgent {
         );
 
         await this.reportToSupervisor('intel', isSignificant ? 'high' : 'low', {
-          source: isSignificant ? 'narrative_shift' : 'quick_scan',
+          intel_type: isSignificant ? 'narrative_shift' : 'quick_scan',
           summary: results.slice(0, 3).join(' | '),
           resultsCount: results.length,
           trendPool: trendSummary || undefined,

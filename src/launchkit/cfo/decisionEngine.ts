@@ -311,12 +311,23 @@ export async function gatherSwarmIntel(pool: any): Promise<SwarmIntel> {
 
       // ── Scout intel ──
       if (from === 'nova-scout' || from === 'nova' /* forwarded by supervisor */) {
-        const cmd = payload.command ?? payload.source;
-        if (cmd === 'scout_intel' || cmd === 'narrative_shift' || cmd === 'quick_scan' || cmd === 'narrative_update') {
+        const cmd = payload.command ?? payload.intel_type ?? payload.source;
+        if (cmd === 'scout_intel' || cmd === 'narrative_shift' || cmd === 'quick_scan' || cmd === 'narrative_update' || cmd === 'research_cycle') {
           if (!intel.scoutReceivedAt || ts > intel.scoutReceivedAt) {
-            intel.scoutBullish = payload.cryptoBullish;
-            intel.scoutNarratives = payload.topNarratives ?? payload.narratives ?? [];
-            intel.scoutConfidence = payload.confidence ?? 0.5;
+            // Accept explicit cryptoBullish OR infer from summary text
+            let bullish = payload.cryptoBullish;
+            if (bullish === undefined && payload.summary) {
+              const lower = (payload.summary as string).toLowerCase();
+              const bullWords = ['surge', 'bullish', 'rally', 'breakout', 'pump', 'trending', 'viral', 'moon', 'ath'];
+              const bearWords = ['crash', 'bearish', 'dump', 'fear', 'sell-off', 'capitulation', 'plunge'];
+              const bullHits = bullWords.filter(w => lower.includes(w)).length;
+              const bearHits = bearWords.filter(w => lower.includes(w)).length;
+              bullish = bullHits >= bearHits; // default neutral-bullish if no signal
+            }
+            intel.scoutBullish = bullish ?? true;
+            intel.scoutNarratives = payload.topNarratives ?? payload.narratives
+              ?? (payload.summary ? (payload.summary as string).split(' | ') : []);
+            intel.scoutConfidence = payload.confidence ?? (payload.source === 'narrative_shift' ? 0.7 : 0.5);
             intel.scoutReceivedAt = ts;
           }
         }
