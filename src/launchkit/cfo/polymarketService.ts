@@ -41,6 +41,9 @@ const CLOB_BASE = 'https://clob.polymarket.com';
 /** Polygon mainnet CTF Exchange contract (verifyingContract for EIP-712) */
 const CTF_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
 
+/** Neg-risk CTF Exchange (used for neg-risk markets, per SDK config.ts) */
+const NEG_RISK_CTF_EXCHANGE = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
+
 /** USDC.e on Polygon (6 decimals) */
 const USDC_POLYGON = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
 
@@ -210,14 +213,6 @@ const CLOB_AUTH_TYPES = {
 const CLOB_AUTH_MESSAGE =
   'This message attests that I control the given wallet';
 
-/** EIP-712 domain for CTF Exchange order signing */
-const CTF_DOMAIN = {
-  name: 'CTFExchange',
-  version: '1',
-  chainId: POLYGON_CHAIN_ID,
-  verifyingContract: CTF_EXCHANGE,
-};
-
 /** EIP-712 types for CTF Exchange Order */
 const ORDER_TYPES = {
   Order: [
@@ -267,34 +262,42 @@ async function getL1Headers(): Promise<Record<string, string>> {
 function buildL2Signature(
   secret: string,
   timestamp: string,
-  nonce: string,
   method: string,
   path: string,
-  body: string,
+  body?: string,
 ): string {
-  const message = `${timestamp}${nonce}${method}${path}${body}`;
+  // Must match @polymarket/clob-client HMAC format exactly:
+  // message = timestamp + method + requestPath [+ body]
+  // (NO nonce — nonce is L1-only)
+  let message = `${timestamp}${method}${path}`;
+  if (body !== undefined) message += body;
   const hmac = createHmac('sha256', Buffer.from(secret, 'base64'));
   hmac.update(message);
-  return hmac.digest('base64');
+  // URL-safe base64 per SDK: '+' → '-', '/' → '_'
+  const sig = hmac.digest('base64');
+  return sig.replace(/\+/g, '-').replace(/\//g, '_');
 }
 
-function getL2Headers(
+async function getL2Headers(
   creds: CLOBCredentials,
   method: string,
   path: string,
-  body = '',
-): Record<string, string> {
+  body?: string,
+): Promise<Record<string, string>> {
   const timestamp = Math.floor(Date.now() / 1000).toString();
-  const nonce = Date.now().toString();
+  const { wallet } = await loadEthers();
 
-  const signature = buildL2Signature(creds.secret, timestamp, nonce, method, path, body);
+  const signature = buildL2Signature(creds.secret, timestamp, method, path, body);
 
+  // Must match @polymarket/clob-client L2PolyHeader exactly:
+  // POLY_ADDRESS, POLY_SIGNATURE, POLY_TIMESTAMP, POLY_API_KEY, POLY_PASSPHRASE
+  // (NO POLY_NONCE — nonce is L1-only)
   return {
-    'POLY_API_KEY': creds.apiKey,
-    'POLY_SIGNATURE': signature,
-    'POLY_TIMESTAMP': timestamp,
-    'POLY_NONCE': nonce,
-    'POLY_PASSPHRASE': creds.passphrase,
+    POLY_ADDRESS: wallet.address,
+    POLY_SIGNATURE: signature,
+    POLY_TIMESTAMP: timestamp,
+    POLY_API_KEY: creds.apiKey,
+    POLY_PASSPHRASE: creds.passphrase,
     'Content-Type': 'application/json',
   };
 }
@@ -381,7 +384,7 @@ async function clobGet<T>(path: string, authed = false): Promise<T> {
 
   if (authed) {
     const creds = await getCLOBCredentials();
-    const l2 = getL2Headers(creds, 'GET', path);
+    const l2 = await getL2Headers(creds, 'GET', path);
     Object.assign(headers, l2);
   }
 
@@ -392,7 +395,7 @@ async function clobGet<T>(path: string, authed = false): Promise<T> {
     invalidateCLOBCredentials();
     logger.warn(`[Polymarket] CLOB GET ${path} got 401 — retrying with fresh creds`);
     const freshCreds = await getCLOBCredentials();
-    const freshHeaders = getL2Headers(freshCreds, 'GET', path);
+    const freshHeaders = await getL2Headers(freshCreds, 'GET', path);
     Object.assign(headers, freshHeaders);
     const retry = await fetch(`${CLOB_BASE}${path}`, { headers });
     if (!retry.ok) {
@@ -413,7 +416,7 @@ async function clobGet<T>(path: string, authed = false): Promise<T> {
 async function clobPost<T>(path: string, body: unknown): Promise<T> {
   const bodyStr = JSON.stringify(body);
   const creds = await getCLOBCredentials();
-  const headers = getL2Headers(creds, 'POST', path, bodyStr);
+  const headers = await getL2Headers(creds, 'POST', path, bodyStr);
 
   const resp = await fetch(`${CLOB_BASE}${path}`, {
     method: 'POST',
@@ -427,7 +430,7 @@ async function clobPost<T>(path: string, body: unknown): Promise<T> {
     logger.warn(`[Polymarket] CLOB POST ${path} got 401 — retrying with fresh creds`);
     const freshCreds = await getCLOBCredentials();
     const freshBodyStr = JSON.stringify(body); // re-serialize in case body was mutated
-    const freshHeaders = getL2Headers(freshCreds, 'POST', path, freshBodyStr);
+    const freshHeaders = await getL2Headers(freshCreds, 'POST', path, freshBodyStr);
     const retry = await fetch(`${CLOB_BASE}${path}`, {
       method: 'POST',
       headers: freshHeaders,
@@ -450,7 +453,7 @@ async function clobPost<T>(path: string, body: unknown): Promise<T> {
 
 async function clobDelete<T>(path: string): Promise<T> {
   const creds = await getCLOBCredentials();
-  const headers = getL2Headers(creds, 'DELETE', path);
+  const headers = await getL2Headers(creds, 'DELETE', path);
 
   const resp = await fetch(`${CLOB_BASE}${path}`, { method: 'DELETE', headers });
 
@@ -458,7 +461,7 @@ async function clobDelete<T>(path: string): Promise<T> {
     invalidateCLOBCredentials();
     logger.warn(`[Polymarket] CLOB DELETE ${path} got 401 — retrying with fresh creds`);
     const freshCreds = await getCLOBCredentials();
-    const freshHeaders = getL2Headers(freshCreds, 'DELETE', path);
+    const freshHeaders = await getL2Headers(freshCreds, 'DELETE', path);
     const retry = await fetch(`${CLOB_BASE}${path}`, { method: 'DELETE', headers: freshHeaders });
     if (!retry.ok) {
       const text = await retry.text();
@@ -1144,6 +1147,8 @@ interface OrderParams {
   pricePerShare: number;     // 0–1
   sizeUsdc: number;          // dollar amount to wager
   expirationSeconds?: number; // 0 = never expire (GTC)
+  negRisk?: boolean;         // true → use negRiskExchange
+  feeRateBps?: number;       // market-specific fee rate (fetched from API)
 }
 
 interface SignedOrder {
@@ -1197,7 +1202,16 @@ async function buildSignedOrder(params: OrderParams): Promise<SignedOrder> {
   const salt = BigInt(Date.now()) * BigInt(1_000_000) + BigInt(Math.floor(Math.random() * 1_000_000));
   const expiration = params.expirationSeconds ?? 0;
   const nonce = BigInt(0);
-  const feeRateBps = BigInt(0); // taker fee handled by protocol
+  const feeRateBps = BigInt(params.feeRateBps ?? 0);
+
+  // Use negRiskExchange for neg-risk markets (per SDK config.ts)
+  const exchangeAddr = params.negRisk ? NEG_RISK_CTF_EXCHANGE : CTF_EXCHANGE;
+  const domain = {
+    name: 'CTFExchange',
+    version: '1',
+    chainId: POLYGON_CHAIN_ID,
+    verifyingContract: exchangeAddr,
+  };
 
   const orderStruct = {
     salt: salt.toString(),
@@ -1214,7 +1228,7 @@ async function buildSignedOrder(params: OrderParams): Promise<SignedOrder> {
     signatureType: 0, // EOA signature
   };
 
-  const signature = await wallet.signTypedData(CTF_DOMAIN, ORDER_TYPES, orderStruct);
+  const signature = await wallet.signTypedData(domain, ORDER_TYPES, orderStruct);
 
   return { ...orderStruct, signature };
 }
@@ -1263,17 +1277,39 @@ export async function placeBuyOrder(
   }
 
   try {
+    // Fetch market-specific config (negRisk, feeRate) per SDK behavior
+    let negRisk = false;
+    let feeRateBps = 0;
+    try {
+      const nrResp = await clobGet<{ neg_risk: boolean }>(`/neg-risk?token_id=${token.tokenId}`);
+      negRisk = nrResp?.neg_risk ?? false;
+    } catch { /* default false */ }
+    try {
+      const feeResp = await clobGet<{ base_fee: number }>(`/fee-rate?token_id=${token.tokenId}`);
+      feeRateBps = feeResp?.base_fee ?? 0;
+    } catch { /* default 0 */ }
+
     const signedOrder = await buildSignedOrder({
       tokenId: token.tokenId,
       side: 0, // BUY
       pricePerShare: token.price,
       sizeUsdc: sizeUsd,
+      negRisk,
+      feeRateBps,
     });
 
+    // Payload format must match SDK's orderToJson() exactly:
+    //   owner = API key (NOT wallet address)
+    //   salt  = number  (parseInt, not string)
+    const creds = await getCLOBCredentials();
     const payload = {
-      order: signedOrder,
-      owner: signedOrder.maker,
-      orderType: 'GTC', // Good till cancelled
+      order: {
+        ...signedOrder,
+        salt: parseInt(signedOrder.salt, 10),
+      },
+      owner: creds.apiKey,
+      orderType: 'GTC' as const,
+      deferExec: false,
     };
 
     const response = await clobPost<{ orderID: string; status: string; transactionsHashes?: string[] }>(
@@ -1459,10 +1495,16 @@ export async function exitPosition(
       sizeUsdc: sizeUsd,
     });
 
+    // Payload format must match SDK's orderToJson() exactly
+    const creds = await getCLOBCredentials();
     const payload = {
-      order: signedOrder,
-      owner: signedOrder.maker,
-      orderType: 'GTC',
+      order: {
+        ...signedOrder,
+        salt: parseInt(signedOrder.salt, 10),
+      },
+      owner: creds.apiKey,
+      orderType: 'GTC' as const,
+      deferExec: false,
     };
 
     const response = await clobPost<{ orderID: string; status: string; transactionsHashes?: string[] }>(
