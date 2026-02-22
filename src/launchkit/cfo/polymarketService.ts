@@ -48,11 +48,51 @@ const POLYGON_CHAIN_ID = 137;
 
 /** Keywords that define a "crypto / tech" market — CFO's edge territory */
 const CRYPTO_KEYWORDS = [
+  // Crypto L1/L2
   'bitcoin', 'btc', 'ethereum', 'eth', 'solana', 'sol', 'crypto',
+  'polygon', 'matic', 'avalanche', 'avax', 'cardano', 'ada', 'xrp',
+  'ripple', 'polkadot', 'dot', 'cosmos', 'atom', 'near', 'sui',
+  'aptos', 'arbitrum', 'optimism', 'base', 'layer 2', 'l2',
+  'ton', 'toncoin', 'sei', 'celestia', 'tia', 'injective', 'inj',
+  'fantom', 'ftm', 'sonic', 'mantle', 'mnt', 'starknet', 'strk',
+  'zksync', 'linea', 'scroll', 'monad', 'berachain',
+  // DeFi / NFT / Web3
   'defi', 'nft', 'blockchain', 'token', 'stablecoin', 'altcoin',
+  'dex', 'amm', 'yield', 'staking', 'airdrop', 'dao', 'web3',
+  'uniswap', 'aave', 'lido', 'maker', 'usdc', 'usdt', 'tether',
+  'curve', 'pendle', 'eigenlayer', 'restaking', 'liquid staking',
+  'jito', 'marinade', 'raydium', 'jupiter', 'orca', 'drift',
+  'morpho', 'compound', 'sushi', 'pancakeswap', 'gmx', 'perp',
+  'ondo', 'ethena', 'ena', 'rwa', 'tokeniz',
+  // Meme coins
+  'doge', 'dogecoin', 'shiba', 'shib', 'pepe', 'bonk', 'wif',
+  'floki', 'meme coin', 'memecoin',
+  // Mining / Infrastructure
+  'mining', 'hashrate', 'halving', 'miner', 'asic',
+  'chainlink', 'link', 'oracle', 'pyth', 'the graph', 'grt',
+  // Macro / TradFi overlap
   'fed', 'interest rate', 'inflation', 'nasdaq', 'sp500', 'stock',
-  'sec', 'etf', 'coinbase', 'binance', 'ftx', 'regulation', 'ai',
-  'nvidia', 'openai', 'tech', 'apple', 'microsoft', 'google',
+  'treasury', 'rate cut', 'rate hike', 'recession', 'gdp', 'cpi',
+  'tariff', 'trade war', 'sanctions', 'fomc', 'powell', 'yellen',
+  'debt ceiling', 'unemployment', 'jobs report', 'nonfarm',
+  'oil', 'gold', 'commodity', 'dollar', 'dxy',
+  // Regulatory
+  'sec', 'etf', 'coinbase', 'binance', 'ftx', 'regulation',
+  'cftc', 'gensler', 'congress', 'ban crypto', 'kraken', 'okx',
+  'bybit', 'bitfinex', 'delist', 'listing',
+  // AI / Tech
+  'ai', 'nvidia', 'openai', 'tech', 'apple', 'microsoft', 'google',
+  'anthropic', 'meta', 'tesla', 'semiconductor', 'gpu', 'chatgpt',
+  'deepseek', 'robot', 'agi', 'amazon', 'alphabet',
+  // Geopolitics / Politics that move markets
+  'china', 'russia', 'trump', 'biden', 'election', 'war', 'conflict',
+  'ukraine', 'taiwan', 'iran', 'korea', 'nato', 'opec',
+  'democrat', 'republican', 'senate', 'house', 'executive order',
+  // Gaming / Metaverse
+  'gaming', 'metaverse', 'play to earn', 'p2e', 'virtual world',
+  // CBDC / Cross-border
+  'cbdc', 'digital dollar', 'digital yuan', 'digital euro',
+  'cross-chain', 'bridge', 'interop', 'wormhole', 'layerzero',
 ];
 
 // ============================================================================
@@ -423,9 +463,9 @@ export async function fetchCryptoMarkets(options?: {
   maxDaysToResolution?: number;
   limit?: number;
 }): Promise<PolyMarket[]> {
-  const minLiq = options?.minLiquidityUsd ?? 10_000;
+  const minLiq = options?.minLiquidityUsd ?? 5_000;
   const maxDays = options?.maxDaysToResolution ?? 90;
-  const limit = options?.limit ?? 100;
+  const limit = options?.limit ?? 200;
 
   try {
     const url = `${GAMMA_BASE}/markets?active=true&closed=false&limit=${limit}&order=volume&ascending=false`;
@@ -599,54 +639,315 @@ export function estimateProbability(
   const question = market.question.toLowerCase();
   const yesToken = market.tokens.find((t) => t.outcome === 'Yes');
   const marketPrice = yesToken?.price ?? 0.5;
+  const bullish = scoutContext?.cryptoBullish;
 
-  // ── Crypto price milestone questions ──
-  // "Will BTC be above $X by date?"
-  const btcPriceMatch = question.match(/btc|bitcoin.*(above|reach|exceed).*\$?([\d,]+)k?/);
+  // ── 1. BTC price milestone ──
+  const btcPriceMatch = question.match(/(?:btc|bitcoin).*(?:above|reach|exceed|hit|surpass|break).*?\$?([\d,]+)\s*k?/);
   if (btcPriceMatch) {
-    if (scoutContext?.btcAbove !== undefined && scoutContext?.cryptoBullish !== undefined) {
-      const targetRaw = btcPriceMatch[2].replace(',', '');
+    if (scoutContext?.btcAbove !== undefined && bullish !== undefined) {
+      const targetRaw = btcPriceMatch[1].replace(',', '');
       const target = Number(targetRaw) * (btcPriceMatch[0].includes('k') ? 1000 : 1);
       if (target > 0 && scoutContext.btcAbove > 0) {
         const prob = scoutContext.btcAbove > target ? 0.72 : 0.28;
-        return {
-          prob,
-          confidence: 0.6,
-          rationale: `BTC target $${target.toLocaleString()} vs Scout estimate $${scoutContext.btcAbove.toLocaleString()}`,
-        };
+        return { prob, confidence: 0.6, rationale: `BTC target $${target.toLocaleString()} vs Scout $${scoutContext.btcAbove.toLocaleString()}` };
       }
     }
   }
 
-  // ── ETF / regulatory approval questions ──
-  if (question.includes('etf') && question.includes('approv')) {
-    // SEC historically approves ~60% of crypto ETFs when in active review
-    const prob = scoutContext?.cryptoBullish ? 0.65 : 0.5;
-    return { prob, confidence: 0.45, rationale: 'ETF approval heuristic + sentiment' };
+  // ── 2. ETH/SOL/alt price milestone ──
+  const cryptoPriceMatch = question.match(
+    /(?:eth(?:ereum)?|sol(?:ana)?|bnb|avax|dot|ada|xrp|matic|polygon|near|sui|aptos).*(?:above|reach|exceed|hit|break).*?\$?([\d,.]+)/
+  );
+  if (cryptoPriceMatch && bullish !== undefined) {
+    const prob = bullish ? 0.62 : 0.38;
+    return { prob, confidence: 0.45, rationale: `Crypto price target (${bullish ? 'bullish' : 'bearish'})` };
   }
 
-  // ── "Will X project launch by date?" ──
-  if (question.includes('launch') || question.includes('mainnet')) {
-    const prob = 0.55; // slight lean yes for announced launches
-    return { prob, confidence: 0.4, rationale: 'Announced project launch base rate' };
+  // ── 3. ETF approval / launch ──
+  if (question.match(/etf.*(?:approv|launch|list|trade)|(?:approv|launch).*etf/)) {
+    const prob = bullish ? 0.65 : 0.5;
+    return { prob, confidence: 0.45, rationale: 'ETF approval heuristic' };
   }
 
-  // ── Scout narrative signal ──
-  if (scoutContext?.relevantNarratives?.length) {
-    const hasPositiveNarrative = scoutContext.relevantNarratives.some(
-      (n) => question.includes(n.toLowerCase()),
-    );
-    if (hasPositiveNarrative) {
-      const prob = Math.min(0.85, marketPrice + 0.12); // Scout gives +12% nudge
-      return {
-        prob,
-        confidence: 0.55,
-        rationale: `Scout narrative match: ${scoutContext.relevantNarratives.join(', ')}`,
-      };
+  // ── 4. SEC / CFTC enforcement / lawsuit ──
+  if (question.match(/\bsec\b|cftc|lawsuit|sue|fine|enforcement|settle|penalty|indic/)) {
+    const prob = bullish ? 0.4 : 0.6;
+    return { prob, confidence: 0.35, rationale: 'Regulatory enforcement heuristic' };
+  }
+
+  // ── 5. Fed / monetary policy ──
+  if (question.match(/fed(?:eral)?.*(?:cut|hike|rate|pause)|interest.*rate|fomc|powell/)) {
+    // Rate cuts = bullish for risk assets → higher prob of "yes" if market expects cuts
+    const prob = bullish ? 0.6 : 0.45;
+    return { prob, confidence: 0.4, rationale: 'Fed/monetary policy heuristic' };
+  }
+
+  // ── 6. Recession / macro downturn ──
+  if (question.match(/recession|downturn|bear.*market|crash|depression|gdp.*contract/)) {
+    const prob = bullish ? 0.35 : 0.6;
+    return { prob, confidence: 0.4, rationale: 'Recession/macro heuristic' };
+  }
+
+  // ── 7. Inflation / CPI ──
+  if (question.match(/inflation|cpi.*(?:above|below|reach)|consumer.*price/)) {
+    const prob = 0.52; // Slight lean toward "inflation persists" — base rate
+    return { prob, confidence: 0.35, rationale: 'Inflation/CPI base rate' };
+  }
+
+  // ── 8. Project launch / mainnet / upgrade / merge ──
+  if (question.match(/launch|mainnet|upgrade|ship|deploy|release|fork|merge|hardfork/)) {
+    const prob = 0.58;
+    return { prob, confidence: 0.4, rationale: 'Project launch/upgrade base rate' };
+  }
+
+  // ── 9. Adoption / TVL / users / milestone ──
+  if (question.match(/(?:users|tvl|volume|market.?cap|mcap|adoption|address|wallet).*(?:reach|exceed|above|surpass|break)/)) {
+    const prob = bullish ? 0.58 : 0.42;
+    return { prob, confidence: 0.35, rationale: 'Adoption milestone heuristic' };
+  }
+
+  // ── 10. AI / tech sector ──
+  if (question.match(/\bai\b|artificial.intell|openai|nvidia|google.*ai|microsoft.*ai|gpu|semiconductor|chatgpt|deepseek|anthropic|agi/)) {
+    const prob = 0.6;
+    return { prob, confidence: 0.4, rationale: 'AI/tech sector growth heuristic' };
+  }
+
+  // ── 11. Partnership / integration / listing ──
+  if (question.match(/partner|integrat|listing|list.*(?:coinbase|binance|kraken)|exchang.*(?:add|list)/)) {
+    const prob = 0.52;
+    return { prob, confidence: 0.35, rationale: 'Partnership/listing base rate' };
+  }
+
+  // ── 12. Airdrop / token launch ──
+  if (question.match(/airdrop|token.*(?:launch|distribute|drop)|tge|ido|ico/)) {
+    const prob = 0.6; // Announced airdrops usually happen
+    return { prob, confidence: 0.4, rationale: 'Airdrop/TGE usually delivered' };
+  }
+
+  // ── 13. Stablecoin depeg / bank risk ──
+  if (question.match(/depeg|stablecoin.*(?:lose|below|fail)|usdt.*(?:crash|collapse)|bank.*(?:fail|run|collapse)/)) {
+    const prob = 0.2; // Depegs/failures are rare
+    return { prob, confidence: 0.45, rationale: 'Stablecoin/bank failure is rare (base rate ~20%)' };
+  }
+
+  // ── 14. Hack / exploit ──
+  if (question.match(/hack|exploit|breach|stolen|drain|rug.*pull/)) {
+    // Will X get hacked? Lean no — most projects don't get hacked in any given window
+    const prob = 0.25;
+    return { prob, confidence: 0.4, rationale: 'Hack/exploit base rate (rare in any window)' };
+  }
+
+  // ── 15. Election / political outcome → market impact ──
+  if (question.match(/trump|biden|election|congress|senate|house.*(?:pass|vote|bill)|presiden/)) {
+    // Political questions: slight mean-reversion (extreme prices overshoot)
+    const prob = marketPrice > 0.7 ? marketPrice - 0.08 : marketPrice < 0.3 ? marketPrice + 0.08 : marketPrice;
+    return { prob, confidence: 0.35, rationale: 'Political: mean-reversion on extreme prices' };
+  }
+
+  // ── 16. Tariff / trade war / sanctions ──
+  if (question.match(/tariff|trade.*war|sanction|embargo|import.*(?:tax|duty)/)) {
+    const prob = bullish ? 0.4 : 0.6; // Tariffs = bearish for risk assets
+    return { prob, confidence: 0.35, rationale: 'Tariff/trade war heuristic' };
+  }
+
+  // ── 17. DeFi-specific (yield, TVL, protocol) ──
+  if (question.match(/defi|yield|liquidity.*(?:crisis|crunch)|protocol.*(?:fail|close|shut)/)) {
+    const prob = bullish ? 0.55 : 0.45;
+    return { prob, confidence: 0.35, rationale: 'DeFi sector heuristic' };
+  }
+
+  // ── 18. Mining / hashrate / energy ──
+  if (question.match(/mining|hashrate|hash.*rate|halving|miner|pow|proof.*work/)) {
+    const prob = 0.55; // Mining metrics usually grow
+    return { prob, confidence: 0.35, rationale: 'Mining/hashrate growth base rate' };
+  }
+
+  // ── 19. CBDC / digital currency ──
+  if (question.match(/cbdc|digital.*(?:dollar|yuan|euro|currency)|central.*bank.*digital/)) {
+    const prob = 0.5;
+    return { prob, confidence: 0.3, rationale: 'CBDC uncertain — near fair value' };
+  }
+
+  // ── 20. Stock market / index milestones ──
+  if (question.match(/nasdaq|s&p|sp500|dow.*jones|stock.*(?:market|index).*(?:reach|above|hit|break|all.time)/)) {
+    const prob = bullish ? 0.58 : 0.42;
+    return { prob, confidence: 0.35, rationale: 'Stock index milestone heuristic' };
+  }
+
+  // ── 21. Extreme market price mean-reversion ──
+  // Markets priced >85% or <15% tend to be overconfident on Polymarket
+  if (marketPrice > 0.85) {
+    return { prob: marketPrice - 0.07, confidence: 0.35, rationale: 'Mean-reversion: market >85% often overconfident' };
+  }
+  if (marketPrice < 0.15) {
+    return { prob: marketPrice + 0.07, confidence: 0.35, rationale: 'Mean-reversion: market <15% often overconfident' };
+  }
+
+  // ── 22. Geopolitics / war / conflict ──
+  if (question.match(/war|conflict|invad|invasion|ceasefire|peace.*(?:deal|agree)|nuclear|missile/)) {
+    const prob = question.match(/ceasefire|peace/) ? 0.35 : 0.55;
+    return { prob, confidence: 0.3, rationale: 'Geopolitical status-quo bias' };
+  }
+
+  // ── 23. "Will [company] do X?" — corporate actions ──
+  if (question.match(/(?:apple|google|meta|amazon|tesla|microsoft|nvidia).*(?:buy|acquir|merge|split|dividen|layoff|ipo)/)) {
+    const prob = 0.4;
+    return { prob, confidence: 0.35, rationale: 'Corporate action base rate (specific events rare)' };
+  }
+
+  // ── 24. Supply / burn / emission / halving dynamics ──
+  if (question.match(/supply.*(?:decrease|burn|deflat)|burn.*(?:rate|token)|halving|emission.*(?:cut|reduce)/)) {
+    const prob = bullish ? 0.6 : 0.5;
+    return { prob, confidence: 0.35, rationale: 'Supply-side dynamics heuristic' };
+  }
+
+  // ── 25. Exchange-specific (Coinbase/Binance/Kraken events) ──
+  if (question.match(/coinbase|binance|kraken|okx|bybit|bitfinex/)) {
+    if (question.match(/delist|remove|shut|close|suspend/)) {
+      const prob = 0.3; // Delistings are rarer than not
+      return { prob, confidence: 0.35, rationale: 'Exchange delisting base rate (rare)' };
+    }
+    if (question.match(/list|add|support|launch/)) {
+      const prob = 0.55; // Listings are more common
+      return { prob, confidence: 0.35, rationale: 'Exchange listing base rate' };
+    }
+    const prob = 0.5;
+    return { prob, confidence: 0.3, rationale: 'Exchange event — near fair value' };
+  }
+
+  // ── 26. Gaming / metaverse / NFT adoption ──
+  if (question.match(/gaming|metaverse|play.*earn|p2e|virtual.*world|nft.*(?:volume|sale|floor)/)) {
+    const prob = bullish ? 0.55 : 0.45;
+    return { prob, confidence: 0.3, rationale: 'Gaming/metaverse adoption heuristic' };
+  }
+
+  // ── 27. Layer-2 / scaling ──
+  if (question.match(/layer.?2|l2|rollup|zk.*(?:sync|proof|rollup)|optimistic.*rollup|scaling/)) {
+    const prob = 0.6; // L2 adoption is generally expanding
+    return { prob, confidence: 0.35, rationale: 'L2/scaling growth trend' };
+  }
+
+  // ── 28. RWA / tokenization ──
+  if (question.match(/rwa|real.*world.*asset|tokeniz|securit.*token|ondo|blackrock.*(?:fund|token)/)) {
+    const prob = 0.58; // RWA is a growing trend
+    return { prob, confidence: 0.35, rationale: 'RWA/tokenization growth trend' };
+  }
+
+  // ── 29. Meme coins / viral tokens ──
+  if (question.match(/meme.*coin|doge|shib|pepe|bonk|wif|(?:will|can).*(?:10x|100x|pump)/)) {
+    // Meme coin specific targets are rarely hit
+    const prob = question.match(/(?:10x|100x)/) ? 0.15 : 0.5;
+    return { prob, confidence: 0.35, rationale: 'Meme coin heuristic (specific targets rarely hit)' };
+  }
+
+  // ── 30. Bridge / cross-chain / interop ──
+  if (question.match(/bridge|cross.?chain|interop|wormhole|layerzero|chainlink.*ccip/)) {
+    const prob = 0.55;
+    return { prob, confidence: 0.3, rationale: 'Cross-chain/bridge adoption trend' };
+  }
+
+  // ── 31. Stablecoin dominance / market share ──
+  if (question.match(/(?:usdc|usdt|dai|frax).*(?:dominan|market.*share|flipp|overtake|surpass)/)) {
+    // Status quo tends to persist in stablecoin rankings
+    const prob = 0.35; // Challenger rarely overtakes incumbent
+    return { prob, confidence: 0.35, rationale: 'Stablecoin dominance: status quo bias' };
+  }
+
+  // ── 32. Institutional adoption (BlackRock, Fidelity, etc.) ──
+  if (question.match(/institutional|blackrock|fidelity|vanguard|grayscale|state.*street|(?:pension|endowment).*(?:crypto|bitcoin)/)) {
+    const prob = bullish ? 0.6 : 0.45;
+    return { prob, confidence: 0.4, rationale: 'Institutional adoption heuristic' };
+  }
+
+  // ── 33. Specific date questions — time decay intelligence ──
+  // Markets resolving within 7 days: current price is more informed, mean-revert less
+  // Markets resolving within 30 days: moderate confidence in nudge
+  {
+    const daysLeft = (new Date(market.endDate).getTime() - Date.now()) / 86_400_000;
+    if (daysLeft > 0 && daysLeft <= 7) {
+      // Near-expiry: market is well-priced but extremes (>80/<20) still overshoot
+      if (marketPrice > 0.80) {
+        return { prob: marketPrice - 0.05, confidence: 0.38, rationale: `Near-expiry (${Math.ceil(daysLeft)}d): >80% still overshoots` };
+      }
+      if (marketPrice < 0.20) {
+        return { prob: marketPrice + 0.05, confidence: 0.38, rationale: `Near-expiry (${Math.ceil(daysLeft)}d): <20% still overshoots` };
+      }
+      // Non-extreme near-expiry: mid-range prices are well-calibrated, small nudge
+      if (bullish !== undefined) {
+        const nudge = bullish ? 0.04 : -0.04;
+        const prob = Math.max(0.05, Math.min(0.95, marketPrice + nudge));
+        return { prob, confidence: 0.32, rationale: `Near-expiry sentiment (${Math.ceil(daysLeft)}d, ${bullish ? 'bull' : 'bear'})` };
+      }
     }
   }
 
-  // ── Fallback: no edge ──
+  // ── 34. "Will X happen this year/month/week?" — timeframe heuristics ──
+  if (question.match(/this.*(?:year|month|week)|by.*(?:end.*of|year|20\d{2})|before.*(?:20\d{2}|january|february|march|april|may|june|july|august|september|october|november|december)/)) {
+    // Longer timeframes: more likely things happen, lean slight yes for positive events
+    if (question.match(/crash|fail|collapse|depeg|hack/)) {
+      const prob = 0.2; // Bad events are rare in any given window
+      return { prob, confidence: 0.35, rationale: 'Negative event in timeframe: base rate low' };
+    }
+    const prob = bullish !== undefined ? (bullish ? 0.58 : 0.45) : 0.52;
+    return { prob, confidence: 0.32, rationale: 'Timeframe question: slight lean toward "yes" for positive events' };
+  }
+
+  // ── 35. Energy / oil / commodities (move crypto indirectly) ──
+  if (question.match(/oil|opec|energy.*(?:price|crisis)|natural.*gas|commodity|gold.*(?:above|reach|hit)/)) {
+    const prob = 0.5;
+    return { prob, confidence: 0.3, rationale: 'Commodity/energy: near fair value' };
+  }
+
+  // ── 36. Employment / jobs / unemployment ──
+  if (question.match(/unemployment|jobs.*(?:report|data)|nonfarm|payroll|labor.*market/)) {
+    const prob = 0.52; // Jobs reports tend to beat expectations slightly
+    return { prob, confidence: 0.3, rationale: 'Employment report: slight beat bias' };
+  }
+
+  // ── 37. Protocol governance / DAO vote ──
+  if (question.match(/(?:dao|governance|proposal|vote).*(?:pass|approve|reject)/) ||
+      question.match(/(?:pass|approve|reject).*(?:proposal|vote)/)) {
+    const prob = 0.6; // Most governance proposals that reach a vote tend to pass
+    return { prob, confidence: 0.35, rationale: 'DAO governance: proposals that reach vote usually pass' };
+  }
+
+  // ── 38. Cross-asset correlation plays ──
+  // "Will crypto rally if stocks rally?" type questions
+  if (question.match(/correlat|if.*(?:stock|nasdaq|sp500).*(?:then|crypto|bitcoin)/) ||
+      question.match(/crypto.*(?:follow|track|correlat).*(?:stock|nasdaq)/)) {
+    const prob = 0.6; // Crypto–equity correlation has been high
+    return { prob, confidence: 0.35, rationale: 'Cross-asset correlation: crypto tracks equities' };
+  }
+
+  // ── 39. Scout narrative signal (keyword match) ──
+  if (scoutContext?.relevantNarratives?.length) {
+    const matchedNarrative = scoutContext.relevantNarratives.find(
+      (n) => question.includes(n.toLowerCase()),
+    );
+    if (matchedNarrative) {
+      const prob = Math.min(0.85, marketPrice + 0.12);
+      return { prob, confidence: 0.55, rationale: `Scout narrative: "${matchedNarrative}"` };
+    }
+  }
+
+  // ── 40. General crypto/tech with scout sentiment (catch-all) ──
+  // If we have scout sentiment and the market passed keyword filter, apply a nudge.
+  // This ensures we always have SOME edge on crypto markets when Scout is live.
+  if (bullish !== undefined) {
+    const sentimentNudge = bullish ? 0.07 : -0.07;
+    const prob = Math.max(0.05, Math.min(0.95, marketPrice + sentimentNudge));
+    return { prob, confidence: 0.32, rationale: `Scout sentiment nudge (${bullish ? 'bullish' : 'bearish'})` };
+  }
+
+  // ── 41. No scout, but market is mid-range — slight contrarian ──
+  // Without scout data, we can still profit from Polymarket's tendency to overprice
+  // popular outcomes. Markets in 40-60% range: slight contrarian lean.
+  if (marketPrice >= 0.40 && marketPrice <= 0.60) {
+    // In the 40-60 zone, lean slightly toward NO (popular=overpriced)
+    return { prob: marketPrice - 0.04, confidence: 0.3, rationale: 'No scout: slight contrarian on 40-60% market' };
+  }
+
+  // ── Fallback: truly no edge ──
   return {
     prob: marketPrice,
     confidence: 0,
@@ -682,6 +983,11 @@ export async function scanOpportunities(
 
     const { prob: ourProb, confidence, rationale } = estimateProbability(market, scoutContext);
 
+    // Log why each market was evaluated (debug visibility)
+    logger.debug(
+      `[Polymarket] "${market.question.slice(0, 60)}..." → prob=${ourProb.toFixed(2)} conf=${confidence.toFixed(2)} | ${rationale}`
+    );
+
     // Check both YES and NO for edge
     for (const [token, side] of [[yesToken, 'YES'], [noToken, 'NO']] as const) {
       const effectiveOurProb = side === 'YES' ? ourProb : 1 - ourProb;
@@ -689,7 +995,7 @@ export async function scanOpportunities(
       const edge = effectiveOurProb - marketProb;
 
       if (edge < env.minEdge) continue;
-      if (confidence < 0.3) continue; // Skip low-confidence calls
+      if (confidence < 0.2) continue; // Skip only truly no-confidence calls
 
       const { fraction, usdAmount } = kellySize(
         marketProb,

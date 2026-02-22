@@ -491,23 +491,24 @@ export class Supervisor extends BaseAgent {
       }
     });
 
-    // ── Health Agent Commands ──
-    this.handlers.set('health-agent:command', async (msg) => {
+    // ── Health Monitor Commands ── (accepts from both 'health-monitor' and legacy 'health-agent')
+    const healthCommandHandler = async (msg: any) => {
       const { action, agentName, reason } = msg.payload;
 
       if (action === 'deactivate_child') {
-        // Health Agent detected a dead token-child — deactivate it
         const addr = this.findChildAddressByName(agentName);
         if (addr) {
           const deactivated = await this.deactivateChild(addr);
           if (deactivated) {
-            logger.info(`[supervisor] Health Agent requested deactivation of ${agentName}: ${reason}`);
+            logger.info(`[supervisor] Health monitor requested deactivation of ${agentName}: ${reason}`);
           }
         } else {
-          logger.debug(`[supervisor] Health Agent requested deactivation of ${agentName} but child not found (may already be stopped)`);
+          logger.debug(`[supervisor] Health monitor requested deactivation of ${agentName} but child not found (may already be stopped)`);
         }
       }
-    });
+    };
+    this.handlers.set('health-monitor:command', healthCommandHandler);
+    this.handlers.set('health-agent:command', healthCommandHandler); // legacy compat
   }
 
   /** Resolve a child's token address from its agent name (child-SYMBOL) */

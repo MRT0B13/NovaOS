@@ -63,11 +63,11 @@ async function main() {
     console.error('[HealthAgent] Schema check/migration failed:', err.message);
   }
 
-  // Register health-agent in the registry
+  // Register health-monitor in the registry (renamed from health-agent)
   try {
     await pool.query(
       `INSERT INTO agent_registry (agent_name, agent_type, enabled, auto_restart)
-       VALUES ('health-agent', 'health', TRUE, FALSE)
+       VALUES ('health-monitor', 'health', TRUE, FALSE)
        ON CONFLICT (agent_name) DO UPDATE SET enabled = TRUE, updated_at = NOW()`
     );
   } catch {

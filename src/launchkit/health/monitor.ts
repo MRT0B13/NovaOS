@@ -82,6 +82,9 @@ export class HealthMonitor {
   // HEARTBEAT MONITORING
   // ============================================================
 
+  // Names that belong to this monitor process — never attempt self-restart
+  private static readonly SELF_NAMES = new Set(['health-monitor', 'health-agent']);
+
   private async checkHeartbeats(): Promise<void> {
     try {
       const heartbeats = await this.db.getAllHeartbeats();
@@ -90,6 +93,9 @@ export class HealthMonitor {
 
       for (const hb of heartbeats) {
         if (hb.status === 'disabled') continue;
+
+        // Never try to restart ourselves — that's a restart loop by definition
+        if (HealthMonitor.SELF_NAMES.has(hb.agentName)) continue;
 
         const silentMs = now - hb.lastBeat.getTime();
 
@@ -281,7 +287,7 @@ export class HealthMonitor {
     const isChildAgent = await this.isTokenChildAgent(hb.agentName);
     if (isChildAgent) {
       console.log(`[HealthAgent] 🧹 Token child ${hb.agentName} is dead — requesting Supervisor deactivation`);
-      await this.db.sendMessage('health-agent', 'nova', 'command', {
+      await this.db.sendMessage('health-monitor', 'nova', 'command', {
         action: 'deactivate_child',
         agentName: hb.agentName,
         reason: 'No heartbeat — presumed dead',
@@ -360,7 +366,7 @@ export class HealthMonitor {
     }
 
     // Send degradation command to affected agents
-    await this.db.sendMessage('health-agent', 'broadcast', 'command', {
+    await this.db.sendMessage('health-monitor', 'broadcast', 'command', {
       action: rule.action,
       params: rule.params,
       reason: `${apiName}: ${reason}`,
@@ -440,9 +446,9 @@ export class HealthMonitor {
     } catch {}
 
     // Fallback: send restart command via message bus
-    await this.db.sendMessage('health-agent', agentName, 'command', {
+    await this.db.sendMessage('health-monitor', agentName, 'command', {
       action: 'restart',
-      reason: 'Health agent triggered restart',
+      reason: 'Health monitor triggered restart',
     }, 'critical');
   }
 
