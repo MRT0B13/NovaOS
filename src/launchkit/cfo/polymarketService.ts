@@ -429,7 +429,11 @@ async function clobPost<T>(path: string, body: unknown): Promise<T> {
     invalidateCLOBCredentials();
     logger.warn(`[Polymarket] CLOB POST ${path} got 401 — retrying with fresh creds`);
     const freshCreds = await getCLOBCredentials();
-    const freshBodyStr = JSON.stringify(body); // re-serialize in case body was mutated
+    // Update owner field in body to match fresh creds (prevents "owner has to be the owner of the API KEY")
+    const freshBody = typeof body === 'object' && body !== null && 'owner' in (body as Record<string, unknown>)
+      ? { ...(body as Record<string, unknown>), owner: freshCreds.apiKey }
+      : body;
+    const freshBodyStr = JSON.stringify(freshBody);
     const freshHeaders = await getL2Headers(freshCreds, 'POST', path, freshBodyStr);
     const retry = await fetch(`${CLOB_BASE}${path}`, {
       method: 'POST',
@@ -1208,8 +1212,10 @@ async function buildSignedOrder(params: OrderParams): Promise<SignedOrder> {
 
   // Use negRiskExchange for neg-risk markets (per SDK config.ts)
   const exchangeAddr = params.negRisk ? NEG_RISK_CTF_EXCHANGE : CTF_EXCHANGE;
+  // Domain name must match SDK's PROTOCOL_NAME exactly: 'Polymarket CTF Exchange'
+  // (not 'CTFExchange' — that was causing "invalid signature" errors)
   const domain = {
-    name: 'CTFExchange',
+    name: 'Polymarket CTF Exchange',
     version: '1',
     chainId: POLYGON_CHAIN_ID,
     verifyingContract: exchangeAddr,
@@ -1492,11 +1498,25 @@ export async function exitPosition(
     // Use current price minus 1% to ensure the order fills
     const sellPrice = Math.max(0.01, position.currentPrice * 0.99);
 
+    // Fetch market-specific config (negRisk, feeRate) per SDK behavior
+    let negRisk = false;
+    let feeRateBps = 0;
+    try {
+      const nrResp = await clobGet<{ neg_risk: boolean }>(`/neg-risk?token_id=${position.tokenId}`);
+      negRisk = nrResp?.neg_risk ?? false;
+    } catch { /* default false */ }
+    try {
+      const feeResp = await clobGet<{ base_fee: number }>(`/fee-rate?token_id=${position.tokenId}`);
+      feeRateBps = feeResp?.base_fee ?? 0;
+    } catch { /* default 0 */ }
+
     const signedOrder = await buildSignedOrder({
       tokenId: position.tokenId,
       side: 1, // SELL
       pricePerShare: sellPrice,
       sizeUsdc: sizeUsd,
+      negRisk,
+      feeRateBps,
     });
 
     // Payload format must match SDK's orderToJson() exactly
