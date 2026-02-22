@@ -26,6 +26,8 @@ import { getTokenPrice, formatMarketCap, getSolPriceUsd } from './priceService.t
 import { getActiveTrends } from './trendMonitor.ts';
 import { getFeesSummary, formatFeesForTweet, formatFeesForTelegram } from './pumpswapFees.ts';
 import { getKnowledgeForPostType, startResearchScheduler } from './novaResearch.ts';
+import { getPnLSummary, getActivePositions, getRecentTrades } from './pnlTracker.ts';
+import { getPortfolioSnapshot } from '../cfo/portfolioService.ts';
 
 // ============================================================================
 // Types
@@ -1099,6 +1101,138 @@ async function buildMarketPulseBlock(): Promise<string> {
   }
 }
 
+/**
+ * Build an enriched data block from P&L tracker, CFO portfolio, and swarm status.
+ * Gives GPT real trading data, DeFi positions, and agent status to reference.
+ * All data is REAL — GPT should reference these numbers instead of inventing its own.
+ */
+async function buildEnrichedDataBlock(type: NovaPostType): Promise<string> {
+  const blocks: string[] = [];
+
+  // ── P&L Trading Data ───────────────────────────────────────────────
+  try {
+    const pnl = await getPnLSummary();
+    if (pnl.totalTrades > 0) {
+      const parts: string[] = [];
+      parts.push(`Total trades: ${pnl.totalTrades} (${pnl.winningTrades}W/${pnl.losingTrades}L)`);
+      if (pnl.winRate !== undefined) parts.push(`Win rate: ${(pnl.winRate * 100).toFixed(0)}%`);
+      if (pnl.totalRealizedPnl !== undefined) parts.push(`Realized P&L: ${pnl.totalRealizedPnl >= 0 ? '+' : ''}${pnl.totalRealizedPnl.toFixed(4)} SOL`);
+      if (pnl.totalUnrealizedPnl !== undefined) parts.push(`Unrealized P&L: ${pnl.totalUnrealizedPnl >= 0 ? '+' : ''}${pnl.totalUnrealizedPnl.toFixed(4)} SOL`);
+      if (pnl.activePositions !== undefined) parts.push(`Active positions: ${pnl.activePositions}`);
+      blocks.push('TRADING P&L (your real trade history):\n' + parts.join('\n'));
+    }
+  } catch (err) {
+    logger.debug(`[NovaPersonalBrand] PnL enrichment failed: ${err}`);
+  }
+
+  // ── Recent Trades (last 5) ─────────────────────────────────────────
+  try {
+    const trades = await getRecentTrades(5);
+    if (trades.length > 0) {
+      const tradeLines = trades.map(t => {
+        const ago = Math.round((Date.now() - new Date(t.timestamp).getTime()) / 3600000);
+        return `${t.type.toUpperCase()} $${t.tokenTicker || t.tokenMint?.slice(0, 6)} — ${t.solAmount.toFixed(4)} SOL (${ago}h ago)`;
+      });
+      blocks.push('RECENT TRADES:\n' + tradeLines.join('\n'));
+    }
+  } catch (err) {
+    logger.debug(`[NovaPersonalBrand] Recent trades enrichment failed: ${err}`);
+  }
+
+  // ── CFO Portfolio (cross-chain positions) ──────────────────────────
+  try {
+    const snap = await getPortfolioSnapshot();
+    if (snap && snap.totalPortfolioUsd > 0) {
+      const parts: string[] = [];
+      parts.push(`Total portfolio: $${snap.totalPortfolioUsd.toFixed(2)} (wallet: $${snap.totalWalletUsd.toFixed(2)}, deployed: $${snap.totalDeployedUsd.toFixed(2)})`);
+      if (snap.totalUnrealizedPnlUsd) parts.push(`CFO unrealized P&L: ${snap.totalUnrealizedPnlUsd >= 0 ? '+' : ''}$${snap.totalUnrealizedPnlUsd.toFixed(2)}`);
+      if (snap.totalRealizedPnlUsd) parts.push(`CFO realized P&L: ${snap.totalRealizedPnlUsd >= 0 ? '+' : ''}$${snap.totalRealizedPnlUsd.toFixed(2)}`);
+      if (snap.cashReservePct !== undefined) parts.push(`Cash reserve: ${(snap.cashReservePct * 100).toFixed(0)}%`);
+
+      // Strategy breakdown — only include active ones
+      const activeStrategies = (snap.strategies || []).filter((s: any) => s.valueUsd > 0.01);
+      for (const strat of activeStrategies.slice(0, 5)) {
+        const pnlStr = strat.unrealizedPnlUsd ? ` (${strat.unrealizedPnlUsd >= 0 ? '+' : ''}$${strat.unrealizedPnlUsd.toFixed(2)})` : '';
+        parts.push(`  ${strat.name}: $${strat.valueUsd.toFixed(2)} on ${strat.chain}${pnlStr}`);
+      }
+
+      // Oracle prices if available
+      if (snap.prices) {
+        const priceItems: string[] = [];
+        if (snap.prices.SOL) priceItems.push(`SOL $${snap.prices.SOL.toFixed(2)}`);
+        if (snap.prices.ETH) priceItems.push(`ETH $${snap.prices.ETH.toFixed(0)}`);
+        if (snap.prices.BTC) priceItems.push(`BTC $${snap.prices.BTC.toFixed(0)}`);
+        if (priceItems.length) parts.push(`Prices: ${priceItems.join(', ')}`);
+      }
+
+      blocks.push('CFO PORTFOLIO (real cross-chain DeFi positions):\n' + parts.join('\n'));
+    }
+  } catch (err) {
+    logger.debug(`[NovaPersonalBrand] CFO portfolio enrichment failed: ${err}`);
+  }
+
+  // ── Active Positions (individual token positions) ──────────────────
+  try {
+    const positions = await getActivePositions();
+    if (positions.length > 0) {
+      const posLines = positions.slice(0, 5).map(p => {
+        const pnl = p.realizedPnlSol !== undefined ? ` | P&L: ${p.realizedPnlSol >= 0 ? '+' : ''}${p.realizedPnlSol.toFixed(4)} SOL` : '';
+        return `$${p.ticker || p.mint.slice(0, 6)} — holding ${p.currentBalance.toFixed(0)} tokens, cost basis: ${p.costBasisSol.toFixed(4)} SOL${pnl}`;
+      });
+      blocks.push('ACTIVE POSITIONS:\n' + posLines.join('\n'));
+    }
+  } catch (err) {
+    logger.debug(`[NovaPersonalBrand] Active positions enrichment failed: ${err}`);
+  }
+
+  // ── Swarm Status (agent heartbeats) ────────────────────────────────
+  if (pgRepo && (type === 'behind_scenes' || type === 'ai_thoughts' || type === 'daily_recap' || type === 'weekly_summary')) {
+    try {
+      const result = await pgRepo.query(
+        `SELECT agent_name, status, 
+                EXTRACT(EPOCH FROM (NOW() - last_beat))::int as seconds_ago,
+                current_task
+         FROM agent_heartbeats 
+         WHERE status != 'disabled'
+         ORDER BY agent_name`
+      );
+      if (result.rows.length > 0) {
+        const agentLines = result.rows.map((r: any) => {
+          const alive = r.seconds_ago < 120 ? '✅' : r.seconds_ago < 600 ? '⚠️' : '❌';
+          const task = r.current_task ? ` — ${r.current_task}` : '';
+          return `${alive} ${r.agent_name}: ${r.status}${task}`;
+        });
+        const aliveCount = result.rows.filter((r: any) => r.seconds_ago < 120).length;
+        blocks.push(`SWARM STATUS (${aliveCount}/${result.rows.length} agents alive):\n` + agentLines.join('\n'));
+      }
+    } catch (err) {
+      logger.debug(`[NovaPersonalBrand] Swarm status enrichment failed: ${err}`);
+    }
+  }
+
+  // ── Guardian Alerts (last 24h rug/safety flags) ────────────────────
+  if (pgRepo && (type === 'trust_talk' || type === 'behind_scenes' || type === 'daily_recap')) {
+    try {
+      const alerts = await pgRepo.query(
+        `SELECT payload->>'summary' as summary, priority, created_at
+         FROM agent_messages 
+         WHERE from_agent = 'guardian' AND message_type = 'alert' 
+           AND created_at >= NOW() - INTERVAL '24 hours'
+         ORDER BY created_at DESC LIMIT 5`
+      );
+      if (alerts.rows.length > 0) {
+        const alertLines = alerts.rows.map((r: any) => `- [${r.priority}] ${r.summary || 'Flag detected'}`);
+        blocks.push(`GUARDIAN ALERTS (last 24h):\n${alertLines.join('\n')}`);
+      }
+    } catch {
+      // agent_messages table may not exist — that's fine
+    }
+  }
+
+  if (!blocks.length) return '';
+  return '\n\n' + blocks.join('\n\n');
+}
+
 // ============================================================================
 // AI Content Generation
 // ============================================================================
@@ -1234,6 +1368,9 @@ async function generateAIContent(
   const tokenTrends = await getTokenTrends(stats.tokenMovers);
   const marketPulse = await buildMarketPulseBlock();
 
+  // Enriched data from P&L tracker, CFO portfolio, swarm status, guardian alerts
+  const enrichedData = await buildEnrichedDataBlock(type);
+
   // Ecosystem knowledge from web research
   const knowledgeBlock = await getKnowledgeForPostType(type);
 
@@ -1283,9 +1420,12 @@ ${stats.holdingsCount > 0 && stats.totalDevBuySol > 0 ? `Dev buy ROI: spent ${st
 TOKEN MOVERS:
 ${tokenMoversBlock}${tokenTrends}
 
+(See TRADING P&L, CFO PORTFOLIO, and ACTIVE POSITIONS sections below for win rate, realized P&L, DeFi strategy data, and recent trades. Use those real numbers.)
+
 Rules:
-- Lead with the P&L number. Then one sentence of insight based on the token data.
+- Lead with the P&L number or win rate. Then one sentence of insight based on the token/trading data.
 - If a specific token moved significantly, mention it by ticker.
+- If your win rate, trade count, or CFO positions have interesting data, lead with that instead.
 - Be honest about losses. This is an accountability post.
 - End with ONE forward-looking sentence (what you'll do differently, what you noticed). Not "stay tuned" or "the grind continues."
 - ${platform === 'x' ? 'MAX 240 chars. Tag @Pumpfun if relevant. NO reaction emojis.' : 'Do NOT use @ tags. This is a group chat — write like you\'re talking to people, not posting a report. No trailing emojis.'}`,
@@ -1310,11 +1450,13 @@ ${tokenMoversBlock}${tokenTrends}${marketPulse}
 
 You're on Day ${stats.dayNumber} with ${stats.totalLaunches} launches.
 
+(See TRADING P&L, RECENT TRADES, CFO PORTFOLIO, and ACTIVE POSITIONS below — rich data for builder observations.)
+
 Rules:
-- Pick ONE thing from the token data and make an observation about it. "$NULLZ down 40% in 24h but buy/sell ratio is 2:1 — someone's accumulating." That kind of thing.
-- If no token data is interesting, share a pattern you've noticed from launching ${stats.totalLaunches} tokens (timing, naming, market conditions).
+- Pick ONE thing from the token data, trading history, or CFO positions and make an observation. "$NULLZ down 40% in 24h but buy/sell ratio is 2:1 — someone's accumulating." Or "Win rate at 15% after 20 trades. The bonding curve filter needs work."
+- If no token data is interesting, share a pattern from your trading P&L or DeFi positions.
 - Do NOT list "X launches, Y graduated, Z SOL portfolio" — that's recap territory.
-- Do NOT fabricate data. Only reference numbers shown above.
+- Do NOT fabricate data. Only reference numbers shown above or in the appended data blocks.
 - Do NOT say "stay tuned", "more to come", "the grind continues", "let's hear your thoughts"
 - ${platform === 'x' ? 'MAX 240 chars. NO reaction emojis.' : 'Do NOT use @ tags. Group chat — conversational, no trailing emojis. Make an observation people will want to respond to (but do NOT ask a question).'}`,
 
@@ -1352,10 +1494,17 @@ YOUR TECH STACK (reference ONLY these):
 - Data: PostgreSQL, DexScreener price feeds, RugCheck API
 - Hosting: Railway
 - Socials: X API (Basic tier), Telegram Bot API
+- Agents: 7-agent swarm (Scout, Analyst, Guardian, Launcher, CFO, Community, Supervisor)
+- DeFi: CFO runs Polymarket bets, Hyperliquid hedges, Jito staking, Kamino yield
+
+(See SWARM STATUS, CFO PORTFOLIO, and GUARDIAN ALERTS below for real agent data.)
 
 ${additionalContext || ''}
-Pick ONE specific item from YOUR REAL SYSTEM ACTIVITY and describe what you learned or noticed from it.
-Example: "Ran 14 RugCheck scans today — 3 flagged for concentrated holders. The filter is earning its keep."
+Pick ONE specific item from YOUR REAL SYSTEM ACTIVITY, SWARM STATUS, or CFO data and describe what you learned or noticed.
+Examples:
+- "Ran 14 RugCheck scans today — 3 flagged for concentrated holders. The filter is earning its keep."
+- "6 of 7 agents alive. Guardian caught 2 rug flags in the last 24h."
+- "CFO hedged 50% of SOL exposure via Hyperliquid. Currently earning 7% APY on idle JitoSOL."
 
 NEVER rules:
 - NEVER invent infrastructure you don't use (no Redis, no Kafka, no Kubernetes, no Memcached, no Chainlink, no Serum, no GraphQL subscriptions)
@@ -1381,6 +1530,8 @@ YOUR DATA:
 ${tokenMoversBlock}${tokenTrends}
 Net P&L: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
 
+(See TRADING P&L below for win rate and trade count \u2014 great roast material.)
+
 ${additionalContext || 'Self-deprecate with REAL numbers. "Portfolio down to ' + totalPortfolio.toFixed(2) + ' SOL. My tokens have a graduation rate of 0%. The bonding curve is my nemesis."'}
 One observation, one punchline. Keep it under 240 chars.`,
 
@@ -1389,21 +1540,26 @@ One observation, one punchline. Keep it under 240 chars.`,
 YOUR ACTUAL SITUATION:
 - Day ${stats.dayNumber}, ${stats.totalLaunches} launches, ${stats.bondingCurveHits || 0} graduated
 - You are built on @elizaOS, launch on @Pumpfun
+- You run a 7-agent swarm (Scout, Analyst, Guardian, Launcher, CFO, Community, Supervisor)
 
 TOKEN DATA:
 ${tokenMoversBlock}${tokenTrends}
 
-${additionalContext || 'What pattern in the data above surprises you? What would a human do differently?'}
-Be specific. Only reference data shown above. Do NOT fabricate analysis claims.
+(See TRADING P&L, CFO PORTFOLIO, SWARM STATUS, and ACTIVE POSITIONS below for more real data.)
+
+${additionalContext || 'What pattern in the data above surprises you? What would a human do differently? Reference a specific number.'}
+Be specific. Only reference data shown above or in appended blocks. Do NOT fabricate analysis claims.
 MAX 240 chars.`,
 
-    degen_wisdom: `Drop a specific lesson from your launch data.
+    degen_wisdom: `Drop a specific lesson from your launch and trading data.
 
 YOUR DATA:
 ${tokenMoversBlock}${tokenTrends}${marketPulse}
 ${stats.totalLaunches} launches. ${stats.bondingCurveHits} graduated. Net: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL.
 
-${additionalContext || 'Share a concrete pattern from your token data. Timing, naming, market conditions, holder behavior.'}
+(See TRADING P&L and RECENT TRADES below for win/loss record and trade-level detail.)
+
+${additionalContext || 'Share a concrete pattern from your token data, trading history, or CFO positions.'}
 "After ${stats.totalLaunches} launches: [specific insight backed by the data above]." One insight per post.
 MAX 240 chars.`,
 
@@ -1445,7 +1601,7 @@ ${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. Gr
   const narrativePrompt = getActiveNarrativePrompt(stats.dayNumber);
   const narrativeContext = narrativePrompt ? `\n\n${narrativePrompt}` : '';
   
-  const prompt = `${moodContext}\n\n${basePrompt}${knowledgeBlock}${recentContext}${narrativeContext}`;
+  const prompt = `${moodContext}\n\n${basePrompt}${enrichedData}${knowledgeBlock}${recentContext}${narrativeContext}`;
   
   try {
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -1618,9 +1774,10 @@ RULES:
   const prompt = threadPrompts[type];
   if (!prompt) return null;
 
-  // Inject research knowledge into threads
+  // Inject enriched data + research knowledge into threads
+  const enrichedData = await buildEnrichedDataBlock(type);
   const knowledgeBlock = await getKnowledgeForPostType(type);
-  const fullPrompt = knowledgeBlock ? `${prompt}${knowledgeBlock}` : prompt;
+  const fullPrompt = `${prompt}${enrichedData}${knowledgeBlock || ''}`;
 
   try {
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
