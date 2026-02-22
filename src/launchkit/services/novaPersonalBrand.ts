@@ -2458,6 +2458,23 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     }
   }
   
+  // ── Security Gate: scan content before publishing ─────────────
+  // Uses Guardian's ContentFilter + NetworkShield to block leaked secrets,
+  // phishing URLs, or hallucinated suspicious content from reaching X.
+  try {
+    const { ContentFilter, NetworkShield } = await import('../../agents/security/index.ts');
+    // Quick static scan (no DB needed, just pattern matching)
+    const tempFilter = new ContentFilter(null as any, async () => {});
+    const scanResult = tempFilter.scanOutbound(content, 'x-post');
+    if (!scanResult.clean) {
+      const threatTypes = scanResult.threats.map(t => t.type).join(', ');
+      logger.error(`[NovaPersonalBrand] ❌ X post BLOCKED by security filter: ${threatTypes}`);
+      return { success: false };
+    }
+  } catch {
+    // Security module not available — don't block posting
+  }
+  
   try {
     // Maybe add TG channel CTA (casual, probability-based)
     const contentWithCTA = maybeAddChannelCTA(content, type);

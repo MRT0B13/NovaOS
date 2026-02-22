@@ -1,28 +1,49 @@
 /**
  * Guardian Agent
  *
- * Role: Safety monitoring — RugCheck scans, LP tracking, whale movement alerts,
- * liquidity monitoring, and holder concentration analysis.
- * Wraps rugcheck.ts service and adds proactive monitoring loops.
+ * Role: Comprehensive security agent — token safety, wallet protection,
+ * network defense, content filtering, agent behavior monitoring, and
+ * automated incident response.
  *
- * Runs on a schedule:
+ * === Token Safety (Original) ===
  *   - Watched token re-scan: every 15 minutes (RugCheck safety scores)
  *   - Liquidity monitor: every 30 minutes (DexScreener LP + volume)
  *   - Scout token ingestion: every 5 minutes
  *
+ * === Security Modules (New) ===
+ *   - Wallet Sentinel: every 2 minutes (balance monitoring, drain detection)
+ *   - Network Shield: every 3 minutes (RPC validation, API key leak detection)
+ *   - Content Filter: every 5 minutes (phishing, prompt injection, secret leaks)
+ *   - Agent Watchdog: every 1 minute (behavioral anomaly detection, quarantine)
+ *   - Incident Response: continuous (event aggregation, escalation, alerting)
+ *
  * Outgoing messages → Supervisor:
- *   - alert (critical): Rug detected, mint/freeze authority re-enabled, 50%+ supply dump, LP drained
- *   - alert (high): New risk flag, LP unlocked, score degradation > 20 points, liquidity drop > 40%
- *   - report (medium): Periodic safety summary, scan result on request
+ *   - alert (critical): Rug detected, wallet drain, agent quarantined, API key leak
+ *   - alert (high): Score degradation, LP drain, phishing detected, RPC issues
+ *   - report (medium): Periodic safety summary, security digest
  *
  * Incoming commands ← Supervisor:
  *   - scan_token: Scan a specific token address and report back
  *   - watch_token: Add a token to the active watch list
+ *   - security_status: Return full security posture report
+ *   - release_agent: Release a quarantined agent
  */
 
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent } from './types.ts';
+
+// Security modules
+import {
+  WalletSentinel,
+  NetworkShield,
+  ContentFilter,
+  AgentWatchdog,
+  IncidentResponse,
+  ensureSecurityTables,
+  type SecurityEvent,
+  type IncidentCallbacks,
+} from './security/index.ts';
 
 // Lazy imports
 let _scanToken: ((mint: string) => Promise<any>) | null = null;
@@ -125,6 +146,14 @@ export class GuardianAgent extends BaseAgent {
   private scanCount = 0;
   private liquidityAlertCount = 0;
 
+  // ── Security Modules ──────────────────────────────────────────
+  private walletSentinel: WalletSentinel;
+  private networkShield: NetworkShield;
+  private contentFilter: ContentFilter;
+  private agentWatchdog: AgentWatchdog;
+  private incidentResponse: IncidentResponse;
+  private securityInitialized = false;
+
   constructor(pool: Pool, opts?: { rescanIntervalMs?: number; liquidityCheckIntervalMs?: number }) {
     super({
       agentId: 'nova-guardian',
@@ -133,6 +162,37 @@ export class GuardianAgent extends BaseAgent {
     });
     this.rescanIntervalMs = opts?.rescanIntervalMs ?? 15 * 60 * 1000; // 15 min
     this.liquidityCheckIntervalMs = opts?.liquidityCheckIntervalMs ?? 30 * 60 * 1000; // 30 min
+
+    // Initialize security modules with shared incident response pipeline
+    this.incidentResponse = new IncidentResponse(pool);
+    const reporter = (event: SecurityEvent) => this.handleSecurityEvent(event);
+    this.walletSentinel = new WalletSentinel(pool, reporter);
+    this.networkShield = new NetworkShield(pool, reporter);
+    this.contentFilter = new ContentFilter(pool, reporter);
+    this.agentWatchdog = new AgentWatchdog(pool, reporter);
+  }
+
+  /** Set external notification callbacks for incident response */
+  setSecurityCallbacks(callbacks: IncidentCallbacks): void {
+    this.incidentResponse.setCallbacks(callbacks);
+  }
+
+  /** Central security event handler — routes all events through incident response */
+  private async handleSecurityEvent(event: SecurityEvent): Promise<void> {
+    // Route through incident response for aggregation & escalation
+    await this.incidentResponse.handleEvent(event);
+
+    // Also report critical/emergency events to supervisor
+    if (event.severity === 'critical' || event.severity === 'emergency') {
+      await this.reportToSupervisor('alert', event.severity === 'emergency' ? 'critical' : 'high', {
+        securityEvent: true,
+        category: event.category,
+        severity: event.severity,
+        title: event.title,
+        details: event.details,
+        autoResponse: event.autoResponse,
+      });
+    }
   }
 
   protected async onStart(): Promise<void> {
@@ -140,6 +200,8 @@ export class GuardianAgent extends BaseAgent {
     await this.restorePersistedState();
 
     this.startHeartbeat(60_000);
+
+    // ── Token Safety (Original) ────────────────────────────────
 
     // Periodic re-scan of watched tokens (RugCheck safety)
     this.addInterval(() => this.rescanWatchList(), this.rescanIntervalMs);
@@ -152,6 +214,47 @@ export class GuardianAgent extends BaseAgent {
 
     // Ingest scout intel for new tokens every 5 minutes
     this.addInterval(() => this.ingestScoutTokens(), 5 * 60 * 1000);
+
+    // ── Security Modules ───────────────────────────────────────
+
+    try {
+      // Ensure security DB tables exist
+      await ensureSecurityTables(this.pool);
+
+      // Initialize all security modules
+      this.walletSentinel.init();
+      this.networkShield.init();
+      this.contentFilter.init();
+      this.agentWatchdog.init();
+
+      // Wallet Sentinel: check every 2 minutes
+      this.addInterval(() => this.walletSentinel.check(), 2 * 60 * 1000);
+
+      // Network Shield: validate RPCs every 3 minutes
+      this.addInterval(() => this.networkShield.checkRpcEndpoints(), 3 * 60 * 1000);
+
+      // Network Shield: check rate anomalies every 1 minute
+      this.addInterval(() => this.networkShield.checkRateAnomalies(), 60 * 1000);
+
+      // Content Filter: scan agent messages every 5 minutes
+      this.addInterval(() => this.contentFilter.scanRecentMessages(), 5 * 60 * 1000);
+
+      // Agent Watchdog: behavioral analysis every 1 minute
+      this.addInterval(() => this.agentWatchdog.check(), 60 * 1000);
+
+      // Incident Response: cleanup stale incidents every 15 minutes
+      this.addInterval(() => this.incidentResponse.cleanup(), 15 * 60 * 1000);
+
+      // Security status persistence every 5 minutes
+      this.addInterval(() => this.persistState(), 5 * 60 * 1000);
+
+      this.securityInitialized = true;
+      logger.info('[guardian] 🛡️ Security modules initialized: WalletSentinel, NetworkShield, ContentFilter, AgentWatchdog, IncidentResponse');
+    } catch (err) {
+      logger.warn('[guardian] Security modules failed to initialize (non-fatal, token safety still active):', err);
+    }
+
+    // ── Token Loading ──────────────────────────────────────────
 
     // 1. Load core ecosystem tokens — always-on baseline
     for (const t of CORE_WATCH_TOKENS) {
@@ -166,6 +269,12 @@ export class GuardianAgent extends BaseAgent {
 
     // 4. First liquidity snapshot (baseline, no alerts)
     await this.monitorLiquidity(true);
+
+    // 5. First wallet snapshot (baseline)
+    if (this.securityInitialized) {
+      await this.walletSentinel.check();
+      await this.networkShield.checkRpcEndpoints();
+    }
 
     logger.info(`[guardian] Monitoring ${this.watchList.size} tokens (${CORE_WATCH_TOKENS.length} core + DB + scout), re-scan every ${this.rescanIntervalMs / 60000}m, liquidity every ${this.liquidityCheckIntervalMs / 60000}m`);
   }
@@ -524,6 +633,32 @@ export class GuardianAgent extends BaseAgent {
             this.addToWatchList(tokenAddress, ticker, 'scout');
           }
         }
+        // Security: return full security posture
+        if (msg.message_type === 'command' && msg.payload?.action === 'security_status') {
+          await this.reportToSupervisor('report', 'medium', {
+            requestedBy: msg.payload?.requestedBy,
+            securityStatus: this.getSecurityStatus(),
+            incidentReport: this.incidentResponse.generateReport(),
+          });
+        }
+        // Security: release a quarantined agent
+        if (msg.message_type === 'command' && msg.payload?.action === 'release_agent') {
+          const { agentName, releasedBy } = msg.payload;
+          if (agentName) {
+            await this.agentWatchdog.releaseAgent(agentName, releasedBy || 'supervisor');
+          }
+        }
+        // Security: scan content on demand
+        if (msg.message_type === 'command' && msg.payload?.action === 'scan_content') {
+          const { content, source } = msg.payload;
+          if (content && this.securityInitialized) {
+            const result = this.contentFilter.scanInbound(content, undefined, source);
+            await this.reportToSupervisor('report', result.clean ? 'low' : 'high', {
+              requestedBy: msg.payload?.requestedBy,
+              scanResult: result,
+            });
+          }
+        }
         if (msg.id) await this.acknowledgeMessage(msg.id);
       }
     } catch {
@@ -537,6 +672,7 @@ export class GuardianAgent extends BaseAgent {
     await this.saveState({
       scanCount: this.scanCount,
       liquidityAlertCount: this.liquidityAlertCount,
+      securityInitialized: this.securityInitialized,
     });
   }
 
@@ -553,6 +689,28 @@ export class GuardianAgent extends BaseAgent {
 
   // ── Public API ───────────────────────────────────────────────────
 
+  /** Get full security status including all modules */
+  getSecurityStatus() {
+    return {
+      securityInitialized: this.securityInitialized,
+      walletSentinel: this.securityInitialized ? this.walletSentinel.getStatus() : null,
+      networkShield: this.securityInitialized ? this.networkShield.getStatus() : null,
+      contentFilter: this.securityInitialized ? this.contentFilter.getStatus() : null,
+      agentWatchdog: this.securityInitialized ? this.agentWatchdog.getStatus() : null,
+      incidentResponse: this.securityInitialized ? this.incidentResponse.getStatus() : null,
+    };
+  }
+
+  /** Expose content filter for external use (e.g., TG message handler) */
+  getContentFilter(): ContentFilter | null {
+    return this.securityInitialized ? this.contentFilter : null;
+  }
+
+  /** Expose network shield for external use (e.g., pre-publish scanning) */
+  getNetworkShield(): NetworkShield | null {
+    return this.securityInitialized ? this.networkShield : null;
+  }
+
   getStatus() {
     // Count by source
     const bySource: Record<string, number> = {};
@@ -566,6 +724,7 @@ export class GuardianAgent extends BaseAgent {
       watchListSources: bySource,
       totalScans: this.scanCount,
       totalLiquidityAlerts: this.liquidityAlertCount,
+      security: this.getSecurityStatus(),
       watchedTokens: Array.from(this.watchList.values()).map(t => ({
         mint: t.mint.slice(0, 8) + '...',
         ticker: t.ticker,

@@ -237,7 +237,20 @@ export class Supervisor extends BaseAgent {
 
     // ── Guardian Alerts ──
     this.handlers.set('nova-guardian:alert', async (msg) => {
-      const { tokenAddress, tokenName, score, alerts } = msg.payload;
+      const { tokenAddress, tokenName, score, alerts, securityEvent, category, severity, title, details } = msg.payload;
+
+      // Security events from Guardian's security modules → route to admin
+      if (securityEvent) {
+        const secMsg = `🛡️ SECURITY ${(severity || 'ALERT').toUpperCase()}\n\n${title || 'Security Event'}\n${details?.message || JSON.stringify(details || {}).slice(0, 200)}`;
+        if (severity === 'emergency' || msg.priority === 'critical') {
+          if (this.callbacks.onPostToAdmin) await this.callbacks.onPostToAdmin(secMsg);
+          logger.warn(`[supervisor] 🛡️ Security ${severity}: ${title}`);
+        } else {
+          logger.info(`[supervisor] 🛡️ Security ${severity}: ${title}`);
+        }
+        return;
+      }
+
       const warning = this.formatSafetyWarning(tokenName || tokenAddress, score, alerts || []);
 
       if (msg.priority === 'critical') {

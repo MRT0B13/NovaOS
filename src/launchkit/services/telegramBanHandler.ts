@@ -109,6 +109,39 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           // Silently ignore caching errors
         }
         
+        // ── Security: scan inbound message for threats ──────────
+        // Checks for phishing links, scam addresses, prompt injection,
+        // and leaked secrets before the message reaches the LLM pipeline.
+        try {
+          const message = (ctx as any).message || (ctx as any).edited_message;
+          const text = message?.text || message?.caption || '';
+          if (text.length > 0) {
+            const { ContentFilter } = await import('../../agents/security/index.ts');
+            const filter = new ContentFilter(null as any, async () => {});
+            const scanResult = filter.scanInbound(
+              text,
+              String(message?.from?.id || ''),
+              String(message?.chat?.id || ''),
+            );
+            if (!scanResult.clean) {
+              const hasCritical = scanResult.threats.some(t => t.severity === 'critical' || t.severity === 'high');
+              if (hasCritical) {
+                console.log(`[BAN_HANDLER] 🛡️ BLOCKED message from ${message?.from?.id}: ${scanResult.threats.map(t => t.type).join(', ')}`);
+                // Try to delete the malicious message
+                try {
+                  await ctx.deleteMessage();
+                } catch { /* may not have delete permission */ }
+                // Don't pass to LLM — return early
+                return;
+              }
+              // Non-critical threats: log but let through
+              console.log(`[BAN_HANDLER] ⚠️ Suspicious message from ${message?.from?.id}: ${scanResult.threats.map(t => t.type).join(', ')}`);
+            }
+          }
+        } catch {
+          // Security module not available — don't block messages
+        }
+        
         // Call original handleMessage
         return originalHandleMessage(ctx);
       };

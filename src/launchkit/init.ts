@@ -366,6 +366,23 @@ export async function initLaunchKit(
       });
       logger.info('[LaunchKit] 🐝 Supervisor callbacks wired (X + TG + Channel + Farcaster)');
 
+      // Wire Guardian security callbacks (incident alerts → admin notification)
+      try {
+        _swarmHandle.guardian.setSecurityCallbacks({
+          onAdminAlert: async (message: string, severity: string) => {
+            try {
+              const { notifyAdminForce } = await import('./services/adminNotify.ts');
+              await notifyAdminForce(`🛡️ SECURITY ${severity.toUpperCase()}\n\n${message}`);
+            } catch (err) {
+              logger.warn('[swarm] Guardian → Admin security alert failed:', err);
+            }
+          },
+        });
+        logger.info('[LaunchKit] 🛡️ Guardian security callbacks wired');
+      } catch (secErr) {
+        logger.warn('[LaunchKit] Security callbacks failed (non-fatal):', secErr);
+      }
+
       // Register /scan and /children TG commands
       try {
         const scanRegistered = await registerScanCommand(runtime, _swarmHandle.supervisor);
