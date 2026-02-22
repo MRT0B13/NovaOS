@@ -1199,7 +1199,9 @@ async function buildSignedOrder(params: OrderParams): Promise<SignedOrder> {
     takerAmountRaw = Math.floor(params.sizeUsdc * 10 ** USDC_DECIMALS);
   }
 
-  const salt = BigInt(Date.now()) * BigInt(1_000_000) + BigInt(Math.floor(Math.random() * 1_000_000));
+  // Salt must fit in Number.MAX_SAFE_INTEGER (2^53-1) since the API payload
+  // sends it as a JSON number via parseInt(). Our old BigInt(Date.now())*1M overflowed.
+  const salt = Date.now() * 1000 + Math.floor(Math.random() * 1000);
   const expiration = params.expirationSeconds ?? 0;
   const nonce = BigInt(0);
   const feeRateBps = BigInt(params.feeRateBps ?? 0);
@@ -1301,11 +1303,13 @@ export async function placeBuyOrder(
     // Payload format must match SDK's orderToJson() exactly:
     //   owner = API key (NOT wallet address)
     //   salt  = number  (parseInt, not string)
+    //   side  = "BUY"/"SELL" string (NOT numeric 0/1 from EIP-712)
     const creds = await getCLOBCredentials();
     const payload = {
       order: {
         ...signedOrder,
         salt: parseInt(signedOrder.salt, 10),
+        side: 'BUY' as const,
       },
       owner: creds.apiKey,
       orderType: 'GTC' as const,
@@ -1501,6 +1505,7 @@ export async function exitPosition(
       order: {
         ...signedOrder,
         salt: parseInt(signedOrder.salt, 10),
+        side: 'SELL' as const,
       },
       owner: creds.apiKey,
       orderType: 'GTC' as const,
