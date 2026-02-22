@@ -40,7 +40,22 @@ let _pyth:    any = null; const pyth    = async () => _pyth    ??= await import(
 let _helius:  any = null; const helius  = async () => _helius  ??= await import('../launchkit/cfo/heliusService.ts');
 
 interface ScoutIntel { cryptoBullish?: boolean; btcEstimate?: number; narratives?: string[]; receivedAt: number; }
-interface PendingApproval { id: string; description: string; amountUsd: number; action: () => Promise<void>; expiresAt: number; }
+
+/** Serializable approval metadata — persisted to DB so approvals survive restarts */
+interface SerializableApproval {
+  id: string;
+  description: string;
+  amountUsd: number;
+  decisionJson: Record<string, any>;   // Decision object (JSON-safe)
+  source: 'decision_engine' | 'legacy_bet';  // which code path queued it
+  createdAt: number;
+  expiresAt: number;
+  remindedAt?: number;                 // last reminder timestamp
+}
+
+interface PendingApproval extends SerializableApproval {
+  action: () => Promise<void>;         // rebuilt from decisionJson on restore
+}
 
 export class CFOAgent extends BaseAgent {
   private repo: PostgresCFORepository | null = null;
@@ -232,6 +247,9 @@ export class CFOAgent extends BaseAgent {
             const o = await polyMod.placeBuyOrder(opp.market, opp.targetToken, opp.recommendedUsd);
             await this.persistPolyOrder(opp, o);
           },
+          // Legacy bet — pass enough data to identify but mark as legacy
+          { type: 'POLY_BET', conditionId: opp.market.conditionId, question: opp.market.question, outcome: opp.targetToken.outcome, sizeUsd: opp.recommendedUsd },
+          'legacy_bet',
         );
         return null;
       }
@@ -565,6 +583,8 @@ export class CFOAgent extends BaseAgent {
             `${d.type}: ${d.reasoning}`,
             Math.abs(d.estimatedImpactUsd),
             action,
+            d,                      // full Decision object (JSON-safe)
+            'decision_engine',
           );
           approvalIds.set(`${d.type}-${r.decision.urgency}`, approvalId);
         }
@@ -695,20 +715,103 @@ export class CFOAgent extends BaseAgent {
     } catch { /* non-fatal */ }
   }
 
-  // ── Approval system ───────────────────────────────────────────────
+  // ── Approval system (DB-persisted, survives restarts) ─────────────
 
-  private async queueForApproval(description: string, amountUsd: number, action: () => Promise<void>): Promise<string> {
-    this.approvalCounter++;
-    const id = `a-${this.approvalCounter}`;
-    this.pendingApprovals.set(id, { id, description, amountUsd, action, expiresAt: Date.now() + 15 * 60_000 });
-    return id;  // caller includes the approve button in the combined report
+  /** Get approval expiry from config (defaults to 30 min) */
+  private getApprovalExpiryMs(): number {
+    return (getDecisionConfig().approvalExpiryMinutes ?? 30) * 60_000;
   }
 
-  private expirePendingApprovals(): void {
+  private async queueForApproval(
+    description: string,
+    amountUsd: number,
+    action: () => Promise<void>,
+    decision?: Record<string, any>,
+    source: 'decision_engine' | 'legacy_bet' = 'decision_engine',
+  ): Promise<string> {
+    this.approvalCounter++;
+    const id = `a-${this.approvalCounter}`;
     const now = Date.now();
-    for (const [id, a] of this.pendingApprovals) {
-      if (now > a.expiresAt) { this.pendingApprovals.delete(id); logger.info(`[CFO] Approval expired: ${id}`); }
+    const expiresAt = now + this.getApprovalExpiryMs();
+    this.pendingApprovals.set(id, {
+      id, description, amountUsd, action,
+      decisionJson: decision ?? {},
+      source,
+      createdAt: now,
+      expiresAt,
+    });
+    // Persist to DB immediately so approval survives a restart
+    await this.persistState();
+    return id;
+  }
+
+  /** Rebuild the executable action closure from a serialized Decision */
+  private rebuildApprovalAction(sa: SerializableApproval): () => Promise<void> {
+    if (sa.source === 'decision_engine' && sa.decisionJson?.type) {
+      return async () => {
+        const { executeDecision } = await import('../launchkit/cfo/decisionEngine.ts');
+        const decision = { ...sa.decisionJson, tier: 'AUTO' } as any;
+        const env = getCFOEnv();
+        const execResult = await executeDecision(decision, env);
+        if (execResult.success && execResult.executed) {
+          logger.info(`[CFO] Approved decision ${decision.type} executed (tx: ${execResult.txId ?? 'n/a'})`);
+          await this.persistDecisionResults([execResult]);
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(`✅ ${decision.type} executed.\ntx: ${execResult.txId ?? 'dry-run'}`);
+        } else {
+          logger.error(`[CFO] Approved decision ${decision.type} failed: ${execResult.error}`);
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(`❌ ${decision.type} failed: ${execResult.error}`);
+        }
+      };
     }
+    // Legacy bet approvals can't be rebuilt (market conditions changed) — expire them
+    return async () => {
+      logger.warn(`[CFO] Cannot re-execute legacy approval ${sa.id} after restart — market may have moved`);
+      const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+      await notifyAdminForce(`⚠️ Approval ${sa.id} expired — market conditions may have changed since restart.`);
+    };
+  }
+
+  private async expirePendingApprovals(): Promise<void> {
+    const now = Date.now();
+    let changed = false;
+
+    for (const [id, a] of this.pendingApprovals) {
+      // ── Expire ────────────────────────────────────────────────
+      if (now > a.expiresAt) {
+        this.pendingApprovals.delete(id);
+        changed = true;
+        logger.info(`[CFO] Approval expired: ${id} — ${a.description}`);
+        try {
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(
+            `⏰ Approval *${id}* expired — ${a.description.slice(0, 60)}\n` +
+            `$${a.amountUsd.toFixed(0)} | was pending ${Math.round((now - a.createdAt) / 60_000)} min`,
+          );
+        } catch { /* non-fatal */ }
+        continue;
+      }
+
+      // ── Reminder at ~50% of remaining time ────────────────────
+      const halfLife = a.createdAt + (a.expiresAt - a.createdAt) / 2;
+      if (now >= halfLife && !a.remindedAt) {
+        a.remindedAt = now;
+        changed = true;
+        const minsLeft = Math.round((a.expiresAt - now) / 60_000);
+        try {
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(
+            `🔔 *Reminder:* Pending approval *${id}*\n` +
+            `${a.description.slice(0, 80)}\n` +
+            `$${a.amountUsd.toFixed(0)} | ⏳ ${minsLeft} min left\n` +
+            `/cfo approve ${id}`,
+          );
+        } catch { /* non-fatal */ }
+      }
+    }
+
+    if (changed) await this.persistState();
   }
 
   // ── Visible life-sign (so logs show CFO is alive) ────────────────
@@ -902,8 +1005,11 @@ export class CFOAgent extends BaseAgent {
         const a = this.pendingApprovals.get(payload.approvalId);
         if (a) {
           this.pendingApprovals.delete(payload.approvalId);
+          await this.persistState();
           await a.action();
           await notify(`✅ CFO: Executed: ${a.description}`);
+        } else {
+          await notify(`⚠️ Approval ${payload.approvalId} not found — may have expired or already been executed.`);
         }
         break;
       }
@@ -1032,9 +1138,25 @@ export class CFOAgent extends BaseAgent {
   // ── State Persistence (survive restarts) ─────────────────────────
 
   private async persistState(): Promise<void> {
+    // Serialize pending approvals (strip non-serializable `action` closure)
+    const serializedApprovals: SerializableApproval[] = [];
+    for (const [, a] of this.pendingApprovals) {
+      serializedApprovals.push({
+        id: a.id,
+        description: a.description,
+        amountUsd: a.amountUsd,
+        decisionJson: a.decisionJson,
+        source: a.source,
+        createdAt: a.createdAt,
+        expiresAt: a.expiresAt,
+        remindedAt: a.remindedAt,
+      });
+    }
     await this.saveState({
       cycleCount: this.cycleCount,
       startedAt: this.startedAt,
+      approvalCounter: this.approvalCounter,
+      pendingApprovals: serializedApprovals,
     });
   }
 
@@ -1042,12 +1164,49 @@ export class CFOAgent extends BaseAgent {
     const s = await this.restoreState<{
       cycleCount?: number;
       startedAt?: number;
+      approvalCounter?: number;
+      pendingApprovals?: SerializableApproval[];
     }>();
     if (!s) return;
     if (s.cycleCount) this.cycleCount = s.cycleCount;
+    if (s.approvalCounter) this.approvalCounter = s.approvalCounter;
     // Keep startedAt from the previous session to show total uptime across restarts
     if (s.startedAt)  this.startedAt = s.startedAt;
-    logger.info(`[cfo] Restored: ${this.cycleCount} cycles, started=${new Date(this.startedAt).toISOString()}`);
+
+    // Restore pending approvals — rebuild action closures, skip already-expired
+    const now = Date.now();
+    let restoredCount = 0;
+    if (s.pendingApprovals?.length) {
+      for (const sa of s.pendingApprovals) {
+        if (now > sa.expiresAt) {
+          logger.info(`[CFO] Skipping expired approval ${sa.id} from previous session`);
+          continue;
+        }
+        const action = this.rebuildApprovalAction(sa);
+        this.pendingApprovals.set(sa.id, { ...sa, action });
+        restoredCount++;
+      }
+    }
+
+    logger.info(
+      `[cfo] Restored: ${this.cycleCount} cycles, ` +
+      `started=${new Date(this.startedAt).toISOString()}, ` +
+      `${restoredCount} pending approvals`,
+    );
+
+    // Notify admin about restored approvals
+    if (restoredCount > 0) {
+      try {
+        const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+        const lines = [...this.pendingApprovals.values()].map(a => {
+          const minsLeft = Math.round((a.expiresAt - now) / 60_000);
+          return `  /cfo approve ${a.id}  ← ${a.description.slice(0, 50)} (${minsLeft}m left)`;
+        });
+        await notifyAdminForce(
+          `🔄 *CFO restarted* — ${restoredCount} pending approval(s) restored:\n${lines.join('\n')}`,
+        );
+      } catch { /* non-fatal */ }
+    }
   }
 
   getStatus() {

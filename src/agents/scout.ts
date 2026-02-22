@@ -246,7 +246,7 @@ export class ScoutAgent extends BaseAgent {
               // Require at least 2 meaningful keywords (or all if fewer)
               if (matchCount >= Math.min(2, keywords.length)) {
                 r.crossConfirmed = true;
-                r.result = `CROSS-CONFIRMED: "${trend.topic}" seen in pool(${trend.sources.join(',')}) + web search — ${r.result.slice(0, 200)}`;
+                r.result = `CROSS-CONFIRMED: "${trend.topic}" seen in pool(${trend.sources.join(',')}) + web search — ${r.result.slice(0, 600)}`;
                 confirmedTrends.add(trendKey);
                 break; // 1 result per trend — move to next trend
               }
@@ -288,7 +288,7 @@ export class ScoutAgent extends BaseAgent {
           const key = topicMatch ? topicMatch[1].toLowerCase() : r.result.slice(0, 80).toLowerCase();
           if (!seenTopics.has(key)) {
             seenTopics.add(key);
-            uniqueItems.push(r.result.slice(0, 200));
+            uniqueItems.push(r.result.slice(0, 600));
           }
         }
         // Cap at 3 items to prevent wall-of-text
@@ -354,7 +354,7 @@ export class ScoutAgent extends BaseAgent {
         }
         summaryLines.push(`🔥 ${uniqueCross.length} cross-confirmed signal(s):`);
         for (const item of uniqueCross.slice(0, 3)) {
-          summaryLines.push(`  • ${item.result.slice(0, 180)}`);
+          summaryLines.push(`  • ${item.result.slice(0, 500)}`);
         }
       }
 
@@ -362,7 +362,7 @@ export class ScoutAgent extends BaseAgent {
       for (const [topic, items] of Object.entries(byTopic)) {
         if (items.length > 0) {
           const best = items.sort((a, b) => b.length - a.length)[0];
-          summaryLines.push(`📡 ${topic}: ${best.slice(0, 180)}`);
+          summaryLines.push(`📡 ${topic}: ${best.slice(0, 400)}`);
         }
       }
 

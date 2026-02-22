@@ -180,32 +180,33 @@ export class Supervisor extends BaseAgent {
           logger.debug(`[supervisor] Skipping narrative post (cooldown: ${Math.round((Supervisor.NARRATIVE_COOLDOWN_MS - (now - this.lastNarrativePostAt)) / 60_000)}m remaining)`);
         } else {
           const rawContent = summary || narratives?.summary || 'Check thread for details';
-          // Truncate AFTER accounting for prefix so the total fits 280 chars for X.
-          // Truncate at word boundary to avoid mid-word cuts like "facilita".
           const prefix = '📡 Narrative shift detected: ';
+
+          // Full content for TG/Farcaster (Telegram supports 4096 chars)
+          const fullContent = `${prefix}${rawContent}`;
+
+          // Truncated content for X (280 char limit)
           const maxBody = 280 - prefix.length;
-          let trimmed: string;
+          let xContent: string;
           if (rawContent.length > maxBody) {
-            // Find last space before the limit (leave room for '...')
             const cutoff = maxBody - 3;
             const lastSpace = rawContent.lastIndexOf(' ', cutoff);
             const breakAt = lastSpace > cutoff * 0.5 ? lastSpace : cutoff;
-            trimmed = rawContent.slice(0, breakAt) + '...';
+            xContent = `${prefix}${rawContent.slice(0, breakAt)}...`;
           } else {
-            trimmed = rawContent;
+            xContent = fullContent;
           }
-          const content = `${prefix}${trimmed}`;
 
-          // Content dedup — don't post same/similar content to X twice
-          const contentHash = content.toLowerCase().replace(/[^a-z ]/g, '').trim().slice(0, 150);
+          // Content dedup — don't post same/similar content twice
+          const contentHash = fullContent.toLowerCase().replace(/[^a-z ]/g, '').trim().slice(0, 150);
           if (this.recentXPostHashes.has(contentHash)) {
             logger.debug(`[supervisor] Skipping duplicate narrative post (same content already posted)`);
           } else {
-            if (this.callbacks.onPostToX) await this.callbacks.onPostToX(content);
-            if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
+            if (this.callbacks.onPostToX) await this.callbacks.onPostToX(xContent);
+            if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(fullContent);
             if (this.callbacks.onPostToFarcaster) {
-              await this.callbacks.onPostToFarcaster(content, 'ai-agents');
-              await this.callbacks.onPostToFarcaster(content, 'solana');
+              await this.callbacks.onPostToFarcaster(fullContent, 'ai-agents');
+              await this.callbacks.onPostToFarcaster(fullContent, 'solana');
             }
             this.recentXPostHashes.add(contentHash);
             // Keep set bounded
