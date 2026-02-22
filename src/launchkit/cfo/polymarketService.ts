@@ -112,6 +112,7 @@ export interface PolyMarket {
   liquidity: number;
   tokens: PolyToken[];
   category: string;
+  minimumTickSize?: string; // e.g. '0.001' — from CLOB /markets response
 }
 
 export interface PolyToken {
@@ -158,6 +159,7 @@ export interface PolyPosition {
   currentValueUsd: number;
   unrealizedPnlUsd: number;
   openedAt: string;
+  minimumTickSize?: string; // e.g. '0.001' — from CLOB /markets response
 }
 
 export interface CLOBCredentials {
@@ -508,6 +510,7 @@ interface GammaMarket {
     price: number;
     winner: boolean;
   }>;
+  minimum_tick_size?: string; // e.g. '0.001'
 }
 
 /**
@@ -585,6 +588,7 @@ export async function fetchCryptoMarkets(options?: {
           liquidity: m.liquidity ?? m.liquidityNum ?? 0,
           category: m.category ?? 'crypto',
           tokens,
+          minimumTickSize: m.minimum_tick_size,
         };
       });
 
@@ -629,6 +633,7 @@ export async function fetchMarket(conditionId: string): Promise<PolyMarket | nul
           liquidity: c.liquidity ?? 0,
           category: 'crypto',
           tokens,
+          minimumTickSize: c.minimum_tick_size ?? c.minimumTickSize,
         };
       }
     }
@@ -670,6 +675,7 @@ export async function fetchMarket(conditionId: string): Promise<PolyMarket | nul
           liquidity: m.liquidity ?? m.liquidityNum ?? 0,
           category: m.category ?? 'crypto',
           tokens,
+          minimumTickSize: m.minimum_tick_size,
         };
       }
     }
@@ -1153,6 +1159,7 @@ interface OrderParams {
   expirationSeconds?: number; // 0 = never expire (GTC)
   negRisk?: boolean;         // true → use negRiskExchange
   feeRateBps?: number;       // market-specific fee rate (fetched from API)
+  tickSize?: number;         // minimum tick size (default 0.01)
 }
 
 interface SignedOrder {
@@ -1177,9 +1184,6 @@ interface SignedOrder {
 async function buildSignedOrder(params: OrderParams): Promise<SignedOrder> {
   const { wallet } = await loadEthers();
 
-  const USDC_DECIMALS = 6;
-  const TOKEN_DECIMALS = 6;
-
   let makerAmountRaw: number;
   let takerAmountRaw: number;
 
@@ -1188,19 +1192,38 @@ async function buildSignedOrder(params: OrderParams): Promise<SignedOrder> {
     throw new Error(`Invalid pricePerShare: ${params.pricePerShare}`);
   }
 
+  // ── Price rounding to tick size (matches SDK ROUNDING_CONFIG) ──
+  // The CLOB rejects orders whose implied price isn't on a tick boundary.
+  // SDK rounds price BEFORE computing amounts so the ratio = exactly roundedPrice.
+  const tickSize = params.tickSize ?? 0.01;
+  const tickDecimals = Math.round(-Math.log10(tickSize));
+  const roundedPrice = parseFloat((Math.round(params.pricePerShare / tickSize) * tickSize).toFixed(tickDecimals));
+  if (roundedPrice < tickSize || roundedPrice > 1 - tickSize) {
+    throw new Error(`Price ${params.pricePerShare} rounds to ${roundedPrice} which is outside valid range [${tickSize}, ${1 - tickSize}]`);
+  }
+
+  // ── Amount calculation per SDK getOrderRawAmounts ──
+  // Start from token size (not USD) so derivedPrice = makerAmt/takerAmt = roundedPrice exactly.
+  // SDK ROUNDING_CONFIG for tick 0.001: price=3dp, size=2dp, amount=5dp
+  // SDK ROUNDING_CONFIG for tick 0.01:  price=2dp, size=2dp, amount=4dp
+  const sizeDecimals = 2;
+  const amountDecimals = tickDecimals + 2; // SDK pattern: amount = price + 2
+
   if (params.side === 0) {
-    // BUY: maker spends USDC, gets outcome tokens
-    //   makerAmount = USDC amount
-    //   takerAmount = outcome token amount (USDC / price)
-    makerAmountRaw = Math.floor(params.sizeUsdc * 10 ** USDC_DECIMALS);
-    takerAmountRaw = Math.floor((params.sizeUsdc / params.pricePerShare) * 10 ** TOKEN_DECIMALS);
+    // BUY: maker spends USDC (makerAmount), gets tokens (takerAmount)
+    const rawTokenSize = Math.floor((params.sizeUsdc / roundedPrice) * 10 ** sizeDecimals) / 10 ** sizeDecimals;
+    let rawUsdcCost = rawTokenSize * roundedPrice;
+    // Round USDC cost to amountDecimals (SDK roundUp then roundDown pattern)
+    rawUsdcCost = parseFloat(rawUsdcCost.toFixed(amountDecimals));
+    makerAmountRaw = Math.round(rawUsdcCost * 1e6);
+    takerAmountRaw = Math.round(rawTokenSize * 1e6);
   } else {
-    // SELL: maker has outcome tokens, wants USDC
-    //   makerAmount = outcome token amount (USDC / price)
-    //   takerAmount = USDC amount
-    const tokenAmount = params.sizeUsdc / params.pricePerShare;
-    makerAmountRaw = Math.floor(tokenAmount * 10 ** TOKEN_DECIMALS);
-    takerAmountRaw = Math.floor(params.sizeUsdc * 10 ** USDC_DECIMALS);
+    // SELL: maker has tokens (makerAmount), gets USDC (takerAmount)
+    const rawTokenSize = Math.floor((params.sizeUsdc / roundedPrice) * 10 ** sizeDecimals) / 10 ** sizeDecimals;
+    let rawUsdcProceeds = rawTokenSize * roundedPrice;
+    rawUsdcProceeds = parseFloat(rawUsdcProceeds.toFixed(amountDecimals));
+    makerAmountRaw = Math.round(rawTokenSize * 1e6);
+    takerAmountRaw = Math.round(rawUsdcProceeds * 1e6);
   }
 
   // Salt must fit in Number.MAX_SAFE_INTEGER (2^53-1) since the API payload
@@ -1297,6 +1320,7 @@ export async function placeBuyOrder(
       feeRateBps = feeResp?.base_fee ?? 0;
     } catch { /* default 0 */ }
 
+    const tickSize = parseFloat(market.minimumTickSize || '0.01');
     const signedOrder = await buildSignedOrder({
       tokenId: token.tokenId,
       side: 0, // BUY
@@ -1304,6 +1328,7 @@ export async function placeBuyOrder(
       sizeUsdc: sizeUsd,
       negRisk,
       feeRateBps,
+      tickSize,
     });
 
     // Payload format must match SDK's orderToJson() exactly:
@@ -1498,9 +1523,10 @@ export async function exitPosition(
     // Use current price minus 1% to ensure the order fills
     const sellPrice = Math.max(0.01, position.currentPrice * 0.99);
 
-    // Fetch market-specific config (negRisk, feeRate) per SDK behavior
+    // Fetch market-specific config (negRisk, feeRate, tickSize) per SDK behavior
     let negRisk = false;
     let feeRateBps = 0;
+    let tickSize = 0.01;
     try {
       const nrResp = await clobGet<{ neg_risk: boolean }>(`/neg-risk?token_id=${position.tokenId}`);
       negRisk = nrResp?.neg_risk ?? false;
@@ -1509,6 +1535,10 @@ export async function exitPosition(
       const feeResp = await clobGet<{ base_fee: number }>(`/fee-rate?token_id=${position.tokenId}`);
       feeRateBps = feeResp?.base_fee ?? 0;
     } catch { /* default 0 */ }
+    try {
+      const mktResp = await clobGet<{ minimum_tick_size?: string }>(`/markets/${position.conditionId}`);
+      tickSize = parseFloat(mktResp?.minimum_tick_size || '0.01');
+    } catch { /* default 0.01 */ }
 
     const signedOrder = await buildSignedOrder({
       tokenId: position.tokenId,
@@ -1517,6 +1547,7 @@ export async function exitPosition(
       sizeUsdc: sizeUsd,
       negRisk,
       feeRateBps,
+      tickSize,
     });
 
     // Payload format must match SDK's orderToJson() exactly
