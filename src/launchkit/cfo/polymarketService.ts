@@ -196,18 +196,19 @@ const CLOB_AUTH_DOMAIN = {
   chainId: POLYGON_CHAIN_ID,
 };
 
-/** EIP-712 types for ClobAuth */
+/** EIP-712 types for ClobAuth (must match @polymarket/clob-client exactly) */
 const CLOB_AUTH_TYPES = {
   ClobAuth: [
     { name: 'address', type: 'address' },
     { name: 'timestamp', type: 'string' },
-    { name: 'nonce', type: 'int256' },
+    { name: 'nonce', type: 'uint256' },
     { name: 'message', type: 'string' },
   ],
 };
 
+/** Exact value from @polymarket/clob-client/src/signing/constants.ts */
 const CLOB_AUTH_MESSAGE =
-  'This message attests that I am the owner of the Ethereum address associated with this API key.';
+  'This message attests that I control the given wallet';
 
 /** EIP-712 domain for CTF Exchange order signing */
 const CTF_DOMAIN = {
@@ -241,21 +242,21 @@ const ORDER_TYPES = {
 
 async function getL1Headers(): Promise<Record<string, string>> {
   const { wallet } = await loadEthers();
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const nonce = Math.floor(Date.now() / 1000);
+  const timestamp = Math.floor(Date.now() / 1000);
+  const nonce = 0; // SDK default — always 0 for L1 auth
 
   const signature = await wallet.signTypedData(CLOB_AUTH_DOMAIN, CLOB_AUTH_TYPES, {
     address: wallet.address,
-    timestamp,
+    timestamp: `${timestamp}`,
     nonce,
     message: CLOB_AUTH_MESSAGE,
   });
 
   return {
-    'POLY_ADDRESS': wallet.address,
-    'POLY_SIGNATURE': signature,
-    'POLY_TIMESTAMP': timestamp,
-    'POLY_NONCE': nonce.toString(),
+    POLY_ADDRESS: wallet.address,
+    POLY_SIGNATURE: signature,
+    POLY_TIMESTAMP: `${timestamp}`,
+    POLY_NONCE: `${nonce}`,
   };
 }
 
@@ -327,13 +328,26 @@ export async function getCLOBCredentials(): Promise<CLOBCredentials> {
   }
 
   // Derive fresh credentials via L1 auth
+  // Polymarket CLOB API endpoints (per official SDK):
+  //   POST /auth/api-key         — creates new API key (L1 headers)
+  //   GET  /auth/derive-api-key  — derives deterministic key (may 400 for new wallets)
   logger.info('[Polymarket] Deriving CLOB credentials via L1 auth...');
   const l1Headers = await getL1Headers();
 
-  const resp = await fetch(`${CLOB_BASE}/auth/api-key`, {
-    method: 'GET',
-    headers: l1Headers,
+  // POST /auth/api-key is the reliable path (works for all wallets)
+  let resp = await fetch(`${CLOB_BASE}/auth/api-key`, {
+    method: 'POST',
+    headers: { ...l1Headers, 'Content-Type': 'application/json' },
   });
+
+  // Fallback: GET /auth/derive-api-key (deterministic, may fail for new wallets)
+  if (!resp.ok) {
+    logger.debug('[Polymarket] POST /auth/api-key returned ' + resp.status + ', trying GET /auth/derive-api-key');
+    resp = await fetch(`${CLOB_BASE}/auth/derive-api-key`, {
+      method: 'GET',
+      headers: l1Headers,
+    });
+  }
 
   if (!resp.ok) {
     const text = await resp.text();
