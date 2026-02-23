@@ -518,7 +518,7 @@ export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promi
     : message;
   await sendToChannel(channelMessage);
   
-  // Community gets a one-liner redirect + rules reminder (NOT the full report)
+  // Community gets a one-liner redirect (rules appended only every Nth update)
   healthUpdateCount++;
   saveValue('health_update_count', healthUpdateCount, 1000);
   const includeRules = healthUpdateCount % RULES_REMINDER_EVERY === 0;
@@ -527,8 +527,6 @@ export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promi
     let communityMsg = `📢 <a href="${env.NOVA_CHANNEL_INVITE}">Nova Announcements Channel</a> — latest health update posted!`;
 
     if (includeRules) {
-      communityMsg += '\n\n━━━━━━━━━━━━━━━\n' + getCommunityRulesMessage();
-    } else {
       communityMsg += '\n' + getRulesReminder();
     }
 
@@ -842,7 +840,7 @@ function getRulesReminder(): string {
 
 // Track how many health updates have been sent so we can append rules every Nth time
 let healthUpdateCount = 0;
-const RULES_REMINDER_EVERY = 3; // append rules reminder every 3rd health update
+const RULES_REMINDER_EVERY = 6; // append rules reminder every 6th health update (~every 12h at 2h interval)
 
 // Restore healthUpdateCount from DB on import
 loadValue<number>('health_update_count').then(v => {

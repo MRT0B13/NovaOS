@@ -488,7 +488,7 @@ export class GroupHealthMonitor {
    * Start periodic health monitoring
    * Default: every hour
    */
-  start(intervalMs: number = 60 * 60 * 1000): void {
+  start(intervalMs: number = 2 * 60 * 60 * 1000): void {
     if (this.monitorInterval) {
       console.log('[GROUP_HEALTH] Monitor already running');
       return;

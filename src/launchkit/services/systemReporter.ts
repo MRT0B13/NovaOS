@@ -1138,8 +1138,14 @@ export async function startSystemReporter(): Promise<void> {
     return; // Already running
   }
   
-  // Send initial startup report after a short delay
+  // Send initial startup report after a short delay — but skip if one was sent recently
+  const MIN_REPORT_GAP_MS = 2 * 60 * 60 * 1000; // 2 hours
   setTimeout(() => {
+    const elapsed = Date.now() - (metrics.lastReportTime || 0);
+    if (elapsed < MIN_REPORT_GAP_MS) {
+      logger.info(`[SystemReporter] Skipping startup report — last report was ${Math.round(elapsed / 60000)}m ago (min gap: ${MIN_REPORT_GAP_MS / 60000}m)`);
+      return;
+    }
     sendStatusReport().catch(err => {
       logger.error('[SystemReporter] Failed to send startup report:', err);
     });
