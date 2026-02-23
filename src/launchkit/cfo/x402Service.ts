@@ -64,7 +64,7 @@ const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const USDC_DECIMALS = 6;
 
 // ============================================================================
-// Revenue tracking (in-memory, also written to DB via CFO agent)
+// Revenue tracking (in-memory cache + DB persistence)
 // ============================================================================
 
 const revenueTracker = {
@@ -73,7 +73,52 @@ const revenueTracker = {
   last24hEarned: 0,
   last24hReset: Date.now(),
   byEndpoint: {} as Record<string, { calls: number; earned: number }>,
+  restored: false,
 };
+
+/** Restore revenue state from DB on first access */
+async function ensureRevenueRestored(): Promise<void> {
+  if (revenueTracker.restored) return;
+  revenueTracker.restored = true;
+  try {
+    const dbUrl = process.env.DATABASE_URL;
+    if (!dbUrl) return;
+    const { Pool } = await import('pg');
+    const pool = new Pool({ connectionString: dbUrl, max: 1 });
+    const { rows } = await pool.query(
+      `SELECT data FROM kv_store WHERE key = 'x402_revenue' LIMIT 1`,
+    );
+    await pool.end();
+    if (rows[0]?.data) {
+      const saved = typeof rows[0].data === 'string' ? JSON.parse(rows[0].data) : rows[0].data;
+      revenueTracker.totalCalls = saved.totalCalls ?? 0;
+      revenueTracker.totalEarned = saved.totalEarned ?? 0;
+      revenueTracker.byEndpoint = saved.byEndpoint ?? {};
+      logger.info(`[x402] Restored revenue state: $${revenueTracker.totalEarned.toFixed(4)} earned, ${revenueTracker.totalCalls} calls`);
+    }
+  } catch { /* non-fatal, start fresh */ }
+}
+
+/** Persist revenue state to DB */
+async function persistRevenue(): Promise<void> {
+  try {
+    const dbUrl = process.env.DATABASE_URL;
+    if (!dbUrl) return;
+    const { Pool } = await import('pg');
+    const pool = new Pool({ connectionString: dbUrl, max: 1 });
+    await pool.query(
+      `INSERT INTO kv_store (key, data) VALUES ('x402_revenue', $1)
+       ON CONFLICT (key) DO UPDATE SET data = $1`,
+      [JSON.stringify({
+        totalCalls: revenueTracker.totalCalls,
+        totalEarned: revenueTracker.totalEarned,
+        byEndpoint: revenueTracker.byEndpoint,
+        updatedAt: new Date().toISOString(),
+      })],
+    );
+    await pool.end();
+  } catch { /* non-fatal */ }
+}
 
 function trackRevenue(endpoint: string, usdcAmount: number): void {
   revenueTracker.totalCalls++;
@@ -91,9 +136,16 @@ function trackRevenue(endpoint: string, usdcAmount: number): void {
   }
   revenueTracker.byEndpoint[endpoint].calls++;
   revenueTracker.byEndpoint[endpoint].earned += usdcAmount;
+
+  // Persist every 5 calls to avoid excessive DB writes
+  if (revenueTracker.totalCalls % 5 === 0) {
+    persistRevenue().catch(() => {});
+  }
 }
 
 export function getRevenue(): X402Revenue {
+  // Trigger restore on first access (lazy)
+  ensureRevenueRestored().catch(() => {});
   return {
     totalCalls: revenueTracker.totalCalls,
     totalEarned: revenueTracker.totalEarned,
@@ -429,4 +481,75 @@ export async function x402Fetch(url: string, maxPriceUsdc = 0.10): Promise<unkno
   } catch (sdkErr) {
     throw new Error(`[x402] Client payment failed: ${(sdkErr as Error).message}`);
   }
+}
+
+// ============================================================================
+// Raw HTTP handler (for non-Express servers like server.ts)
+// ============================================================================
+
+/**
+ * Handle an x402 request from the raw HTTP server.
+ * Returns { status, body } for the server to send.
+ */
+export async function handleX402Request(
+  pathname: string,
+  searchParams: URLSearchParams,
+  _pool: any,
+): Promise<{ status: number; body: any }> {
+  const env = getCFOEnv();
+
+  if (!env.x402Enabled) {
+    return { status: 404, body: { error: 'x402 service is disabled' } };
+  }
+
+  // Route: /x402/rugcheck/:mint
+  const rugcheckMatch = pathname.match(/^\/x402\/rugcheck\/([A-Za-z0-9]+)$/);
+  if (rugcheckMatch) {
+    try {
+      const { scanToken } = await import('../services/rugcheck.ts');
+      const report = await scanToken(rugcheckMatch[1]);
+      if (!report) return { status: 404, body: { error: 'Token not found or scan failed' } };
+      trackRevenue('rugcheck', env.x402PriceRugcheck);
+      return { status: 200, body: { mint: rugcheckMatch[1], report, generatedAt: new Date().toISOString() } };
+    } catch (err) {
+      return { status: 500, body: { error: (err as Error).message } };
+    }
+  }
+
+  // Route: /x402/signal
+  if (pathname === '/x402/signal') {
+    try {
+      const { getReplyIntel } = await import('../services/novaResearch.ts');
+      const query = searchParams.get('q') ?? 'latest crypto signal';
+      const intel = await getReplyIntel(query);
+      trackRevenue('signal', env.x402PriceSignal);
+      return { status: 200, body: { query, intel, generatedAt: new Date().toISOString() } };
+    } catch (err) {
+      return { status: 500, body: { error: (err as Error).message } };
+    }
+  }
+
+  // Route: /x402/trend
+  if (pathname === '/x402/trend') {
+    try {
+      const fs = await import('fs');
+      const path = await import('path');
+      let trends: any = null;
+      try {
+        const raw = fs.readFileSync(path.resolve('./data/trend_pool.json'), 'utf-8');
+        trends = JSON.parse(raw);
+      } catch { /* file may not exist */ }
+      trackRevenue('trend', env.x402PriceTrend);
+      return { status: 200, body: { trends: trends?.trends?.slice(0, 10) ?? [], generatedAt: new Date().toISOString() } };
+    } catch (err) {
+      return { status: 500, body: { error: (err as Error).message } };
+    }
+  }
+
+  // Route: /x402/revenue — public stats (no payment required)
+  if (pathname === '/x402/revenue') {
+    return { status: 200, body: { data: getRevenue() } };
+  }
+
+  return { status: 404, body: { error: 'Unknown x402 endpoint' } };
 }

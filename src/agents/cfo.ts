@@ -22,7 +22,7 @@ import { BaseAgent } from './types.ts';
 import { getCFOEnv } from '../launchkit/cfo/cfoEnv.ts';
 import { PostgresCFORepository } from '../launchkit/cfo/postgresCFORepository.ts';
 import { PositionManager } from '../launchkit/cfo/positionManager.ts';
-import { getDecisionConfig, runDecisionCycle, classifyTier } from '../launchkit/cfo/decisionEngine.ts';
+import { getDecisionConfig, runDecisionCycle, classifyTier, getCooldownState, restoreCooldownState } from '../launchkit/cfo/decisionEngine.ts';
 import type { DecisionResult } from '../launchkit/cfo/decisionEngine.ts';
 import type { PlacedOrder, MarketOpportunity } from '../launchkit/cfo/polymarketService.ts';
 import type { TransactionType, PositionStrategy } from '../launchkit/cfo/postgresCFORepository.ts';
@@ -361,8 +361,8 @@ export class CFOAgent extends BaseAgent {
             // Fetch current SOL price for entry
             let entryPrice = 0;
             try {
-              const pyth = await import('../launchkit/cfo/pythOracleService.ts');
-              entryPrice = await (await pyth.createPythOracle()).getSolPrice();
+              const pythMod = await import('../launchkit/cfo/pythOracleService.ts');
+              entryPrice = await pythMod.getSolPrice();
             } catch { /* non-fatal */ }
             await this.positionManager.openHyperliquidPosition({
               coin: 'SOL', side: 'SHORT', sizeUsd, entryPrice, leverage,
@@ -675,6 +675,9 @@ export class CFOAgent extends BaseAgent {
           );
         } catch { /* non-fatal */ }
       }
+
+      // Persist cooldown state so hedge/stake timers survive restarts
+      await this.persistState();
 
       await this.updateStatus('idle');
     } catch (err) {
@@ -1157,6 +1160,7 @@ export class CFOAgent extends BaseAgent {
       startedAt: this.startedAt,
       approvalCounter: this.approvalCounter,
       pendingApprovals: serializedApprovals,
+      cooldowns: getCooldownState(),
     });
   }
 
@@ -1166,12 +1170,20 @@ export class CFOAgent extends BaseAgent {
       startedAt?: number;
       approvalCounter?: number;
       pendingApprovals?: SerializableApproval[];
+      cooldowns?: Record<string, number>;
     }>();
     if (!s) return;
     if (s.cycleCount) this.cycleCount = s.cycleCount;
     if (s.approvalCounter) this.approvalCounter = s.approvalCounter;
     // Keep startedAt from the previous session to show total uptime across restarts
     if (s.startedAt)  this.startedAt = s.startedAt;
+
+    // Restore decision engine cooldowns so hedge/stake timers survive restarts
+    if (s.cooldowns) {
+      restoreCooldownState(s.cooldowns);
+      const restored = Object.keys(s.cooldowns).length;
+      if (restored > 0) logger.info(`[CFO] Restored ${restored} decision cooldown(s)`);
+    }
 
     // Restore pending approvals — rebuild action closures, skip already-expired
     const now = Date.now();

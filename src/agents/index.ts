@@ -76,6 +76,19 @@ export async function initSwarm(
 
   if (callbacks) supervisor.setCallbacks(callbacks);
 
+  // Wire quarantine stop callback so AgentWatchdog can actually halt agents
+  const agentMap: Record<string, typeof scout> = {
+    'nova-scout': scout, 'nova-guardian': guardian, 'nova-analyst': analyst,
+    'nova-launcher': launcher, 'nova-community': community, 'nova-cfo': cfo,
+  };
+  guardian.setStopAgentCallback(async (agentName: string) => {
+    const agent = agentMap[agentName];
+    if (agent) {
+      logger.warn(`[swarm] Quarantine stopping agent ${agentName}`);
+      await agent.stop();
+    }
+  });
+
   // Start all agents (non-blocking, each registers + starts loops)
   const agents = [supervisor, scout, guardian, analyst, launcher, community, cfo];
 

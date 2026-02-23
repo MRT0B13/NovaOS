@@ -430,6 +430,8 @@ export class ScoutAgent extends BaseAgent {
       lastScanAt: this.lastScanAt,
       lastDigestAt: this.lastDigestAt,
       seenHashes: [...this.seenHashes].slice(-100), // cap to avoid bloat
+      // Persist intel buffer so scout doesn't lose accumulated intel on restart
+      intelBuffer: this.intelBuffer.slice(-60), // cap to avoid bloat
     });
   }
 
@@ -441,6 +443,7 @@ export class ScoutAgent extends BaseAgent {
       lastScanAt?: number;
       lastDigestAt?: number;
       seenHashes?: string[];
+      intelBuffer?: Array<{ query: string; result: string; at: number; crossConfirmed: boolean }>;
     }>();
     if (!s) return;
     if (s.cycleCount)      this.cycleCount = s.cycleCount;
@@ -449,7 +452,12 @@ export class ScoutAgent extends BaseAgent {
     if (s.lastScanAt)      this.lastScanAt = s.lastScanAt;
     if (s.lastDigestAt)    this.lastDigestAt = s.lastDigestAt;
     if (s.seenHashes)      this.seenHashes = new Set(s.seenHashes);
-    logger.info(`[scout] Restored: ${this.cycleCount} cycles, ${this.scanCount} scans, seenHashes=${this.seenHashes.size}`);
+    if (s.intelBuffer && s.intelBuffer.length > 0) {
+      // Only restore items newer than 2 hours to avoid stale intel
+      const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+      this.intelBuffer = s.intelBuffer.filter(i => i.at > cutoff);
+    }
+    logger.info(`[scout] Restored: ${this.cycleCount} cycles, ${this.scanCount} scans, seenHashes=${this.seenHashes.size}, intelBuffer=${this.intelBuffer.length}`);
   }
 
   // ── Public API (for direct use if needed) ────────────────────────

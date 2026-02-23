@@ -77,29 +77,37 @@ interface LiquiditySnapshot {
 async function fetchDexScreenerLiquidity(mints: string[]): Promise<Map<string, LiquiditySnapshot>> {
   const result = new Map<string, LiquiditySnapshot>();
   if (mints.length === 0) return result;
-  try {
-    const batch = mints.slice(0, 30).join(',');
-    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${batch}`);
-    if (!res.ok) return result;
-    const data = await res.json() as any;
-    const seen = new Set<string>();
-    for (const pair of (data.pairs || [])) {
-      const addr = pair.baseToken?.address;
-      if (addr && !seen.has(addr)) {
-        seen.add(addr);
-        result.set(addr, {
-          mint: addr,
-          liquidityUsd: pair.liquidity?.usd || 0,
-          volume24h: pair.volume?.h24 || 0,
-          priceUsd: parseFloat(pair.priceUsd) || 0,
-          priceChange24h: pair.priceChange?.h24 || 0,
-          fdv: pair.fdv || 0,
-          pairAddress: pair.pairAddress || '',
-        });
+
+  // DexScreener API accepts max 30 tokens per request — paginate in chunks
+  const CHUNK_SIZE = 30;
+  for (let i = 0; i < mints.length; i += CHUNK_SIZE) {
+    const chunk = mints.slice(i, i + CHUNK_SIZE);
+    try {
+      const batch = chunk.join(',');
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${batch}`);
+      if (!res.ok) continue;
+      const data = await res.json() as any;
+      const seen = new Set<string>();
+      for (const pair of (data.pairs || [])) {
+        const addr = pair.baseToken?.address;
+        if (addr && !seen.has(addr) && !result.has(addr)) {
+          seen.add(addr);
+          result.set(addr, {
+            mint: addr,
+            liquidityUsd: pair.liquidity?.usd || 0,
+            volume24h: pair.volume?.h24 || 0,
+            priceUsd: parseFloat(pair.priceUsd) || 0,
+            priceChange24h: pair.priceChange?.h24 || 0,
+            fdv: pair.fdv || 0,
+            pairAddress: pair.pairAddress || '',
+          });
+        }
       }
+      // Rate limit courtesy: small delay between chunks
+      if (i + CHUNK_SIZE < mints.length) await new Promise(r => setTimeout(r, 300));
+    } catch {
+      // DexScreener rate limit or down — non-fatal, continue with next chunk
     }
-  } catch {
-    // DexScreener rate limit or down — non-fatal
   }
   return result;
 }
@@ -178,6 +186,11 @@ export class GuardianAgent extends BaseAgent {
   /** Set external notification callbacks for incident response */
   setSecurityCallbacks(callbacks: IncidentCallbacks): void {
     this.incidentResponse.setCallbacks(callbacks);
+  }
+
+  /** Wire the agent stop callback so quarantine can actually halt a running agent */
+  setStopAgentCallback(cb: (agentName: string) => Promise<void>): void {
+    this.agentWatchdog.setStopAgentCallback(cb);
   }
 
   /** Central security event handler — routes all events through incident response */
@@ -672,10 +685,18 @@ export class GuardianAgent extends BaseAgent {
   // ── State Persistence (survive restarts) ─────────────────────────
 
   private async persistState(): Promise<void> {
+    // Persist scout-added watchList tokens so they survive restarts
+    const scoutTokens: Array<{ mint: string; ticker?: string; source: string; addedAt: number }> = [];
+    for (const [mint, t] of this.watchList) {
+      if (t.source === 'scout' || t.source === 'manual') {
+        scoutTokens.push({ mint, ticker: t.ticker, source: t.source, addedAt: t.addedAt });
+      }
+    }
     await this.saveState({
       scanCount: this.scanCount,
       liquidityAlertCount: this.liquidityAlertCount,
       securityInitialized: this.securityInitialized,
+      scoutTokens,
     });
   }
 
@@ -683,11 +704,20 @@ export class GuardianAgent extends BaseAgent {
     const s = await this.restoreState<{
       scanCount?: number;
       liquidityAlertCount?: number;
+      scoutTokens?: Array<{ mint: string; ticker?: string; source: string; addedAt: number }>;
     }>();
     if (!s) return;
     if (s.scanCount)           this.scanCount = s.scanCount;
     if (s.liquidityAlertCount) this.liquidityAlertCount = s.liquidityAlertCount;
-    logger.info(`[guardian] Restored: ${this.scanCount} scans, ${this.liquidityAlertCount} LP alerts`);
+    // Re-add persisted scout/manual tokens to watchList
+    if (s.scoutTokens) {
+      for (const t of s.scoutTokens) {
+        if (!this.watchList.has(t.mint)) {
+          this.addToWatchList(t.mint, t.ticker, (t.source as WatchedToken['source']) || 'scout');
+        }
+      }
+    }
+    logger.info(`[guardian] Restored: ${this.scanCount} scans, ${this.liquidityAlertCount} LP alerts, ${s.scoutTokens?.length || 0} persisted tokens`);
   }
 
   // ── Public API ───────────────────────────────────────────────────

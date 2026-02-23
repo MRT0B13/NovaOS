@@ -239,10 +239,12 @@ export abstract class BaseAgent {
   protected async readMessages(limit: number = 10): Promise<AgentMessage[]> {
     try {
       const result = await this.pool.query(
-        `SELECT id, from_agent, to_agent, message_type, priority, payload, created_at
+        `SELECT id, from_agent, to_agent, message_type, priority, payload, created_at,
+                COALESCE(retry_count, 0) as retry_count
          FROM agent_messages
          WHERE (to_agent = $1 OR to_agent = 'broadcast') AND acknowledged = false
            AND (expires_at IS NULL OR expires_at > NOW())
+           AND COALESCE(retry_count, 0) < 5
          ORDER BY
            CASE priority
              WHEN 'critical' THEN 0
@@ -254,8 +256,37 @@ export abstract class BaseAgent {
          LIMIT $2`,
         [this.agentId, limit],
       );
+      // Increment retry_count for each message read (tracks processing attempts)
+      for (const row of result.rows) {
+        await this.pool.query(
+          `UPDATE agent_messages SET retry_count = COALESCE(retry_count, 0) + 1 WHERE id = $1`,
+          [row.id],
+        ).catch(() => {}); // silent — column may not exist yet
+      }
       return result.rows;
     } catch (err) {
+      // If retry_count column doesn't exist, fall back to original query
+      if (String(err).includes('retry_count')) {
+        try {
+          const fallback = await this.pool.query(
+            `SELECT id, from_agent, to_agent, message_type, priority, payload, created_at
+             FROM agent_messages
+             WHERE (to_agent = $1 OR to_agent = 'broadcast') AND acknowledged = false
+               AND (expires_at IS NULL OR expires_at > NOW())
+             ORDER BY
+               CASE priority
+                 WHEN 'critical' THEN 0
+                 WHEN 'high' THEN 1
+                 WHEN 'medium' THEN 2
+                 WHEN 'low' THEN 3
+               END,
+               created_at ASC
+             LIMIT $2`,
+            [this.agentId, limit],
+          );
+          return fallback.rows;
+        } catch { /* fall through */ }
+      }
       logger.warn(`[${this.agentId}] Failed to read messages:`, err);
       return [];
     }
@@ -265,11 +296,33 @@ export abstract class BaseAgent {
   protected async acknowledgeMessage(messageId: number): Promise<void> {
     try {
       await this.pool.query(
-        `UPDATE agent_messages SET acknowledged = true, acknowledged_at = NOW() WHERE id = $1`,
+        `UPDATE agent_messages SET acknowledged = true, acknowledged_at = NOW(), processed_at = NOW() WHERE id = $1`,
         [messageId],
       );
     } catch (err) {
-      // Silent
+      // Fallback if processed_at column doesn't exist
+      try {
+        await this.pool.query(
+          `UPDATE agent_messages SET acknowledged = true, acknowledged_at = NOW() WHERE id = $1`,
+          [messageId],
+        );
+      } catch { /* Silent */ }
+    }
+  }
+
+  /** Move a message to dead-letter queue (exceeded max retries or unprocessable) */
+  protected async deadLetterMessage(messageId: number, reason: string): Promise<void> {
+    try {
+      await this.pool.query(
+        `UPDATE agent_messages SET acknowledged = true, acknowledged_at = NOW(),
+         payload = jsonb_set(COALESCE(payload::jsonb, '{}'::jsonb), '{_dlq_reason}', $2::jsonb)
+         WHERE id = $1`,
+        [messageId, JSON.stringify(reason)],
+      );
+      logger.warn(`[${this.agentId}] Message ${messageId} moved to DLQ: ${reason}`);
+    } catch {
+      // Fallback: just acknowledge it
+      await this.acknowledgeMessage(messageId);
     }
   }
 

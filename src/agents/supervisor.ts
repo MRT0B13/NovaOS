@@ -26,6 +26,7 @@ import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent, type AgentMessage, type MessageType } from './types.ts';
 import { TokenChildAgent, type TokenChildConfig } from './token-child.ts';
+import { ContentFilter, type ContentScanResult } from './security/contentFilter.ts';
 
 // ============================================================================
 // Types
@@ -52,6 +53,9 @@ export class Supervisor extends BaseAgent {
   public callbacks: SupervisorCallbacks = {};
   private lastNarrativePostAt = 0;
   private static NARRATIVE_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours between narrative posts
+
+  // ── Outbound Content Filter ──────────────────────────────────
+  private outboundFilter: ContentFilter | null = null;
 
   // ── X Post Dedup ─────────────────────────────────────────────
   // Track recently posted content to avoid duplicate X tweets
@@ -84,6 +88,13 @@ export class Supervisor extends BaseAgent {
     // Restore persisted state from DB (survive restarts)
     await this.restorePersistedState();
 
+    // Initialize outbound content filter (no-op reporter — just scan, don't report)
+    try {
+      this.outboundFilter = new ContentFilter(this.pool, async () => {});
+    } catch {
+      logger.warn('[supervisor] Could not initialize outbound content filter');
+    }
+
     this.startHeartbeat(60_000);
     this.addInterval(() => this.pollMessages(), this.pollIntervalMs);
     // Also periodically check agent health (separate from Health Agent's deeper checks)
@@ -91,7 +102,32 @@ export class Supervisor extends BaseAgent {
     this.addInterval(() => this.checkAgentStatuses(), 5 * 60 * 1000); // every 5 min
     // Periodic swarm briefing — digest of all agent activity
     this.addInterval(() => this.publishBriefing(), this.briefingIntervalMs);
+    // Periodic DB cleanup — prune stale kv_store entries and old agent_messages
+    this.addInterval(() => this.cleanupStaleData(), 6 * 60 * 60 * 1000); // every 6 hours
     logger.info(`[supervisor] Polling every ${this.pollIntervalMs}ms, briefing every ${this.briefingIntervalMs / 3600000}h`);
+  }
+
+  /**
+   * Scan outbound content before publishing to X/TG/Channel.
+   * Returns the original text if clean, or null if threats detected (blocked).
+   */
+  private scanOutboundSafe(text: string, destination: string): string | null {
+    if (!this.outboundFilter) return text; // no filter = pass through
+    try {
+      const result: ContentScanResult = this.outboundFilter.scanOutbound(text, destination);
+      if (!result.clean) {
+        const critical = result.threats.filter(t => t.severity === 'critical');
+        if (critical.length > 0) {
+          logger.error(`[supervisor] BLOCKED outbound ${destination}: ${critical.map(t => t.description).join('; ')}`);
+          return null; // block critical threats (leaked secrets, etc.)
+        }
+        // Non-critical threats: log warning but allow
+        logger.warn(`[supervisor] Outbound ${destination} has warnings: ${result.threats.map(t => t.description).join('; ')}`);
+      }
+      return text;
+    } catch {
+      return text; // on error, don't block
+    }
   }
 
   protected async onStop(): Promise<void> {
@@ -202,11 +238,14 @@ export class Supervisor extends BaseAgent {
           if (this.recentXPostHashes.has(contentHash)) {
             logger.debug(`[supervisor] Skipping duplicate narrative post (same content already posted)`);
           } else {
-            if (this.callbacks.onPostToX) await this.callbacks.onPostToX(xContent);
-            if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(fullContent);
-            if (this.callbacks.onPostToFarcaster) {
-              await this.callbacks.onPostToFarcaster(fullContent, 'ai-agents');
-              await this.callbacks.onPostToFarcaster(fullContent, 'solana');
+            // Scan outbound content before publishing
+            const safeXContent = this.scanOutboundSafe(xContent, 'x-post');
+            const safeFullContent = this.scanOutboundSafe(fullContent, 'tg-channel');
+            if (safeXContent && this.callbacks.onPostToX) await this.callbacks.onPostToX(safeXContent);
+            if (safeFullContent && this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(safeFullContent);
+            if (safeFullContent && this.callbacks.onPostToFarcaster) {
+              await this.callbacks.onPostToFarcaster(safeFullContent, 'ai-agents');
+              await this.callbacks.onPostToFarcaster(safeFullContent, 'solana');
             }
             this.recentXPostHashes.add(contentHash);
             // Keep set bounded
@@ -287,6 +326,24 @@ export class Supervisor extends BaseAgent {
         // HIGH: Post to TG channel only
         if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(warning);
         logger.info(`[supervisor] High safety alert posted for ${tokenName || tokenAddress}`);
+
+        // Forward LP drain / price crash events to CFO as market_crash
+        // so CFO can pause trading or close positions defensively
+        const alertTypes = (alerts || []).map((a: string) => a.toLowerCase());
+        const hasLpDrain = alertTypes.some((a: string) => a.includes('lp') || a.includes('liquidity') || a.includes('drain'));
+        const hasCrash = alertTypes.some((a: string) => a.includes('crash') || a.includes('dump') || a.includes('plunge'));
+        if (hasLpDrain || hasCrash) {
+          await this.sendMessage('nova-cfo', 'alert', 'high', {
+            command: 'market_crash',
+            source: 'guardian',
+            tokenAddress,
+            tokenName,
+            score,
+            alerts,
+            message: `Guardian HIGH (LP drain/crash): ${tokenName || tokenAddress} — ${(alerts || []).join(', ')}`,
+          });
+          logger.warn(`[supervisor] Forwarded guardian HIGH alert to CFO as market_crash: ${tokenName || tokenAddress}`);
+        }
       }
       // Medium/low alerts are logged but not posted (available in DB for reference)
     });
@@ -296,7 +353,8 @@ export class Supervisor extends BaseAgent {
       const { requestedBy, report } = msg.payload;
       if (this.callbacks.onPostToTelegram && requestedBy) {
         const formatted = this.formatScanReport(report || {});
-        await this.callbacks.onPostToTelegram(requestedBy, formatted);
+        const safe = this.scanOutboundSafe(formatted, 'tg-direct');
+        if (safe) await this.callbacks.onPostToTelegram(requestedBy, safe);
       }
     });
 
@@ -502,6 +560,17 @@ export class Supervisor extends BaseAgent {
         const content = `⚠️ $${tokenSymbol} dropped ${changePercent}%${tokenAddress ? ` — CA: ${tokenAddress.slice(0, 8)}...` : ''}`;
         if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(content);
         logger.warn(`[supervisor] Token child price crash: ${content}`);
+        // Forward severe crashes (>60% drop) to CFO for emergency evaluation
+        if (changePercent && Math.abs(Number(changePercent)) >= 60) {
+          await this.sendMessage('nova-cfo', 'alert', 'high', {
+            command: 'market_crash',
+            source: 'token_child',
+            tokenAddress,
+            tokenSymbol,
+            changePercent,
+            message: `Token crash: $${tokenSymbol} dropped ${changePercent}%`,
+          });
+        }
       } else if (event === 'mcap_milestone') {
         const formatMcap = (v: number) => v >= 1e6 ? `$${(v / 1e6).toFixed(1)}M` : `$${(v / 1e3).toFixed(0)}K`;
         const content = `🎯 $${tokenSymbol} hit ${formatMcap(milestone)} market cap!`;
@@ -635,6 +704,42 @@ export class Supervisor extends BaseAgent {
       }
     } catch {
       // Silent — health agent handles deeper monitoring
+    }
+  }
+
+  // ── DB Cleanup (TTL for kv_store, agent_messages, etc.) ──────────
+
+  private async cleanupStaleData(): Promise<void> {
+    try {
+      // 1. Clean old cfo_decision_* entries from kv_store (>30 days)
+      const kvResult = await this.pool.query(
+        `DELETE FROM kv_store WHERE key LIKE 'cfo_decision_%' AND updated_at < NOW() - INTERVAL '30 days'`
+      );
+      const kvDeleted = (kvResult as any).rowCount || 0;
+
+      // 2. Clean old processed agent_messages (>7 days, already acknowledged)
+      const msgResult = await this.pool.query(
+        `DELETE FROM agent_messages WHERE processed_at IS NOT NULL AND created_at < NOW() - INTERVAL '7 days'`
+      );
+      const msgDeleted = (msgResult as any).rowCount || 0;
+
+      // 3. Clean old agent heartbeat history (keep last 24h only in logs)
+      const hbResult = await this.pool.query(
+        `DELETE FROM agent_heartbeats WHERE last_beat < NOW() - INTERVAL '7 days' AND status = 'stopped'`
+      );
+      const hbDeleted = (hbResult as any).rowCount || 0;
+
+      // 4. Clean expired agent_messages
+      const expResult = await this.pool.query(
+        `DELETE FROM agent_messages WHERE expires_at IS NOT NULL AND expires_at < NOW()`
+      );
+      const expDeleted = (expResult as any).rowCount || 0;
+
+      if (kvDeleted + msgDeleted + hbDeleted + expDeleted > 0) {
+        logger.info(`[supervisor] DB cleanup: kv=${kvDeleted}, messages=${msgDeleted}, heartbeats=${hbDeleted}, expired=${expDeleted}`);
+      }
+    } catch {
+      // Tables may not exist yet — silent
     }
   }
 

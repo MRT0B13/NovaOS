@@ -111,6 +111,22 @@ export class WalletSentinel {
       });
     }
 
+    // CFO EVM wallet (Polygon) — derive from private key or use explicit address
+    const cfoEvmKey = process.env.CFO_EVM_PRIVATE_KEY;
+    const cfoEvmAddress = process.env.CFO_EVM_WALLET_ADDRESS;
+    const polygonRpc = process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com';
+    const evmAddr = cfoEvmAddress || (cfoEvmKey ? this._deriveEvmAddress(cfoEvmKey) : null);
+    if (evmAddr) {
+      this.wallets.push({
+        address: evmAddr,
+        label: 'cfo-polygon',
+        chain: 'evm',
+        drainThresholdPct: 25,
+        lowBalanceThreshold: 0.5, // 0.5 MATIC minimum
+        rpcUrl: polygonRpc,
+      });
+    }
+
     logger.info(`[wallet-sentinel] Monitoring ${this.wallets.length} wallet(s): ${this.wallets.map(w => w.label).join(', ') || 'none configured'}`);
   }
 
@@ -188,8 +204,9 @@ export class WalletSentinel {
       try {
         if (wallet.chain === 'solana') {
           await this.checkSolanaWallet(wallet);
+        } else if (wallet.chain === 'evm') {
+          await this.checkEvmWallet(wallet);
         }
-        // EVM wallet checks can be added here
         this.consecutiveFailures = 0;
       } catch (err) {
         this.consecutiveFailures++;
@@ -295,6 +312,106 @@ export class WalletSentinel {
       await this.report(event);
       await logSecurityEvent(this.pool, event);
     }
+  }
+
+  /** Check a single EVM wallet via JSON-RPC (eth_getBalance) */
+  private async checkEvmWallet(wallet: WalletConfig): Promise<void> {
+    const balance = await this.fetchEvmBalance(wallet.rpcUrl, wallet.address);
+    if (balance === null) return;
+
+    const now = Date.now();
+    const balanceLamports = BigInt(Math.round(balance * 1e18));
+    await this.persistSnapshot(wallet.address, wallet.label, balance, balanceLamports);
+
+    const prev = this.lastSnapshots.get(wallet.address);
+    this.lastSnapshots.set(wallet.address, {
+      address: wallet.address,
+      label: wallet.label,
+      balanceSol: balance, // reusing field for native token balance
+      balanceLamports,
+      timestamp: now,
+    });
+
+    if (!prev) return;
+
+    // Drain detection (same logic as Solana)
+    if (prev.balanceSol > 0.01) {
+      const dropPct = ((prev.balanceSol - balance) / prev.balanceSol) * 100;
+      if (dropPct >= wallet.drainThresholdPct) {
+        const event: SecurityEvent = {
+          category: 'wallet',
+          severity: dropPct >= 80 ? 'emergency' : 'critical',
+          title: `EVM WALLET DRAIN DETECTED: ${wallet.label}`,
+          details: {
+            walletAddress: wallet.address,
+            walletLabel: wallet.label,
+            chain: 'polygon',
+            previousBalance: prev.balanceSol.toFixed(6),
+            currentBalance: balance.toFixed(6),
+            droppedNative: (prev.balanceSol - balance).toFixed(6),
+            dropPercent: dropPct.toFixed(1),
+            timeSinceLastCheck: Math.round((now - prev.timestamp) / 1000),
+          },
+          autoResponse: dropPct >= 80 ? 'Emergency alert sent to admin' : 'Alert sent to supervisor',
+        };
+        this.totalAlerts++;
+        await this.report(event);
+        await logSecurityEvent(this.pool, event);
+      }
+    }
+
+    // Low balance warning
+    if (balance < wallet.lowBalanceThreshold && prev.balanceSol >= wallet.lowBalanceThreshold) {
+      const event: SecurityEvent = {
+        category: 'wallet',
+        severity: 'warning',
+        title: `Low EVM balance: ${wallet.label}`,
+        details: {
+          walletAddress: wallet.address,
+          walletLabel: wallet.label,
+          chain: 'polygon',
+          balance: balance.toFixed(6),
+          threshold: wallet.lowBalanceThreshold,
+        },
+      };
+      this.totalAlerts++;
+      await this.report(event);
+      await logSecurityEvent(this.pool, event);
+    }
+  }
+
+  /** Fetch native EVM balance via JSON-RPC */
+  private async fetchEvmBalance(rpcUrl: string, address: string): Promise<number | null> {
+    try {
+      const res = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'eth_getBalance',
+          params: [address, 'latest'],
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) return null;
+      const data = await res.json() as any;
+      if (data.error) return null;
+      // Result is hex wei — convert to native token units
+      const wei = BigInt(data.result || '0x0');
+      return Number(wei) / 1e18;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Derive EVM address from hex private key (keccak256 of uncompressed pubkey) */
+  private _deriveEvmAddress(privateKey: string): string | null {
+    // If address is already explicitly set, don't need to derive
+    // For now return null — users should set CFO_EVM_WALLET_ADDRESS
+    // Full derivation requires secp256k1 which is heavy to inline
+    logger.warn('[wallet-sentinel] CFO_EVM_WALLET_ADDRESS not set — cannot derive from private key alone. Set CFO_EVM_WALLET_ADDRESS explicitly.');
+    return null;
   }
 
   /** Fetch SOL balance via JSON-RPC (no @solana/web3.js dependency) */

@@ -76,6 +76,7 @@ export interface DecisionResult {
   error?: string;
   dryRun: boolean;
   pendingApproval?: boolean;  // true if queued for admin approval
+  traceId?: string;           // correlation ID linking all decisions in one cycle
 }
 
 // ============================================================================
@@ -222,6 +223,22 @@ function checkCooldown(type: DecisionType, cooldownMs: number): boolean {
 
 function markDecision(type: DecisionType): void {
   lastDecisionAt[type] = Date.now();
+}
+
+/** Export cooldown state so CFO can persist it across restarts */
+export function getCooldownState(): Record<string, number> {
+  return { ...lastDecisionAt };
+}
+
+/** Restore cooldown state from DB on restart — skip entries older than the longest cooldown */
+export function restoreCooldownState(saved: Record<string, number>): void {
+  const maxCooldownMs = 6 * 3600_000; // longest cooldown is 6h (stake)
+  const now = Date.now();
+  for (const [type, ts] of Object.entries(saved)) {
+    if (typeof ts === 'number' && now - ts < maxCooldownMs) {
+      lastDecisionAt[type] = ts;
+    }
+  }
 }
 
 // ============================================================================
@@ -1090,11 +1107,15 @@ export async function runDecisionCycle(pool?: any): Promise<{
   results: DecisionResult[];
   report: string;
   intel: SwarmIntel;
+  traceId: string;
 }> {
   const env = getCFOEnv();
   const config = getDecisionConfig();
 
-  logger.info('[CFO:Decision] Starting decision cycle...');
+  // Generate a unique trace ID for this decision cycle
+  const traceId = `cfo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  logger.info(`[CFO:Decision] Starting decision cycle (traceId=${traceId})...`);
 
   // 1. Gather portfolio state
   const state = await gatherPortfolioState();
@@ -1128,6 +1149,7 @@ export async function runDecisionCycle(pool?: any): Promise<{
   const results: DecisionResult[] = [];
   for (const decision of decisions) {
     const result = await executeDecision(decision, env);
+    result.traceId = traceId;
     results.push(result);
 
     // Small delay between executions to avoid rate limits
@@ -1139,5 +1161,5 @@ export async function runDecisionCycle(pool?: any): Promise<{
   // 5. Report (includes swarm intel summary)
   const report = formatDecisionReport(state, results, env.dryRun, intel);
 
-  return { state, decisions, results, report, intel };
+  return { state, decisions, results, report, intel, traceId };
 }

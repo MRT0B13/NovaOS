@@ -112,6 +112,7 @@ async function ensureCFOSchema(pool: Pool): Promise<void> {
       status TEXT NOT NULL DEFAULT 'OPEN',
       entry_price DOUBLE PRECISION NOT NULL DEFAULT 0,
       current_price DOUBLE PRECISION NOT NULL DEFAULT 0,
+      exit_price DOUBLE PRECISION,
       size_units DOUBLE PRECISION NOT NULL DEFAULT 0,
       cost_basis_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
       current_value_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -126,6 +127,11 @@ async function ensureCFOSchema(pool: Pool): Promise<void> {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  // Add exit_price column if it doesn't exist (migration for existing DBs)
+  await pool.query(`
+    ALTER TABLE cfo_positions ADD COLUMN IF NOT EXISTS exit_price DOUBLE PRECISION;
+  `).catch(() => { /* column may already exist or syntax not supported */ });
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cfo_transactions (
@@ -251,15 +257,46 @@ export class PostgresCFORepository {
     return res.rows.map((r) => this.rowToPosition(r));
   }
 
-  async closePosition(id: string, exitTxHash: string, realizedPnlUsd: number): Promise<void> {
-    await this.pool.query(
-      `UPDATE cfo_positions
-       SET status = 'CLOSED', exit_tx_hash = $2, realized_pnl_usd = $3,
-           unrealized_pnl_usd = 0, current_value_usd = 0,
-           closed_at = NOW(), updated_at = NOW()
-       WHERE id = $1`,
-      [id, exitTxHash, realizedPnlUsd],
+  async getPositionsByStatus(status: string): Promise<CFOPosition[]> {
+    const res = await this.pool.query(
+      `SELECT * FROM cfo_positions WHERE status = $1 ORDER BY opened_at DESC`,
+      [status.toUpperCase()],
     );
+    return res.rows.map((r) => this.rowToPosition(r));
+  }
+
+  async getAllPositions(): Promise<CFOPosition[]> {
+    const res = await this.pool.query(
+      `SELECT * FROM cfo_positions ORDER BY opened_at DESC LIMIT 500`,
+    );
+    return res.rows.map((r) => this.rowToPosition(r));
+  }
+
+  async closePosition(id: string, exitTxHash: string, realizedPnlUsd: number, exitPrice?: number): Promise<void> {
+    if (exitPrice !== undefined && exitPrice > 0) {
+      await this.pool.query(
+        `UPDATE cfo_positions
+         SET status = 'CLOSED', exit_tx_hash = $2, realized_pnl_usd = $3,
+             exit_price = $4,
+             unrealized_pnl_usd = 0, current_value_usd = 0,
+             closed_at = NOW(), updated_at = NOW()
+         WHERE id = $1`,
+        [id, exitTxHash, realizedPnlUsd, exitPrice],
+      );
+    } else {
+      await this.pool.query(
+        `UPDATE cfo_positions
+         SET status = 'CLOSED', exit_tx_hash = $2, realized_pnl_usd = $3,
+             unrealized_pnl_usd = 0, current_value_usd = 0,
+             closed_at = NOW(), updated_at = NOW()
+         WHERE id = $1`,
+        [id, exitTxHash, realizedPnlUsd],
+      );
+    }
+  }
+
+  async getDailySnapshots(days = 30): Promise<CFODailySnapshot[]> {
+    return this.getSnapshots(days);
   }
 
   async updatePositionPrice(id: string, currentPrice: number, currentValueUsd: number): Promise<void> {

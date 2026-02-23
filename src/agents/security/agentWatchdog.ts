@@ -106,6 +106,8 @@ export class AgentWatchdog {
   private totalChecks = 0;
   private totalAlerts = 0;
   private totalQuarantines = 0;
+  /** Callback to actually stop a live agent — set by guardian after swarm init */
+  private stopAgentCallback?: (agentName: string) => Promise<void>;
 
   /** Anomaly score thresholds */
   private static readonly WARN_THRESHOLD = 3;
@@ -116,6 +118,11 @@ export class AgentWatchdog {
   constructor(pool: Pool, report: SecurityReporter) {
     this.pool = pool;
     this.report = report;
+  }
+
+  /** Set the callback used to stop a running agent during quarantine */
+  setStopAgentCallback(cb: (agentName: string) => Promise<void>): void {
+    this.stopAgentCallback = cb;
   }
 
   init(): void {
@@ -316,6 +323,18 @@ export class AgentWatchdog {
         [agentName],
       );
     } catch { /* non-fatal */ }
+
+    // Actually stop the running agent if callback is wired
+    if (this.stopAgentCallback) {
+      try {
+        await this.stopAgentCallback(agentName);
+        logger.warn(`[agent-watchdog] Stopped running agent ${agentName}`);
+      } catch (err) {
+        logger.error(`[agent-watchdog] Failed to stop agent ${agentName}:`, err);
+      }
+    } else {
+      logger.warn(`[agent-watchdog] No stopAgentCallback set — ${agentName} quarantined in DB only`);
+    }
 
     const event: SecurityEvent = {
       category: 'agent',

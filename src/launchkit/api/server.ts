@@ -160,6 +160,35 @@ function unauthorized(res: http.ServerResponse) {
   sendJson(res, 401, { error: { code: 'UNAUTHORIZED', message: 'Invalid admin token' } });
 }
 
+function rateLimited(res: http.ServerResponse) {
+  sendJson(res, 429, { error: { code: 'RATE_LIMITED', message: 'Too many requests — try again later' } });
+}
+
+// ── Simple in-memory rate limiter (per IP, sliding window) ──────────
+const rateLimitMap = new Map<string, number[]>();
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 60;  // 60 requests per minute per IP
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const timestamps = rateLimitMap.get(ip) || [];
+  // Remove entries outside the window
+  const recent = timestamps.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+  if (recent.length >= RATE_LIMIT_MAX_REQUESTS) {
+    rateLimitMap.set(ip, recent);
+    return false; // rate limited
+  }
+  recent.push(now);
+  rateLimitMap.set(ip, recent);
+  // Periodic cleanup: remove stale IPs every 100 checks
+  if (rateLimitMap.size > 1000) {
+    for (const [key, ts] of rateLimitMap) {
+      if (ts.every(t => now - t > RATE_LIMIT_WINDOW_MS)) rateLimitMap.delete(key);
+    }
+  }
+  return true;
+}
+
 function notFound(res: http.ServerResponse) {
   sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'Resource not found' } });
 }
@@ -363,6 +392,14 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
         sendJson(res, 200, { ok: true }); // Always return 200 to Telegram
         return;
       }
+    }
+
+    // ── Rate limiting for admin API endpoints ──
+    const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim()
+      || req.socket?.remoteAddress || 'unknown';
+    if (!checkRateLimit(clientIp)) {
+      rateLimited(res);
+      return;
     }
 
     if (!adminToken || req.headers['x-admin-token'] !== adminToken) {
@@ -1136,6 +1173,66 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+
+    // ─── x402 Micropayment Routes ────────────────────────────────────────
+    if (pathname.startsWith('/x402/') && req.method === 'GET') {
+      try {
+        const { handleX402Request } = await import('../cfo/x402Service.ts');
+        const result = await handleX402Request(pathname, url.searchParams, pool);
+        sendJson(res, result.status, result.body);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'x402 request failed';
+        sendJson(res, 500, { error: { code: 'X402_FAILED', message: msg } });
+      }
+      return;
+    }
+
+    // ─── CFO Portfolio (DeFi strategy positions: Polymarket, Jito, Kamino, HL) ──
+    if (pathname.startsWith('/v1/cfo/') && req.method === 'GET' && pool) {
+      try {
+        const { PostgresCFORepository } = await import('../cfo/postgresCFORepository.ts');
+        const repo = await PostgresCFORepository.create(process.env.DATABASE_URL!);
+
+        if (pathname === '/v1/cfo/positions') {
+          const statusFilter = url.searchParams.get('status') || 'OPEN';
+          const rows = statusFilter === 'all'
+            ? await repo.getAllPositions()
+            : await repo.getPositionsByStatus(statusFilter);
+          sendJson(res, 200, { data: rows });
+        } else if (pathname === '/v1/cfo/transactions') {
+          const limit = Math.min(Number(url.searchParams.get('limit') || 50), 200);
+          const rows = await repo.getRecentTransactions(limit);
+          sendJson(res, 200, { data: rows });
+        } else if (pathname === '/v1/cfo/snapshots') {
+          const rows = await repo.getDailySnapshots(30);
+          sendJson(res, 200, { data: rows });
+        } else if (pathname === '/v1/cfo/status') {
+          // Live CFO status — pull from kv_store
+          const { rows } = await pool.query(
+            `SELECT data FROM kv_store WHERE key = 'nova-cfo_state' LIMIT 1`,
+          );
+          const state = rows[0]?.data ? (typeof rows[0].data === 'string' ? JSON.parse(rows[0].data) : rows[0].data) : null;
+          sendJson(res, 200, { data: state });
+        } else if (pathname === '/v1/cfo/portfolio') {
+          // Combined: positions + strategy breakdown
+          const openPositions = await repo.getPositionsByStatus('OPEN');
+          const byStrategy: Record<string, { count: number; totalValueUsd: number }> = {};
+          for (const p of openPositions) {
+            const s = p.strategy || 'unknown';
+            if (!byStrategy[s]) byStrategy[s] = { count: 0, totalValueUsd: 0 };
+            byStrategy[s].count++;
+            byStrategy[s].totalValueUsd += p.currentValueUsd || p.costBasisUsd || 0;
+          }
+          sendJson(res, 200, { data: { openPositions, byStrategy, totalPositions: openPositions.length } });
+        } else {
+          sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'Unknown CFO endpoint' } });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'CFO query failed';
+        sendJson(res, 500, { error: { code: 'CFO_FAILED', message: msg } });
+      }
+      return;
+    }
 
     notFound(res);
   });

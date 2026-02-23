@@ -148,6 +148,15 @@ export class LauncherAgent extends BaseAgent {
               mint,
             });
 
+            // Notify CFO of graduation — may want to adjust position/take profit
+            await this.sendMessage('nova-cfo', 'intel', 'high', {
+              event: 'token_graduated',
+              tokenName: pack.brand?.name,
+              tokenSymbol: pack.brand?.ticker,
+              mint,
+              message: `Token ${pack.brand?.ticker || pack.brand?.name} graduated from pump.fun to Raydium`,
+            });
+
             logger.info(`[launcher] Graduation detected: ${pack.brand?.name || pack.brand?.ticker}`);
           }
         } catch { /* skip malformed */ }

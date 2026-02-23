@@ -336,7 +336,7 @@ export class PositionManager {
 
     const realizedPnl = receivedUsd - pos.costBasisUsd;
 
-    await this.repo.closePosition(positionId, exitTxHash, realizedPnl);
+    await this.repo.closePosition(positionId, exitTxHash, realizedPnl, exitPrice);
 
     logger.info(
       `[PositionManager] Closed ${positionId}: PnL ${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)} ` +

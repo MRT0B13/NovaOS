@@ -146,6 +146,10 @@ CREATE TABLE IF NOT EXISTS agent_messages (
 CREATE INDEX IF NOT EXISTS idx_agent_messages_pending ON agent_messages(to_agent, acknowledged, created_at)
   WHERE acknowledged = FALSE;
 
+-- Add retry_count and processed_at for DLQ support (idempotent migration)
+ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
+ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
+
 -- ============================================================
 -- 8. AGENT REGISTRY — agent config and process management
 -- ============================================================
