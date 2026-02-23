@@ -1502,11 +1502,10 @@ export async function cancelOrder(orderId: string): Promise<boolean> {
 export async function cancelAllOrders(): Promise<number> {
   try {
     const raw = await clobGet<Array<{ id: string }>>('/data/orders', true)
-      .catch((err: any) => {
-        // 404/405 = endpoint may not exist on this CLOB version — treat as empty
-        const status = err?.response?.status ?? err?.status;
-        if (status === 404 || status === 405) {
-          logger.warn('[Polymarket] /data/orders returned ' + status + ', treating as no open orders');
+      .catch((err: Error) => {
+        // clobGet throws plain Error with status in message — check message text
+        if (err.message.includes('404') || err.message.includes('405')) {
+          logger.warn(`[Polymarket] /data/orders error (${err.message}) — assuming no open orders`);
           return [] as Array<{ id: string }>;
         }
         throw err;

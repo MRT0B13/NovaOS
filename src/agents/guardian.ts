@@ -594,7 +594,12 @@ export class GuardianAgent extends BaseAgent {
     try {
       await loadRugcheck();
       if (!_scanToken) return { score: null, riskLevel: 'unknown', isRugged: false, alerts: [] };
-      const report = await _scanToken(mint);
+      // 8s timeout — don't let a hung RugCheck API freeze the liquidity monitor loop
+      const report = await Promise.race([
+        _scanToken(mint),
+        new Promise<null>(resolve => setTimeout(() => resolve(null), 8_000)),
+      ]);
+      if (!report) { logger.debug(`[guardian] quickRugScan timed out for ${mint}`); return { score: null, riskLevel: 'unknown', isRugged: false, alerts: [] }; }
       const score = typeof report?.score === 'number' ? report.score : null;
       const isRugged = _isSafe ? !_isSafe(report) : false;
       const riskLevel = score === null ? 'unknown' : score >= 800 ? 'critical' : score >= 500 ? 'high' : score >= 200 ? 'medium' : 'low';
