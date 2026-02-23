@@ -61,6 +61,8 @@ export class CFOAgent extends BaseAgent {
   private repo: PostgresCFORepository | null = null;
   private positionManager: PositionManager | null = null;
   private paused = false;
+  private autoResumeTimer: ReturnType<typeof setTimeout> | null = null;
+  private emergencyPausedUntil: number | null = null;
   private scoutIntel: ScoutIntel | null = null;
   private pendingApprovals = new Map<string, PendingApproval>();
   private approvalCounter = 0;
@@ -856,6 +858,18 @@ export class CFOAgent extends BaseAgent {
       if (r.rows.length) return;
     } catch { /* ok */ }
     await this.sendDailyDigest(todayStr);
+
+    // Purge old decision audit rows (>30 days) to prevent unbounded kv_store growth
+    try {
+      const cutoffMs = Date.now() - 30 * 24 * 3600_000;
+      const res = await this.pool.query(
+        `DELETE FROM kv_store WHERE key LIKE 'cfo_decision_%' AND key < $1`,
+        [`cfo_decision_${cutoffMs}`],
+      );
+      if (res.rowCount && res.rowCount > 0) {
+        logger.info(`[CFO] Purged ${res.rowCount} decision audit row(s) older than 30 days`);
+      }
+    } catch { /* non-fatal cleanup */ }
   }
 
   private async sendDailyDigest(date: string): Promise<void> {
@@ -974,7 +988,13 @@ export class CFOAgent extends BaseAgent {
 
     switch (cmd) {
       case 'cfo_stop': this.paused = true; logger.info('[CFO] PAUSED'); break;
-      case 'cfo_start': this.paused = false; logger.info('[CFO] RESUMED'); break;
+      case 'cfo_start': {
+        this.paused = false;
+        this.emergencyPausedUntil = null;
+        if (this.autoResumeTimer) { clearTimeout(this.autoResumeTimer); this.autoResumeTimer = null; }
+        logger.info('[CFO] RESUMED (manual)');
+        break;
+      }
 
       case 'cfo_close_poly': {
         logger.warn('[CFO] Emergency: closing all Polymarket positions');
@@ -1082,19 +1102,50 @@ export class CFOAgent extends BaseAgent {
       case 'emergency_exit': {
         logger.error(`[CFO] Emergency from ${msg.from_agent}: ${payload.message}`);
         this.paused = true;
+
         // Only attempt to close positions on services that are actually enabled
         const cfoEnv = getCFOEnv();
-        const closeOps: Promise<any>[] = [];
+        const closeResults: string[] = [];
         if (cfoEnv.polymarketEnabled) {
-          closeOps.push((await poly()).cancelAllOrders().catch((e: any) => logger.error('[CFO] Emergency poly cancel failed:', e)));
+          try {
+            const cancelled = await (await poly()).cancelAllOrders();
+            closeResults.push(`Poly: cancelled ${cancelled} orders`);
+          } catch (e: any) { closeResults.push(`Poly cancel failed: ${e.message ?? e}`); }
+          try {
+            const positions = await (await poly()).fetchPositions();
+            for (const p of positions) await (await poly()).exitPosition(p, 1.0);
+            closeResults.push(`Poly: exited ${positions.length} positions`);
+          } catch (e: any) { closeResults.push(`Poly exit failed: ${e.message ?? e}`); }
         }
         if (cfoEnv.hyperliquidEnabled) {
-          closeOps.push((await hl()).closeAllPositions().catch((e: any) => logger.error('[CFO] Emergency HL close failed:', e)));
+          try {
+            await (await hl()).closeAllPositions();
+            closeResults.push('HL: closed all positions');
+          } catch (e: any) { closeResults.push(`HL close failed: ${e.message ?? e}`); }
         }
-        if (closeOps.length > 0) {
-          await Promise.allSettled(closeOps);
-        }
-        await notify(`🚨 CFO PAUSED — emergency from ${msg.from_agent}: ${payload.message}`);
+
+        // Auto-resume timer
+        const cooldownMs = (cfoEnv.emergencyCooldownMinutes ?? 240) * 60_000;
+        this.emergencyPausedUntil = Date.now() + cooldownMs;
+        if (this.autoResumeTimer) clearTimeout(this.autoResumeTimer);
+        this.autoResumeTimer = setTimeout(() => {
+          this.paused = false;
+          this.emergencyPausedUntil = null;
+          this.autoResumeTimer = null;
+          logger.info('[CFO] Auto-resumed after emergency cooldown');
+          notify('✅ CFO auto-resumed after emergency cooldown').catch(() => {});
+        }, cooldownMs);
+
+        // Persist state so restorePersistedState can re-arm the timer on restart
+        this.persistState().catch(() => {});
+
+        const resumeAt = new Date(this.emergencyPausedUntil).toISOString();
+        await notify(
+          `🚨 CFO PAUSED — emergency from ${msg.from_agent}\n` +
+          `${payload.message}\n\n` +
+          `Close results:\n${closeResults.map(r => `  • ${r}`).join('\n')}\n\n` +
+          `Auto-resume at: ${resumeAt}`,
+        );
         break;
       }
 
@@ -1161,6 +1212,7 @@ export class CFOAgent extends BaseAgent {
       approvalCounter: this.approvalCounter,
       pendingApprovals: serializedApprovals,
       cooldowns: getCooldownState(),
+      emergencyPausedUntil: this.emergencyPausedUntil,
     });
   }
 
@@ -1171,12 +1223,28 @@ export class CFOAgent extends BaseAgent {
       approvalCounter?: number;
       pendingApprovals?: SerializableApproval[];
       cooldowns?: Record<string, number>;
+      emergencyPausedUntil?: number | null;
     }>();
     if (!s) return;
     if (s.cycleCount) this.cycleCount = s.cycleCount;
     if (s.approvalCounter) this.approvalCounter = s.approvalCounter;
     // Keep startedAt from the previous session to show total uptime across restarts
     if (s.startedAt)  this.startedAt = s.startedAt;
+
+    // Restore emergency pause — re-arm timer for remaining cooldown
+    if (s.emergencyPausedUntil && s.emergencyPausedUntil > Date.now()) {
+      this.paused = true;
+      this.emergencyPausedUntil = s.emergencyPausedUntil;
+      const remainingMs = s.emergencyPausedUntil - Date.now();
+      if (this.autoResumeTimer) clearTimeout(this.autoResumeTimer);
+      this.autoResumeTimer = setTimeout(() => {
+        this.paused = false;
+        this.emergencyPausedUntil = null;
+        this.autoResumeTimer = null;
+        logger.info('[CFO] Auto-resumed after emergency cooldown (restored timer)');
+      }, remainingMs);
+      logger.info(`[CFO] Emergency pause restored — auto-resume in ${Math.round(remainingMs / 60_000)}m`);
+    }
 
     // Restore decision engine cooldowns so hedge/stake timers survive restarts
     if (s.cooldowns) {

@@ -76,6 +76,10 @@ export interface CFOEnv {
 
   // ── Pyth ─────────────────────────────────────────────────────────
   pythEnabled: boolean;
+
+  // ── Emergency ─────────────────────────────────────────────────────
+  /** Minutes to auto-resume after emergency pause (default 240 = 4h) */
+  emergencyCooldownMinutes: number;
 }
 
 // ── Validation helpers ────────────────────────────────────────────
@@ -156,6 +160,8 @@ export function getCFOEnv(bust = false): CFOEnv {
     heliusApiKey: process.env.CFO_HELIUS_API_KEY,
 
     pythEnabled,
+
+    emergencyCooldownMinutes: Number(process.env.CFO_EMERGENCY_COOLDOWN_MINUTES ?? 240),
   };
 
   return _cached;

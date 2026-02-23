@@ -3,6 +3,7 @@ import { getEnv } from '../env.ts';
 import { nowIso } from './time.ts';
 import { appendAudit } from './audit.ts';
 import type { LaunchPack } from '../model/launchPack.ts';
+import { logger } from '@elizaos/core';
 
 interface PublishOptions {
   force?: boolean;
@@ -112,6 +113,19 @@ export class TelegramPublisherService {
 
     const maybeSendAndPin = async (text: string | undefined) => {
       if (!text) return null;
+
+      // Outbound content scan — block messages containing leaked secrets
+      try {
+        const { ContentFilter } = await import('../../agents/security/contentFilter.ts');
+        const filter = new ContentFilter(null as any, async () => {});
+        const scan = filter.scanOutbound(text, `tg-launch-${chatId}`);
+        if (!scan.clean) {
+          const threatSummary = scan.threats.map(t => t.description).join('; ');
+          logger.error(`[TGPublisher] Outbound scan BLOCKED launch message: ${threatSummary}`);
+          return null; // Do not send — content contains secrets or threats
+        }
+      } catch { /* non-fatal: if filter unavailable, proceed cautiously */ }
+
       const message = await tgApi(env.TG_BOT_TOKEN!, 'sendMessage', {
         chat_id: chatId,
         text,

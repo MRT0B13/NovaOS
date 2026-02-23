@@ -14,6 +14,7 @@ import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import type { SecurityReporter, SecurityEvent } from './securityTypes.ts';
 import { SECRET_PATTERNS, logSecurityEvent } from './securityTypes.ts';
+import { rotateRpc } from '../../launchkit/services/solanaRpc.ts';
 
 // ============================================================================
 // Types
@@ -149,6 +150,18 @@ export class NetworkShield {
       } catch (err) {
         ep.consecutiveFailures++;
         if (ep.consecutiveFailures >= NetworkShield.MAX_CONSECUTIVE_FAILURES) {
+          // Actually rotate to a healthy backup RPC for Solana endpoints
+          let rotatedTo: string | null = null;
+          if (ep.chain === 'solana' && ep.label === 'solana-primary') {
+            rotatedTo = rotateRpc();
+            if (rotatedTo) {
+              logger.warn(`[network-shield] RPC rotation: ${ep.label} failed ${ep.consecutiveFailures}x → rotated to ${rotatedTo}`);
+              ep.url = rotatedTo;
+              ep.consecutiveFailures = 0;
+              ep.validated = false;
+            }
+          }
+
           const event: SecurityEvent = {
             category: 'network',
             severity: 'critical',
@@ -158,8 +171,9 @@ export class NetworkShield {
               chain: ep.chain,
               consecutiveFailures: ep.consecutiveFailures,
               error: String(err),
+              rotatedTo: rotatedTo ?? 'no backup available',
             },
-            autoResponse: 'RPC rotation triggered',
+            autoResponse: rotatedTo ? `RPC rotated to ${rotatedTo}` : 'RPC rotation failed — no backup available',
           };
           this.totalAlerts++;
           await this.report(event);
@@ -224,6 +238,14 @@ export class NetworkShield {
         const publicSlot = pubData.result;
 
         if (publicSlot && Math.abs(currentSlot - publicSlot) > NetworkShield.STALE_SLOT_THRESHOLD) {
+          // Slot divergence is critical — rotate away from the stale primary
+          const rotatedTo = rotateRpc();
+          if (rotatedTo) {
+            ep.url = rotatedTo;
+            ep.consecutiveFailures = 0;
+            ep.validated = false;
+          }
+
           const event: SecurityEvent = {
             category: 'network',
             severity: 'critical',
@@ -233,8 +255,9 @@ export class NetworkShield {
               publicSlot,
               divergence: Math.abs(currentSlot - publicSlot),
               message: 'Primary RPC significantly behind public RPC — possible MITM or fork',
+              rotatedTo: rotatedTo ?? 'rotation on cooldown or no backup',
             },
-            autoResponse: 'Recommend RPC rotation',
+            autoResponse: rotatedTo ? `RPC rotated to ${rotatedTo}` : 'Rotation attempted but unavailable',
           };
           this.totalAlerts++;
           await this.report(event);

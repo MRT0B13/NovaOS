@@ -4,15 +4,17 @@
  * Role: Intelligence gathering — web research, narrative detection, trend cross-referencing.
  * Wraps novaResearch.ts functions and feeds intel to the Supervisor via agent_messages.
  *
- * Architecture (batched-digest model):
+ * Architecture (batched-digest model + GPT synthesis):
  *   - Scan cycle: every 30 min — runs 7 Tavily searches, cross-refs trend pool
- *   - Digest cycle: every 2 hours — summarises buffered intel → single report to Supervisor + CFO
+ *   - Digest cycle: every 2 hours — GPT-4o-mini synthesises buffered intel into:
+ *       1. channelPost  → clean readable narrative for Telegram community
+ *       2. agentIntel   → structured data for CFO/Analyst (sentiment, tickers, signals)
  *   - Full research: every 8 hours — deep research cycle (novaResearch.runResearchCycle)
- *   - CROSS-CONFIRMED intel bypasses the digest and fires immediately (truly breaking)
+ *   - Cross-confirmed intel: bypasses digest, synthesised into clean alert → posted immediately
  *
  * Outgoing messages → Supervisor:
- *   - intel (high):   Breaking signal (CROSS-CONFIRMED only — immediate)
- *   - intel (medium): Digest summary (batched, every 2h)
+ *   - intel (high):   Breaking signal (cross-confirmed, synthesised — immediate)
+ *   - intel (medium): Digest with channelPost + agentIntel (batched, every 2h)
  *   - intel (medium): Full research cycle completed
  *
  * Incoming commands ← Supervisor:
@@ -72,6 +74,8 @@ export class ScoutAgent extends BaseAgent {
     result: string;
     at: number;
     crossConfirmed: boolean;
+    crossSignalTitle?: string;
+    crossSignalSources?: string;
   }> = [];
   private trendSnapshots: string[] = [];     // trend pool state at each scan
   private static MAX_BUFFER = 100;           // bound memory
@@ -191,7 +195,7 @@ export class ScoutAgent extends BaseAgent {
         topics.push(ScoutAgent.TOPIC_POOL[(offset + i) % ScoutAgent.TOPIC_POOL.length]);
       }
 
-      const results: Array<{ query: string; result: string; crossConfirmed: boolean }> = [];
+      const results: Array<{ query: string; result: string; crossConfirmed: boolean; crossSignalTitle?: string; crossSignalSources?: string }> = [];
 
       for (const topic of topics) {
         try {
@@ -246,7 +250,9 @@ export class ScoutAgent extends BaseAgent {
               // Require at least 2 meaningful keywords (or all if fewer)
               if (matchCount >= Math.min(2, keywords.length)) {
                 r.crossConfirmed = true;
-                r.result = `CROSS-CONFIRMED: "${trend.topic}" seen in pool(${trend.sources.join(',')}) + web search — ${r.result.slice(0, 600)}`;
+                r.crossSignalTitle = trend.topic.replace(/^"|"$/g, '').slice(0, 60);
+                r.crossSignalSources = trend.sources.includes('dexscreener') ? 'DexScreener + web' : trend.sources.join(' + ');
+                // DO NOT mangle r.result — leave raw research intact for synthesis step
                 confirmedTrends.add(trendKey);
                 break; // 1 result per trend — move to next trend
               }
@@ -258,7 +264,14 @@ export class ScoutAgent extends BaseAgent {
       // Add to buffer
       const now = Date.now();
       for (const r of results) {
-        this.intelBuffer.push({ query: r.query, result: r.result, at: now, crossConfirmed: r.crossConfirmed });
+        this.intelBuffer.push({
+          query: r.query,
+          result: r.result,
+          at: now,
+          crossConfirmed: r.crossConfirmed,
+          crossSignalTitle: r.crossSignalTitle,
+          crossSignalSources: r.crossSignalSources,
+        });
       }
       // Bound buffer
       if (this.intelBuffer.length > ScoutAgent.MAX_BUFFER) {
@@ -279,28 +292,40 @@ export class ScoutAgent extends BaseAgent {
       // ── IMMEDIATE ALERT: Only CROSS-CONFIRMED intel breaks out of digest ──
       const crossConfirmed = results.filter(r => r.crossConfirmed);
       if (crossConfirmed.length > 0) {
-        // Deduplicate by extracting the quoted topic from each CROSS-CONFIRMED result
-        const seenTopics = new Set<string>();
-        const uniqueItems: string[] = [];
+        // Deduplicate signals by their clean title
+        const seenTitles = new Set<string>();
+        const cleanAlerts: string[] = [];
+
         for (const r of crossConfirmed) {
-          // Extract topic: CROSS-CONFIRMED: "TopicHere" ...
-          const topicMatch = r.result.match(/CROSS-CONFIRMED: "([^"]+)"/);
-          const key = topicMatch ? topicMatch[1].toLowerCase() : r.result.slice(0, 80).toLowerCase();
-          if (!seenTopics.has(key)) {
-            seenTopics.add(key);
-            uniqueItems.push(r.result.slice(0, 600));
-          }
+          const title = r.crossSignalTitle || r.query.slice(0, 60);
+          const titleKey = title.toLowerCase();
+          if (seenTitles.has(titleKey)) continue;
+          seenTitles.add(titleKey);
+
+          // Synthesise into a clean 2-3 sentence alert
+          const cleanAlert = await this.synthesiseCrossConfirmed(title, r.result);
+          cleanAlerts.push(cleanAlert);
+
+          if (cleanAlerts.length >= 2) break; // max 2 breaking alerts per scan
         }
-        // Cap at 3 items to prevent wall-of-text
-        const breakingSummary = uniqueItems.slice(0, 3).join(' | ');
-        logger.info(`[scout] 🚨 ${uniqueItems.length} unique CROSS-CONFIRMED signal(s) — sending immediate alert`);
-        await this.reportToSupervisor('intel', 'high', {
-          intel_type: 'narrative_shift',
-          summary: breakingSummary,
-          resultsCount: uniqueItems.length,
-          trendPool: trendSummary || undefined,
-          immediate: true,
-        });
+
+        if (cleanAlerts.length > 0) {
+          // For X (280 chars): use just the first alert
+          // For TG/Farcaster: all alerts with a header
+          const xSummary = cleanAlerts[0].slice(0, 240);
+          const channelSummary = cleanAlerts.join('\n\n');
+
+          logger.info(`[scout] 🚨 ${cleanAlerts.length} clean cross-confirmed alert(s) — sending immediate`);
+          await this.reportToSupervisor('intel', 'high', {
+            intel_type: 'narrative_shift',
+            xSummary,             // ← what gets posted to X (under 240 chars, clean sentence)
+            channelSummary,       // ← what gets posted to Telegram (can be longer)
+            // Legacy field — keep for backward compat
+            summary: channelSummary,
+            resultsCount: cleanAlerts.length,
+            immediate: true,
+          });
+        }
       }
 
       await this.updateStatus('alive');
@@ -324,75 +349,73 @@ export class ScoutAgent extends BaseAgent {
       const periodH = Math.round(periodMs / 3600_000) || 1;
       this.lastDigestAt = now;
 
-      // ── Build digest from buffer ──
       const totalItems = this.intelBuffer.length;
       const crossItems = this.intelBuffer.filter(i => i.crossConfirmed);
 
-      // Group non-cross-confirmed items by query topic area for summary
-      const nonCrossItems = this.intelBuffer.filter(i => !i.crossConfirmed);
-      const byTopic: Record<string, string[]> = {};
-      for (const item of nonCrossItems) {
-        const topicKey = item.query.split(' ').slice(0, 3).join(' ');
-        if (!byTopic[topicKey]) byTopic[topicKey] = [];
-        byTopic[topicKey].push(item.result.slice(0, 150));
-      }
+      // ── Synthesise with GPT-4o-mini ──────────────────────────────────────────
+      const synthesis = await this.synthesiseBuffer(this.intelBuffer);
 
-      // Build summary lines (most interesting first)
-      const summaryLines: string[] = [];
+      let channelPost: string;
+      let agentIntel: Record<string, unknown>;
 
-      // Cross-confirmed items first (highest value) — dedup by extracted topic
-      if (crossItems.length > 0) {
-        const seenCrossTopics = new Set<string>();
-        const uniqueCross: typeof crossItems = [];
-        for (const item of crossItems) {
-          const tm = item.result.match(/CROSS-CONFIRMED: "([^"]+)"/);
-          const key = tm ? tm[1].toLowerCase() : item.result.slice(0, 80).toLowerCase();
-          if (!seenCrossTopics.has(key)) {
-            seenCrossTopics.add(key);
-            uniqueCross.push(item);
+      if (synthesis) {
+        // ── Synthesised path (OpenAI available) ──
+        channelPost = synthesis.channelPost;
+        agentIntel = synthesis.agentIntel;
+        logger.info(`[scout] 🧠 Synthesis complete — sentiment: ${synthesis.agentIntel.sentiment}, tickers: ${synthesis.agentIntel.trendingTickers.join(', ') || 'none'}`);
+      } else {
+        // ── Fallback: build a minimal readable digest without GPT ──
+        const CATEGORY_MAP: Record<string, string> = {
+          'AI agents':        'AI & agents',
+          'Solana meme':      'Solana memes',
+          'pump.fun':         'pump.fun',
+          'crypto market':    'Market sentiment',
+          'DeFi protocol':    'DeFi',
+          'Solana ecosystem': 'Solana ecosystem',
+          'crypto twitter':   'Social/viral',
+          'web3 AI':          'AI & Web3',
+          'bitcoin ethereum': 'BTC/ETH macro',
+          'crypto regulation':'Regulation',
+        };
+
+        const lines: string[] = [];
+        const usedCategories = new Set<string>();
+
+        for (const item of this.intelBuffer.slice(-8)) {
+          const cat = Object.entries(CATEGORY_MAP).find(([k]) =>
+            item.query.toLowerCase().includes(k.toLowerCase())
+          );
+          const label = cat ? cat[1] : item.query.split(' ').slice(0, 2).join(' ');
+          if (!usedCategories.has(label)) {
+            usedCategories.add(label);
+            // Find the last complete sentence in the result (don't slice mid-word)
+            const result = item.result.slice(0, 200);
+            const lastPeriod = result.lastIndexOf('.');
+            const clean = lastPeriod > 80 ? result.slice(0, lastPeriod + 1) : result;
+            lines.push(`• ${label}: ${clean}`);
           }
         }
-        summaryLines.push(`🔥 ${uniqueCross.length} cross-confirmed signal(s):`);
-        for (const item of uniqueCross.slice(0, 3)) {
-          summaryLines.push(`  • ${item.result.slice(0, 500)}`);
-        }
+
+        channelPost = lines.join('\n');
+        agentIntel = { sentiment: 'neutral', sentimentScore: 0, signals: [], trendingTickers: [], narratives: [], launchRecommendation: '' };
       }
 
-      // Topic-grouped summaries (cross-confirmed items already excluded above)
-      for (const [topic, items] of Object.entries(byTopic)) {
-        if (items.length > 0) {
-          const best = items.sort((a, b) => b.length - a.length)[0];
-          summaryLines.push(`📡 ${topic}: ${best.slice(0, 400)}`);
-        }
-      }
-
-      // Trend pool snapshot
-      const latestTrend = this.trendSnapshots[this.trendSnapshots.length - 1];
-      if (latestTrend) {
-        summaryLines.push(`📊 ${latestTrend}`);
-      }
-
-      const digestSummary = summaryLines.slice(0, 10).join('\n');
-
-      // ── Determine priority ──
-      // High only if we have cross-confirmed signals that haven't been sent immediately
-      const hasBreaking = crossItems.some(i => !i.crossConfirmed); // (all cross-confirmed already sent)
-      const priority = hasBreaking ? 'high' : 'medium';
-
-      // ── Send single digest to supervisor (which forwards to CFO) ──
-      await this.reportToSupervisor('intel', priority as any, {
+      // ── Send digest to supervisor ─────────────────────────────────────────────
+      await this.reportToSupervisor('intel', 'medium', {
         intel_type: 'intel_digest',
-        summary: digestSummary,
+        channelPost,            // ← what gets posted to Telegram (clean readable narrative)
+        agentIntel,             // ← what gets sent to CFO/Analyst agents (structured data, NOT posted)
+        // Legacy field kept for backward compat — use channelPost for display
+        summary: channelPost,
         periodHours: periodH,
         scansInPeriod: this.scanCount,
         totalIntelItems: totalItems,
         crossConfirmedCount: crossItems.length,
-        trendPool: latestTrend || undefined,
       });
 
       logger.info(
-        `[scout] 📋 Digest sent: ${totalItems} items from ${this.scanCount} scans ` +
-        `(${crossItems.length} cross-confirmed) | ${periodH}h window`
+        `[scout] 📋 Digest sent: ${totalItems} items, ${crossItems.length} cross-confirmed | ` +
+        `synthesis: ${synthesis ? 'GPT' : 'fallback'} | ${periodH}h window`
       );
 
       // Clear buffer for next digest window
@@ -400,6 +423,137 @@ export class ScoutAgent extends BaseAgent {
       this.scanCount = 0;
     } catch (err) {
       logger.error('[scout] Digest failed:', err);
+    }
+  }
+
+  // ── Synthesis Methods ────────────────────────────────────────────
+
+  /**
+   * Run GPT-4o-mini synthesis over the raw intel buffer.
+   * Returns { channelPost, agentIntel } — two separate outputs for two audiences.
+   * Falls back gracefully if OpenAI is unavailable.
+   */
+  private async synthesiseBuffer(items: typeof this.intelBuffer): Promise<{
+    channelPost: string;
+    agentIntel: {
+      sentiment: 'bullish' | 'bearish' | 'cautious' | 'neutral';
+      sentimentScore: number;
+      trendingTickers: string[];
+      signals: Array<{ type: string; description: string; confidence: 'high' | 'medium' | 'low' }>;
+      narratives: string[];
+      launchRecommendation: string;
+    };
+  } | null> {
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey || items.length === 0) return null;
+
+    // Feed the raw results as a numbered list — don't send query names, only results
+    const rawIntel = items
+      .map((item, i) => `[${i + 1}] ${item.result.slice(0, 300)}`)
+      .join('\n');
+
+    const systemPrompt = `You are Scout, the intelligence analyst for Nova — an autonomous AI agent that launches meme tokens on Solana. Your job is to synthesise raw web research into two things:
+1. A clean, readable market summary for Nova's Telegram community (plain language, no jargon)
+2. Structured intelligence data for other AI agents to act on
+
+Nova's community are crypto-native Solana users interested in meme coins, market trends, and AI agents.
+Write the channel post in Nova's voice: direct, confident, slightly edgy — like a well-connected trader sharing what they're seeing. Never use phrases like "I have gathered" or "based on my research".
+Maximum channel post length: 600 characters. Use bullet points for key signals.
+
+Return ONLY valid JSON matching this exact schema:
+{
+  "channelPost": "string — clean readable narrative for Telegram",
+  "sentiment": "bullish|bearish|cautious|neutral",
+  "sentimentScore": "number between -1.0 and 1.0",
+  "trendingTickers": ["$TICKER1", "$TICKER2"],
+  "signals": [
+    { "type": "string", "description": "string (max 80 chars)", "confidence": "high|medium|low" }
+  ],
+  "narratives": ["string array of active themes like ai_agents, defi_growth, macro_fear, meme_rotation"],
+  "launchRecommendation": "string — one sentence on whether conditions favour launching a token now"
+}`;
+
+    try {
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openaiKey}`,
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          max_tokens: 600,
+          temperature: 0.4,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: `Synthesise these ${items.length} raw intel items from the last scan cycle:\n\n${rawIntel}` },
+          ],
+        }),
+      });
+
+      if (!res.ok) return null;
+      const data = await res.json() as any;
+      const text = data.choices?.[0]?.message?.content;
+      if (!text) return null;
+
+      const parsed = JSON.parse(text);
+      return {
+        channelPost: parsed.channelPost || '',
+        agentIntel: {
+          sentiment: parsed.sentiment || 'neutral',
+          sentimentScore: parsed.sentimentScore ?? 0,
+          trendingTickers: parsed.trendingTickers || [],
+          signals: parsed.signals || [],
+          narratives: parsed.narratives || [],
+          launchRecommendation: parsed.launchRecommendation || '',
+        },
+      };
+    } catch {
+      return null; // synthesis failure is non-fatal; fall back to raw
+    }
+  }
+
+  /**
+   * Convert a raw cross-confirmed result into a clean single-sentence alert.
+   * Used for the immediate narrative_shift message sent to supervisor.
+   */
+  private async synthesiseCrossConfirmed(
+    signalTitle: string,
+    rawResult: string,
+  ): Promise<string> {
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey) return `🔥 Trending: ${signalTitle}`;
+
+    try {
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openaiKey}`,
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          max_tokens: 120,
+          temperature: 0.3,
+          messages: [{
+            role: 'user',
+            content: `A trending signal has been cross-confirmed across on-chain data and web search.
+Signal topic: "${signalTitle}"
+Raw research: "${rawResult.slice(0, 400)}"
+
+Write a single clean alert message (2-3 sentences max, under 200 chars total) for a Telegram channel.
+Start with the ticker if there is one (e.g. "$XINGXING is trending..."), otherwise summarise what's happening.
+Be specific, no hype words, no jargon like "cross-confirmed" or "trend pool". Just what's actually happening.`,
+          }],
+        }),
+      });
+
+      if (!res.ok) return `🔥 Trending: ${signalTitle}`;
+      const data = await res.json() as any;
+      return data.choices?.[0]?.message?.content?.trim() || `🔥 Trending: ${signalTitle}`;
+    } catch {
+      return `🔥 Trending: ${signalTitle}`;
     }
   }
 
@@ -443,7 +597,7 @@ export class ScoutAgent extends BaseAgent {
       lastScanAt?: number;
       lastDigestAt?: number;
       seenHashes?: string[];
-      intelBuffer?: Array<{ query: string; result: string; at: number; crossConfirmed: boolean }>;
+      intelBuffer?: Array<{ query: string; result: string; at: number; crossConfirmed: boolean; crossSignalTitle?: string; crossSignalSources?: string }>;
     }>();
     if (!s) return;
     if (s.cycleCount)      this.cycleCount = s.cycleCount;

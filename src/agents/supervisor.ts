@@ -215,32 +215,33 @@ export class Supervisor extends BaseAgent {
         if (now - this.lastNarrativePostAt < Supervisor.NARRATIVE_COOLDOWN_MS) {
           logger.debug(`[supervisor] Skipping narrative post (cooldown: ${Math.round((Supervisor.NARRATIVE_COOLDOWN_MS - (now - this.lastNarrativePostAt)) / 60_000)}m remaining)`);
         } else {
-          const rawContent = summary || narratives?.summary || 'Check thread for details';
-          const prefix = '📡 Narrative shift detected: ';
+          // Use synthesised fields if available, fall back to legacy summary
+          const xContent = msg.payload.xSummary || summary || narratives?.summary || 'Check thread for details';
+          const channelContent = msg.payload.channelSummary || summary || narratives?.summary || 'Check thread for details';
 
-          // Full content for TG/Farcaster (Telegram supports 4096 chars)
-          const fullContent = `${prefix}${rawContent}`;
+          const xPrefix = '📡 Narrative shift detected: ';
+          const fullChannelContent = `${xPrefix}${channelContent}`;
 
           // Truncated content for X (280 char limit)
-          const maxBody = 280 - prefix.length;
-          let xContent: string;
-          if (rawContent.length > maxBody) {
+          const maxBody = 280 - xPrefix.length;
+          let xPost: string;
+          if (xContent.length > maxBody) {
             const cutoff = maxBody - 3;
-            const lastSpace = rawContent.lastIndexOf(' ', cutoff);
+            const lastSpace = xContent.lastIndexOf(' ', cutoff);
             const breakAt = lastSpace > cutoff * 0.5 ? lastSpace : cutoff;
-            xContent = `${prefix}${rawContent.slice(0, breakAt)}...`;
+            xPost = `${xPrefix}${xContent.slice(0, breakAt)}...`;
           } else {
-            xContent = fullContent;
+            xPost = `${xPrefix}${xContent}`;
           }
 
           // Content dedup — don't post same/similar content twice
-          const contentHash = fullContent.toLowerCase().replace(/[^a-z ]/g, '').trim().slice(0, 150);
+          const contentHash = fullChannelContent.toLowerCase().replace(/[^a-z ]/g, '').trim().slice(0, 150);
           if (this.recentXPostHashes.has(contentHash)) {
             logger.debug(`[supervisor] Skipping duplicate narrative post (same content already posted)`);
           } else {
             // Scan outbound content before publishing
-            const safeXContent = this.scanOutboundSafe(xContent, 'x-post');
-            const safeFullContent = this.scanOutboundSafe(fullContent, 'tg-channel');
+            const safeXContent = this.scanOutboundSafe(xPost, 'x-post');
+            const safeFullContent = this.scanOutboundSafe(fullChannelContent, 'tg-channel');
             if (safeXContent && this.callbacks.onPostToX) await this.callbacks.onPostToX(safeXContent);
             if (safeFullContent && this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(safeFullContent);
             if (safeFullContent && this.callbacks.onPostToFarcaster) {
@@ -262,15 +263,31 @@ export class Supervisor extends BaseAgent {
 
       // ── Intel Digest (batched summary from scout — every 2h) ──
       if (intelSource === 'intel_digest') {
-        const { periodHours, totalIntelItems, crossConfirmedCount, scansInPeriod } = msg.payload;
+        const { channelPost, agentIntel, periodHours, totalIntelItems, crossConfirmedCount, scansInPeriod } = msg.payload;
+        const displayContent = channelPost || msg.payload.summary || 'No notable signals';
         logger.info(
           `[supervisor] 📋 Scout digest: ${totalIntelItems} items from ${scansInPeriod} scans ` +
           `(${crossConfirmedCount} cross-confirmed) | ${periodHours}h window`
         );
         // Don't post digests to community/X — they're operational intel for CFO + admin only
         if (this.callbacks.onPostToAdmin && totalIntelItems > 0) {
-          const digestMsg = `📋 <b>Scout Digest</b> (${periodHours}h)\n\n${summary || 'No notable signals'}`;
+          const digestMsg = `📋 <b>Scout Digest</b> (${periodHours}h)\n\n${displayContent}`;
           await this.callbacks.onPostToAdmin(digestMsg);
+        }
+
+        // Forward structured agent intel to CFO separately (not the channel post)
+        if (agentIntel) {
+          try {
+            await this.sendMessage('nova-cfo', 'intel', 'low', {
+              command: 'scout_intel',
+              intel_type: 'structured_digest',
+              forwardedBy: 'supervisor',
+              originalFrom: 'nova-scout',
+              ...agentIntel,
+            });
+          } catch (err) {
+            logger.debug(`[supervisor] Failed to forward structured intel to CFO:`, err);
+          }
         }
       }
 
@@ -303,7 +320,7 @@ export class Supervisor extends BaseAgent {
         return;
       }
 
-      const warning = this.formatSafetyWarning(tokenName || tokenAddress, score, alerts || []);
+      const warning = this.formatSafetyWarning(tokenName || tokenAddress, score, alerts || [], payload.type);
 
       if (msg.priority === 'critical') {
         // CRITICAL: Post warning to X + TG + Farcaster immediately
@@ -745,9 +762,14 @@ export class Supervisor extends BaseAgent {
 
   // ── Formatting Helpers ───────────────────────────────────────────
 
-  private formatSafetyWarning(tokenName: string, score: number, alerts: string[]): string {
+  private formatSafetyWarning(tokenName: string, score: number | null | undefined, alerts: string[], alertType?: string): string {
+    const typePrefix = alertType === 'lp_drain' ? '💧 LP Alert'
+      : alertType === 'price_crash' ? '📉 Price Alert'
+      : alertType === 'volume_spike' ? '📊 Volume Alert'
+      : '🚨 Safety Alert';
+    const scoreLine = score != null ? `\nRugCheck Score: ${score}` : '';
     const alertLines = alerts.map(a => `⚠️ ${a}`).join('\n');
-    return `🚨 Safety Alert: ${tokenName}\nRugCheck Score: ${score}\n${alertLines}`;
+    return `${typePrefix}: ${tokenName}${scoreLine}\n${alertLines}`;
   }
 
   private formatScanReport(report: Record<string, any>): string {

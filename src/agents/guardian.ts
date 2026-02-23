@@ -519,10 +519,16 @@ export class GuardianAgent extends BaseAgent {
         // LP DRAIN: liquidity dropped > 40%
         if (prevLiq > 1000 && snapshot.liquidityUsd < prevLiq * 0.6) {
           const dropPct = Math.round((1 - snapshot.liquidityUsd / prevLiq) * 100);
+          const rug = await this.quickRugScan(mint);
+          const alertLines = [`LP drained ${dropPct}%: $${this.formatUSD(prevLiq)} → $${this.formatUSD(snapshot.liquidityUsd)}`];
+          if (rug.alerts.length) alertLines.push(...rug.alerts.map(a => `RugCheck: ${a}`));
           await this.reportToSupervisor('alert', dropPct > 80 ? 'critical' : 'high', {
             tokenAddress: mint,
             tokenName: name,
-            alerts: [`LP drained ${dropPct}%: $${this.formatUSD(prevLiq)} → $${this.formatUSD(snapshot.liquidityUsd)}`],
+            alerts: alertLines,
+            score: rug.score,
+            riskLevel: rug.riskLevel,
+            isRugged: rug.isRugged,
             liquidityUsd: snapshot.liquidityUsd,
             previousLiquidityUsd: prevLiq,
             type: 'lp_drain',
@@ -546,10 +552,16 @@ export class GuardianAgent extends BaseAgent {
         // PRICE CRASH: > 30% drop since last check
         if (prevPrice && prevPrice > 0 && snapshot.priceUsd < prevPrice * 0.7) {
           const crashPct = Math.round((1 - snapshot.priceUsd / prevPrice) * 100);
+          const rug = await this.quickRugScan(mint);
+          const alertLines = [`Price crashed ${crashPct}%: $${prevPrice.toFixed(6)} → $${snapshot.priceUsd.toFixed(6)}`];
+          if (rug.alerts.length) alertLines.push(...rug.alerts.map(a => `RugCheck: ${a}`));
           await this.reportToSupervisor('alert', crashPct > 50 ? 'critical' : 'high', {
             tokenAddress: mint,
             tokenName: name,
-            alerts: [`Price crashed ${crashPct}%: $${prevPrice.toFixed(6)} → $${snapshot.priceUsd.toFixed(6)}`],
+            alerts: alertLines,
+            score: rug.score,
+            riskLevel: rug.riskLevel,
+            isRugged: rug.isRugged,
             priceUsd: snapshot.priceUsd,
             previousPriceUsd: prevPrice,
             type: 'price_crash',
@@ -572,6 +584,29 @@ export class GuardianAgent extends BaseAgent {
     if (value >= 1e6) return `${(value / 1e6).toFixed(1)}M`;
     if (value >= 1e3) return `${(value / 1e3).toFixed(0)}K`;
     return value.toFixed(0);
+  }
+
+  /**
+   * Quick rug scan — returns score + risk level, never throws.
+   * Used to enrich LP drain and price crash alerts before forwarding.
+   */
+  private async quickRugScan(mint: string): Promise<{ score: number | null; riskLevel: string; isRugged: boolean; alerts: string[] }> {
+    try {
+      await loadRugcheck();
+      if (!_scanToken) return { score: null, riskLevel: 'unknown', isRugged: false, alerts: [] };
+      const report = await _scanToken(mint);
+      const score = typeof report?.score === 'number' ? report.score : null;
+      const isRugged = _isSafe ? !_isSafe(report) : false;
+      const riskLevel = score === null ? 'unknown' : score >= 800 ? 'critical' : score >= 500 ? 'high' : score >= 200 ? 'medium' : 'low';
+      const alerts: string[] = [];
+      if (report?.risks?.length) {
+        for (const r of report.risks.slice(0, 3)) alerts.push(r.name || r.description || String(r));
+      }
+      return { score, riskLevel, isRugged, alerts };
+    } catch (err) {
+      logger.debug(`[guardian] quickRugScan failed for ${mint}:`, err);
+      return { score: null, riskLevel: 'unknown', isRugged: false, alerts: [] };
+    }
   }
 
   // ── Scout Intel Ingestion ──────────────────────────────────────
