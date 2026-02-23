@@ -66,6 +66,9 @@ export abstract class BaseAgent {
   protected intervals: NodeJS.Timeout[] = [];
   private _stateColumnEnsured = false;
 
+  // Shared across all agent instances — avoids repeated failing queries + PG error log spam
+  private static _hasRetryCount: boolean | null = null;
+
   constructor(config: AgentConfig) {
     this.pool = config.pool;
     this.agentId = config.agentId;
@@ -237,14 +240,54 @@ export abstract class BaseAgent {
 
   /** Read pending messages addressed to this agent (or broadcast) */
   protected async readMessages(limit: number = 10): Promise<AgentMessage[]> {
+    // On first call, try to ensure retry_count column exists (idempotent ALTER)
+    if (BaseAgent._hasRetryCount === null) {
+      try {
+        await this.pool.query(
+          `ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0`,
+        );
+        BaseAgent._hasRetryCount = true;
+      } catch {
+        BaseAgent._hasRetryCount = false;
+      }
+    }
+
     try {
+      if (BaseAgent._hasRetryCount) {
+        const result = await this.pool.query(
+          `SELECT id, from_agent, to_agent, message_type, priority, payload, created_at,
+                  COALESCE(retry_count, 0) as retry_count
+           FROM agent_messages
+           WHERE (to_agent = $1 OR to_agent = 'broadcast') AND acknowledged = false
+             AND (expires_at IS NULL OR expires_at > NOW())
+             AND COALESCE(retry_count, 0) < 5
+           ORDER BY
+             CASE priority
+               WHEN 'critical' THEN 0
+               WHEN 'high' THEN 1
+               WHEN 'medium' THEN 2
+               WHEN 'low' THEN 3
+             END,
+             created_at ASC
+           LIMIT $2`,
+          [this.agentId, limit],
+        );
+        // Increment retry_count for each message read (tracks processing attempts)
+        for (const row of result.rows) {
+          await this.pool.query(
+            `UPDATE agent_messages SET retry_count = COALESCE(retry_count, 0) + 1 WHERE id = $1`,
+            [row.id],
+          ).catch(() => {});
+        }
+        return result.rows;
+      }
+
+      // Fallback: retry_count column doesn't exist
       const result = await this.pool.query(
-        `SELECT id, from_agent, to_agent, message_type, priority, payload, created_at,
-                COALESCE(retry_count, 0) as retry_count
+        `SELECT id, from_agent, to_agent, message_type, priority, payload, created_at
          FROM agent_messages
          WHERE (to_agent = $1 OR to_agent = 'broadcast') AND acknowledged = false
            AND (expires_at IS NULL OR expires_at > NOW())
-           AND COALESCE(retry_count, 0) < 5
          ORDER BY
            CASE priority
              WHEN 'critical' THEN 0
@@ -256,37 +299,8 @@ export abstract class BaseAgent {
          LIMIT $2`,
         [this.agentId, limit],
       );
-      // Increment retry_count for each message read (tracks processing attempts)
-      for (const row of result.rows) {
-        await this.pool.query(
-          `UPDATE agent_messages SET retry_count = COALESCE(retry_count, 0) + 1 WHERE id = $1`,
-          [row.id],
-        ).catch(() => {}); // silent — column may not exist yet
-      }
       return result.rows;
     } catch (err) {
-      // If retry_count column doesn't exist, fall back to original query
-      if (String(err).includes('retry_count')) {
-        try {
-          const fallback = await this.pool.query(
-            `SELECT id, from_agent, to_agent, message_type, priority, payload, created_at
-             FROM agent_messages
-             WHERE (to_agent = $1 OR to_agent = 'broadcast') AND acknowledged = false
-               AND (expires_at IS NULL OR expires_at > NOW())
-             ORDER BY
-               CASE priority
-                 WHEN 'critical' THEN 0
-                 WHEN 'high' THEN 1
-                 WHEN 'medium' THEN 2
-                 WHEN 'low' THEN 3
-               END,
-               created_at ASC
-             LIMIT $2`,
-            [this.agentId, limit],
-          );
-          return fallback.rows;
-        } catch { /* fall through */ }
-      }
       logger.warn(`[${this.agentId}] Failed to read messages:`, err);
       return [];
     }
