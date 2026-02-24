@@ -658,6 +658,18 @@ export class CFOAgent extends BaseAgent {
       await this.updateStatus('deciding');
       const { state, decisions, results, report, intel } = await runDecisionCycle(this.pool);
 
+      // ── Hydrate scoutIntel from swarm intel (covers restarts + missed messages) ──
+      if (intel.scoutReceivedAt && intel.scoutBullish !== undefined) {
+        const existing = this.scoutIntel;
+        if (!existing || intel.scoutReceivedAt > existing.receivedAt) {
+          this.scoutIntel = {
+            cryptoBullish: intel.scoutBullish,
+            narratives: intel.scoutNarratives ?? [],
+            receivedAt: intel.scoutReceivedAt,
+          };
+        }
+      }
+
       // ── Handle APPROVAL-tier decisions → queue for admin approval ─
       const approvalIds: Map<string, string> = new Map(); // decision.type → approval id
       for (const r of results) {
@@ -1440,6 +1452,7 @@ export class CFOAgent extends BaseAgent {
       pendingApprovals: serializedApprovals,
       cooldowns: getCooldownState(),
       emergencyPausedUntil: this.emergencyPausedUntil,
+      scoutIntel: this.scoutIntel,
     });
   }
 
@@ -1451,12 +1464,19 @@ export class CFOAgent extends BaseAgent {
       pendingApprovals?: SerializableApproval[];
       cooldowns?: Record<string, number>;
       emergencyPausedUntil?: number | null;
+      scoutIntel?: ScoutIntel | null;
     }>();
     if (!s) return;
     if (s.cycleCount) this.cycleCount = s.cycleCount;
     if (s.approvalCounter) this.approvalCounter = s.approvalCounter;
     // Keep startedAt from the previous session to show total uptime across restarts
     if (s.startedAt)  this.startedAt = s.startedAt;
+
+    // Restore scout intel (if still fresh — within 8h)
+    if (s.scoutIntel && s.scoutIntel.receivedAt && (Date.now() - s.scoutIntel.receivedAt) < 8 * 3600_000) {
+      this.scoutIntel = s.scoutIntel;
+      logger.info(`[CFO] Scout intel restored: ${s.scoutIntel.cryptoBullish ? '🟢' : '🔴'} (${Math.floor((Date.now() - s.scoutIntel.receivedAt) / 60_000)}m old)`);
+    }
 
     // Restore emergency pause — re-arm timer for remaining cooldown
     if (s.emergencyPausedUntil && s.emergencyPausedUntil > Date.now()) {
