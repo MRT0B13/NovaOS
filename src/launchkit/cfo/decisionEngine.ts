@@ -101,12 +101,28 @@ export interface SwarmIntel {
   guardianAlerts?: string[];          // active safety warnings
   guardianCritical?: boolean;         // any critical threats active?
   guardianReceivedAt?: number;
+  // Enriched watchlist data (from broadcastWatchlistSnapshot)
+  guardianTokens?: Array<{
+    mint: string;
+    ticker: string;
+    priceUsd: number;
+    liquidityUsd: number;
+    volume24h: number;
+    rugScore: number | null;
+    safe: boolean;
+  }>;
+  guardianSnapshotAt?: number;
 
   // From Analyst (DeFi data)
   analystSolanaTvl?: number;          // Solana ecosystem TVL
   analystVolumeSpike?: boolean;       // significant volume increase?
   analystPriceAlert?: string;         // price movement summary
   analystReceivedAt?: number;
+  // Enriched token price intel (from broadcastTokenIntel)
+  analystPrices?: Record<string, { usd: number; change24h: number }>;
+  analystMovers?: Array<{ symbol: string; usd: number; change24hPct: number }>;
+  analystTrending?: string[];         // CoinGecko trending tickers
+  analystPricesAt?: number;
 
   // Composite score (computed)
   riskMultiplier: number;             // 0.5 (bullish) to 2.0 (danger) — scales hedge aggressiveness
@@ -335,8 +351,8 @@ export async function gatherSwarmIntel(pool: any): Promise<SwarmIntel> {
   };
 
   try {
-    // Read recent messages from swarm agents to CFO (last 2 hours)
-    const cutoff = new Date(Date.now() - 2 * 3600_000).toISOString();
+    // Read recent messages from swarm agents to CFO (last 4 hours — wider window for price/LP context)
+    const cutoff = new Date(Date.now() - 4 * 3600_000).toISOString();
     const result = await pool.query(
       `SELECT from_agent, payload, created_at
        FROM agent_messages
@@ -393,6 +409,24 @@ export async function gatherSwarmIntel(pool: any): Promise<SwarmIntel> {
           intel.analystVolumeSpike = payload.source === 'volume_spike';
           intel.analystPriceAlert = payload.summary;
           intel.analystReceivedAt = ts;
+        }
+      }
+
+      // ── Guardian watchlist snapshot (enriched token data) ──
+      if (from === 'nova-guardian' && payload.source === 'watchlist_snapshot') {
+        if (!intel.guardianSnapshotAt || ts > intel.guardianSnapshotAt) {
+          intel.guardianTokens = payload.tokens ?? [];
+          intel.guardianSnapshotAt = ts;
+        }
+      }
+
+      // ── Analyst token intel (enriched price data) ──
+      if (from === 'nova-analyst' && payload.source === 'token_intel') {
+        if (!intel.analystPricesAt || ts > intel.analystPricesAt) {
+          intel.analystPrices = payload.prices ?? {};
+          intel.analystMovers = payload.movers ?? [];
+          intel.analystTrending = payload.trending ?? [];
+          intel.analystPricesAt = ts;
         }
       }
     }
@@ -633,6 +667,194 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
 // STEP 2 + 3: Assess risk & decide
 // ============================================================================
 
+// Known Orca Whirlpool addresses for CFO-approved pairs (0.3% fee tier)
+// NOTE: Verify addresses against https://orca.so/pools before deploying.
+// SOL/USDC is confirmed. Others must be verified against live on-chain data.
+const ORCA_WHIRLPOOLS: Record<string, { address: string; tokenA: string; tokenB: string; minLiquidityUsd: number }> = {
+  'SOL/USDC':  { address: 'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ', tokenA: 'SOL',  tokenB: 'USDC', minLiquidityUsd: 500_000 },
+  'BONK/USDC': { address: 'Fy6SnHPbDxMhVj8j7BNKMiNaVVesCzK8qcFNmRKokFgT', tokenA: 'BONK', tokenB: 'USDC', minLiquidityUsd: 100_000 },
+  'WIF/USDC':  { address: 'ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq', tokenA: 'WIF',  tokenB: 'USDC', minLiquidityUsd: 50_000  },
+  'JUP/USDC':  { address: 'BoG9sBfBBsGJBJbUqsFPRrmGCJF5i4kk5mMHPzSnVBa4', tokenA: 'JUP',  tokenB: 'USDC', minLiquidityUsd: 50_000  },
+};
+
+/**
+ * Select the best Orca LP pair given current swarm intel.
+ * Scoring: 40% volume momentum, 30% price trend, 20% liquidity depth, 10% rug safety
+ */
+function selectBestOrcaPair(intel: SwarmIntel): {
+  pair: string;
+  whirlpool: typeof ORCA_WHIRLPOOLS[string];
+  score: number;
+  reasoning: string;
+} {
+  const defaultPair = {
+    pair: 'SOL/USDC',
+    whirlpool: ORCA_WHIRLPOOLS['SOL/USDC'],
+    score: 50,
+    reasoning: 'Default SOL/USDC — no enriched intel available',
+  };
+
+  if (!intel.guardianTokens?.length && !intel.analystPrices) {
+    return defaultPair;
+  }
+
+  const candidates: Array<{ pair: string; score: number; reasoning: string[] }> = [];
+
+  for (const [pairName, pool] of Object.entries(ORCA_WHIRLPOOLS)) {
+    const tokenSymbol = pool.tokenA;
+    let score = 0;
+    const reasons: string[] = [];
+
+    // ── Volume score (from Guardian watchlist) ──
+    const guardianToken = intel.guardianTokens?.find(t => t.ticker === tokenSymbol);
+    if (guardianToken) {
+      if (guardianToken.volume24h > 1_000_000) { score += 40; reasons.push(`high vol $${(guardianToken.volume24h / 1e6).toFixed(1)}M`); }
+      else if (guardianToken.volume24h > 100_000) { score += 20; reasons.push(`vol $${(guardianToken.volume24h / 1e3).toFixed(0)}k`); }
+      else if (guardianToken.volume24h > 10_000) { score += 10; }
+
+      // Liquidity depth
+      if (guardianToken.liquidityUsd >= pool.minLiquidityUsd) {
+        score += 20; reasons.push(`liq $${(guardianToken.liquidityUsd / 1e3).toFixed(0)}k`);
+      } else {
+        score -= 20;
+        reasons.push('low liq');
+      }
+
+      // Rug safety
+      if (tokenSymbol === 'SOL') {
+        score += 10;
+      } else if (!guardianToken.safe) {
+        score -= 30;
+        reasons.push('rug risk');
+      } else {
+        score += 10; reasons.push('clean');
+      }
+    }
+
+    // ── Price trend score (from Analyst) ──
+    const analystPrice = intel.analystPrices?.[tokenSymbol];
+    if (analystPrice) {
+      const change = analystPrice.change24h;
+      if (change > 10) { score += 30; reasons.push(`+${change.toFixed(0)}% 24h`); }
+      else if (change > 5) { score += 20; reasons.push(`+${change.toFixed(0)}% 24h`); }
+      else if (change > 0) { score += 10; }
+      else if (change < -10) { score -= 15; reasons.push(`${change.toFixed(0)}% 24h`); }
+    }
+
+    // ── Trending bonus (from Analyst CoinGecko trending) ──
+    if (intel.analystTrending?.includes(tokenSymbol)) {
+      score += 15; reasons.push('trending');
+    }
+
+    // ── Market condition modifier ──
+    if (intel.marketCondition === 'bearish' || intel.marketCondition === 'danger') {
+      if (tokenSymbol !== 'SOL') score -= 20;
+    }
+
+    candidates.push({ pair: pairName, score, reasoning: reasons });
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+  if (!best || best.score < 30) return defaultPair;
+
+  return {
+    pair: best.pair,
+    whirlpool: ORCA_WHIRLPOOLS[best.pair],
+    score: best.score,
+    reasoning: best.reasoning.join(', '),
+  };
+}
+
+/**
+ * Adjust Polymarket market probability estimates using live token intel.
+ * Returns an adjusted probability and reasoning behind the adjustment.
+ */
+function adjustPolyProbabilityWithIntel(
+  question: string,
+  marketProb: number,
+  intel: SwarmIntel,
+): { adjustedProb: number; confidence: number; reasoning: string } {
+  let prob = marketProb;
+  let confidence = 0.3;
+  const factors: string[] = [];
+
+  const q = question.toLowerCase();
+
+  // ── SOL price questions ──
+  if (q.includes('sol') && (q.includes('above') || q.includes('reach') || q.includes('hit') || q.includes('exceed'))) {
+    const solPrice = intel.analystPrices?.['SOL']?.usd ?? intel.guardianTokens?.find(t => t.ticker === 'SOL')?.priceUsd;
+    if (solPrice) {
+      const match = question.match(/\$?(\d[\d,]*(?:\.\d+)?)/);
+      if (match) {
+        const target = parseFloat(match[1].replace(',', ''));
+        const distancePct = (target - solPrice) / solPrice;
+        if (distancePct > 0 && distancePct < 0.1) {
+          prob = Math.min(prob + 0.1, 0.9);
+          factors.push(`SOL $${solPrice.toFixed(0)} is ${(distancePct * 100).toFixed(0)}% from target`);
+        } else if (distancePct < 0) {
+          prob = Math.min(prob + 0.15, 0.95);
+          factors.push(`SOL already above target ($${solPrice.toFixed(0)})`);
+        } else if (distancePct > 0.3) {
+          prob = Math.max(prob - 0.1, 0.05);
+          factors.push(`SOL far from target (${(distancePct * 100).toFixed(0)}% away)`);
+        }
+        confidence += 0.2;
+      }
+    }
+
+    const solChange = intel.analystPrices?.['SOL']?.change24h;
+    if (solChange !== undefined) {
+      if (solChange > 5 && q.includes('above')) { prob = Math.min(prob + 0.08, 0.9); confidence += 0.1; factors.push(`SOL trending +${solChange.toFixed(1)}%`); }
+      else if (solChange < -5 && q.includes('above')) { prob = Math.max(prob - 0.08, 0.05); confidence += 0.1; factors.push(`SOL falling ${solChange.toFixed(1)}%`); }
+    }
+  }
+
+  // ── BTC price questions ──
+  if (q.includes('btc') || q.includes('bitcoin')) {
+    const btcChange = intel.analystPrices?.['BTC']?.change24h;
+    if (btcChange !== undefined && Math.abs(btcChange) > 3) {
+      const bullishQuestion = q.includes('above') || q.includes('reach') || q.includes('hit');
+      if ((btcChange > 0) === bullishQuestion) {
+        prob = Math.min(prob + 0.07, 0.9); confidence += 0.1;
+        factors.push(`BTC ${btcChange > 0 ? '+' : ''}${btcChange.toFixed(1)}% 24h`);
+      }
+    }
+  }
+
+  // ── Meme token questions (BONK, WIF, POPCAT etc.) ──
+  const memeTokens = ['bonk', 'wif', 'popcat', 'dogwifhat'];
+  for (const meme of memeTokens) {
+    if (q.includes(meme)) {
+      const ticker = meme === 'dogwifhat' ? 'WIF' : meme.toUpperCase();
+      const change = intel.analystPrices?.[ticker]?.change24h;
+      const isGuardianToken = intel.guardianTokens?.find(t => t.ticker === ticker);
+      if (change !== undefined) {
+        if (change > 20) { prob = Math.min(prob + 0.12, 0.9); confidence += 0.15; factors.push(`${ticker} surging +${change.toFixed(0)}%`); }
+        else if (change < -20) { prob = Math.max(prob - 0.10, 0.05); confidence += 0.1; factors.push(`${ticker} dropping ${change.toFixed(0)}%`); }
+      }
+      if (isGuardianToken && isGuardianToken.volume24h > 500_000) {
+        confidence += 0.1;
+        factors.push(`${ticker} high volume $${(isGuardianToken.volume24h / 1e6).toFixed(1)}M`);
+      }
+    }
+  }
+
+  // ── Scout sentiment modifier ──
+  if (intel.scoutBullish === true && (intel.scoutConfidence ?? 0) > 0.6) {
+    if (q.includes('above') || q.includes('bull') || q.includes('up')) {
+      prob = Math.min(prob + 0.05, 0.9); confidence += 0.05;
+      factors.push(`Scout bullish (${((intel.scoutConfidence ?? 0) * 100).toFixed(0)}% confidence)`);
+    }
+  }
+
+  return {
+    adjustedProb: Math.round(prob * 100) / 100,
+    confidence: Math.min(confidence, 0.9),
+    reasoning: factors.length > 0 ? factors.join(' | ') : 'No token intel available for this market',
+  };
+}
+
 export async function generateDecisions(
   state: PortfolioState,
   config: DecisionConfig,
@@ -828,6 +1050,14 @@ export async function generateDecisions(
 
         // Take top 2 opportunities and create decisions
         for (const opp of opps.slice(0, 2)) {
+          // Adjust probability estimate using live token intel
+          const intelAdj = adjustPolyProbabilityWithIntel(opp.market.question, opp.ourProb, intel);
+          const adjustedOurProb = intelAdj.adjustedProb;
+          const adjustedEdge = adjustedOurProb - opp.marketProb;
+
+          // Skip if intel adjustment killed the edge
+          if (adjustedEdge < 0.03) continue;
+
           const betUsd = Math.min(opp.recommendedUsd, env.maxSingleBetUsd);
           if (betUsd < 2) continue;
 
@@ -835,8 +1065,11 @@ export async function generateDecisions(
             type: 'POLY_BET',
             reasoning:
               `Polymarket: "${opp.market.question.slice(0, 80)}" — ` +
-              `edge: ${(opp.edge * 100).toFixed(1)}% (our: ${(opp.ourProb * 100).toFixed(0)}% vs market: ${(opp.marketProb * 100).toFixed(0)}%) | ` +
+              `edge: ${(adjustedEdge * 100).toFixed(1)}% ` +
+              `(our: ${(adjustedOurProb * 100).toFixed(0)}% [adj from ${(opp.ourProb * 100).toFixed(0)}%] ` +
+              `vs market: ${(opp.marketProb * 100).toFixed(0)}%) | ` +
               `${opp.rationale}` +
+              (intelAdj.reasoning !== 'No token intel available for this market' ? ` | Intel: ${intelAdj.reasoning}` : '') +
               (intel.scoutBullish !== undefined ? ` | Scout: ${intel.scoutBullish ? 'bullish' : 'bearish'}` : ''),
             params: {
               conditionId: opp.market.conditionId,
@@ -846,11 +1079,17 @@ export async function generateDecisions(
               sizeUsd: betUsd,
               marketQuestion: opp.market.question,
               kellyFraction: opp.kellyFraction,
-              edge: opp.edge,
+              edge: adjustedEdge,
+              adjustedOurProb,
+              intelConfidence: intelAdj.confidence,
             },
             urgency: 'low',
             estimatedImpactUsd: betUsd,
-            intelUsed: intel.scoutReceivedAt ? ['scout'] : [],
+            intelUsed: [
+              intel.scoutReceivedAt ? 'scout' : '',
+              intel.analystPricesAt ? 'analyst' : '',
+              intel.guardianSnapshotAt ? 'guardian' : '',
+            ].filter(Boolean),
             tier: 'AUTO',
           };
           d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
@@ -1009,18 +1248,36 @@ export async function generateDecisions(
     ) {
       const deployUsd = Math.min(orcaHeadroomUsd, state.polyUsdcBalance * 0.3);
       if (deployUsd >= 20) {
-        const solSide = deployUsd / 2 / state.solPriceUsd;
+        const bestPair = selectBestOrcaPair(intel);
         const usdcSide = deployUsd / 2;
+        const solSide = deployUsd / 2 / state.solPriceUsd;
+        const tokenAAmount = bestPair.whirlpool.tokenA !== 'SOL'
+          ? deployUsd / 2 / (intel.analystPrices?.[bestPair.whirlpool.tokenA]?.usd ?? 1)
+          : solSide;
+
         decisions.push({
           type: 'ORCA_LP_OPEN',
           reasoning:
-            `Opening Orca SOL/USDC concentrated LP: $${deployUsd.toFixed(0)} total ` +
-            `(${usdcSide.toFixed(0)} USDC + ${solSide.toFixed(3)} SOL) at ±${env.orcaLpRangeWidthPct / 2}% range. ` +
-            `Estimated fee APY: ~15-25% while in-range.`,
-          params: { usdcAmount: usdcSide, solAmount: solSide, rangeWidthPct: env.orcaLpRangeWidthPct },
+            `Opening Orca ${bestPair.pair} concentrated LP: $${deployUsd.toFixed(0)} total ` +
+            `(range ±${env.orcaLpRangeWidthPct / 2}%). ` +
+            `Pair selected because: ${bestPair.reasoning}. ` +
+            `Est. fee APY: ~15-25% while in-range.`,
+          params: {
+            pair: bestPair.pair,
+            whirlpoolAddress: bestPair.whirlpool.address,
+            tokenA: bestPair.whirlpool.tokenA,
+            usdcAmount: usdcSide,
+            solAmount: bestPair.whirlpool.tokenA === 'SOL' ? solSide : 0,
+            tokenAAmount,
+            rangeWidthPct: env.orcaLpRangeWidthPct,
+          },
           urgency: 'low',
           estimatedImpactUsd: deployUsd * 0.18,
-          intelUsed: [],
+          intelUsed: [
+            intel.guardianSnapshotAt ? 'guardian' : '',
+            intel.analystPricesAt ? 'analyst' : '',
+            intel.scoutReceivedAt ? 'scout' : '',
+          ].filter(Boolean),
           tier: 'APPROVAL',
         });
       }
@@ -1321,8 +1578,10 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
       case 'ORCA_LP_OPEN': {
         const orca = await import('./orcaService.ts');
-        const { usdcAmount, solAmount, rangeWidthPct } = decision.params;
-        const result = await orca.openPosition(usdcAmount, solAmount, rangeWidthPct);
+        const { usdcAmount, solAmount, tokenAAmount, rangeWidthPct, whirlpoolAddress } = decision.params;
+        // Use tokenA amount if available (for non-SOL pairs), otherwise fall back to solAmount
+        const amountA = tokenAAmount ?? solAmount;
+        const result = await orca.openPosition(usdcAmount, amountA, rangeWidthPct, whirlpoolAddress);
         markDecision('ORCA_LP_OPEN');
         return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
       }
@@ -1554,6 +1813,22 @@ export async function runDecisionCycle(pool?: any): Promise<{
   } else {
     logger.debug('[CFO:Decision] No DB pool provided — skipping swarm intel');
   }
+
+  // Log enriched intel summary
+  const tokenSummary = intel.guardianTokens?.length
+    ? `${intel.guardianTokens.length} tokens watched`
+    : 'no token data';
+  const topMover = intel.analystMovers?.length
+    ? `top mover: ${intel.analystMovers[0].symbol} ${intel.analystMovers[0].change24hPct > 0 ? '+' : ''}${intel.analystMovers[0].change24hPct.toFixed(0)}%`
+    : '';
+  const trendingStr = intel.analystTrending?.slice(0, 3).join(', ') || '';
+  logger.info(
+    `[CFO:Intel] Market: ${intel.marketCondition} (risk×${intel.riskMultiplier.toFixed(2)}) | ` +
+    `Scout: ${intel.scoutBullish === true ? '🟢 bullish' : intel.scoutBullish === false ? '🔴 bearish' : '⚪ no data'} | ` +
+    `Guardian: ${intel.guardianCritical ? '🚨 CRITICAL' : intel.guardianAlerts?.length ? `⚠️ ${intel.guardianAlerts.length} alerts` : '✅ clear'} (${tokenSummary}) | ` +
+    `Analyst: ${intel.analystVolumeSpike ? '📈 vol spike' : '📊 normal'}${topMover ? ` | ${topMover}` : ''}` +
+    `${trendingStr ? ` | trending: ${trendingStr}` : ''}`,
+  );
 
   // 2+3. Assess + Decide (with intel)
   const decisions = await generateDecisions(state, config, env, intel);

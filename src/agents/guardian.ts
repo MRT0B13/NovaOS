@@ -573,10 +573,58 @@ export class GuardianAgent extends BaseAgent {
       this.liquidityAlertCount += lpAlerts;
       const checkedCount = snapshots.size;
       if (checkedCount > 0 && !baseline) {
+        await this.broadcastWatchlistSnapshot();
         logger.info(`[guardian] Liquidity check: ${checkedCount} tokens, ${lpAlerts} alerts (${this.liquidityAlertCount} total)`);
       }
     } catch (err) {
       logger.debug('[guardian] Liquidity monitoring failed:', err);
+    }
+  }
+
+  /**
+   * Send a compact snapshot of the watchList to the CFO after each liquidity check.
+   * Gives the CFO live token intel for LP pair selection and risk decisions.
+   */
+  private async broadcastWatchlistSnapshot(): Promise<void> {
+    try {
+      const tokens: Array<{
+        mint: string;
+        ticker: string;
+        priceUsd: number;
+        liquidityUsd: number;
+        volume24h: number;
+        rugScore: number | null;
+        safe: boolean;
+      }> = [];
+
+      for (const [mint, token] of this.watchList) {
+        if (!token.lastPriceUsd && !token.lastLiquidityUsd) continue;
+        tokens.push({
+          mint,
+          ticker: token.ticker ?? mint.slice(0, 8),
+          priceUsd: token.lastPriceUsd ?? 0,
+          liquidityUsd: token.lastLiquidityUsd ?? 0,
+          volume24h: token.lastVolume24h ?? 0,
+          rugScore: token.lastScore > 0 ? token.lastScore : null,
+          safe: token.lastScore < 300,
+        });
+      }
+
+      if (tokens.length === 0) return;
+
+      // Sort by volume — CFO should look at most active tokens first
+      tokens.sort((a, b) => b.volume24h - a.volume24h);
+
+      await this.sendMessage('nova-cfo', 'intel', 'low', {
+        source: 'watchlist_snapshot',
+        tokens,
+        tokenCount: tokens.length,
+        at: Date.now(),
+      });
+
+      logger.debug(`[guardian] Sent watchlist snapshot to CFO: ${tokens.length} tokens`);
+    } catch (err) {
+      logger.debug('[guardian] broadcastWatchlistSnapshot failed (non-fatal):', err);
     }
   }
 

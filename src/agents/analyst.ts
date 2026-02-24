@@ -646,12 +646,54 @@ export class AnalystAgent extends BaseAgent {
         logger.warn(`[analyst] ⚠️ Price alerts: ${alerts.join(', ')}`);
       }
 
+      // Send enriched token intel to CFO on every price check
+      await this.broadcastTokenIntel(allPrices);
+
       // Refresh launched tokens periodically (new launches may have appeared)
       if (this.cycleCount % 4 === 0) {
         await this.loadLaunchedTokens();
       }
     } catch (err) {
       logger.debug('[analyst] Price check failed:', err);
+    }
+  }
+
+  /**
+   * Send enriched token intel directly to the CFO.
+   * Called after every price check so CFO has fresh data for decisions.
+   */
+  private async broadcastTokenIntel(
+    allPrices: Array<{ symbol: string; usd: number; usd_24h_change?: number }>,
+  ): Promise<void> {
+    try {
+      if (allPrices.length === 0) return;
+
+      const prices: Record<string, { usd: number; change24h: number }> = {};
+      const movers: Array<{ symbol: string; usd: number; change24hPct: number }> = [];
+
+      for (const p of allPrices) {
+        const change = p.usd_24h_change ?? 0;
+        prices[p.symbol] = { usd: p.usd, change24h: change };
+        if (Math.abs(change) >= 5) {
+          movers.push({ symbol: p.symbol, usd: p.usd, change24hPct: change });
+        }
+      }
+
+      const trendingSymbols = Array.from(this.dynamicCoinGeckoIds.values()).slice(0, 10);
+      movers.sort((a, b) => b.change24hPct - a.change24hPct);
+
+      await this.sendMessage('nova-cfo', 'intel', 'low', {
+        source: 'token_intel',
+        prices,
+        movers,
+        trending: trendingSymbols,
+        tokenCount: allPrices.length,
+        at: Date.now(),
+      });
+
+      logger.debug(`[analyst] Sent token intel to CFO: ${allPrices.length} prices, ${movers.length} movers`);
+    } catch (err) {
+      logger.debug('[analyst] broadcastTokenIntel failed (non-fatal):', err);
     }
   }
 
