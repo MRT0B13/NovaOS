@@ -1024,6 +1024,9 @@ async function sendStatusReport(): Promise<void> {
     const hedgePct = (c.hedgeRatio * 100).toFixed(0);
     message += `<b>💹 CFO Portfolio ($${c.totalPortfolioUsd.toFixed(2)}):</b>\n`;
     message += `  SOL: ${c.solBalance.toFixed(4)} ($${(c.solBalance * c.solPriceUsd).toFixed(2)}) @ $${c.solPriceUsd.toFixed(2)}\n`;
+    if (c.polyUsdcBalance > 0 || c.polyDeployedUsd > 0) {
+      message += `  Polygon USDC: $${c.polyUsdcBalance.toFixed(2)} (wallet) + $${c.polyDeployedUsd.toFixed(2)} (deployed)\n`;
+    }
     message += `  Hedge ratio: ${hedgePct}%\n\n`;
 
     // Kamino
@@ -1219,6 +1222,9 @@ async function sendDailySummary(): Promise<void> {
     const c = stats.cfo;
     message += `<b>💹 CFO Portfolio ($${c.totalPortfolioUsd.toFixed(2)}):</b>\n`;
     message += `  • SOL: ${c.solBalance.toFixed(4)} @ $${c.solPriceUsd.toFixed(2)} | Hedge: ${(c.hedgeRatio * 100).toFixed(0)}%\n`;
+    if (c.polyUsdcBalance > 0 || c.polyDeployedUsd > 0) {
+      message += `  • Polygon USDC: $${c.polyUsdcBalance.toFixed(2)} wallet + $${c.polyDeployedUsd.toFixed(2)} deployed\n`;
+    }
 
     if (c.kaminoEnabled && (c.kaminoDepositUsd > 0 || c.kaminoBorrowUsd > 0)) {
       const healthEmoji = c.kaminoHealthFactor > 1.5 ? '🟢' : c.kaminoHealthFactor > 1.2 ? '🟡' : '🔴';

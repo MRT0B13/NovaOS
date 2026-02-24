@@ -558,7 +558,8 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     .filter((p) => p.coin === 'SOL' && p.side === 'SHORT')
     .reduce((s, p) => s + p.sizeUsd, 0);
 
-  const totalPortfolioUsd = solExposureUsd + jitoSolValueUsd + hlEquity + polyDeployedUsd;
+  // Preliminary total — Kamino & Orca not yet known; patched below after gathering
+  let totalPortfolioUsd = solExposureUsd + jitoSolValueUsd + hlEquity + polyDeployedUsd + polyUsdcBalance;
   const hedgeRatio = solExposureUsd > 0 ? hlTotalShortUsd / solExposureUsd : 0;
 
   // Idle SOL available for staking (above reserve)
@@ -625,6 +626,9 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
       orcaLpFeeApy = positions.length > 0 ? (inRangePositions / positions.length) * 0.15 : 0;
     } catch { /* 0 */ }
   }
+
+  // Patch totalPortfolioUsd with Kamino + Orca values gathered above
+  totalPortfolioUsd += kaminoNetValueUsd + orcaLpValueUsd;
 
   return {
     solBalance,
