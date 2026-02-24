@@ -457,6 +457,14 @@ export interface TokenHealthSummary {
 export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promise<boolean> {
   if (!isUpdateEnabled('health')) return false;
   if (tokens.length === 0) return false;
+
+  // Cooldown guard — skip if we posted recently (prevents restart spam)
+  const now = Date.now();
+  if (lastHealthPostAt && (now - lastHealthPostAt) < HEALTH_POST_COOLDOWN_MS) {
+    const minsAgo = Math.round((now - lastHealthPostAt) / 60000);
+    logger.info(`[NovaChannel] Health update skipped — last posted ${minsAgo}m ago (cooldown ${HEALTH_POST_COOLDOWN_MS / 60000}m)`);
+    return false;
+  }
   
   let message = `📊 <b>Community Health Update</b>\n\n`;
   
@@ -517,6 +525,10 @@ export async function announceHealthSummary(tokens: TokenHealthSummary[]): Promi
     ? message + `\n\n💬 <a href="${env.TELEGRAM_COMMUNITY_LINK}">Join the Discussion</a>`
     : message;
   await sendToChannel(channelMessage);
+
+  // Record timestamp + persist so cooldown survives restarts
+  lastHealthPostAt = Date.now();
+  saveValue('last_health_post_at', lastHealthPostAt, 1000);
   
   // Community gets a one-liner redirect (rules appended only every Nth update)
   healthUpdateCount++;
@@ -837,6 +849,18 @@ function getRulesReminder(): string {
     `Full rules pinned above.`,
   ].join('\n');
 }
+
+// Track when last health update was posted (persisted — survives restarts)
+let lastHealthPostAt = 0;
+const HEALTH_POST_COOLDOWN_MS = 90 * 60 * 1000; // 90 min cooldown (interval is 2h, this blocks restart spam)
+
+// Restore lastHealthPostAt from DB on import
+loadValue<number>('last_health_post_at').then(v => {
+  if (v != null) {
+    lastHealthPostAt = v;
+    logger.info(`[NovaChannel] Restored lastHealthPostAt=${new Date(v).toISOString()} from DB`);
+  }
+}).catch(() => {});
 
 // Track how many health updates have been sent so we can append rules every Nth time
 let healthUpdateCount = 0;

@@ -283,10 +283,14 @@ export class Supervisor extends BaseAgent {
           `[supervisor] 📋 Scout digest: ${totalIntelItems} items from ${scansInPeriod} scans ` +
           `(${crossConfirmedCount} cross-confirmed) | ${periodHours}h window`
         );
-        // Don't post digests to community/X — they're operational intel for CFO + admin only
+        // Admin gets full intel; channel gets the public-friendly digest
         if (this.callbacks.onPostToAdmin && totalIntelItems > 0) {
           const digestMsg = `📋 <b>Scout Digest</b> (${periodHours}h)\n\n${displayContent}`;
           await this.callbacks.onPostToAdmin(digestMsg);
+        }
+        // Public channel gets the clean, Nova-voice summary
+        if (this.callbacks.onPostToChannel && channelPost && totalIntelItems > 0) {
+          await this.callbacks.onPostToChannel(`📡 <b>Scout Report</b>\n\n${channelPost}`);
         }
 
         // Forward structured agent intel to CFO separately (not the channel post)
@@ -945,13 +949,13 @@ export class Supervisor extends BaseAgent {
 
       const communityBriefing = communityLines.join('\n');
 
-      // Post community briefing to channel
-      if (this.callbacks.onPostToChannel) {
-        await this.callbacks.onPostToChannel(communityBriefing);
+      // Hive briefing goes to admin only — community gets health updates via groupHealthMonitor
+      if (this.callbacks.onPostToAdmin) {
+        await this.callbacks.onPostToAdmin(communityBriefing);
       }
 
       // Log
-      logger.info(`[supervisor] 🐝 Briefings sent: admin (${criticalItems.length + highItems.length} intel) + community | ${activeAgents.length} agents, ${this.messagesProcessed} msgs`);
+      logger.info(`[supervisor] 🐝 Briefings sent: admin (detailed + hive) | ${activeAgents.length} agents, ${this.messagesProcessed} msgs`);
 
       // Reset
       this.messagesProcessed = 0;

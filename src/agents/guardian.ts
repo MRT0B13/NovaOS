@@ -292,7 +292,54 @@ export class GuardianAgent extends BaseAgent {
       await this.networkShield.checkRpcEndpoints();
     }
 
+    // ── X Quota Guard ──────────────────────────────────────────
+    // Check X daily write quota every 2 minutes.
+    // When exhausted → pause reply engine so it doesn't burn remaining budget.
+    // When refreshed → auto-resume.
+    this.addInterval(() => this.checkXQuota(), 2 * 60 * 1000);
+
     logger.info(`[guardian] Monitoring ${this.watchList.size} tokens (${CORE_WATCH_TOKENS.length} core + DB + scout), re-scan every ${this.rescanIntervalMs / 60000}m, liquidity every ${this.liquidityCheckIntervalMs / 60000}m`);
+  }
+
+  // ── X Quota Guard ─────────────────────────────────────────────
+
+  private xQuotaExhausted = false;
+
+  /** Check X daily write quota and pause/resume reply engine accordingly */
+  private async checkXQuota(): Promise<void> {
+    try {
+      const { getDailyWritesRemaining } = await import('../launchkit/services/xRateLimiter.ts');
+      const { pauseReplyEngine, resumeReplyEngine, isReplyEnginePaused } = await import('../launchkit/services/xReplyEngine.ts');
+      const remaining = getDailyWritesRemaining();
+
+      if (remaining <= 0 && !this.xQuotaExhausted) {
+        // Quota just hit 0 — pause reply engine + alert + persist
+        this.xQuotaExhausted = true;
+        pauseReplyEngine('daily X quota exhausted (0 remaining in 24h window)');
+        logger.warn(`[guardian] 🚨 X daily quota exhausted — reply engine paused`);
+        await this.persistState().catch(err =>
+          logger.debug('[guardian] Persist after quota pause failed (non-fatal):', err)
+        );
+        await this.sendMessage('nova-supervisor', 'alert', 'high', {
+          command: 'x_quota_exhausted',
+          remaining: 0,
+          message: 'X daily write quota exhausted. Reply engine paused until oldest tweet ages out of 24h window.',
+        }).catch(() => {});
+      } else if (remaining > 0 && this.xQuotaExhausted) {
+        // Quota refreshed — resume + persist
+        this.xQuotaExhausted = false;
+        resumeReplyEngine();
+        logger.info(`[guardian] ✅ X quota refreshed (${remaining} remaining) — reply engine resumed`);
+        await this.persistState().catch(err =>
+          logger.debug('[guardian] Persist after quota resume failed (non-fatal):', err)
+        );
+      } else if (remaining <= 2 && remaining > 0 && !this.xQuotaExhausted) {
+        // Low quota warning (once)
+        logger.info(`[guardian] ⚠️ X quota low: only ${remaining} tweets left in 24h window`);
+      }
+    } catch {
+      // xRateLimiter or xReplyEngine not initialised yet — ignore
+    }
   }
 
   // ── Watch List Management ────────────────────────────────────────
@@ -784,6 +831,7 @@ export class GuardianAgent extends BaseAgent {
       scanCount: this.scanCount,
       liquidityAlertCount: this.liquidityAlertCount,
       securityInitialized: this.securityInitialized,
+      xQuotaExhausted: this.xQuotaExhausted,
       scoutTokens,
     });
   }
@@ -792,11 +840,20 @@ export class GuardianAgent extends BaseAgent {
     const s = await this.restoreState<{
       scanCount?: number;
       liquidityAlertCount?: number;
+      xQuotaExhausted?: boolean;
       scoutTokens?: Array<{ mint: string; ticker?: string; source: string; addedAt: number }>;
     }>();
     if (!s) return;
     if (s.scanCount)           this.scanCount = s.scanCount;
     if (s.liquidityAlertCount) this.liquidityAlertCount = s.liquidityAlertCount;
+    // Restore X quota pause state — immediately re-pause reply engine if it was paused
+    if (s.xQuotaExhausted) {
+      this.xQuotaExhausted = true;
+      try {
+        const { pauseReplyEngine } = await import('../launchkit/services/xReplyEngine.ts');
+        pauseReplyEngine('restored from persisted state — quota was exhausted before restart');
+      } catch { /* reply engine not init yet — checkXQuota interval will catch it */ }
+    }
     // Re-add persisted scout/manual tokens to watchList
     if (s.scoutTokens) {
       for (const t of s.scoutTokens) {
@@ -805,7 +862,7 @@ export class GuardianAgent extends BaseAgent {
         }
       }
     }
-    logger.info(`[guardian] Restored: ${this.scanCount} scans, ${this.liquidityAlertCount} LP alerts, ${s.scoutTokens?.length || 0} persisted tokens`);
+    logger.info(`[guardian] Restored: ${this.scanCount} scans, ${this.liquidityAlertCount} LP alerts, ${s.scoutTokens?.length || 0} persisted tokens${s.xQuotaExhausted ? ', X quota PAUSED' : ''}`);
   }
 
   // ── Public API ───────────────────────────────────────────────────

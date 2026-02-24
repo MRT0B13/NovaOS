@@ -193,6 +193,30 @@ export function stopReplyEngine(): void {
   logger.info('[ReplyEngine] Stopped');
 }
 
+// ── Quota-based pause (guardian can pause when X daily quota hits 0) ──
+let quotaPaused = false;
+
+/** Pause reply engine due to quota exhaustion (called by guardian) */
+export function pauseReplyEngine(reason?: string): void {
+  if (!quotaPaused) {
+    quotaPaused = true;
+    logger.warn(`[ReplyEngine] ⏸ Paused by guardian${reason ? `: ${reason}` : ''}`);
+  }
+}
+
+/** Resume reply engine when quota refreshes (called by guardian) */
+export function resumeReplyEngine(): void {
+  if (quotaPaused) {
+    quotaPaused = false;
+    logger.info(`[ReplyEngine] ▶ Resumed — quota available again`);
+  }
+}
+
+/** Check if reply engine is quota-paused */
+export function isReplyEnginePaused(): boolean {
+  return quotaPaused;
+}
+
 /**
  * Get reply engine status
  */
@@ -229,6 +253,18 @@ async function runReplyRound(): Promise<void> {
 }
 async function _runReplyRoundInner(): Promise<void> {
   const env = getEnv();
+
+  // Quota-paused by guardian — skip entire round silently
+  if (quotaPaused) {
+    const remaining = getDailyWritesRemaining();
+    if (remaining > 0) {
+      // Quota has refreshed — auto-resume
+      resumeReplyEngine();
+    } else {
+      logger.debug(`[ReplyEngine] Skipping round — quota-paused by guardian`);
+      return;
+    }
+  }
 
   // Fast-path: skip entire round if X daily quota is exhausted (24h rolling window)
   const windowRemaining = getDailyWritesRemaining();
@@ -1027,6 +1063,9 @@ Only tag if the tweet is directly about that account/topic. Never force a tag.`;
 export default {
   startReplyEngine,
   stopReplyEngine,
+  pauseReplyEngine,
+  resumeReplyEngine,
+  isReplyEnginePaused,
   getReplyEngineStatus,
   // Shared data (single-source reads)
   getTopEngagers,
