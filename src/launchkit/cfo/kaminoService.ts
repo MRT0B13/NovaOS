@@ -473,7 +473,7 @@ export async function getPosition(): Promise<KaminoPosition> {
 
     const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
     if (!market) {
-      return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.75 };
+      return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.85 };
     }
 
     // klend-sdk v7 uses getUserVanillaObligation (throws if no obligation exists)
@@ -482,7 +482,7 @@ export async function getPosition(): Promise<KaminoPosition> {
       obligation = await market.getUserVanillaObligation(wallet.publicKey.toBase58() as any);
     } catch {
       // No obligation found — wallet hasn't deposited yet
-      return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.75 };
+      return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.85 };
     }
 
     const apys = await fetchKaminoApys();
@@ -570,13 +570,51 @@ export async function getPosition(): Promise<KaminoPosition> {
     }
 
     const netValueUsd = depositValueUsd - borrowValueUsd;
-    const healthFactor = ltv > 0 ? 0.75 / ltv : 999;
 
-    logger.debug(`[Kamino] Position: ${deposits.length} deposits ($${depositValueUsd.toFixed(2)}), ${borrows.length} borrows ($${borrowValueUsd.toFixed(2)}), LTV=${(ltv * 100).toFixed(1)}%`);
-    return { deposits, borrows, netValueUsd, healthFactor, ltv, maxLtv: 0.75 };
+    /**
+     * Health factor calculation.
+     *
+     * Prefer the SDK's own computed value when available (stats.healthFactor or
+     * stats.borrowUtilization). The SDK applies per-asset liquidation thresholds
+     * correctly — e.g. JitoSOL/SOL positions have ~0.90-0.92 liquidation LTV,
+     * not 0.75 like stablecoin pairs.
+     *
+     * Fallback formula uses 0.90 (covers JitoSOL/SOL safely; still conservative
+     * for USDC-only positions which liquidate at ~0.80).
+     *
+     * NEVER use 0.75 as the constant — it under-reports health for JitoSOL/SOL
+     * loops and causes the auto-unwind to fire immediately after the loop opens.
+     */
+    let healthFactor: number;
+    if (stats?.healthFactor && Number(stats.healthFactor) > 0 && isFinite(Number(stats.healthFactor))) {
+      // SDK computes this correctly against per-asset liquidation thresholds
+      healthFactor = Number(stats.healthFactor);
+    } else if (stats?.borrowUtilization && Number(stats.borrowUtilization) > 0) {
+      // borrowUtilization = borrowValue / (depositValue * liquidationThreshold)
+      // healthFactor = 1 / borrowUtilization
+      healthFactor = 1 / Number(stats.borrowUtilization);
+    } else {
+      // Fallback: use 0.90 (safe for JitoSOL/SOL; conservative for USDC positions)
+      healthFactor = ltv > 0 ? 0.90 / ltv : 999;
+    }
+
+    /**
+     * maxLtv: use the SDK's unhealthyBorrowValue / depositValue when available.
+     * Fallback 0.85 is a conservative estimate across all asset pairs.
+     */
+    const maxLtv = (stats?.unhealthyBorrowValue && depositValueUsd > 0)
+      ? Number(stats.unhealthyBorrowValue) / depositValueUsd
+      : 0.85;
+
+    logger.debug(
+      `[Kamino] Position: ${deposits.length} deposits ($${depositValueUsd.toFixed(2)}), ` +
+      `${borrows.length} borrows ($${borrowValueUsd.toFixed(2)}), ` +
+      `LTV=${(ltv * 100).toFixed(1)}%, health=${healthFactor.toFixed(3)}`
+    );
+    return { deposits, borrows, netValueUsd, healthFactor, ltv, maxLtv };
   } catch (err) {
     logger.warn('[Kamino] getPosition error:', err);
-    return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.75 };
+    return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.85 };
   }
 }
 

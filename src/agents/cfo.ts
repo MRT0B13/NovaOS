@@ -459,6 +459,105 @@ export class CFOAgent extends BaseAgent {
             break;
           }
 
+          // ── Kamino Borrow + Deploy ─────────────────────────────
+          case 'KAMINO_BORROW_DEPLOY': {
+            const borrowUsd  = p.borrowUsd ?? d.estimatedImpactUsd;
+            const target     = p.deployTarget ?? 'unknown';
+            const borrowApy  = p.borrowApy ?? 0;
+            const deployApy  = p.deployApy ?? 0;
+            const spreadPct  = ((deployApy - borrowApy) * 100).toFixed(1);
+            await this.repo.insertTransaction({
+              id: `tx-kamino-borrow-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'kamino_loop', txType: 'borrow',
+              tokenIn: 'collateral', amountIn: 0,
+              tokenOut: 'USDC', amountOut: borrowUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { deployTarget: target, borrowApy, deployApy, spreadPct, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted KAMINO_BORROW_DEPLOY: $${borrowUsd} USDC → ${target} (spread ${spreadPct}%)`);
+            break;
+          }
+
+          // ── Kamino Repay ───────────────────────────────────────
+          case 'KAMINO_REPAY': {
+            const repayUsd = p.repayUsd ?? d.estimatedImpactUsd;
+            await this.repo.insertTransaction({
+              id: `tx-kamino-repay-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'kamino_loop', txType: 'repay',
+              tokenIn: 'USDC', amountIn: repayUsd,
+              tokenOut: 'collateral', amountOut: 0,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted KAMINO_REPAY: $${repayUsd} USDC repaid`);
+            break;
+          }
+
+          // ── JitoSOL Loop OPEN ──────────────────────────────────
+          case 'KAMINO_JITO_LOOP': {
+            const jitoSol    = p.jitoSolToDeposit ?? 0;
+            const targetLtv  = p.targetLtv ?? 0.65;
+            const estApy     = p.estimatedApy ?? 0;
+            await this.repo.insertTransaction({
+              id: `tx-kamino-loop-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'kamino_jito_loop', txType: 'stake',
+              tokenIn: 'JitoSOL', amountIn: jitoSol,
+              tokenOut: 'JitoSOL-leveraged', amountOut: jitoSol / (1 - targetLtv),
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { targetLtv, estimatedApy: estApy, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted KAMINO_JITO_LOOP: ${jitoSol} JitoSOL → ${(targetLtv * 100).toFixed(0)}% LTV, est. APY ${(estApy * 100).toFixed(1)}%`);
+            break;
+          }
+
+          // ── JitoSOL Loop UNWIND ────────────────────────────────
+          case 'KAMINO_JITO_UNWIND': {
+            await this.repo.insertTransaction({
+              id: `tx-kamino-unwind-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'kamino_jito_loop', txType: 'unstake',
+              tokenIn: 'JitoSOL-leveraged', amountIn: 0,
+              tokenOut: 'JitoSOL', amountOut: 0,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted KAMINO_JITO_UNWIND`);
+            break;
+          }
+
+          // ── Orca LP OPEN ───────────────────────────────────────
+          case 'ORCA_LP_OPEN': {
+            const deployUsd = (p.usdcAmount ?? 0) * 2;
+            const pair = p.pair ?? 'SOL/USDC';
+            await this.repo.insertTransaction({
+              id: `tx-orca-lp-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'orca_lp', txType: 'liquidity_add',
+              tokenIn: 'USDC+tokenA', amountIn: deployUsd,
+              tokenOut: `orca-lp-${pair}`, amountOut: deployUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: {
+                pair, whirlpoolAddress: p.whirlpoolAddress, rangeWidthPct: p.rangeWidthPct,
+                usdcAmount: p.usdcAmount, tokenAAmount: p.tokenAAmount,
+                reasoning: d.reasoning,
+              },
+            });
+            logger.info(`[CFO] Persisted ORCA_LP_OPEN: $${deployUsd.toFixed(0)} ${pair} LP`);
+            break;
+          }
+
+          // ── Orca LP REBALANCE ──────────────────────────────────
+          case 'ORCA_LP_REBALANCE': {
+            await this.repo.insertTransaction({
+              id: `tx-orca-rebalance-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'orca_lp', txType: 'liquidity_rebalance',
+              tokenIn: 'orca-lp', amountIn: 0,
+              tokenOut: 'orca-lp', amountOut: 0,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { positionMint: p.positionMint, rangeWidthPct: p.rangeWidthPct, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted ORCA_LP_REBALANCE: ${(p.positionMint as string)?.slice(0, 8)}`);
+            break;
+          }
+
           // SKIP / REBALANCE_HEDGE — nothing to persist
           default:
             break;
@@ -1132,7 +1231,7 @@ export class CFOAgent extends BaseAgent {
         await notify(`⏳ Starting JitoSOL/SOL multiply loop (target LTV: ${targetLtv}%, max loops: ${maxLoops})...`);
         const result = await kaminoMod.loopJitoSol(targetLtv / 100, maxLoops, solPrice);
         await notify(result.success
-          ? `✅ JitoSOL loop complete — ${result.loopsExecuted ?? '?'} loops, final LTV: ${((result.finalLtv ?? 0) * 100).toFixed(1)}%`
+          ? `✅ JitoSOL loop complete — ${result.loopsCompleted} loop(s), final LTV: ${(result.effectiveLtv * 100).toFixed(1)}%, est. APY: ${(result.estimatedApy * 100).toFixed(1)}%`
           : `❌ JitoSOL loop failed: ${result.error}`);
         break;
       }
@@ -1142,7 +1241,7 @@ export class CFOAgent extends BaseAgent {
         await notify('⏳ Unwinding JitoSOL/SOL multiply loop...');
         const result = await kaminoMod.unwindJitoSolLoop();
         await notify(result.success
-          ? `✅ JitoSOL loop unwound — ${result.stepsExecuted ?? '?'} steps completed`
+          ? `✅ JitoSOL loop unwound — ${result.txSignatures.length} transaction(s) completed`
           : `❌ JitoSOL unwind failed: ${result.error}`);
         break;
       }
@@ -1150,21 +1249,34 @@ export class CFOAgent extends BaseAgent {
       case 'cfo_kamino_loop_status': {
         const kaminoMod = await kamino();
         const pos = await kaminoMod.getPosition();
-        if (!pos.success) {
-          await notify(`❌ Could not fetch Kamino position: ${pos.error}`);
+        const jitoDeposit = pos.deposits.find((d: any) => d.asset === 'JitoSOL');
+        const solBorrow   = pos.borrows.find((b: any) => b.asset === 'SOL');
+        const hasLoop     = (jitoDeposit?.amount ?? 0) > 0 && (solBorrow?.amount ?? 0) > 0;
+
+        if (hasLoop) {
+          const leverage = pos.ltv > 0 ? (1 / (1 - pos.ltv)) : 1;
+          const jitoDepositUsd = pos.deposits
+            .filter((d: any) => d.asset === 'JitoSOL')
+            .reduce((s: number, d: any) => s + d.valueUsd, 0);
+          const solBorrowUsd = pos.borrows
+            .filter((b: any) => b.asset === 'SOL')
+            .reduce((s: number, b: any) => s + b.valueUsd, 0);
+          await notify(
+            `🔄 *JitoSOL Loop Status:*\n` +
+            `JitoSOL deposited: ${jitoDeposit!.amount.toFixed(4)} ($${jitoDepositUsd.toFixed(2)})\n` +
+            `SOL borrowed: ${solBorrow!.amount.toFixed(4)} ($${solBorrowUsd.toFixed(2)})\n` +
+            `LTV: ${(pos.ltv * 100).toFixed(1)}% | Health: ${pos.healthFactor.toFixed(2)}\n` +
+            `Effective leverage: ~${leverage.toFixed(1)}x | Net equity: $${pos.netValueUsd.toFixed(2)}`
+          );
         } else {
-          const hasLoop = (pos.deposits?.JitoSOL ?? 0) > 0 && (pos.borrows?.SOL ?? 0) > 0;
-          if (hasLoop) {
-            const leverage = 1 / (1 - pos.ltv);
+          const totalDeposits = pos.deposits.reduce((s: number, d: any) => s + d.valueUsd, 0);
+          if (totalDeposits > 0) {
             await notify(
-              `🔄 *JitoSOL Loop Status:*\n` +
-              `JitoSOL deposited: ${pos.deposits?.JitoSOL?.toFixed(4) ?? '0'}\n` +
-              `SOL borrowed: ${pos.borrows?.SOL?.toFixed(4) ?? '0'}\n` +
-              `LTV: ${(pos.ltv * 100).toFixed(1)}% | Health: ${pos.healthFactor?.toFixed(2) ?? 'N/A'}\n` +
-              `Effective leverage: ~${leverage.toFixed(1)}x`
+              `📊 No active JitoSOL/SOL loop. Kamino deposits: $${totalDeposits.toFixed(2)}\n` +
+              `LTV: ${(pos.ltv * 100).toFixed(1)}% | Health: ${pos.healthFactor.toFixed(2)}`
             );
           } else {
-            await notify('📊 No active JitoSOL/SOL multiply loop detected.');
+            await notify('📊 No active JitoSOL/SOL multiply loop and no Kamino deposits found.');
           }
         }
         break;

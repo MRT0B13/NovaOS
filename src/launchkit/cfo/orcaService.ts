@@ -28,6 +28,23 @@ import Decimal from 'decimal.js';
 const SOL_USDC_WHIRLPOOL = 'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ';
 const TICK_SPACING = 64;
 
+/**
+ * Known Orca Whirlpool pool → token decimal mapping.
+ * TokenA is the non-USDC token. TokenB is always USDC (6 decimals).
+ * Addresses match ORCA_WHIRLPOOLS in decisionEngine.ts.
+ *
+ * BONK: 5 decimals
+ * WIF:  6 decimals
+ * JUP:  6 decimals
+ * SOL:  9 decimals
+ */
+const KNOWN_POOL_DECIMALS: Record<string, { tokenADecimals: number; tokenBDecimals: number }> = {
+  'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ': { tokenADecimals: 9, tokenBDecimals: 6 }, // SOL/USDC
+  'Fy6SnHPbDxMhVj8j7BNKMiNaVVesCzK8qcFNmRKokFgT': { tokenADecimals: 5, tokenBDecimals: 6 }, // BONK/USDC
+  'ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq': { tokenADecimals: 6, tokenBDecimals: 6 }, // WIF/USDC
+  'BoG9sBfBBsGJBJbUqsFPRrmGCJF5i4kk5mMHPzSnVBa4': { tokenADecimals: 6, tokenBDecimals: 6 }, // JUP/USDC
+};
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -84,6 +101,7 @@ async function buildSendAndConfirm(
 
 export interface OrcaPosition {
   positionMint: string;
+  whirlpoolAddress?: string;
   lowerPrice: number;
   upperPrice: number;
   currentPrice: number;
@@ -146,24 +164,28 @@ async function loadAnchor() {
 // ============================================================================
 
 /**
- * Open a new concentrated LP position centred on current SOL price.
- * @param usdcAmount  USDC to deposit as one side of the LP
- * @param solAmount   SOL to deposit as the other side (should be ~equal USD value)
- * @param rangeWidthPct  total range width as % of current price (e.g. 20 = ±10%)
- * @param whirlpoolAddress  optional whirlpool address (defaults to SOL/USDC)
+ * Open a new concentrated LP position centred on current price.
+ * @param usdcAmount       USDC to deposit as one side of the LP
+ * @param tokenAAmount     TokenA to deposit as the other side (SOL, BONK, WIF, etc.)
+ * @param rangeWidthPct    total range width as % of current price (e.g. 20 = ±10%)
+ * @param whirlpoolAddress optional whirlpool address (defaults to SOL/USDC)
+ * @param tokenADecimals   decimals for tokenA (default 9 = SOL; 5 = BONK, 6 = WIF/JUP)
+ * @param tokenBDecimals   decimals for tokenB (default 6 = USDC)
  */
 export async function openPosition(
   usdcAmount: number,
-  solAmount: number,
+  tokenAAmount: number,
   rangeWidthPct?: number,
   whirlpoolAddress?: string,
+  tokenADecimals = 9,
+  tokenBDecimals = 6,
 ): Promise<OrcaOpenResult> {
   const env = getCFOEnv();
   const halfRange = (rangeWidthPct ?? env.orcaLpRangeWidthPct ?? 20) / 2 / 100;
   const poolAddress = whirlpoolAddress ?? SOL_USDC_WHIRLPOOL;
 
   if (env.dryRun) {
-    logger.info(`[Orca] DRY RUN — would open LP: $${usdcAmount} USDC + ${solAmount} SOL, range ±${halfRange * 100}%`);
+    logger.info(`[Orca] DRY RUN — would open LP: $${usdcAmount} USDC + ${tokenAAmount} tokenA, range ±${halfRange * 100}%`);
     return { success: true, positionMint: `dry-position-${Date.now()}`, lowerPrice: 0, upperPrice: 0 };
   }
 
@@ -185,8 +207,8 @@ export async function openPosition(
     // BN and Decimal imported at top level
     const currentPriceDec = PriceMath.sqrtPriceX64ToPrice(
       whirlpoolData.sqrtPrice,
-      9,  // SOL decimals
-      6,  // USDC decimals
+      tokenADecimals,
+      tokenBDecimals,
     );
     const currentPrice = currentPriceDec.toNumber();
 
@@ -194,24 +216,23 @@ export async function openPosition(
     const lowerPriceDec = currentPriceDec.mul(1 - halfRange);
     const upperPriceDec = currentPriceDec.mul(1 + halfRange);
     const lowerTick = TickUtil.getInitializableTickIndex(
-      PriceMath.priceToTickIndex(lowerPriceDec, 9, 6),
+      PriceMath.priceToTickIndex(lowerPriceDec, tokenADecimals, tokenBDecimals),
       TICK_SPACING,
     );
     const upperTick = TickUtil.getInitializableTickIndex(
-      PriceMath.priceToTickIndex(upperPriceDec, 9, 6),
+      PriceMath.priceToTickIndex(upperPriceDec, tokenADecimals, tokenBDecimals),
       TICK_SPACING,
     );
 
     // Build liquidity quote — pick the token with the larger USD value as input
-    // Pool: tokenA = SOL (9 decimals), tokenB = USDC (6 decimals)
-    const solInputBN = new BN(Math.floor(solAmount * 1e9));
-    const usdcInputBN = new BN(Math.floor(usdcAmount * 1e6));
+    const tokenAInputBN = new BN(Math.floor(tokenAAmount * (10 ** tokenADecimals)));
+    const usdcInputBN = new BN(Math.floor(usdcAmount * (10 ** tokenBDecimals)));
 
     // Use whichever side the user provided more of (by USD-equivalent)
-    const solValueUsd = solAmount * currentPrice;
-    const useUsdc = usdcAmount > 0 && usdcAmount >= solValueUsd;
+    const tokenAValueUsd = tokenAAmount * currentPrice;
+    const useUsdc = usdcAmount > 0 && usdcAmount >= tokenAValueUsd;
     const inputTokenMint = useUsdc ? whirlpoolData.tokenMintB : whirlpoolData.tokenMintA;
-    const inputTokenAmount = useUsdc ? usdcInputBN : solInputBN;
+    const inputTokenAmount = useUsdc ? usdcInputBN : tokenAInputBN;
 
     const slippageTolerance = Percentage.fromFraction(10, 1000); // 1%
     const quote = increaseLiquidityQuoteByInputTokenWithParams({
@@ -440,9 +461,8 @@ export async function getPositions(): Promise<OrcaPosition[]> {
     const ctx = WhirlpoolContext.withProvider(provider);
     const client = buildWhirlpoolClient(ctx);
 
-    const whirlpool = await client.getPool(new PublicKey(SOL_USDC_WHIRLPOOL));
-    const whirlpoolData = whirlpool.getData();
-    const currentPrice = PriceMath.sqrtPriceX64ToPrice(whirlpoolData.sqrtPrice, 9, 6).toNumber();
+    // Do NOT pre-fetch currentPrice here — each position belongs to a different pool.
+    // currentPrice is fetched per-position inside the loop.
 
     // Enumerate all token accounts owned by the wallet to find position NFTs.
     // Position NFTs have amount=1 and can be checked via PDA derivation.
@@ -455,7 +475,7 @@ export async function getPositions(): Promise<OrcaPosition[]> {
     const result: OrcaPosition[] = [];
     for (const { account } of tokenAccounts.value) {
       const parsed = account.data.parsed?.info;
-      if (!parsed || parsed.tokenAmount?.uiAmount !== 1) continue; // NFTs have amount = 1
+      if (!parsed || parsed.tokenAmount?.uiAmount !== 1) continue;
 
       const mintPk = new PublicKey(parsed.mint);
       const positionPda = PDAUtil.getPosition(ORCA_WHIRLPOOL_PROGRAM_ID, mintPk);
@@ -464,11 +484,24 @@ export async function getPositions(): Promise<OrcaPosition[]> {
         const position = await client.getPosition(positionPda.publicKey);
         const data = position.getData();
 
-        // Only include positions for our SOL/USDC whirlpool
-        if (!data.whirlpool.equals(new PublicKey(SOL_USDC_WHIRLPOOL))) continue;
+        // Fetch the actual pool this position belongs to
+        const posWhirlpool = await client.getPool(data.whirlpool);
+        const poolData = posWhirlpool.getData();
 
-        const lowerPrice = PriceMath.tickIndexToPrice(data.tickLowerIndex, 9, 6).toNumber();
-        const upperPrice = PriceMath.tickIndexToPrice(data.tickUpperIndex, 9, 6).toNumber();
+        // Determine token decimals for this pool from our known pool table; fall back to 9/6.
+        const poolAddress = data.whirlpool.toBase58();
+        const knownPool = KNOWN_POOL_DECIMALS[poolAddress];
+        const tokenADec = knownPool?.tokenADecimals ?? 9;
+        const tokenBDec = knownPool?.tokenBDecimals ?? 6;
+
+        const currentPrice = PriceMath.sqrtPriceX64ToPrice(
+          poolData.sqrtPrice,
+          tokenADec,
+          tokenBDec,
+        ).toNumber();
+
+        const lowerPrice = PriceMath.tickIndexToPrice(data.tickLowerIndex, tokenADec, tokenBDec).toNumber();
+        const upperPrice = PriceMath.tickIndexToPrice(data.tickUpperIndex, tokenADec, tokenBDec).toNumber();
         const inRange = currentPrice >= lowerPrice && currentPrice <= upperPrice;
 
         const midPrice = (lowerPrice + upperPrice) / 2;
@@ -480,6 +513,7 @@ export async function getPositions(): Promise<OrcaPosition[]> {
 
         result.push({
           positionMint: parsed.mint,
+          whirlpoolAddress: poolAddress,
           lowerPrice,
           upperPrice,
           currentPrice,
@@ -490,7 +524,7 @@ export async function getPositions(): Promise<OrcaPosition[]> {
           rangeUtilisationPct,
         });
       } catch {
-        // Not a Whirlpool position — skip
+        // Not a Whirlpool position or pool not found — skip
         continue;
       }
     }

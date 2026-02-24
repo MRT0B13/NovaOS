@@ -670,11 +670,11 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
 // Known Orca Whirlpool addresses for CFO-approved pairs (0.3% fee tier)
 // NOTE: Verify addresses against https://orca.so/pools before deploying.
 // SOL/USDC is confirmed. Others must be verified against live on-chain data.
-const ORCA_WHIRLPOOLS: Record<string, { address: string; tokenA: string; tokenB: string; minLiquidityUsd: number }> = {
-  'SOL/USDC':  { address: 'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ', tokenA: 'SOL',  tokenB: 'USDC', minLiquidityUsd: 500_000 },
-  'BONK/USDC': { address: 'Fy6SnHPbDxMhVj8j7BNKMiNaVVesCzK8qcFNmRKokFgT', tokenA: 'BONK', tokenB: 'USDC', minLiquidityUsd: 100_000 },
-  'WIF/USDC':  { address: 'ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq', tokenA: 'WIF',  tokenB: 'USDC', minLiquidityUsd: 50_000  },
-  'JUP/USDC':  { address: 'BoG9sBfBBsGJBJbUqsFPRrmGCJF5i4kk5mMHPzSnVBa4', tokenA: 'JUP',  tokenB: 'USDC', minLiquidityUsd: 50_000  },
+const ORCA_WHIRLPOOLS: Record<string, { address: string; tokenA: string; tokenB: string; tokenADecimals: number; minLiquidityUsd: number }> = {
+  'SOL/USDC':  { address: 'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ', tokenA: 'SOL',  tokenB: 'USDC', tokenADecimals: 9, minLiquidityUsd: 500_000 },
+  'BONK/USDC': { address: 'Fy6SnHPbDxMhVj8j7BNKMiNaVVesCzK8qcFNmRKokFgT', tokenA: 'BONK', tokenB: 'USDC', tokenADecimals: 5, minLiquidityUsd: 100_000 },
+  'WIF/USDC':  { address: 'ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq', tokenA: 'WIF',  tokenB: 'USDC', tokenADecimals: 6, minLiquidityUsd: 50_000  },
+  'JUP/USDC':  { address: 'BoG9sBfBBsGJBJbUqsFPRrmGCJF5i4kk5mMHPzSnVBa4', tokenA: 'JUP',  tokenB: 'USDC', tokenADecimals: 6, minLiquidityUsd: 50_000  },
 };
 
 /**
@@ -1246,40 +1246,53 @@ export async function generateDecisions(
       state.orcaPositions.length === 0 &&
       checkCooldown('ORCA_LP_OPEN', 24 * 3600_000)
     ) {
-      const deployUsd = Math.min(orcaHeadroomUsd, state.polyUsdcBalance * 0.3);
-      if (deployUsd >= 20) {
-        const bestPair = selectBestOrcaPair(intel);
-        const usdcSide = deployUsd / 2;
-        const solSide = deployUsd / 2 / state.solPriceUsd;
-        const tokenAAmount = bestPair.whirlpool.tokenA !== 'SOL'
-          ? deployUsd / 2 / (intel.analystPrices?.[bestPair.whirlpool.tokenA]?.usd ?? 1)
-          : solSide;
+      const bestPair = selectBestOrcaPair(intel);
+      const needsSol = bestPair.whirlpool.tokenA === 'SOL';
+      const solAvailableUsd = state.solBalance * state.solPriceUsd;
 
-        decisions.push({
-          type: 'ORCA_LP_OPEN',
-          reasoning:
-            `Opening Orca ${bestPair.pair} concentrated LP: $${deployUsd.toFixed(0)} total ` +
-            `(range ±${env.orcaLpRangeWidthPct / 2}%). ` +
-            `Pair selected because: ${bestPair.reasoning}. ` +
-            `Est. fee APY: ~15-25% while in-range.`,
-          params: {
-            pair: bestPair.pair,
-            whirlpoolAddress: bestPair.whirlpool.address,
-            tokenA: bestPair.whirlpool.tokenA,
-            usdcAmount: usdcSide,
-            solAmount: bestPair.whirlpool.tokenA === 'SOL' ? solSide : 0,
-            tokenAAmount,
-            rangeWidthPct: env.orcaLpRangeWidthPct,
-          },
-          urgency: 'low',
-          estimatedImpactUsd: deployUsd * 0.18,
-          intelUsed: [
-            intel.guardianSnapshotAt ? 'guardian' : '',
-            intel.analystPricesAt ? 'analyst' : '',
-            intel.scoutReceivedAt ? 'scout' : '',
-          ].filter(Boolean),
-          tier: 'APPROVAL',
-        });
+      // For SOL/USDC: need SOL for the A-side. For token pairs (BONK/WIF/JUP): no SOL required.
+      if (needsSol && solAvailableUsd < 10) {
+        logger.debug(`[CFO:Decision] ORCA_LP_OPEN skipped — insufficient SOL ($${solAvailableUsd.toFixed(2)} available, need >$10 for SOL/USDC LP)`);
+      } else {
+        const deployUsd = Math.min(
+          orcaHeadroomUsd,
+          state.polyUsdcBalance * 0.3,
+          needsSol ? solAvailableUsd * 2 * 0.8 : Infinity, // cap to 80% of available SOL×2 for SOL/USDC
+        );
+        if (deployUsd >= 20) {
+          const usdcSide = deployUsd / 2;
+          const solSide = deployUsd / 2 / state.solPriceUsd;
+          const tokenAAmount = bestPair.whirlpool.tokenA !== 'SOL'
+            ? deployUsd / 2 / (intel.analystPrices?.[bestPair.whirlpool.tokenA]?.usd ?? 1)
+            : solSide;
+
+          decisions.push({
+            type: 'ORCA_LP_OPEN',
+            reasoning:
+              `Opening Orca ${bestPair.pair} concentrated LP: $${deployUsd.toFixed(0)} total ` +
+              `(range ±${env.orcaLpRangeWidthPct / 2}%). ` +
+              `Pair selected because: ${bestPair.reasoning}. ` +
+              `Est. fee APY: ~15-25% while in-range.`,
+            params: {
+              pair: bestPair.pair,
+              whirlpoolAddress: bestPair.whirlpool.address,
+              tokenA: bestPair.whirlpool.tokenA,
+              tokenADecimals: bestPair.whirlpool.tokenADecimals,
+              usdcAmount: usdcSide,
+              solAmount: bestPair.whirlpool.tokenA === 'SOL' ? solSide : 0,
+              tokenAAmount,
+              rangeWidthPct: env.orcaLpRangeWidthPct,
+            },
+            urgency: 'low',
+            estimatedImpactUsd: deployUsd * 0.18,
+            intelUsed: [
+              intel.guardianSnapshotAt ? 'guardian' : '',
+              intel.analystPricesAt ? 'analyst' : '',
+              intel.scoutReceivedAt ? 'scout' : '',
+            ].filter(Boolean),
+            tier: 'APPROVAL',
+          });
+        }
       }
     }
 
@@ -1578,10 +1591,10 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
       case 'ORCA_LP_OPEN': {
         const orca = await import('./orcaService.ts');
-        const { usdcAmount, solAmount, tokenAAmount, rangeWidthPct, whirlpoolAddress } = decision.params;
+        const { usdcAmount, solAmount, tokenAAmount, rangeWidthPct, whirlpoolAddress, tokenADecimals } = decision.params;
         // Use tokenA amount if available (for non-SOL pairs), otherwise fall back to solAmount
         const amountA = tokenAAmount ?? solAmount;
-        const result = await orca.openPosition(usdcAmount, amountA, rangeWidthPct, whirlpoolAddress);
+        const result = await orca.openPosition(usdcAmount, amountA, rangeWidthPct, whirlpoolAddress, tokenADecimals ?? 9);
         markDecision('ORCA_LP_OPEN');
         return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
       }
