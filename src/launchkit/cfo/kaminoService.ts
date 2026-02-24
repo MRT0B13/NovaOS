@@ -60,11 +60,11 @@ const SOL_MINT     = 'So11111111111111111111111111111111111111112';
 export type KaminoAsset = 'USDC' | 'USDT' | 'SOL' | 'JitoSOL' | 'JUP';
 
 const KAMINO_RESERVES: Record<KaminoAsset, string> = {
-  USDC:    'H9gBUJs5Kc5zyiKRTzZcYom4Hpj9VPHLy4VzExTVPgTL',  // confirmed
-  SOL:     'dK2MkMREV9K2H7gFkuycMpRKXQ6oQZZWk9X5xgLqkFz',   // confirmed
-  USDT:    'H4Q3hDbuMVLaHbCiHTeGABGhYPMNJv9nR8P3r6eKLaL',   // VERIFY before use
-  JitoSOL: 'GLP9jKbuMvkHeiaVkLtnBkBdgThyiS7CgTfnMZfHxZFz',  // VERIFY before use
-  JUP:     'Ga4rZytCpq1unD4DbEJ5bkHeUz9g3oh9AAFEh6on9dsp',   // VERIFY before use
+  USDC:    'D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59',  // confirmed via SDK enum
+  SOL:     'd4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q',   // confirmed via SDK enum
+  USDT:    'H3t6qZ1JkguCNTi9uzVKqQ7dvt2cum4XiXWom6Gn5e5S',   // confirmed via SDK enum
+  JitoSOL: 'EVbyPKrHG6WBfm4dLxLMJpUDY43cCAcHSpV3KYjKsktW',  // confirmed via SDK enum
+  JUP:     '4AFAGAm5G8fkcKy7QerL88E7BiSE22ZRbvJzvaKjayor',   // confirmed via SDK enum
 };
 
 // Token decimals
@@ -163,6 +163,14 @@ export interface KaminoRepayResult {
   error?: string;
 }
 
+export interface KaminoClosePositionResult {
+  success: boolean;
+  repaid: { asset: KaminoAsset; amount: number };
+  withdrawn: { asset: KaminoAsset; amount: number };
+  txSignature?: string;
+  error?: string;
+}
+
 // ============================================================================
 // Wallet loader
 // ============================================================================
@@ -206,6 +214,29 @@ async function pollConfirmation(
 function getRpcV2(): any {
   const { createSolanaRpc } = require('@solana/kit');
   return createSolanaRpc(getRpcUrl());
+}
+
+/**
+ * Convert a @solana/kit v2 instruction to a @solana/web3.js v1 TransactionInstruction.
+ * klend-sdk v7 returns v2-format instructions:
+ *   { programAddress: string, accounts: [{address, role}], data: Uint8Array }
+ * but we sign with v1 Transaction which needs:
+ *   { programId: PublicKey, keys: [{pubkey, isSigner, isWritable}], data: Buffer }
+ *
+ * Role values from @solana/instructions:
+ *   0 = READONLY, 1 = WRITABLE, 2 = READONLY_SIGNER, 3 = WRITABLE_SIGNER
+ */
+function ixV2toV1(ix: any): any {
+  if (ix.programId) return ix; // already v1 format
+  return {
+    programId: new PublicKey(ix.programAddress),
+    keys: (ix.accounts ?? []).map((acc: any) => ({
+      pubkey: new PublicKey(acc.address),
+      isSigner: acc.role >= 2,
+      isWritable: acc.role === 1 || acc.role === 3,
+    })),
+    data: Buffer.from(ix.data ?? []),
+  };
 }
 
 // ============================================================================
@@ -301,15 +332,17 @@ export async function deposit(asset: KaminoAsset, amount: number): Promise<Kamin
       400, // recent slot duration ms
     );
 
-    const reserveAddress = new PublicKey(KAMINO_RESERVES[asset]);
+    const reserveAddress = KAMINO_RESERVES[asset];
     const reserve = market!.getReserveByAddress(reserveAddress as any);
     if (!reserve) throw new Error(`Reserve ${asset} not found in market`);
 
+    const walletAddr = { address: wallet.publicKey.toBase58() } as any;
+    const baseAmount = Math.floor(amount * 10 ** ASSET_DECIMALS[asset]).toString();
     const kaminoAction = await klend.KaminoAction.buildDepositTxns(
       market!,
-      amount.toString(),
+      baseAmount,
       reserve.getLiquidityMint(),
-      wallet.publicKey as any,
+      walletAddr,
       new klend.VanillaObligation(klend.PROGRAM_ID),
       0 as any,
       undefined,
@@ -319,12 +352,13 @@ export async function deposit(asset: KaminoAsset, amount: number): Promise<Kamin
     );
 
     const tx = new Transaction();
+    for (const ix of kaminoAction.computeBudgetIxs ?? []) tx.add(ixV2toV1(ix));
     for (const ix of [
       ...kaminoAction.setupIxs,
       ...kaminoAction.lendingIxs,
       ...kaminoAction.cleanupIxs,
     ]) {
-      tx.add(ix as any);
+      tx.add(ixV2toV1(ix));
     }
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
@@ -377,15 +411,17 @@ export async function withdraw(asset: KaminoAsset, amount: number): Promise<Kami
     const rpc = getRpcV2();
 
     const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
-    const reserveAddress = new PublicKey(KAMINO_RESERVES[asset]);
+    const reserveAddress = KAMINO_RESERVES[asset];
     const reserve = market!.getReserveByAddress(reserveAddress as any);
     if (!reserve) throw new Error(`Reserve ${asset} not found`);
 
+    const walletAddr = { address: wallet.publicKey.toBase58() } as any;
+    const baseAmount = Math.floor(amount * 10 ** ASSET_DECIMALS[asset]).toString();
     const kaminoAction = await klend.KaminoAction.buildWithdrawTxns(
       market!,
-      amount.toString(),
+      baseAmount,
       reserve.getLiquidityMint(),
-      wallet.publicKey as any,
+      walletAddr,
       new klend.VanillaObligation(klend.PROGRAM_ID),
       0 as any,
       undefined,
@@ -395,12 +431,13 @@ export async function withdraw(asset: KaminoAsset, amount: number): Promise<Kami
     );
 
     const tx = new Transaction();
+    for (const ix of kaminoAction.computeBudgetIxs ?? []) tx.add(ixV2toV1(ix));
     for (const ix of [
       ...kaminoAction.setupIxs,
       ...kaminoAction.lendingIxs,
       ...kaminoAction.cleanupIxs,
     ]) {
-      tx.add(ix as any);
+      tx.add(ixV2toV1(ix));
     }
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
@@ -452,53 +489,90 @@ export async function getPosition(): Promise<KaminoPosition> {
     const deposits: KaminoPosition['deposits'] = [];
     const borrows: KaminoPosition['borrows'] = [];
 
-    // Extract deposits from obligation
-    if (obligation.deposits && typeof obligation.deposits[Symbol.iterator] === 'function') {
-      for (const deposit of obligation.deposits) {
-        const mint = deposit.mintAddress?.toString?.() ?? '';
-        const asset = MINT_TO_ASSET[mint] ?? (mint === KAMINO_RESERVES.USDC ? 'USDC' : 'SOL');
-        const amount = Number(deposit.amount ?? 0);
-        const valueUsd = Number(deposit.marketValueSf ?? deposit.marketValue ?? 0);
-        if (amount > 0 || valueUsd > 0) {
+    // Helper: safely convert SDK Decimal / number / null to a finite number
+    const num = (v: any): number => { const x = Number(v ?? 0); return isFinite(x) ? x : 0; };
+
+    // ── Parse deposits ─────────────────────────────────────────────────────
+    // SDK v7: obligation.deposits is Map<reserveAddr, {mintAddress, amount (base units), marketValueRefreshed (USD)}>
+    if (obligation.deposits instanceof Map) {
+      for (const [reserveAddr, dep] of obligation.deposits) {
+        const mint = String(dep.mintAddress ?? '');
+        const asset = MINT_TO_ASSET[mint] ?? MINT_TO_ASSET[reserveAddr] ?? 'UNKNOWN';
+        const decimals = ASSET_DECIMALS[asset as KaminoAsset] ?? 9;
+        const amount = num(dep.amount) / (10 ** decimals);
+        const valueUsd = num(dep.marketValueRefreshed);
+        if (amount > 0.000001) {
           deposits.push({ asset, amount, valueUsd, apy: apys[asset as KaminoAsset]?.supplyApy ?? 0.08 });
         }
       }
-    } else if (obligation.state?.deposits) {
-      // Fallback: old-style state object
-      for (const [mintStr, deposit] of Object.entries(obligation.state.deposits as Record<string, any>)) {
-        const asset = MINT_TO_ASSET[mintStr] ?? (mintStr.includes(KAMINO_RESERVES.USDC) ? 'USDC' : 'SOL');
-        const amount = Number(deposit.depositedAmount ?? 0);
-        const valueUsd = Number(deposit.marketValueRefreshed ?? 0);
-        deposits.push({ asset, amount, valueUsd, apy: apys[asset as KaminoAsset]?.supplyApy ?? 0.08 });
+    } else if (obligation.deposits && typeof obligation.deposits[Symbol.iterator] === 'function') {
+      // Fallback: array-like iterable (older SDK versions)
+      for (const entry of obligation.deposits) {
+        const dep = Array.isArray(entry) ? entry[1] : entry;
+        const mint = String(dep?.mintAddress ?? '');
+        const asset = MINT_TO_ASSET[mint] ?? 'UNKNOWN';
+        const amount = num(dep?.amount);
+        const valueUsd = num(dep?.marketValueRefreshed ?? dep?.marketValue ?? 0);
+        if (amount > 0) {
+          deposits.push({ asset, amount, valueUsd, apy: apys[asset as KaminoAsset]?.supplyApy ?? 0.08 });
+        }
       }
     }
 
-    // Extract borrows from obligation
-    if (obligation.borrows && typeof obligation.borrows[Symbol.iterator] === 'function') {
-      for (const borrow of obligation.borrows) {
-        const mint = borrow.mintAddress?.toString?.() ?? '';
-        const asset = MINT_TO_ASSET[mint] ?? (mint === KAMINO_RESERVES.USDC ? 'USDC' : 'SOL');
-        const amount = Number(borrow.amount ?? 0);
-        const valueUsd = Number(borrow.marketValueSf ?? borrow.marketValue ?? 0);
-        if (amount > 0 || valueUsd > 0) {
+    // ── Parse borrows ──────────────────────────────────────────────────────
+    if (obligation.borrows instanceof Map) {
+      for (const [reserveAddr, brw] of obligation.borrows) {
+        const mint = String(brw.mintAddress ?? '');
+        const asset = MINT_TO_ASSET[mint] ?? MINT_TO_ASSET[reserveAddr] ?? 'UNKNOWN';
+        const decimals = ASSET_DECIMALS[asset as KaminoAsset] ?? 6;
+        const amount = num(brw.amount) / (10 ** decimals);
+        const valueUsd = num(brw.marketValueRefreshed);
+        if (amount > 0.000001) {
           borrows.push({ asset, amount, valueUsd, apy: apys[asset as KaminoAsset]?.borrowApy ?? 0.12 });
         }
       }
-    } else if (obligation.state?.borrows) {
-      for (const [mintStr, borrow] of Object.entries(obligation.state.borrows as Record<string, any>)) {
-        const asset = MINT_TO_ASSET[mintStr] ?? (mintStr.includes(KAMINO_RESERVES.USDC) ? 'USDC' : 'SOL');
-        const amount = Number(borrow.borrowedAmountSf ?? 0);
-        const valueUsd = Number(borrow.marketValueRefreshed ?? 0);
-        borrows.push({ asset, amount, valueUsd, apy: apys[asset as KaminoAsset]?.borrowApy ?? 0.12 });
+    } else if (obligation.borrows && typeof obligation.borrows[Symbol.iterator] === 'function') {
+      for (const entry of obligation.borrows) {
+        const brw = Array.isArray(entry) ? entry[1] : entry;
+        const mint = String(brw?.mintAddress ?? '');
+        const asset = MINT_TO_ASSET[mint] ?? 'UNKNOWN';
+        const amount = num(brw?.amount);
+        const valueUsd = num(brw?.marketValueRefreshed ?? brw?.marketValue ?? 0);
+        if (amount > 0) {
+          borrows.push({ asset, amount, valueUsd, apy: apys[asset as KaminoAsset]?.borrowApy ?? 0.12 });
+        }
       }
     }
 
-    const depositValueUsd = deposits.reduce((s, d) => s + d.valueUsd, 0);
-    const borrowValueUsd = borrows.reduce((s, b) => s + b.valueUsd, 0);
+    // ── Aggregate values from refreshedStats (oracle-accurate) ─────────────
+    const stats = obligation.refreshedStats;
+    let depositValueUsd: number;
+    let borrowValueUsd: number;
+    let ltv: number;
+
+    if (stats) {
+      depositValueUsd = num(stats.userTotalDeposit);
+      borrowValueUsd = num(stats.userTotalBorrow);
+      ltv = num(stats.loanToValue);
+      // Backfill per-entry USD if aggregate is available but entries report zero
+      const entryDepSum = deposits.reduce((s, d) => s + d.valueUsd, 0);
+      if (entryDepSum < 0.01 && depositValueUsd > 0 && deposits.length === 1) {
+        deposits[0].valueUsd = depositValueUsd;
+      }
+      const entryBrrSum = borrows.reduce((s, b) => s + b.valueUsd, 0);
+      if (entryBrrSum < 0.01 && borrowValueUsd > 0 && borrows.length === 1) {
+        borrows[0].valueUsd = borrowValueUsd;
+      }
+    } else {
+      depositValueUsd = deposits.reduce((s, d) => s + d.valueUsd, 0);
+      borrowValueUsd = borrows.reduce((s, b) => s + b.valueUsd, 0);
+      ltv = depositValueUsd > 0 ? borrowValueUsd / depositValueUsd : 0;
+    }
+
     const netValueUsd = depositValueUsd - borrowValueUsd;
-    const ltv = depositValueUsd > 0 ? borrowValueUsd / depositValueUsd : 0;
     const healthFactor = ltv > 0 ? 0.75 / ltv : 999;
 
+    logger.debug(`[Kamino] Position: ${deposits.length} deposits ($${depositValueUsd.toFixed(2)}), ${borrows.length} borrows ($${borrowValueUsd.toFixed(2)}), LTV=${(ltv * 100).toFixed(1)}%`);
     return { deposits, borrows, netValueUsd, healthFactor, ltv, maxLtv: 0.75 };
   } catch (err) {
     logger.warn('[Kamino] getPosition error:', err);
@@ -573,15 +647,17 @@ export async function borrow(
     const rpc = getRpcV2();
 
     const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
-    const reserveAddress = new PublicKey(KAMINO_RESERVES[asset]);
+    const reserveAddress = KAMINO_RESERVES[asset];
     const reserve = market!.getReserveByAddress(reserveAddress as any);
     if (!reserve) throw new Error(`Reserve ${asset} not found`);
 
+    const walletAddr = { address: wallet.publicKey.toBase58() } as any;
+    const baseAmount = Math.floor(amount * 10 ** ASSET_DECIMALS[asset]).toString();
     const kaminoAction = await klend.KaminoAction.buildBorrowTxns(
       market!,
-      amount.toString(),
+      baseAmount,
       reserve.getLiquidityMint(),
-      wallet.publicKey as any,
+      walletAddr,
       new klend.VanillaObligation(klend.PROGRAM_ID),
       0 as any,
       undefined,
@@ -591,8 +667,9 @@ export async function borrow(
     );
 
     const tx = new Transaction();
+    for (const ix of kaminoAction.computeBudgetIxs ?? []) tx.add(ixV2toV1(ix));
     for (const ix of [...kaminoAction.setupIxs, ...kaminoAction.lendingIxs, ...kaminoAction.cleanupIxs]) {
-      tx.add(ix as any);
+      tx.add(ixV2toV1(ix));
     }
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
@@ -650,15 +727,17 @@ export async function repay(
     const rpc = getRpcV2();
 
     const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
-    const reserveAddress = new PublicKey(KAMINO_RESERVES[asset]);
+    const reserveAddress = KAMINO_RESERVES[asset];
     const reserve = market!.getReserveByAddress(reserveAddress as any);
     if (!reserve) throw new Error(`Reserve ${asset} not found`);
 
+    const walletAddr = { address: wallet.publicKey.toBase58() } as any;
+    const baseAmount = Math.floor(repayAmount * 10 ** ASSET_DECIMALS[asset]).toString();
     const kaminoAction = await klend.KaminoAction.buildRepayTxns(
       market!,
-      repayAmount.toString(),
+      baseAmount,
       reserve.getLiquidityMint(),
-      wallet.publicKey as any,
+      walletAddr,
       new klend.VanillaObligation(klend.PROGRAM_ID),
       0 as any,
       undefined as any,
@@ -668,8 +747,9 @@ export async function repay(
     );
 
     const tx = new Transaction();
+    for (const ix of kaminoAction.computeBudgetIxs ?? []) tx.add(ixV2toV1(ix));
     for (const ix of [...kaminoAction.setupIxs, ...kaminoAction.lendingIxs, ...kaminoAction.cleanupIxs]) {
-      tx.add(ix as any);
+      tx.add(ixV2toV1(ix));
     }
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
@@ -685,6 +765,122 @@ export async function repay(
   } catch (err) {
     logger.error('[Kamino] repay error:', err);
     return { success: false, asset, amountRepaid: 0, error: (err as Error).message };
+  }
+}
+
+// ============================================================================
+// Atomic Repay + Withdraw (for full position closure)
+// ============================================================================
+
+/**
+ * Atomically repay a borrow AND withdraw collateral in a single transaction.
+ * Required for full position closure — Kamino rejects repay-only that would
+ * leave a dust obligation (NetValueRemainingTooSmall error).
+ *
+ * Usage: await repayAndWithdraw('USDC', 5.01, 'JitoSOL', 0.1)
+ * Add a small buffer (1.005x) to repayAmount to cover accrued interest.
+ */
+export async function repayAndWithdraw(
+  repayAsset: KaminoAsset,
+  repayAmount: number,
+  withdrawAsset: KaminoAsset,
+  withdrawAmount: number,
+): Promise<KaminoClosePositionResult> {
+  const env = getCFOEnv();
+
+  if (env.dryRun) {
+    logger.info(`[Kamino] DRY RUN — would repay ${repayAmount} ${repayAsset} + withdraw ${withdrawAmount} ${withdrawAsset}`);
+    return {
+      success: true,
+      repaid: { asset: repayAsset, amount: repayAmount },
+      withdrawn: { asset: withdrawAsset, amount: withdrawAmount },
+      txSignature: `dry-repay-withdraw-${Date.now()}`,
+    };
+  }
+
+  if (repayAmount <= 0 || withdrawAmount <= 0) {
+    return {
+      success: false,
+      repaid: { asset: repayAsset, amount: 0 },
+      withdrawn: { asset: withdrawAsset, amount: 0 },
+      error: 'Both repayAmount and withdrawAmount must be positive',
+    };
+  }
+
+  try {
+    const klend = await loadKlend();
+    const wallet = loadWallet();
+    const connection = getConnection();
+    const rpc = getRpcV2();
+
+    const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
+
+    const repayReserve = market!.getReserveByAddress(KAMINO_RESERVES[repayAsset] as any);
+    const withdrawReserve = market!.getReserveByAddress(KAMINO_RESERVES[withdrawAsset] as any);
+    if (!repayReserve) throw new Error(`Repay reserve ${repayAsset} not found`);
+    if (!withdrawReserve) throw new Error(`Withdraw reserve ${withdrawAsset} not found`);
+
+    const walletAddr = { address: wallet.publicKey.toBase58() } as any;
+    const repayBase = Math.floor(repayAmount * 10 ** ASSET_DECIMALS[repayAsset]).toString();
+    const withdrawBase = Math.floor(withdrawAmount * 10 ** ASSET_DECIMALS[withdrawAsset]).toString();
+
+    // SDK v7 needs current slot as BigInt for exchange-rate estimation
+    const currentSlot = BigInt(await connection.getSlot('confirmed'));
+
+    const kaminoAction = await klend.KaminoAction.buildRepayAndWithdrawTxns(
+      market!,
+      repayBase,
+      repayReserve.getLiquidityMint(),
+      withdrawBase,
+      withdrawReserve.getLiquidityMint(),
+      walletAddr,
+      currentSlot as any,
+      new klend.VanillaObligation(klend.PROGRAM_ID),   // obligation type
+    );
+
+    // Multi-token action: correct instruction ordering is critical.
+    // Kamino requires refresh IXs between the repay and withdraw operations.
+    const tx = new Transaction();
+    for (const ix of kaminoAction.computeBudgetIxs ?? []) tx.add(ixV2toV1(ix));
+    for (const ix of kaminoAction.setupIxs) tx.add(ixV2toV1(ix));
+
+    // Interleave: lendingIxs[0] (repay) → inBetweenIxs (refreshes) → lendingIxs[1] (withdraw)
+    if (kaminoAction.inBetweenIxs?.length > 0 && kaminoAction.lendingIxs.length === 2) {
+      tx.add(ixV2toV1(kaminoAction.lendingIxs[0]));
+      for (const ix of kaminoAction.inBetweenIxs) tx.add(ixV2toV1(ix));
+      tx.add(ixV2toV1(kaminoAction.lendingIxs[1]));
+    } else {
+      for (const ix of kaminoAction.lendingIxs) tx.add(ixV2toV1(ix));
+    }
+    for (const ix of kaminoAction.cleanupIxs) tx.add(ixV2toV1(ix));
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = wallet.publicKey;
+    tx.sign(wallet);
+
+    const signature = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    logger.info(`[Kamino] Repay+Withdraw tx sent: ${signature}, polling...`);
+    await pollConfirmation(connection, signature, lastValidBlockHeight);
+
+    logger.info(`[Kamino] Repaid ${repayAmount} ${repayAsset} + withdrew ${withdrawAmount} ${withdrawAsset}: ${signature}`);
+    return {
+      success: true,
+      repaid: { asset: repayAsset, amount: repayAmount },
+      withdrawn: { asset: withdrawAsset, amount: withdrawAmount },
+      txSignature: signature,
+    };
+  } catch (err) {
+    logger.error('[Kamino] repayAndWithdraw error:', err);
+    return {
+      success: false,
+      repaid: { asset: repayAsset, amount: 0 },
+      withdrawn: { asset: withdrawAsset, amount: 0 },
+      error: (err as Error).message,
+    };
   }
 }
 

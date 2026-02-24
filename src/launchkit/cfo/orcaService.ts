@@ -115,44 +115,68 @@ export async function openPosition(
   }
 
   try {
-    const { WhirlpoolContext, buildWhirlpoolClient, PriceMath, TickUtil, ORCA_WHIRLPOOL_PROGRAM_ID } = await loadOrcaSdk();
+    const { WhirlpoolContext, buildWhirlpoolClient, PriceMath, TickUtil,
+            increaseLiquidityQuoteByInputTokenWithParams, NO_TOKEN_EXTENSION_CONTEXT,
+          } = await loadOrcaSdk();
     const { AnchorProvider, Wallet } = await loadAnchor();
+    const { Percentage } = await import('@orca-so/common-sdk' as string);
 
     const walletKeypair = loadWallet();
     const connection = new Connection(getRpcUrl(), 'confirmed');
     const provider = new AnchorProvider(connection, new Wallet(walletKeypair), {});
-    const ctx = WhirlpoolContext.withProvider(provider, ORCA_WHIRLPOOL_PROGRAM_ID);
+    const ctx = WhirlpoolContext.withProvider(provider);
     const client = buildWhirlpoolClient(ctx);
 
     const whirlpool = await client.getPool(new PublicKey(poolAddress));
     const whirlpoolData = whirlpool.getData();
-    const currentPrice = PriceMath.sqrtPriceX64ToPrice(
+    const Decimal = (await import('decimal.js')).default;
+    const BN = (await import('bn.js')).default;
+    const currentPriceDec = PriceMath.sqrtPriceX64ToPrice(
       whirlpoolData.sqrtPrice,
       9,  // SOL decimals
       6,  // USDC decimals
-    ).toNumber();
+    );
+    const currentPrice = currentPriceDec.toNumber();
 
-    // Calculate tick range centred on current price
-    const lowerPrice = currentPrice * (1 - halfRange);
-    const upperPrice = currentPrice * (1 + halfRange);
+    // Calculate tick range centred on current price — PriceMath needs Decimal
+    const lowerPriceDec = currentPriceDec.mul(1 - halfRange);
+    const upperPriceDec = currentPriceDec.mul(1 + halfRange);
     const lowerTick = TickUtil.getInitializableTickIndex(
-      PriceMath.priceToTickIndex(lowerPrice, 9, 6),
+      PriceMath.priceToTickIndex(lowerPriceDec, 9, 6),
       TICK_SPACING,
     );
     const upperTick = TickUtil.getInitializableTickIndex(
-      PriceMath.priceToTickIndex(upperPrice, 9, 6),
+      PriceMath.priceToTickIndex(upperPriceDec, 9, 6),
       TICK_SPACING,
     );
 
-    // Build open position transaction
-    const { tx, positionMint } = await (whirlpool as any).openPositionWithOptimalLiquidity(
+    // Build liquidity quote from the USDC input amount (token A = USDC in SOL/USDC pool)
+    const tokenAMint = whirlpoolData.tokenMintA; // USDC
+    const usdcInputAmount = new BN(Math.floor(usdcAmount * 1e6));
+    const liquidityInput = increaseLiquidityQuoteByInputTokenWithParams({
+      tokenMintA: whirlpoolData.tokenMintA,
+      tokenMintB: whirlpoolData.tokenMintB,
+      sqrtPrice: whirlpoolData.sqrtPrice,
+      tickCurrentIndex: whirlpoolData.tickCurrentIndex,
+      tickLowerIndex: lowerTick,
+      tickUpperIndex: upperTick,
+      inputTokenMint: tokenAMint,
+      inputTokenAmount: usdcInputAmount,
+      slippageTolerance: Percentage.fromFraction(10, 1000), // 1% slippage
+      tokenExtensionCtx: NO_TOKEN_EXTENSION_CONTEXT,
+    });
+
+    // Open LP position
+    const { tx, positionMint } = await whirlpool.openPosition(
       lowerTick,
       upperTick,
-      { tokenA: Math.floor(usdcAmount * 1e6), tokenB: Math.floor(solAmount * 1e9) },
+      liquidityInput,
       walletKeypair.publicKey,
     );
 
     const signature = await tx.buildAndExecute();
+    const lowerPrice = lowerPriceDec.toNumber();
+    const upperPrice = upperPriceDec.toNumber();
     logger.info(`[Orca] Opened LP position: ${positionMint.toBase58()} | range $${lowerPrice.toFixed(2)}-$${upperPrice.toFixed(2)} | tx: ${signature}`);
 
     return {
@@ -184,21 +208,38 @@ export async function closePosition(positionMint: string): Promise<OrcaCloseResu
   }
 
   try {
-    const { WhirlpoolContext, buildWhirlpoolClient, ORCA_WHIRLPOOL_PROGRAM_ID } = await loadOrcaSdk();
+    const { WhirlpoolContext, buildWhirlpoolClient } = await loadOrcaSdk();
     const { AnchorProvider, Wallet } = await loadAnchor();
+    const { Percentage } = await import('@orca-so/common-sdk' as string);
 
     const walletKeypair = loadWallet();
     const connection = new Connection(getRpcUrl(), 'confirmed');
     const provider = new AnchorProvider(connection, new Wallet(walletKeypair), {});
-    const ctx = WhirlpoolContext.withProvider(provider, ORCA_WHIRLPOOL_PROGRAM_ID);
+    const ctx = WhirlpoolContext.withProvider(provider);
     const client = buildWhirlpoolClient(ctx);
 
+    // Use the whirlpool's closePosition which handles:
+    // decrease liquidity → collect fees → collect rewards → close position account
     const position = await client.getPosition(new PublicKey(positionMint));
-    const closeTx = await (position as any).closePosition(walletKeypair.publicKey);
-    const signature = await closeTx.buildAndExecute();
+    const posData = position.getData();
+    const whirlpool = await client.getPool(posData.whirlpool);
+    const closeTxs = await whirlpool.closePosition(
+      new PublicKey(positionMint),
+      Percentage.fromFraction(10, 1000), // 1% slippage
+      walletKeypair.publicKey,           // destination wallet
+      walletKeypair.publicKey,           // position wallet (owns the NFT)
+      walletKeypair.publicKey,           // payer
+    );
 
-    logger.info(`[Orca] Closed LP position ${positionMint.slice(0, 8)}: ${signature}`);
-    return { success: true, txSignature: signature };
+    // closeTxs may be an array of TransactionBuilders or a single builder
+    const txBuilders = Array.isArray(closeTxs) ? closeTxs : [closeTxs];
+    let lastSig = '';
+    for (const txBuilder of txBuilders) {
+      lastSig = await txBuilder.buildAndExecute();
+    }
+
+    logger.info(`[Orca] Closed LP position ${positionMint.slice(0, 8)}: ${lastSig}`);
+    return { success: true, txSignature: lastSig };
   } catch (err) {
     logger.error('[Orca] closePosition error:', err);
     return { success: false, error: (err as Error).message };
@@ -215,13 +256,13 @@ export async function closePosition(positionMint: string): Promise<OrcaCloseResu
  */
 export async function getPositions(): Promise<OrcaPosition[]> {
   try {
-    const { WhirlpoolContext, buildWhirlpoolClient, PriceMath, ORCA_WHIRLPOOL_PROGRAM_ID } = await loadOrcaSdk();
+    const { WhirlpoolContext, buildWhirlpoolClient, PriceMath } = await loadOrcaSdk();
     const { AnchorProvider, Wallet } = await loadAnchor();
 
     const walletKeypair = loadWallet();
     const connection = new Connection(getRpcUrl(), 'confirmed');
     const provider = new AnchorProvider(connection, new Wallet(walletKeypair), {});
-    const ctx = WhirlpoolContext.withProvider(provider, ORCA_WHIRLPOOL_PROGRAM_ID);
+    const ctx = WhirlpoolContext.withProvider(provider);
     const client = buildWhirlpoolClient(ctx);
 
     const whirlpool = await client.getPool(new PublicKey(SOL_USDC_WHIRLPOOL));
