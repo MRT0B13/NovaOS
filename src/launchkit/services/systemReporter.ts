@@ -81,6 +81,9 @@ interface SystemStats {
 
   // Swarm agents
   swarm: SwarmStats | null;
+
+  // CFO portfolio
+  cfo: CFOSnapshot | null;
 }
 
 interface SwarmAgentInfo {
@@ -94,6 +97,53 @@ interface SwarmStats {
   agents: SwarmAgentInfo[];
   totalAgents: number;
   aliveCount: number;
+}
+
+// ── CFO Portfolio Snapshot (for status reports) ──
+interface CFOSnapshot {
+  enabled: boolean;
+  totalPortfolioUsd: number;
+  solBalance: number;
+  solPriceUsd: number;
+  hedgeRatio: number;       // 0-1
+
+  // Kamino
+  kaminoEnabled: boolean;
+  kaminoDepositUsd: number;
+  kaminoBorrowUsd: number;
+  kaminoNetUsd: number;
+  kaminoLtv: number;
+  kaminoHealthFactor: number;
+  kaminoJitoLoopActive: boolean;
+  kaminoJitoLoopApy: number;
+
+  // Orca LP
+  orcaEnabled: boolean;
+  orcaLpValueUsd: number;
+  orcaLpFeeApy: number;
+  orcaPositions: Array<{ positionMint: string; inRange: boolean; rangeUtilisationPct: number }>;
+
+  // Jito staking
+  jitoSolBalance: number;
+  jitoSolValueUsd: number;
+
+  // Hyperliquid
+  hlEnabled: boolean;
+  hlEquity: number;
+  hlTotalPnl: number;
+  hlPositions: Array<{ coin: string; side: string; sizeUsd: number; unrealizedPnlUsd: number; leverage: number }>;
+
+  // Polymarket
+  polyEnabled: boolean;
+  polyDeployedUsd: number;
+  polyHeadroomUsd: number;
+  polyPositionCount: number;
+  polyUsdcBalance: number;
+
+  // x402 revenue
+  x402TotalCalls: number;
+  x402TotalEarned: number;
+  x402Last24h: number;
 }
 
 // Banned user record
@@ -584,6 +634,83 @@ async function checkMidnightReset(): Promise<void> {
   }
 }
 
+// ── CFO portfolio snapshot (lazy-imports to avoid circular deps) ──
+async function gatherCFOSnapshot(): Promise<CFOSnapshot | null> {
+  try {
+    const { getCFOEnv } = await import('../cfo/cfoEnv.ts');
+    const env = getCFOEnv();
+    if (!env.cfoEnabled) return null;
+
+    const { gatherPortfolioState } = await import('../cfo/decisionEngine.ts');
+    const ps = await gatherPortfolioState();
+
+    // x402 revenue (non-fatal)
+    let x402TotalCalls = 0, x402TotalEarned = 0, x402Last24h = 0;
+    if (env.x402Enabled) {
+      try {
+        const { getRevenue } = await import('../cfo/x402Service.ts');
+        const rev = getRevenue();
+        x402TotalCalls = rev.totalCalls;
+        x402TotalEarned = rev.totalEarned;
+        x402Last24h = rev.last24h;
+      } catch { /* non-fatal */ }
+    }
+
+    return {
+      enabled: true,
+      totalPortfolioUsd: ps.totalPortfolioUsd,
+      solBalance: ps.solBalance,
+      solPriceUsd: ps.solPriceUsd,
+      hedgeRatio: ps.hedgeRatio,
+
+      kaminoEnabled: env.kaminoEnabled,
+      kaminoDepositUsd: ps.kaminoDepositValueUsd,
+      kaminoBorrowUsd: ps.kaminoBorrowValueUsd,
+      kaminoNetUsd: ps.kaminoNetValueUsd,
+      kaminoLtv: ps.kaminoLtv,
+      kaminoHealthFactor: ps.kaminoHealthFactor,
+      kaminoJitoLoopActive: ps.kaminoJitoLoopActive,
+      kaminoJitoLoopApy: ps.kaminoJitoLoopApy,
+
+      orcaEnabled: env.orcaLpEnabled,
+      orcaLpValueUsd: ps.orcaLpValueUsd,
+      orcaLpFeeApy: ps.orcaLpFeeApy,
+      orcaPositions: ps.orcaPositions.map(p => ({
+        positionMint: p.positionMint,
+        inRange: p.inRange,
+        rangeUtilisationPct: p.rangeUtilisationPct,
+      })),
+
+      jitoSolBalance: ps.jitoSolBalance,
+      jitoSolValueUsd: ps.jitoSolValueUsd,
+
+      hlEnabled: env.hyperliquidEnabled,
+      hlEquity: ps.hlEquity,
+      hlTotalPnl: ps.hlTotalPnl,
+      hlPositions: ps.hlPositions.map(p => ({
+        coin: p.coin,
+        side: p.side,
+        sizeUsd: p.sizeUsd,
+        unrealizedPnlUsd: p.unrealizedPnlUsd,
+        leverage: p.leverage,
+      })),
+
+      polyEnabled: env.polymarketEnabled,
+      polyDeployedUsd: ps.polyDeployedUsd,
+      polyHeadroomUsd: ps.polyHeadroomUsd,
+      polyPositionCount: ps.polyPositionCount,
+      polyUsdcBalance: ps.polyUsdcBalance,
+
+      x402TotalCalls,
+      x402TotalEarned,
+      x402Last24h,
+    };
+  } catch (err) {
+    logger.warn(`[SystemReporter] CFO snapshot failed: ${err}`);
+    return null;
+  }
+}
+
 /**
  * Collect current system stats
  */
@@ -684,6 +811,9 @@ async function collectStats(): Promise<SystemStats> {
     
     // Swarm agents
     swarm: collectSwarmStats(),
+
+    // CFO portfolio
+    cfo: await gatherCFOSnapshot(),
   };
 }
 
@@ -887,7 +1017,74 @@ async function sendStatusReport(): Promise<void> {
     message += `  Funding Wallet: ⚠️ Not configured\n`;
   }
   message += '\n';
-  
+
+  // ── CFO Portfolio Section ──
+  if (stats.cfo) {
+    const c = stats.cfo;
+    const hedgePct = (c.hedgeRatio * 100).toFixed(0);
+    message += `<b>💹 CFO Portfolio ($${c.totalPortfolioUsd.toFixed(2)}):</b>\n`;
+    message += `  SOL: ${c.solBalance.toFixed(4)} ($${(c.solBalance * c.solPriceUsd).toFixed(2)}) @ $${c.solPriceUsd.toFixed(2)}\n`;
+    message += `  Hedge ratio: ${hedgePct}%\n\n`;
+
+    // Kamino
+    if (c.kaminoEnabled && (c.kaminoDepositUsd > 0 || c.kaminoBorrowUsd > 0)) {
+      const healthEmoji = c.kaminoHealthFactor > 1.5 ? '🟢' : c.kaminoHealthFactor > 1.2 ? '🟡' : '🔴';
+      message += `  <b>🏦 Kamino Lending:</b>\n`;
+      message += `    Deposits: $${c.kaminoDepositUsd.toFixed(2)}\n`;
+      message += `    Borrows: $${c.kaminoBorrowUsd.toFixed(2)}\n`;
+      message += `    Net equity: $${c.kaminoNetUsd.toFixed(2)}\n`;
+      message += `    LTV: ${(c.kaminoLtv * 100).toFixed(1)}% | Health: ${healthEmoji} ${c.kaminoHealthFactor.toFixed(2)}\n`;
+      if (c.kaminoJitoLoopActive) {
+        message += `    JitoSOL loop: ✅ active (${(c.kaminoJitoLoopApy * 100).toFixed(1)}% APY)\n`;
+      }
+      message += '\n';
+    }
+
+    // Orca LP
+    if (c.orcaEnabled && c.orcaPositions.length > 0) {
+      message += `  <b>🌊 Orca LP ($${c.orcaLpValueUsd.toFixed(2)}):</b>\n`;
+      for (const pos of c.orcaPositions) {
+        const rangeEmoji = pos.inRange ? '🟢' : '🔴';
+        message += `    ${rangeEmoji} <code>${pos.positionMint.slice(0, 6)}…</code> ${pos.rangeUtilisationPct.toFixed(0)}% util${pos.inRange ? '' : ' (out of range)'}\n`;
+      }
+      message += `    Est. fee APY: ${(c.orcaLpFeeApy * 100).toFixed(1)}%\n\n`;
+    }
+
+    // Jito Staking
+    if (c.jitoSolBalance > 0) {
+      message += `  <b>⚡ Jito Staking:</b>\n`;
+      message += `    JitoSOL: ${c.jitoSolBalance.toFixed(4)} ($${c.jitoSolValueUsd.toFixed(2)})\n\n`;
+    }
+
+    // Hyperliquid
+    if (c.hlEnabled && (c.hlEquity > 0 || c.hlPositions.length > 0)) {
+      const pnlEmoji = c.hlTotalPnl >= 0 ? '🟢' : '🔴';
+      const pnlSign = c.hlTotalPnl >= 0 ? '+' : '';
+      message += `  <b>📊 HyperLiquid ($${c.hlEquity.toFixed(2)}):</b>\n`;
+      message += `    PnL: ${pnlEmoji} ${pnlSign}$${c.hlTotalPnl.toFixed(2)}\n`;
+      for (const p of c.hlPositions) {
+        const posEmoji = p.unrealizedPnlUsd >= 0 ? '🟢' : '🔴';
+        message += `    ${posEmoji} ${p.coin} ${p.side} $${p.sizeUsd.toFixed(0)} (${p.leverage}x) PnL: ${p.unrealizedPnlUsd >= 0 ? '+' : ''}$${p.unrealizedPnlUsd.toFixed(2)}\n`;
+      }
+      message += '\n';
+    }
+
+    // Polymarket
+    if (c.polyEnabled && (c.polyDeployedUsd > 0 || c.polyUsdcBalance > 0)) {
+      message += `  <b>🎰 Polymarket:</b>\n`;
+      message += `    Deployed: $${c.polyDeployedUsd.toFixed(2)} (${c.polyPositionCount} positions)\n`;
+      message += `    USDC balance: $${c.polyUsdcBalance.toFixed(2)}\n`;
+      message += `    Headroom: $${c.polyHeadroomUsd.toFixed(2)}\n\n`;
+    }
+
+    // x402 Revenue
+    if (c.x402TotalCalls > 0 || c.x402TotalEarned > 0) {
+      message += `  <b>💳 x402 Payments:</b>\n`;
+      message += `    Total earned: $${c.x402TotalEarned.toFixed(4)} USDC (${c.x402TotalCalls} calls)\n`;
+      message += `    Last 24h: $${c.x402Last24h.toFixed(4)} USDC\n\n`;
+    }
+  }
+
   // PnL Section
   if (stats.pnl) {
     const pnl = stats.pnl;
@@ -1016,7 +1213,50 @@ async function sendDailySummary(): Promise<void> {
     message += `  • Net flow: ${p.netSolFlow >= 0 ? '+' : ''}${p.netSolFlow.toFixed(4)} SOL\n`;
     message += '\n';
   }
-  
+
+  // ── CFO Portfolio (condensed) ──
+  if (stats.cfo) {
+    const c = stats.cfo;
+    message += `<b>💹 CFO Portfolio ($${c.totalPortfolioUsd.toFixed(2)}):</b>\n`;
+    message += `  • SOL: ${c.solBalance.toFixed(4)} @ $${c.solPriceUsd.toFixed(2)} | Hedge: ${(c.hedgeRatio * 100).toFixed(0)}%\n`;
+
+    if (c.kaminoEnabled && (c.kaminoDepositUsd > 0 || c.kaminoBorrowUsd > 0)) {
+      const healthEmoji = c.kaminoHealthFactor > 1.5 ? '🟢' : c.kaminoHealthFactor > 1.2 ? '🟡' : '🔴';
+      message += `  • Kamino: $${c.kaminoNetUsd.toFixed(2)} net | LTV ${(c.kaminoLtv * 100).toFixed(1)}% | ${healthEmoji} HF ${c.kaminoHealthFactor.toFixed(2)}`;
+      if (c.kaminoJitoLoopActive) message += ` | Loop ${(c.kaminoJitoLoopApy * 100).toFixed(1)}%`;
+      message += '\n';
+    }
+
+    if (c.orcaEnabled && c.orcaPositions.length > 0) {
+      const inRange = c.orcaPositions.filter(p => p.inRange).length;
+      message += `  • Orca LP: $${c.orcaLpValueUsd.toFixed(2)} | ${inRange}/${c.orcaPositions.length} in range | ${(c.orcaLpFeeApy * 100).toFixed(1)}% APY\n`;
+    }
+
+    if (c.jitoSolBalance > 0) {
+      message += `  • Jito: ${c.jitoSolBalance.toFixed(4)} JitoSOL ($${c.jitoSolValueUsd.toFixed(2)})\n`;
+    }
+
+    if (c.hlEnabled && (c.hlEquity > 0 || c.hlPositions.length > 0)) {
+      const pnlSign = c.hlTotalPnl >= 0 ? '+' : '';
+      message += `  • HL: $${c.hlEquity.toFixed(2)} equity | PnL: ${pnlSign}$${c.hlTotalPnl.toFixed(2)}`;
+      if (c.hlPositions.length > 0) {
+        const posStr = c.hlPositions.map(p => `${p.coin} ${p.side} $${p.sizeUsd.toFixed(0)}`).join(', ');
+        message += ` | ${posStr}`;
+      }
+      message += '\n';
+    }
+
+    if (c.polyEnabled && (c.polyDeployedUsd > 0 || c.polyUsdcBalance > 0)) {
+      message += `  • Poly: $${c.polyDeployedUsd.toFixed(2)} deployed (${c.polyPositionCount} pos) | $${c.polyUsdcBalance.toFixed(2)} USDC\n`;
+    }
+
+    if (c.x402TotalCalls > 0 || c.x402TotalEarned > 0) {
+      message += `  • x402: $${c.x402TotalEarned.toFixed(4)} earned (${c.x402TotalCalls} calls) | 24h: $${c.x402Last24h.toFixed(4)}\n`;
+    }
+
+    message += '\n';
+  }
+
   // Swarm performance
   if (stats.swarm) {
     const sw = stats.swarm;
