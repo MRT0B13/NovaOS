@@ -20,10 +20,63 @@ import { getEnv } from '../env.ts';
 import { getRpcUrl } from '../services/solanaRpc.ts';
 import { getCFOEnv } from './cfoEnv.ts';
 import bs58 from 'bs58';
+// @ts-ignore — bn.js types excluded by tsconfig "types": ["bun-types"]
+import BN from 'bn.js';
+import Decimal from 'decimal.js';
 
 // SOL/USDC Whirlpool (0.3% fee tier) — highest liquidity, most fee revenue
 const SOL_USDC_WHIRLPOOL = 'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ';
 const TICK_SPACING = 64;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Build, send, and confirm a TransactionBuilder using polling (not websockets).
+ * Alchemy and some RPC providers don't support `signatureSubscribe`, which
+ * the SDK's `buildAndExecute()` uses under the hood.
+ */
+async function buildSendAndConfirm(
+  txBuilder: any,
+  connection: Connection,
+  wallet: Keypair,
+): Promise<string> {
+  const { transaction, signers } = await txBuilder.build();
+
+  // Sign with wallet + any additional signers from the SDK
+  const allSigners = [wallet, ...signers.filter((s: any) => s.publicKey && !s.publicKey.equals(wallet.publicKey))];
+  if ('version' in transaction) {
+    // VersionedTransaction.sign expects Signer[]
+    transaction.sign(allSigners);
+  } else {
+    // Legacy Transaction
+    const latestBlockhash = await connection.getLatestBlockhash('confirmed');
+    transaction.recentBlockhash = latestBlockhash.blockhash;
+    transaction.feePayer = wallet.publicKey;
+    transaction.sign(...allSigners);
+  }
+
+  const rawTx = transaction.serialize();
+  const signature = await connection.sendRawTransaction(rawTx, {
+    skipPreflight: false,
+    preflightCommitment: 'confirmed',
+  });
+
+  // Poll for confirmation (avoids websocket signatureSubscribe)
+  for (let i = 0; i < 60; i++) {
+    const status = await connection.getSignatureStatuses([signature]);
+    const val = status.value[0];
+    if (val?.err) throw new Error(`Transaction failed: ${JSON.stringify(val.err)}`);
+    if (val?.confirmationStatus === 'confirmed' || val?.confirmationStatus === 'finalized') {
+      return signature;
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  // If we timed out but still got a signature, return it — it may confirm later
+  logger.warn(`[Orca] TX ${signature.slice(0, 12)}… confirmation timed out, may still land`);
+  return signature;
+}
 
 // ============================================================================
 // Types
@@ -129,8 +182,7 @@ export async function openPosition(
 
     const whirlpool = await client.getPool(new PublicKey(poolAddress));
     const whirlpoolData = whirlpool.getData();
-    const Decimal = (await import('decimal.js')).default;
-    const BN = (await import('bn.js')).default;
+    // BN and Decimal imported at top level
     const currentPriceDec = PriceMath.sqrtPriceX64ToPrice(
       whirlpoolData.sqrtPrice,
       9,  // SOL decimals
@@ -150,21 +202,53 @@ export async function openPosition(
       TICK_SPACING,
     );
 
-    // Build liquidity quote from the USDC input amount (token A = USDC in SOL/USDC pool)
-    const tokenAMint = whirlpoolData.tokenMintA; // USDC
-    const usdcInputAmount = new BN(Math.floor(usdcAmount * 1e6));
-    const liquidityInput = increaseLiquidityQuoteByInputTokenWithParams({
+    // Build liquidity quote — pick the token with the larger USD value as input
+    // Pool: tokenA = SOL (9 decimals), tokenB = USDC (6 decimals)
+    const solInputBN = new BN(Math.floor(solAmount * 1e9));
+    const usdcInputBN = new BN(Math.floor(usdcAmount * 1e6));
+
+    // Use whichever side the user provided more of (by USD-equivalent)
+    const solValueUsd = solAmount * currentPrice;
+    const useUsdc = usdcAmount > 0 && usdcAmount >= solValueUsd;
+    const inputTokenMint = useUsdc ? whirlpoolData.tokenMintB : whirlpoolData.tokenMintA;
+    const inputTokenAmount = useUsdc ? usdcInputBN : solInputBN;
+
+    const slippageTolerance = Percentage.fromFraction(10, 1000); // 1%
+    const quote = increaseLiquidityQuoteByInputTokenWithParams({
       tokenMintA: whirlpoolData.tokenMintA,
       tokenMintB: whirlpoolData.tokenMintB,
       sqrtPrice: whirlpoolData.sqrtPrice,
       tickCurrentIndex: whirlpoolData.tickCurrentIndex,
       tickLowerIndex: lowerTick,
       tickUpperIndex: upperTick,
-      inputTokenMint: tokenAMint,
-      inputTokenAmount: usdcInputAmount,
-      slippageTolerance: Percentage.fromFraction(10, 1000), // 1% slippage
+      inputTokenMint,
+      inputTokenAmount,
+      slippageTolerance,
       tokenExtensionCtx: NO_TOKEN_EXTENSION_CONTEXT,
     });
+
+    // The quote doesn't include minSqrtPrice/maxSqrtPrice, but ByTokenAmountsParams
+    // requires them—otherwise the program errors with PriceSlippageOutOfBounds (6069).
+    // Compute from current sqrtPrice ± slippage.
+    const SLIPPAGE_NUM = 10;   // numerator  (1%)
+    const SLIPPAGE_DEN = 1000; // denominator
+    const minSqrtPrice = whirlpoolData.sqrtPrice
+      .mul(new BN(SLIPPAGE_DEN - SLIPPAGE_NUM))
+      .div(new BN(SLIPPAGE_DEN));
+    const maxSqrtPrice = whirlpoolData.sqrtPrice
+      .mul(new BN(SLIPPAGE_DEN + SLIPPAGE_NUM))
+      .div(new BN(SLIPPAGE_DEN));
+
+    const liquidityInput = {
+      tokenMaxA: quote.tokenMaxA,
+      tokenMaxB: quote.tokenMaxB,
+      minSqrtPrice,
+      maxSqrtPrice,
+    };
+
+    logger.info(`[Orca] Opening position: lowerTick=${lowerTick}, upperTick=${upperTick}, ` +
+      `tokenMaxA=${quote.tokenMaxA.toString()}, tokenMaxB=${quote.tokenMaxB.toString()}, ` +
+      `minSqrt=${minSqrtPrice.toString()}, maxSqrt=${maxSqrtPrice.toString()}`);
 
     // Open LP position
     const { tx, positionMint } = await whirlpool.openPosition(
@@ -174,7 +258,7 @@ export async function openPosition(
       walletKeypair.publicKey,
     );
 
-    const signature = await tx.buildAndExecute();
+    const signature = await buildSendAndConfirm(tx, connection, walletKeypair);
     const lowerPrice = lowerPriceDec.toNumber();
     const upperPrice = upperPriceDec.toNumber();
     logger.info(`[Orca] Opened LP position: ${positionMint.toBase58()} | range $${lowerPrice.toFixed(2)}-$${upperPrice.toFixed(2)} | tx: ${signature}`);
@@ -208,7 +292,7 @@ export async function closePosition(positionMint: string): Promise<OrcaCloseResu
   }
 
   try {
-    const { WhirlpoolContext, buildWhirlpoolClient } = await loadOrcaSdk();
+    const { WhirlpoolContext, buildWhirlpoolClient, PDAUtil, ORCA_WHIRLPOOL_PROGRAM_ID } = await loadOrcaSdk();
     const { AnchorProvider, Wallet } = await loadAnchor();
     const { Percentage } = await import('@orca-so/common-sdk' as string);
 
@@ -218,13 +302,29 @@ export async function closePosition(positionMint: string): Promise<OrcaCloseResu
     const ctx = WhirlpoolContext.withProvider(provider);
     const client = buildWhirlpoolClient(ctx);
 
+    // Derive position PDA from the mint (the SDK expects the PDA, not the mint)
+    const mintPubkey = new PublicKey(positionMint);
+    const positionPda = PDAUtil.getPosition(ORCA_WHIRLPOOL_PROGRAM_ID, mintPubkey);
+    logger.info(`[Orca] Position PDA: ${positionPda.publicKey.toBase58()} (mint: ${positionMint.slice(0, 8)}…)`);
+
+    // Snapshot wallet balances BEFORE closing so we can report what we got back
+    const solBefore = await connection.getBalance(walletKeypair.publicKey);
+    const { TOKEN_PROGRAM_ID, getAssociatedTokenAddress } = await import('@solana/spl-token' as string);
+    const USDC_MINT = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+    const usdcAta = await getAssociatedTokenAddress(USDC_MINT, walletKeypair.publicKey);
+    let usdcBefore = 0;
+    try {
+      const usdcAcct = await connection.getTokenAccountBalance(usdcAta);
+      usdcBefore = Number(usdcAcct.value.uiAmount ?? 0);
+    } catch { /* ATA may not exist yet */ }
+
     // Use the whirlpool's closePosition which handles:
     // decrease liquidity → collect fees → collect rewards → close position account
-    const position = await client.getPosition(new PublicKey(positionMint));
+    const position = await client.getPosition(positionPda.publicKey);
     const posData = position.getData();
     const whirlpool = await client.getPool(posData.whirlpool);
     const closeTxs = await whirlpool.closePosition(
-      new PublicKey(positionMint),
+      positionPda.publicKey,
       Percentage.fromFraction(10, 1000), // 1% slippage
       walletKeypair.publicKey,           // destination wallet
       walletKeypair.publicKey,           // position wallet (owns the NFT)
@@ -235,15 +335,89 @@ export async function closePosition(positionMint: string): Promise<OrcaCloseResu
     const txBuilders = Array.isArray(closeTxs) ? closeTxs : [closeTxs];
     let lastSig = '';
     for (const txBuilder of txBuilders) {
-      lastSig = await txBuilder.buildAndExecute();
+      lastSig = await buildSendAndConfirm(txBuilder, connection, walletKeypair);
     }
 
-    logger.info(`[Orca] Closed LP position ${positionMint.slice(0, 8)}: ${lastSig}`);
-    return { success: true, txSignature: lastSig };
+    // Snapshot balances AFTER to compute received amounts
+    await new Promise(r => setTimeout(r, 2000)); // wait for balance finality
+    const solAfter = await connection.getBalance(walletKeypair.publicKey);
+    let usdcAfter = 0;
+    try {
+      const usdcAcct = await connection.getTokenAccountBalance(usdcAta);
+      usdcAfter = Number(usdcAcct.value.uiAmount ?? 0);
+    } catch { /* ATA may not exist */ }
+
+    const solReceived = Math.max(0, (solAfter - solBefore) / 1e9);
+    const usdcReceived = Math.max(0, usdcAfter - usdcBefore);
+
+    logger.info(`[Orca] Closed LP position ${positionMint.slice(0, 8)}: ${lastSig} | ` +
+      `received ${solReceived.toFixed(6)} SOL + ${usdcReceived.toFixed(4)} USDC`);
+    return {
+      success: true,
+      txSignature: lastSig,
+      solReceived,
+      usdcReceived,
+      feesCollectedUsdc: 0, // fees are included in the withdrawn amounts
+      feesCollectedSol: 0,
+    };
   } catch (err) {
     logger.error('[Orca] closePosition error:', err);
     return { success: false, error: (err as Error).message };
   }
+}
+
+// ============================================================================
+// Rebalance Position
+// ============================================================================
+
+/**
+ * Rebalance an existing LP position: close it and reopen centred on current price.
+ * Used when price drifts near range edge or goes out of range.
+ * @param positionMint  NFT mint of the position to rebalance
+ * @param rangeWidthPct total range width as % of current price (e.g. 20 = ±10%)
+ */
+export async function rebalancePosition(
+  positionMint: string,
+  rangeWidthPct?: number,
+): Promise<{ success: boolean; newPositionMint?: string; txSignature?: string; error?: string }> {
+  const env = getCFOEnv();
+  const width = rangeWidthPct ?? env.orcaLpRangeWidthPct ?? 20;
+
+  if (env.dryRun) {
+    logger.info(`[Orca] DRY RUN — would rebalance position ${positionMint.slice(0, 8)} with ±${width / 2}% range`);
+    return { success: true, newPositionMint: `dry-rebalance-${Date.now()}` };
+  }
+
+  logger.info(`[Orca] Rebalancing position ${positionMint.slice(0, 8)}… closing then reopening ±${width / 2}%`);
+
+  // Step 1: Close existing position — get back SOL + USDC
+  const closeResult = await closePosition(positionMint);
+  if (!closeResult.success) {
+    return { success: false, error: `Close failed: ${closeResult.error}` };
+  }
+
+  const usdcReceived = closeResult.usdcReceived ?? 0;
+  const solReceived = closeResult.solReceived ?? 0;
+
+  if (usdcReceived <= 0 && solReceived <= 0) {
+    logger.warn(`[Orca] Rebalance: position closed but got no tokens back (already empty?)`);
+    return { success: true, txSignature: closeResult.txSignature };
+  }
+
+  // Step 2: Reopen centred on current price using the tokens we got back
+  logger.info(`[Orca] Rebalance: reopening with ${solReceived.toFixed(6)} SOL + ${usdcReceived.toFixed(4)} USDC`);
+  const openResult = await openPosition(usdcReceived, solReceived, width);
+  if (!openResult.success) {
+    return { success: false, error: `Reopen failed: ${openResult.error} (closed OK, funds in wallet)` };
+  }
+
+  logger.info(`[Orca] Rebalance complete: old=${positionMint.slice(0, 8)} → new=${openResult.positionMint?.slice(0, 8)} ` +
+    `range $${openResult.lowerPrice?.toFixed(2)}-$${openResult.upperPrice?.toFixed(2)}`);
+  return {
+    success: true,
+    newPositionMint: openResult.positionMint,
+    txSignature: openResult.txSignature,
+  };
 }
 
 // ============================================================================
@@ -256,7 +430,8 @@ export async function closePosition(positionMint: string): Promise<OrcaCloseResu
  */
 export async function getPositions(): Promise<OrcaPosition[]> {
   try {
-    const { WhirlpoolContext, buildWhirlpoolClient, PriceMath } = await loadOrcaSdk();
+    const { WhirlpoolContext, buildWhirlpoolClient, PriceMath, PDAUtil,
+            ORCA_WHIRLPOOL_PROGRAM_ID } = await loadOrcaSdk();
     const { AnchorProvider, Wallet } = await loadAnchor();
 
     const walletKeypair = loadWallet();
@@ -269,35 +444,55 @@ export async function getPositions(): Promise<OrcaPosition[]> {
     const whirlpoolData = whirlpool.getData();
     const currentPrice = PriceMath.sqrtPriceX64ToPrice(whirlpoolData.sqrtPrice, 9, 6).toNumber();
 
-    // Fetch all positions owned by this wallet for this whirlpool
-    const positions = await (client as any).getPositionsByOwner(walletKeypair.publicKey);
+    // Enumerate all token accounts owned by the wallet to find position NFTs.
+    // Position NFTs have amount=1 and can be checked via PDA derivation.
+    const { TOKEN_PROGRAM_ID } = await import('@solana/spl-token' as string);
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+      walletKeypair.publicKey,
+      { programId: TOKEN_PROGRAM_ID },
+    );
+
     const result: OrcaPosition[] = [];
+    for (const { account } of tokenAccounts.value) {
+      const parsed = account.data.parsed?.info;
+      if (!parsed || parsed.tokenAmount?.uiAmount !== 1) continue; // NFTs have amount = 1
 
-    for (const pos of positions) {
-      const data = pos.getData();
-      const lowerPrice = PriceMath.tickIndexToPrice(data.tickLowerIndex, 9, 6).toNumber();
-      const upperPrice = PriceMath.tickIndexToPrice(data.tickUpperIndex, 9, 6).toNumber();
-      const inRange = currentPrice >= lowerPrice && currentPrice <= upperPrice;
+      const mintPk = new PublicKey(parsed.mint);
+      const positionPda = PDAUtil.getPosition(ORCA_WHIRLPOOL_PROGRAM_ID, mintPk);
 
-      // Range utilisation: 100% = exactly centred, 0% = at range edge
-      const midPrice = (lowerPrice + upperPrice) / 2;
-      const rangeHalf = (upperPrice - lowerPrice) / 2;
-      const distFromCentre = Math.abs(currentPrice - midPrice);
-      const rangeUtilisationPct = rangeHalf > 0
-        ? Math.max(0, (1 - distFromCentre / rangeHalf) * 100)
-        : 0;
+      try {
+        const position = await client.getPosition(positionPda.publicKey);
+        const data = position.getData();
 
-      result.push({
-        positionMint: pos.getAddress().toBase58(),
-        lowerPrice,
-        upperPrice,
-        currentPrice,
-        liquidityUsd: 0, // TODO: calculate from liquidity units + current prices
-        unclaimedFeesUsdc: 0, // TODO: fetch from fees_owed
-        unclaimedFeesSol: 0,
-        inRange,
-        rangeUtilisationPct,
-      });
+        // Only include positions for our SOL/USDC whirlpool
+        if (!data.whirlpool.equals(new PublicKey(SOL_USDC_WHIRLPOOL))) continue;
+
+        const lowerPrice = PriceMath.tickIndexToPrice(data.tickLowerIndex, 9, 6).toNumber();
+        const upperPrice = PriceMath.tickIndexToPrice(data.tickUpperIndex, 9, 6).toNumber();
+        const inRange = currentPrice >= lowerPrice && currentPrice <= upperPrice;
+
+        const midPrice = (lowerPrice + upperPrice) / 2;
+        const rangeHalf = (upperPrice - lowerPrice) / 2;
+        const distFromCentre = Math.abs(currentPrice - midPrice);
+        const rangeUtilisationPct = rangeHalf > 0
+          ? Math.max(0, (1 - distFromCentre / rangeHalf) * 100)
+          : 0;
+
+        result.push({
+          positionMint: parsed.mint,
+          lowerPrice,
+          upperPrice,
+          currentPrice,
+          liquidityUsd: 0,
+          unclaimedFeesUsdc: 0,
+          unclaimedFeesSol: 0,
+          inRange,
+          rangeUtilisationPct,
+        });
+      } catch {
+        // Not a Whirlpool position — skip
+        continue;
+      }
     }
 
     return result;

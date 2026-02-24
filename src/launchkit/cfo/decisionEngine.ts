@@ -1589,21 +1589,9 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       case 'ORCA_LP_REBALANCE': {
         const orca = await import('./orcaService.ts');
         const { positionMint, rangeWidthPct } = decision.params;
-        // Step 1: close existing
-        const closeResult = await orca.closePosition(positionMint);
-        if (!closeResult.success) {
-          return { ...base, executed: true, success: false, error: `Close failed: ${closeResult.error}` };
-        }
-        // Step 2: reopen centred on current price — use same USD value from close
-        const usdcReceived = closeResult.usdcReceived ?? 0;
-        const solReceived = closeResult.solReceived ?? 0;
-        if (usdcReceived > 0 || solReceived > 0) {
-          const openResult = await orca.openPosition(usdcReceived, solReceived, rangeWidthPct);
-          markDecision('ORCA_LP_OPEN'); // reuses OPEN cooldown
-          return { ...base, executed: true, success: openResult.success, txId: openResult.txSignature, error: openResult.error };
-        }
-        markDecision('ORCA_LP_OPEN');
-        return { ...base, executed: true, success: true, txId: closeResult.txSignature };
+        const result = await orca.rebalancePosition(positionMint, rangeWidthPct);
+        markDecision('ORCA_LP_OPEN'); // reuses OPEN cooldown
+        return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
       }
 
       case 'KAMINO_JITO_LOOP': {
