@@ -338,7 +338,7 @@ export class Supervisor extends BaseAgent {
         return;
       }
 
-      const warning = this.formatSafetyWarning(tokenName || tokenAddress, score, alerts || [], payload.type);
+      const warning = this.formatSafetyWarning(tokenName || tokenAddress, score, alerts || [], msg.payload.type);
 
       if (msg.priority === 'critical') {
         // CRITICAL: Post warning to X + TG + Farcaster immediately
