@@ -53,6 +53,12 @@ export type DecisionType =
   | 'REBALANCE_HEDGE'  // adjust hedge size to match current SOL exposure
   | 'POLY_BET'         // place a Polymarket prediction bet
   | 'POLY_EXIT'        // exit a Polymarket position (stop-loss / expiry)
+  | 'KAMINO_BORROW_DEPLOY'   // borrow USDC from Kamino and deploy into yield opportunity
+  | 'KAMINO_REPAY'           // repay Kamino borrow (scheduled, or LTV rising)
+  | 'KAMINO_JITO_LOOP'       // JitoSOL/SOL Multiply — leverage staking yield 2-3x
+  | 'KAMINO_JITO_UNWIND'     // unwind the JitoSOL loop (SOL borrow + JitoSOL position)
+  | 'ORCA_LP_OPEN'           // open a new concentrated LP position
+  | 'ORCA_LP_REBALANCE'      // close out-of-range position and reopen centred on new price
   | 'SKIP';            // no action taken (for logging)
 
 /** Approval tier determines whether CFO executes immediately or waits for admin */
@@ -141,6 +147,26 @@ export interface PortfolioState {
   hedgeRatio: number;             // hlTotalShortUsd / solExposureUsd (0 = unhedged, 1 = fully hedged)
   idleSolForStaking: number;      // SOL above reserve that could be staked
   timestamp: number;
+
+  // Kamino lending state
+  kaminoDepositValueUsd: number;     // total deposited collateral value
+  kaminoBorrowValueUsd: number;      // total outstanding borrows
+  kaminoNetValueUsd: number;         // deposit - borrow (net equity in Kamino)
+  kaminoLtv: number;                 // current LTV (0-1)
+  kaminoHealthFactor: number;        // health factor (>1.5 is safe, <1.2 is danger)
+  kaminoBorrowApy: number;           // current USDC borrow APY
+  kaminoSolBorrowApy: number;        // SOL borrow APY (for JitoSOL loop profitability)
+  kaminoJitoSupplyApy: number;       // JitoSOL supply APY (for loop profitability check)
+  kaminoUsdcSupplyApy: number;       // USDC supply APY (for simple loop deploy yield)
+  kaminoSupplyApy: number;           // current USDC supply APY (legacy alias)
+  kaminoBorrowableUsd: number;       // how much more we can borrow at max LTV
+  kaminoJitoLoopActive: boolean;     // true when JitoSOL deposits + SOL borrows are both present
+  kaminoJitoLoopApy: number;         // estimated current loop APY (0 if loop not active)
+
+  // Orca concentrated LP state
+  orcaLpValueUsd: number;            // total value in Orca LP positions
+  orcaLpFeeApy: number;              // estimated fee APY on current LP positions
+  orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean }>;
 }
 
 // ============================================================================
@@ -505,6 +531,66 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
   const reserveNeeded = Number(process.env.CFO_STAKE_RESERVE_SOL ?? 0.5);
   const idleSolForStaking = Math.max(0, solBalance - reserveNeeded);
 
+  // Kamino state
+  let kaminoDepositValueUsd = 0, kaminoBorrowValueUsd = 0, kaminoNetValueUsd = 0;
+  let kaminoLtv = 0, kaminoHealthFactor = 999, kaminoBorrowApy = 0.12, kaminoSupplyApy = 0.08;
+  let kaminoSolBorrowApy = 0.10, kaminoJitoSupplyApy = 0.07, kaminoUsdcSupplyApy = 0.08;
+  let kaminoBorrowableUsd = 0, kaminoJitoLoopActive = false, kaminoJitoLoopApy = 0;
+  if (env.kaminoEnabled) {
+    try {
+      const kamino = await import('./kaminoService.ts');
+      const [pos, apys] = await Promise.all([kamino.getPosition(), kamino.getApys()]);
+      kaminoDepositValueUsd = pos.deposits.reduce((s, d) => s + d.valueUsd, 0);
+      kaminoBorrowValueUsd  = pos.borrows.reduce((s, b) => s + b.valueUsd, 0);
+      kaminoNetValueUsd     = pos.netValueUsd;
+      kaminoLtv             = pos.ltv;
+      kaminoHealthFactor    = pos.healthFactor;
+      kaminoBorrowApy       = apys.USDC?.borrowApy    ?? 0.12;
+      kaminoSolBorrowApy    = apys.SOL?.borrowApy     ?? 0.10;
+      kaminoJitoSupplyApy   = apys.JitoSOL?.supplyApy ?? 0.07;
+      kaminoUsdcSupplyApy   = apys.USDC?.supplyApy    ?? 0.08;
+      kaminoSupplyApy       = kaminoUsdcSupplyApy;
+
+      // USDC borrowable headroom for simple collateral loop
+      const maxBorrowLtv = (env.kaminoBorrowMaxLtvPct ?? 60) / 100;
+      kaminoBorrowableUsd = Math.max(0, Math.min(
+        kaminoDepositValueUsd * maxBorrowLtv - kaminoBorrowValueUsd,
+        env.maxKaminoBorrowUsd - kaminoBorrowValueUsd,
+      ));
+
+      // Detect JitoSOL loop: has JitoSOL deposits AND SOL borrows simultaneously
+      const hasJitoDeposit = pos.deposits.some(d => d.asset === 'JitoSOL');
+      const hasSolBorrow   = pos.borrows.some(b => b.asset === 'SOL');
+      kaminoJitoLoopActive = hasJitoDeposit && hasSolBorrow;
+
+      if (kaminoJitoLoopActive) {
+        const jitoDepositUsd = pos.deposits.filter(d => d.asset === 'JitoSOL').reduce((s, d) => s + d.valueUsd, 0);
+        const leverage = kaminoNetValueUsd > 0 ? jitoDepositUsd / kaminoNetValueUsd : 1;
+        kaminoJitoLoopApy = leverage * kaminoJitoSupplyApy - (leverage - 1) * kaminoSolBorrowApy;
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // Orca LP state
+  let orcaLpValueUsd = 0, orcaLpFeeApy = 0;
+  let orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean }> = [];
+  if (env.orcaLpEnabled) {
+    try {
+      const orca = await import('./orcaService.ts');
+      const positions = await orca.getPositions();
+      orcaLpValueUsd = positions.reduce((s, p) => s + p.liquidityUsd, 0);
+      orcaPositions = positions.map(p => ({
+        positionMint: p.positionMint,
+        rangeUtilisationPct: p.rangeUtilisationPct,
+        inRange: p.inRange,
+      }));
+      // Orca 0.3% fee pool at full utilisation ≈ 20-40% APY depending on volume
+      // Conservative estimate: 15% if in-range, 0% if out-of-range
+      const inRangePositions = positions.filter(p => p.inRange).length;
+      orcaLpFeeApy = positions.length > 0 ? (inRangePositions / positions.length) * 0.15 : 0;
+    } catch { /* 0 */ }
+  }
+
   return {
     solBalance,
     solPriceUsd,
@@ -524,6 +610,22 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     hedgeRatio,
     idleSolForStaking,
     timestamp: Date.now(),
+    kaminoDepositValueUsd,
+    kaminoBorrowValueUsd,
+    kaminoNetValueUsd,
+    kaminoLtv,
+    kaminoHealthFactor,
+    kaminoBorrowApy,
+    kaminoSolBorrowApy,
+    kaminoJitoSupplyApy,
+    kaminoUsdcSupplyApy,
+    kaminoSupplyApy,
+    kaminoBorrowableUsd,
+    kaminoJitoLoopActive,
+    kaminoJitoLoopApy,
+    orcaLpValueUsd,
+    orcaLpFeeApy,
+    orcaPositions,
   };
 }
 
@@ -760,6 +862,188 @@ export async function generateDecisions(
     }
   }
 
+  // ── F) Simple collateral loop — borrow USDC, deploy for spread ───────────
+  if (
+    env.kaminoEnabled && env.kaminoBorrowEnabled &&
+    !state.kaminoJitoLoopActive &&           // don't double up — one active strategy at a time
+    state.kaminoBorrowableUsd >= 10 &&
+    state.kaminoHealthFactor > 1.8 &&
+    state.kaminoLtv < (env.kaminoBorrowMaxLtvPct / 100) * 0.85
+  ) {
+    if (checkCooldown('KAMINO_BORROW_DEPLOY', 6 * 3600_000)) {
+      const borrowCost = state.kaminoBorrowApy;
+      const estimatedDeployYield = intel.scoutBullish && env.polymarketEnabled && state.polyHeadroomUsd > 5
+        ? Math.max(state.kaminoUsdcSupplyApy, 0.18) // Polymarket expected ~18% if bullish
+        : state.kaminoUsdcSupplyApy;
+
+      const spreadPct = (estimatedDeployYield - borrowCost) * 100;
+      if (spreadPct >= (env.kaminoBorrowMinSpreadPct ?? 3)) {
+        const borrowUsd = Math.min(state.kaminoBorrowableUsd * 0.6, env.maxKaminoBorrowUsd * 0.5);
+        if (borrowUsd >= 10) {
+          const deployTarget = intel.scoutBullish && env.polymarketEnabled && state.polyHeadroomUsd >= borrowUsd
+            ? 'polymarket' : 'kamino_supply';
+          decisions.push({
+            type: 'KAMINO_BORROW_DEPLOY',
+            reasoning:
+              `Collateral loop: borrow $${borrowUsd.toFixed(0)} USDC at ${(borrowCost * 100).toFixed(1)}% → ` +
+              `deploy into ${deployTarget} at ~${(estimatedDeployYield * 100).toFixed(1)}%. ` +
+              `Spread: ${spreadPct.toFixed(1)}% | LTV: ${(state.kaminoLtv * 100).toFixed(1)}% | Health: ${state.kaminoHealthFactor.toFixed(2)}`,
+            params: { borrowUsd, deployTarget, borrowApy: borrowCost, deployApy: estimatedDeployYield, spreadPct },
+            urgency: 'low',
+            estimatedImpactUsd: borrowUsd * (spreadPct / 100),
+            intelUsed: intel.scoutBullish !== undefined ? ['scout'] : [],
+            tier: 'APPROVAL',
+          });
+        }
+      }
+    }
+  }
+
+  // ── G) JitoSOL/SOL Multiply loop ─────────────────────────────────────────
+  if (
+    env.kaminoEnabled && env.kaminoBorrowEnabled && env.kaminoJitoLoopEnabled &&
+    !state.kaminoJitoLoopActive &&
+    state.jitoSolBalance >= 0.1 &&          // need JitoSOL to start
+    state.kaminoHealthFactor > 2.0 &&       // comfortable position before leveraging
+    intel.marketCondition !== 'danger'       // don't lever up during market crises
+  ) {
+    if (checkCooldown('KAMINO_JITO_LOOP', 24 * 3600_000)) {
+      // Only initiate when spread is profitable
+      const loopSpread = state.kaminoJitoSupplyApy - state.kaminoSolBorrowApy;
+      if (loopSpread > 0.01) { // need at least 1% spread
+        const targetLtv = (env.kaminoJitoLoopTargetLtv ?? 65) / 100;
+        const leverage = 1 / (1 - targetLtv);
+        const estimatedApy = leverage * state.kaminoJitoSupplyApy - (leverage - 1) * state.kaminoSolBorrowApy;
+        const jitoSolToCommit = state.jitoSolBalance * 0.9; // leave 10% in wallet as buffer
+
+        decisions.push({
+          type: 'KAMINO_JITO_LOOP',
+          reasoning:
+            `JitoSOL/SOL Multiply: deposit ${jitoSolToCommit.toFixed(3)} JitoSOL + loop to ${(targetLtv * 100).toFixed(0)}% LTV ` +
+            `(~${leverage.toFixed(1)}x leverage). ` +
+            `JitoSOL supply: ${(state.kaminoJitoSupplyApy * 100).toFixed(1)}%, ` +
+            `SOL borrow: ${(state.kaminoSolBorrowApy * 100).toFixed(1)}%, ` +
+            `est. loop APY: ${(estimatedApy * 100).toFixed(1)}% ` +
+            `(vs ${(state.kaminoJitoSupplyApy * 100).toFixed(1)}% unlevered). ` +
+            `Market: ${intel.marketCondition}`,
+          params: {
+            jitoSolToDeposit: jitoSolToCommit,
+            targetLtv,
+            maxLoops: env.kaminoJitoLoopMaxLoops ?? 3,
+            solPriceUsd: state.solPriceUsd,
+            estimatedApy,
+          },
+          urgency: 'low',
+          estimatedImpactUsd: state.jitoSolValueUsd * (estimatedApy - state.kaminoJitoSupplyApy),
+          intelUsed: [],
+          tier: 'APPROVAL',
+        });
+      }
+    }
+  }
+
+  // ── H) Auto-repay / unwind — LTV breached or loop unprofitable ────────────
+  if (env.kaminoEnabled) {
+    const ltvBreached      = state.kaminoLtv > (env.kaminoBorrowMaxLtvPct / 100);
+    const healthDanger     = state.kaminoHealthFactor < 1.5;
+    const loopUnprofitable = state.kaminoJitoLoopActive && state.kaminoJitoLoopApy < 0;
+
+    if ((ltvBreached || healthDanger) && state.kaminoBorrowValueUsd > 0) {
+      const urgency: Decision['urgency'] = state.kaminoHealthFactor < 1.3 ? 'critical' : 'high';
+
+      if (state.kaminoJitoLoopActive) {
+        // JitoSOL loop: correct response is full unwind (can't just repay USDC — borrow is SOL)
+        decisions.push({
+          type: 'KAMINO_JITO_UNWIND',
+          reasoning:
+            `JitoSOL loop health degrading — LTV ${(state.kaminoLtv * 100).toFixed(1)}%, ` +
+            `health factor ${state.kaminoHealthFactor.toFixed(2)}. Unwinding loop.`,
+          params: {},
+          urgency,
+          estimatedImpactUsd: state.kaminoBorrowValueUsd,
+          intelUsed: [],
+          tier: urgency === 'critical' ? 'AUTO' : 'NOTIFY',
+        });
+      } else {
+        // Simple loop: repay USDC to bring LTV back to 40%
+        const targetLtv = 0.40;
+        const repayUsd = Math.max(0, state.kaminoBorrowValueUsd - state.kaminoDepositValueUsd * targetLtv);
+        if (repayUsd > 0) {
+          decisions.push({
+            type: 'KAMINO_REPAY',
+            reasoning:
+              `Kamino LTV ${(state.kaminoLtv * 100).toFixed(1)}% (health: ${state.kaminoHealthFactor.toFixed(2)}) — ` +
+              `repaying $${repayUsd.toFixed(0)} USDC to bring LTV to ${targetLtv * 100}%`,
+            params: { repayUsd, repayAsset: 'USDC' },
+            urgency,
+            estimatedImpactUsd: repayUsd,
+            intelUsed: [],
+            tier: urgency === 'critical' ? 'AUTO' : 'NOTIFY',
+          });
+        }
+      }
+    } else if (loopUnprofitable && checkCooldown('KAMINO_JITO_UNWIND', 12 * 3600_000)) {
+      decisions.push({
+        type: 'KAMINO_JITO_UNWIND',
+        reasoning:
+          `JitoSOL loop unprofitable — current APY ${(state.kaminoJitoLoopApy * 100).toFixed(1)}% ` +
+          `(SOL borrow rate exceeds JitoSOL staking yield). Unwinding.`,
+        params: {},
+        urgency: 'low',
+        estimatedImpactUsd: 0,
+        intelUsed: [],
+        tier: 'NOTIFY',
+      });
+    }
+  }
+
+  // ── I) Orca Concentrated LP ───────────────────────────────────────────────
+  if (env.orcaLpEnabled && intel.marketCondition !== 'bearish' && intel.marketCondition !== 'danger') {
+    const orcaHeadroomUsd = Math.max(0, env.orcaLpMaxUsd - state.orcaLpValueUsd);
+
+    // I1: Open new position if we have capital and no active LP
+    if (
+      orcaHeadroomUsd >= 20 &&
+      state.orcaPositions.length === 0 &&
+      checkCooldown('ORCA_LP_OPEN', 24 * 3600_000)
+    ) {
+      const deployUsd = Math.min(orcaHeadroomUsd, state.polyUsdcBalance * 0.3);
+      if (deployUsd >= 20) {
+        const solSide = deployUsd / 2 / state.solPriceUsd;
+        const usdcSide = deployUsd / 2;
+        decisions.push({
+          type: 'ORCA_LP_OPEN',
+          reasoning:
+            `Opening Orca SOL/USDC concentrated LP: $${deployUsd.toFixed(0)} total ` +
+            `(${usdcSide.toFixed(0)} USDC + ${solSide.toFixed(3)} SOL) at ±${env.orcaLpRangeWidthPct / 2}% range. ` +
+            `Estimated fee APY: ~15-25% while in-range.`,
+          params: { usdcAmount: usdcSide, solAmount: solSide, rangeWidthPct: env.orcaLpRangeWidthPct },
+          urgency: 'low',
+          estimatedImpactUsd: deployUsd * 0.18,
+          intelUsed: [],
+          tier: 'APPROVAL',
+        });
+      }
+    }
+
+    // I2: Rebalance out-of-range or near-edge positions
+    for (const pos of state.orcaPositions) {
+      if (!pos.inRange || pos.rangeUtilisationPct < env.orcaLpRebalanceTriggerPct) {
+        decisions.push({
+          type: 'ORCA_LP_REBALANCE',
+          reasoning:
+            `Orca LP ${pos.positionMint.slice(0, 8)} ${pos.inRange ? 'near range edge' : 'OUT OF RANGE'} ` +
+            `(utilisation: ${pos.rangeUtilisationPct.toFixed(0)}%). Closing and reopening centred on current price.`,
+          params: { positionMint: pos.positionMint, rangeWidthPct: env.orcaLpRangeWidthPct },
+          urgency: pos.inRange ? 'low' : 'medium',
+          estimatedImpactUsd: 0,
+          intelUsed: [],
+          tier: 'NOTIFY',
+        });
+      }
+    }
+  }
+
   // Sort by urgency: critical > high > medium > low
   const urgencyOrder: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
   decisions.sort((a, b) => urgencyOrder[a.urgency] - urgencyOrder[b.urgency]);
@@ -984,6 +1268,120 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       case 'SKIP':
         return { ...base, executed: false, success: true };
 
+      case 'KAMINO_BORROW_DEPLOY': {
+        const kamino = await import('./kaminoService.ts');
+        const { borrowUsd, deployTarget } = decision.params;
+
+        // Step 1: Borrow USDC from Kamino
+        const borrowResult = await kamino.borrow('USDC', borrowUsd);
+        if (!borrowResult.success) {
+          return { ...base, executed: true, success: false, error: `Borrow failed: ${borrowResult.error}` };
+        }
+
+        // Step 2: Deploy borrowed USDC
+        let deploySuccess = false;
+        let deployTxId: string | undefined;
+
+        if (deployTarget === 'kamino_supply') {
+          // Re-deposit the borrowed USDC back into Kamino USDC supply (recursive yield — valid strategy)
+          const depositResult = await kamino.deposit('USDC', borrowUsd * 0.995); // small buffer for fees
+          deploySuccess = depositResult.success;
+          deployTxId = depositResult.txSignature;
+        } else if (deployTarget === 'polymarket') {
+          // Route to Polymarket — the decision engine will pick up USDC headroom on next cycle
+          // USDC is now in the wallet ready for Polymarket deployment
+          deploySuccess = true;
+          deployTxId = borrowResult.txSignature;
+          logger.info(`[CFO:KAMINO_BORROW_DEPLOY] $${borrowUsd} USDC borrowed and ready for Polymarket deployment`);
+        }
+
+        markDecision('KAMINO_BORROW_DEPLOY');
+        return {
+          ...base,
+          executed: true,
+          success: deploySuccess,
+          txId: deployTxId,
+          error: deploySuccess ? undefined : 'Borrow succeeded but deploy failed — USDC is in wallet, repay manually if needed',
+        };
+      }
+
+      case 'KAMINO_REPAY': {
+        const kamino = await import('./kaminoService.ts');
+        const { repayUsd } = decision.params;
+        const result = await kamino.repay('USDC', repayUsd);
+        markDecision('KAMINO_REPAY');
+        return {
+          ...base,
+          executed: true,
+          success: result.success,
+          txId: result.txSignature,
+          error: result.error,
+        };
+      }
+
+      case 'ORCA_LP_OPEN': {
+        const orca = await import('./orcaService.ts');
+        const { usdcAmount, solAmount, rangeWidthPct } = decision.params;
+        const result = await orca.openPosition(usdcAmount, solAmount, rangeWidthPct);
+        markDecision('ORCA_LP_OPEN');
+        return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
+      }
+
+      case 'ORCA_LP_REBALANCE': {
+        const orca = await import('./orcaService.ts');
+        const { positionMint, rangeWidthPct } = decision.params;
+        // Step 1: close existing
+        const closeResult = await orca.closePosition(positionMint);
+        if (!closeResult.success) {
+          return { ...base, executed: true, success: false, error: `Close failed: ${closeResult.error}` };
+        }
+        // Step 2: reopen centred on current price — use same USD value from close
+        const usdcReceived = closeResult.usdcReceived ?? 0;
+        const solReceived = closeResult.solReceived ?? 0;
+        if (usdcReceived > 0 || solReceived > 0) {
+          const openResult = await orca.openPosition(usdcReceived, solReceived, rangeWidthPct);
+          markDecision('ORCA_LP_OPEN'); // reuses OPEN cooldown
+          return { ...base, executed: true, success: openResult.success, txId: openResult.txSignature, error: openResult.error };
+        }
+        markDecision('ORCA_LP_OPEN');
+        return { ...base, executed: true, success: true, txId: closeResult.txSignature };
+      }
+
+      case 'KAMINO_JITO_LOOP': {
+        const kamino = await import('./kaminoService.ts');
+        const { jitoSolToDeposit, targetLtv, maxLoops, solPriceUsd } = decision.params;
+
+        // Step 1: Deposit initial JitoSOL as collateral
+        const depositResult = await kamino.deposit('JitoSOL', jitoSolToDeposit);
+        if (!depositResult.success) {
+          return { ...base, executed: true, success: false, error: `Initial JitoSOL deposit failed: ${depositResult.error}` };
+        }
+
+        // Step 2: Execute the multiply loop
+        const loopResult = await kamino.loopJitoSol(targetLtv, maxLoops, solPriceUsd);
+        markDecision('KAMINO_JITO_LOOP');
+        return {
+          ...base,
+          executed: true,
+          success: loopResult.success,
+          txId: loopResult.txSignatures?.[0],
+          error: loopResult.error,
+        };
+      }
+
+      case 'KAMINO_JITO_UNWIND': {
+        const kamino = await import('./kaminoService.ts');
+        const unwindResult = await kamino.unwindJitoSolLoop();
+        markDecision('KAMINO_JITO_UNWIND');
+        return {
+          ...base,
+          executed: true,
+          success: unwindResult.success,
+          txId: unwindResult.txSignatures?.[0],
+          error: unwindResult.error,
+        };
+      }
+
       default:
         return { ...base, executed: false, error: `Unknown decision type: ${decision.type}` };
     }
@@ -1014,6 +1412,12 @@ export function formatDecisionReport(
     UNSTAKE_JITO: 'Unstake JitoSOL',
     POLY_BET: 'Prediction Bet',
     POLY_EXIT: 'Close Prediction',
+    KAMINO_BORROW_DEPLOY: 'Kamino Borrow+Deploy',
+    KAMINO_REPAY: 'Kamino Repay',
+    KAMINO_JITO_LOOP: 'JitoSOL Multiply Loop',
+    KAMINO_JITO_UNWIND: 'JitoSOL Loop Unwind',
+    ORCA_LP_OPEN: 'Orca LP Open',
+    ORCA_LP_REBALANCE: 'Orca LP Rebalance',
     SKIP: 'No Action',
   };
 
@@ -1092,6 +1496,20 @@ function _shortReason(d: Decision): string {
     }
     case 'POLY_EXIT':
       return `Exit prediction position`;
+    case 'KAMINO_BORROW_DEPLOY': {
+      const target = p.deployTarget === 'polymarket' ? 'Polymarket' : 'Kamino supply';
+      return `Borrow $${p.borrowUsd?.toFixed(0) ?? '?'} USDC → ${target} (spread ${p.spreadPct?.toFixed(1) ?? '?'}%)`;
+    }
+    case 'KAMINO_REPAY':
+      return `Repay $${p.repayUsd?.toFixed(0) ?? '?'} USDC (LTV management)`;
+    case 'KAMINO_JITO_LOOP':
+      return `JitoSOL loop ${p.jitoSolToDeposit?.toFixed(2) ?? '?'} JitoSOL → ${((p.targetLtv ?? 0.65) * 100).toFixed(0)}% LTV (est. ${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY)`;
+    case 'KAMINO_JITO_UNWIND':
+      return `Unwind JitoSOL/SOL multiply loop`;
+    case 'ORCA_LP_OPEN':
+      return `SOL/USDC LP $${((p.usdcAmount ?? 0) * 2).toFixed(0)} ±${(p.rangeWidthPct ?? 20) / 2}% range`;
+    case 'ORCA_LP_REBALANCE':
+      return `Rebalance LP ${(p.positionMint ?? '').slice(0, 8)} to current price`;
     default:
       return d.reasoning.length > 80 ? d.reasoning.slice(0, 77) + '…' : d.reasoning;
   }

@@ -57,6 +57,18 @@ export interface CFOEnv {
   // ── Kamino ────────────────────────────────────────────────────────
   maxKaminoUsd: number;
   kaminoMaxLtvPct: number;                        // never borrow above this LTV (default 60)
+  kaminoBorrowEnabled: boolean;                   // enable/disable borrowing (default false)
+  kaminoBorrowMaxLtvPct: number;                  // max LTV when borrowing (default 50 — tighter than deposit cap)
+  kaminoBorrowMinSpreadPct: number;               // minimum yield spread to justify borrowing (default 3%)
+  maxKaminoBorrowUsd: number;                     // hard cap on total borrowed value in USD (default 500)
+  kaminoJitoLoopEnabled: boolean;                  // enable JitoSOL/SOL Multiply loop (default false)
+  kaminoJitoLoopTargetLtv: number;                 // target LTV % for the loop (default 65)
+  kaminoJitoLoopMaxLoops: number;                  // max iterations (default 3, ~2.85x leverage at 65% LTV)
+  // ── Orca Concentrated LP ──────────────────────────────────────────
+  orcaLpEnabled: boolean;                         // enable Orca concentrated LP (default false)
+  orcaLpRangeWidthPct: number;                    // range width as % of current price (default 20%)
+  orcaLpMaxUsd: number;                           // max USD deployed into Orca LP (default 500)
+  orcaLpRebalanceTriggerPct: number;              // rebalance when price within X% of range edge (default 5%)
 
   // ── Jito ─────────────────────────────────────────────────────────
   maxJitoSol: number;                             // max SOL to stake in Jito
@@ -146,6 +158,17 @@ export function getCFOEnv(bust = false): CFOEnv {
 
     maxKaminoUsd: Number(process.env.CFO_MAX_KAMINO_USD ?? 1000),
     kaminoMaxLtvPct: Number(process.env.CFO_KAMINO_MAX_LTV_PCT ?? 60),
+    kaminoBorrowEnabled: process.env.CFO_KAMINO_BORROW_ENABLE === 'true',
+    kaminoBorrowMaxLtvPct: Number(process.env.CFO_KAMINO_BORROW_MAX_LTV_PCT ?? 50),
+    kaminoBorrowMinSpreadPct: Number(process.env.CFO_KAMINO_BORROW_MIN_SPREAD_PCT ?? 3),
+    maxKaminoBorrowUsd: Number(process.env.CFO_MAX_KAMINO_BORROW_USD ?? 500),
+    kaminoJitoLoopEnabled: process.env.CFO_KAMINO_JITO_LOOP_ENABLE === 'true',
+    kaminoJitoLoopTargetLtv: Number(process.env.CFO_KAMINO_JITO_LOOP_TARGET_LTV ?? 65),
+    kaminoJitoLoopMaxLoops: Number(process.env.CFO_KAMINO_JITO_LOOP_MAX_LOOPS ?? 3),
+    orcaLpEnabled: process.env.CFO_ORCA_LP_ENABLE === 'true',
+    orcaLpRangeWidthPct: Number(process.env.CFO_ORCA_LP_RANGE_WIDTH_PCT ?? 20),
+    orcaLpMaxUsd: Number(process.env.CFO_ORCA_LP_MAX_USD ?? 500),
+    orcaLpRebalanceTriggerPct: Number(process.env.CFO_ORCA_LP_REBALANCE_TRIGGER_PCT ?? 5),
 
     maxJitoSol: Number(process.env.CFO_MAX_JITO_SOL ?? 5),
 

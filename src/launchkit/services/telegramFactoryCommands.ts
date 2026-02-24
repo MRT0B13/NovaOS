@@ -289,6 +289,59 @@ export async function registerFactoryCommands(
             await ctx.reply(`✅ Approval sent for ${approvalId}.`);
             break;
           }
+          case 'borrow': {
+            const borrowAmt = parseFloat(parts[1]);
+            if (!borrowAmt || borrowAmt <= 0) { await ctx.reply('Usage: /cfo borrow <USD amount>'); break; }
+            await sendToCFO('cfo_kamino_borrow', { amount: borrowAmt });
+            await ctx.reply(`⏳ CFO: Requesting Kamino borrow of $${borrowAmt} USDC...`);
+            break;
+          }
+          case 'repay': {
+            const repayAll = parts[1] === 'all';
+            const repayAmt = repayAll ? Infinity : parseFloat(parts[1]);
+            if (!repayAll && (!repayAmt || repayAmt <= 0)) { await ctx.reply('Usage: /cfo repay <USD amount|all>'); break; }
+            await sendToCFO('cfo_kamino_repay', { amount: repayAll ? 'all' : repayAmt });
+            await ctx.reply(`⏳ CFO: Repaying ${repayAll ? 'all' : `$${repayAmt}`} USDC borrow...`);
+            break;
+          }
+          case 'lp': {
+            const lpSub = (parts[1] || '').toLowerCase();
+            if (lpSub === 'open') {
+              const lpUsd = parseFloat(parts[2]);
+              if (!lpUsd || lpUsd <= 0) { await ctx.reply('Usage: /cfo lp open <USD amount>'); break; }
+              await sendToCFO('cfo_orca_open', { usdAmount: lpUsd });
+              await ctx.reply(`⏳ CFO: Opening Orca LP with $${lpUsd}...`);
+            } else if (lpSub === 'close') {
+              const pmint = parts[2];
+              if (!pmint) { await ctx.reply('Usage: /cfo lp close <positionMint>'); break; }
+              await sendToCFO('cfo_orca_close', { positionMint: pmint });
+              await ctx.reply('⏳ CFO: Closing Orca LP position...');
+            } else if (lpSub === 'status') {
+              await sendToCFO('cfo_orca_status', {});
+              await ctx.reply('⏳ Fetching Orca LP status...');
+            } else {
+              await ctx.reply('Usage: /cfo lp <open|close|status> [args]');
+            }
+            break;
+          }
+          case 'loop': {
+            const loopSub = (parts[1] || '').toLowerCase();
+            if (loopSub === 'start') {
+              const targetLtv = parseFloat(parts[2]) || 65;
+              const maxLoops = parseInt(parts[3]) || 3;
+              await sendToCFO('cfo_kamino_jito_loop', { targetLtv, maxLoops });
+              await ctx.reply(`⏳ CFO: Starting JitoSOL multiply loop (target LTV: ${targetLtv}%, max loops: ${maxLoops})...`);
+            } else if (loopSub === 'stop' || loopSub === 'unwind') {
+              await sendToCFO('cfo_kamino_jito_unwind', {});
+              await ctx.reply('⏳ CFO: Unwinding JitoSOL/SOL multiply loop...');
+            } else if (loopSub === 'status') {
+              await sendToCFO('cfo_kamino_loop_status', {});
+              await ctx.reply('⏳ Fetching JitoSOL loop status...');
+            } else {
+              await ctx.reply('Usage: /cfo loop <start|stop|status> [targetLtv] [maxLoops]');
+            }
+            break;
+          }
           default:
             await ctx.reply(
               `🏦 *CFO Commands:*\n` +
@@ -299,7 +352,11 @@ export async function registerFactoryCommands(
               `/cfo close poly|hl|all — Emergency close\n` +
               `/cfo stake <SOL> — Stake via Jito\n` +
               `/cfo hedge <USD> [leverage] — SOL hedge\n` +
-              `/cfo approve <id> — Approve pending trade`,
+              `/cfo approve <id> — Approve pending trade\n` +
+              `/cfo borrow <USD> — Borrow USDC from Kamino\n` +
+              `/cfo repay <USD|all> — Repay Kamino borrow\n` +
+              `/cfo lp open|close|status — Orca LP\n` +
+              `/cfo loop start|stop|status — JitoSOL loop`,
               { parse_mode: 'Markdown' }
             );
         }

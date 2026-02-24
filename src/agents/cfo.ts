@@ -1055,6 +1055,121 @@ export class CFOAgent extends BaseAgent {
         break;
       }
 
+      case 'cfo_kamino_borrow': {
+        const { amount } = payload;
+        if (amount > 0) {
+          const result = await (await kamino()).borrow('USDC', amount);
+          await notify(result.success
+            ? `✅ Borrowed $${amount} USDC from Kamino (tx: ${result.txSignature?.slice(0, 12)}…)`
+            : `❌ Borrow failed: ${result.error}`);
+        } else {
+          await notify('Usage: /cfo borrow <USD amount>');
+        }
+        break;
+      }
+
+      case 'cfo_kamino_repay': {
+        const { amount } = payload;
+        const repayAmount = amount === Infinity || amount === 'all' ? Infinity : Number(amount);
+        const result = await (await kamino()).repay('USDC', repayAmount);
+        await notify(result.success
+          ? `✅ Repaid ${isFinite(repayAmount) ? `$${repayAmount}` : 'all'} USDC to Kamino (tx: ${result.txSignature?.slice(0, 12)}…)`
+          : `❌ Repay failed: ${result.error}`);
+        break;
+      }
+
+      case 'cfo_orca_open': {
+        const { usdAmount } = payload;
+        if (usdAmount > 0) {
+          const orca = await import('../launchkit/cfo/orcaService.ts');
+          // Split 50/50 between USDC and SOL side
+          const pyth = await import('../launchkit/cfo/pythOracleService.ts');
+          const solPrice = await pyth.getSolPrice().catch(() => 85);
+          const usdcSide = usdAmount / 2;
+          const solSide = usdAmount / 2 / solPrice;
+          const result = await orca.openPosition(usdcSide, solSide);
+          await notify(result.success
+            ? `✅ Opened Orca LP: $${usdAmount} (${result.positionMint?.slice(0, 8)}…) range $${result.lowerPrice?.toFixed(2)}-$${result.upperPrice?.toFixed(2)}`
+            : `❌ Orca LP open failed: ${result.error}`);
+        }
+        break;
+      }
+
+      case 'cfo_orca_close': {
+        const { positionMint } = payload;
+        if (positionMint) {
+          const orca = await import('../launchkit/cfo/orcaService.ts');
+          const result = await orca.closePosition(positionMint);
+          await notify(result.success
+            ? `✅ Closed Orca LP position ${positionMint.slice(0, 8)}…`
+            : `❌ Orca LP close failed: ${result.error}`);
+        } else {
+          await notify('Usage: /cfo lp close <positionMint>');
+        }
+        break;
+      }
+
+      case 'cfo_orca_status': {
+        const orca = await import('../launchkit/cfo/orcaService.ts');
+        const positions = await orca.getPositions();
+        if (positions.length === 0) {
+          await notify('📊 No active Orca LP positions.');
+        } else {
+          const lines = positions.map(p =>
+            `• ${p.positionMint.slice(0, 8)}… | $${p.lowerPrice.toFixed(2)}-$${p.upperPrice.toFixed(2)} | ` +
+            `${p.inRange ? '✅ in-range' : '⚠️ out-of-range'} | util: ${p.rangeUtilisationPct.toFixed(0)}%`
+          );
+          await notify(`📊 *Orca LP Positions:*\n${lines.join('\n')}`);
+        }
+        break;
+      }
+
+      case 'cfo_kamino_jito_loop': {
+        const kaminoMod = await kamino();
+        const { targetLtv = 65, maxLoops = 3 } = payload;
+        const pyth = await import('../launchkit/cfo/pythOracleService.ts');
+        const solPrice = await pyth.getSolPrice().catch(() => 80);
+        await notify(`⏳ Starting JitoSOL/SOL multiply loop (target LTV: ${targetLtv}%, max loops: ${maxLoops})...`);
+        const result = await kaminoMod.loopJitoSol(targetLtv / 100, maxLoops, solPrice);
+        await notify(result.success
+          ? `✅ JitoSOL loop complete — ${result.loopsExecuted ?? '?'} loops, final LTV: ${((result.finalLtv ?? 0) * 100).toFixed(1)}%`
+          : `❌ JitoSOL loop failed: ${result.error}`);
+        break;
+      }
+
+      case 'cfo_kamino_jito_unwind': {
+        const kaminoMod = await kamino();
+        await notify('⏳ Unwinding JitoSOL/SOL multiply loop...');
+        const result = await kaminoMod.unwindJitoSolLoop();
+        await notify(result.success
+          ? `✅ JitoSOL loop unwound — ${result.stepsExecuted ?? '?'} steps completed`
+          : `❌ JitoSOL unwind failed: ${result.error}`);
+        break;
+      }
+
+      case 'cfo_kamino_loop_status': {
+        const kaminoMod = await kamino();
+        const pos = await kaminoMod.getPosition();
+        if (!pos.success) {
+          await notify(`❌ Could not fetch Kamino position: ${pos.error}`);
+        } else {
+          const hasLoop = (pos.deposits?.JitoSOL ?? 0) > 0 && (pos.borrows?.SOL ?? 0) > 0;
+          if (hasLoop) {
+            const leverage = 1 / (1 - pos.ltv);
+            await notify(
+              `🔄 *JitoSOL Loop Status:*\n` +
+              `JitoSOL deposited: ${pos.deposits?.JitoSOL?.toFixed(4) ?? '0'}\n` +
+              `SOL borrowed: ${pos.borrows?.SOL?.toFixed(4) ?? '0'}\n` +
+              `LTV: ${(pos.ltv * 100).toFixed(1)}% | Health: ${pos.healthFactor?.toFixed(2) ?? 'N/A'}\n` +
+              `Effective leverage: ~${leverage.toFixed(1)}x`
+            );
+          } else {
+            await notify('📊 No active JitoSOL/SOL multiply loop detected.');
+          }
+        }
+        break;
+      }
+
       case 'cfo_hedge': {
         const { solExposureUsd, leverage } = payload;
         if (solExposureUsd > 0) {

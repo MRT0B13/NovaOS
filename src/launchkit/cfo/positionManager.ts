@@ -32,6 +32,9 @@ export const STRATEGY_CAPS: Record<PositionStrategy, { maxPortfolioFraction: num
   kamino:        { maxPortfolioFraction: 0.30, leverage: 1 },   // 30%
   jito:          { maxPortfolioFraction: 0.25, leverage: 1 },   // 25%
   jupiter_swap:  { maxPortfolioFraction: 0.10, leverage: 1 },   // 10%
+  kamino_loop:      { maxPortfolioFraction: 0.15, leverage: 1 },   // 15% collateral loop
+  kamino_jito_loop: { maxPortfolioFraction: 0.20, leverage: 3 },   // 20% JitoSOL multiply
+  orca_lp:          { maxPortfolioFraction: 0.15, leverage: 1 },   // 15% concentrated LP
 };
 
 // ============================================================================
