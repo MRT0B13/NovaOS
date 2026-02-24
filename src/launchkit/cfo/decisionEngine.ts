@@ -1051,7 +1051,11 @@ export async function generateDecisions(
 
       try {
         const polyMod = await import('./polymarketService.ts');
-        const opps = await polyMod.scanOpportunities(state.polyHeadroomUsd, scoutCtx);
+
+        // Use a floor bankroll of $100 for Kelly sizing so small wallet balances still
+        // produce sensible bet fractions. Actual bets are always capped to what's available.
+        const kellyBankroll = Math.max(state.polyHeadroomUsd, 100);
+        const opps = await polyMod.scanOpportunities(kellyBankroll, scoutCtx);
 
         // Take top 2 opportunities and create decisions
         for (const opp of opps.slice(0, 2)) {
@@ -1063,8 +1067,9 @@ export async function generateDecisions(
           // Skip if intel adjustment killed the edge
           if (adjustedEdge < 0.03) continue;
 
-          const betUsd = Math.min(opp.recommendedUsd, env.maxSingleBetUsd);
-          if (betUsd < 2) continue;
+          // Cap to actual available balance — kelly reference bankroll is just for sizing math
+          const betUsd = Math.min(opp.recommendedUsd, state.polyHeadroomUsd, env.maxSingleBetUsd);
+          if (betUsd < 1) continue;   // lowered from $2 — small wallet shouldn't kill all bets
 
           const d: Decision = {
             type: 'POLY_BET',
@@ -1143,13 +1148,31 @@ export async function generateDecisions(
     }
   }
 
+  // Section F skip diagnostics
+  if (env.kaminoEnabled && env.kaminoBorrowEnabled) {
+    if (state.kaminoBorrowableUsd < 10) {
+      logger.debug(`[CFO:Decision] Section F skip: kaminoBorrowableUsd=$${state.kaminoBorrowableUsd.toFixed(0)} (need ≥$10) | deposits=$${state.kaminoDepositValueUsd.toFixed(0)}`);
+    } else if (state.kaminoHealthFactor <= 1.8) {
+      logger.debug(`[CFO:Decision] Section F skip: healthFactor=${state.kaminoHealthFactor.toFixed(2)} (need >1.8)`);
+    }
+  } else if (env.kaminoEnabled && !env.kaminoBorrowEnabled) {
+    logger.debug('[CFO:Decision] Section F skip: CFO_KAMINO_BORROW_ENABLE=false');
+  }
+
   // ── G) JitoSOL/SOL Multiply loop ─────────────────────────────────────────
+  // Available JitoSOL: already staked OR can stake from wallet this cycle
+  const jitoSolAvailable = state.jitoSolBalance >= 0.1
+    ? state.jitoSolBalance
+    : state.idleSolForStaking >= 0.1
+      ? state.idleSolForStaking * 0.9   // 90% of idle wallet SOL (leave buffer)
+      : 0;
+
   if (
     env.kaminoEnabled && env.kaminoBorrowEnabled && env.kaminoJitoLoopEnabled &&
     !state.kaminoJitoLoopActive &&
-    state.jitoSolBalance >= 0.1 &&          // need JitoSOL to start
-    state.kaminoHealthFactor > 2.0 &&       // comfortable position before leveraging
-    intel.marketCondition !== 'danger'       // don't lever up during market crises
+    jitoSolAvailable >= 0.1 &&              // JitoSOL staked OR enough wallet SOL to stake
+    state.kaminoHealthFactor > 2.0 &&
+    intel.marketCondition !== 'danger'
   ) {
     if (checkCooldown('KAMINO_JITO_LOOP', 24 * 3600_000)) {
       // Only initiate when spread is profitable
@@ -1158,7 +1181,8 @@ export async function generateDecisions(
         const targetLtv = (env.kaminoJitoLoopTargetLtv ?? 65) / 100;
         const leverage = 1 / (1 - targetLtv);
         const estimatedApy = leverage * state.kaminoJitoSupplyApy - (leverage - 1) * state.kaminoSolBorrowApy;
-        const jitoSolToCommit = state.jitoSolBalance * 0.9; // leave 10% in wallet as buffer
+        const jitoSolToCommit = jitoSolAvailable;
+        const needsStakeFirst = state.jitoSolBalance < 0.1; // stake from wallet before looping
 
         decisions.push({
           type: 'KAMINO_JITO_LOOP',
@@ -1172,6 +1196,7 @@ export async function generateDecisions(
             `Market: ${intel.marketCondition}`,
           params: {
             jitoSolToDeposit: jitoSolToCommit,
+            needsStakeFirst,
             targetLtv,
             maxLoops: env.kaminoJitoLoopMaxLoops ?? 3,
             solPriceUsd: state.solPriceUsd,
@@ -1183,6 +1208,15 @@ export async function generateDecisions(
           tier: 'APPROVAL',
         });
       }
+    }
+  }
+
+  // Section G skip diagnostics
+  if (env.kaminoEnabled && env.kaminoJitoLoopEnabled) {
+    if (jitoSolAvailable < 0.1) {
+      logger.debug(`[CFO:Decision] Section G skip: jitoSolBalance=${state.jitoSolBalance.toFixed(4)}, idleSol=${state.idleSolForStaking.toFixed(4)} (need ≥0.1 combined)`);
+    } else if (state.kaminoHealthFactor <= 2.0) {
+      logger.debug(`[CFO:Decision] Section G skip: healthFactor=${state.kaminoHealthFactor.toFixed(2)} (need >2.0)`);
     }
   }
 
@@ -1268,7 +1302,6 @@ export async function generateDecisions(
       } else {
         const deployUsd = Math.min(
           orcaHeadroomUsd,
-          state.polyUsdcBalance * 0.3,
           needsSol ? solAvailableUsd * 2 * 0.8 : Infinity, // cap to 80% of available SOL×2 for SOL/USDC
         );
         if (deployUsd >= 20) {
@@ -1621,7 +1654,19 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
       case 'KAMINO_JITO_LOOP': {
         const kamino = await import('./kaminoService.ts');
-        const { jitoSolToDeposit, targetLtv, maxLoops, solPriceUsd } = decision.params;
+        const { jitoSolToDeposit, needsStakeFirst, targetLtv, maxLoops, solPriceUsd } = decision.params;
+
+        // If bootstrapping from wallet SOL: stake it first to get JitoSOL, then loop
+        if (needsStakeFirst) {
+          const jito = await import('./jitoStakingService.ts');
+          const stakeResult = await jito.stakeSol(jitoSolToDeposit);
+          if (!stakeResult.success) {
+            return { ...base, executed: true, success: false, error: `Pre-loop stake failed: ${stakeResult.error}` };
+          }
+          logger.info(`[CFO] Pre-loop stake: ${jitoSolToDeposit.toFixed(4)} SOL → JitoSOL | tx: ${stakeResult.txSignature}`);
+          // Brief wait for stake to settle
+          await new Promise(r => setTimeout(r, 3000));
+        }
 
         // Step 1: Deposit initial JitoSOL as collateral
         const depositResult = await kamino.deposit('JitoSOL', jitoSolToDeposit);
@@ -1813,6 +1858,13 @@ export async function runDecisionCycle(pool?: any): Promise<{
     `[CFO:Decision] Portfolio: $${state.totalPortfolioUsd.toFixed(0)} | ` +
     `SOL: ${state.solBalance.toFixed(2)} ($${state.solExposureUsd.toFixed(0)}) | ` +
     `hedge: ${(state.hedgeRatio * 100).toFixed(0)}% | HL equity: $${state.hlEquity.toFixed(0)}`,
+  );
+  logger.debug(
+    `[CFO:Decision] Strategy state | ` +
+    `kaminoDeposits:$${state.kaminoDepositValueUsd.toFixed(0)} borrowable:$${state.kaminoBorrowableUsd.toFixed(0)} health:${state.kaminoHealthFactor === 999 ? 'none' : state.kaminoHealthFactor.toFixed(2)} | ` +
+    `jitoSOL:${state.jitoSolBalance.toFixed(4)} idleSOL:${state.idleSolForStaking.toFixed(4)} | ` +
+    `orcaPositions:${state.orcaPositions.length} orcaValue:$${state.orcaLpValueUsd.toFixed(0)} | ` +
+    `polyUSDC:$${state.polyUsdcBalance.toFixed(0)} polyHeadroom:$${state.polyHeadroomUsd.toFixed(0)}`
   );
 
   // 1.5. Consult swarm — gather intel from scout, guardian, analyst

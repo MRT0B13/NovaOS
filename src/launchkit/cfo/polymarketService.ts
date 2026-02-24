@@ -1130,7 +1130,7 @@ export async function scanOpportunities(
         env.minEdge,
       );
 
-      if (usdAmount < 2) continue; // Min $2 bet
+      if (usdAmount < 1) continue; // Min $1 bet (actual size capped to wallet balance in decisionEngine)
 
       const cappedUsd = Math.min(usdAmount, env.maxSingleBetUsd);
 
