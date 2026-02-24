@@ -80,7 +80,7 @@ const ASSET_DECIMALS: Record<KaminoAsset, number> = {
  */
 const SAFE_BORROW_LTV: Record<KaminoAsset, number> = {
   JitoSOL: 0.75,  // high — correlated with the SOL borrow, liq threshold ~95%
-  SOL:     0.60,
+  SOL:     0.75,  // when borrowed against JitoSOL collateral — liq threshold ~95%, 0.75 is conservative
   USDC:    0.70,
   USDT:    0.70,
   JUP:     0.45,  // volatile — conservative
@@ -668,13 +668,19 @@ export async function borrow(
   }
   if (amount <= 0) return { success: false, asset, amountBorrowed: 0, error: 'Amount must be positive' };
 
-  // LTV guard — use the tighter of: per-asset safe cap or global env cap
-  const health = await checkLtvHealth();
-  const borrowLtvCap = Math.min(SAFE_BORROW_LTV[asset], (env.kaminoBorrowMaxLtvPct ?? 60) / 100);
-  if (!health.safe || health.ltv > borrowLtvCap) {
+  // LTV guard — fetch position directly to avoid checkLtvHealth()'s kaminoMaxLtvPct threshold,
+  // which is calibrated for alerts, not for gating borrow calls.
+  // SOL borrows are always for the JitoSOL loop and use a higher LTV cap (correlated collateral).
+  const pos = await getPosition();
+  const isJitoLoopBorrow = asset === 'SOL';
+  const configuredCap = isJitoLoopBorrow
+    ? (env.kaminoJitoLoopMaxLtvPct ?? 72) / 100
+    : (env.kaminoBorrowMaxLtvPct ?? 60) / 100;
+  const borrowLtvCap = Math.min(SAFE_BORROW_LTV[asset], configuredCap);
+  if (pos.ltv > borrowLtvCap) {
     return {
       success: false, asset, amountBorrowed: 0,
-      error: `LTV ${(health.ltv * 100).toFixed(1)}% exceeds borrow cap ${(borrowLtvCap * 100).toFixed(0)}% for ${asset}`,
+      error: `LTV ${(pos.ltv * 100).toFixed(1)}% exceeds borrow cap ${(borrowLtvCap * 100).toFixed(0)}% for ${asset}`,
     };
   }
 

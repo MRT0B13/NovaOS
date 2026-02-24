@@ -182,7 +182,7 @@ export interface PortfolioState {
   // Orca concentrated LP state
   orcaLpValueUsd: number;            // total value in Orca LP positions
   orcaLpFeeApy: number;              // estimated fee APY on current LP positions
-  orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean }>;
+  orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string }>;
 }
 
 // ============================================================================
@@ -607,7 +607,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
 
   // Orca LP state
   let orcaLpValueUsd = 0, orcaLpFeeApy = 0;
-  let orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean }> = [];
+  let orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string }> = [];
   if (env.orcaLpEnabled) {
     try {
       const orca = await import('./orcaService.ts');
@@ -617,6 +617,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
         positionMint: p.positionMint,
         rangeUtilisationPct: p.rangeUtilisationPct,
         inRange: p.inRange,
+        whirlpoolAddress: p.whirlpoolAddress,
       }));
       // Orca 0.3% fee pool at full utilisation ≈ 20-40% APY depending on volume
       // Conservative estimate: 15% if in-range, 0% if out-of-range
@@ -1183,8 +1184,15 @@ export async function generateDecisions(
 
   // ── H) Auto-repay / unwind — LTV breached or loop unprofitable ────────────
   if (env.kaminoEnabled) {
-    const ltvBreached      = state.kaminoLtv > (env.kaminoBorrowMaxLtvPct / 100);
-    const healthDanger     = state.kaminoHealthFactor < 1.5;
+    // Use separate thresholds for each strategy:
+    // JitoSOL loop targets 65-72% LTV with ~95% liquidation threshold — 1.5 health factor is normal
+    // Simple USDC loop targets <60% LTV with ~75% liquidation threshold — 1.5 is a real warning
+    const ltvBreached = state.kaminoJitoLoopActive
+      ? state.kaminoLtv > (env.kaminoJitoLoopMaxLtvPct / 100)
+      : state.kaminoLtv > (env.kaminoBorrowMaxLtvPct / 100);
+    const healthDanger = state.kaminoJitoLoopActive
+      ? state.kaminoHealthFactor < 1.2   // JitoSOL: danger is ~77% LTV (0.90/0.77 ≈ 1.17)
+      : state.kaminoHealthFactor < 1.5;  // simple loop: tighter — liquidation is at 75%
     const loopUnprofitable = state.kaminoJitoLoopActive && state.kaminoJitoLoopApy < 0;
 
     if ((ltvBreached || healthDanger) && state.kaminoBorrowValueUsd > 0) {
@@ -1304,7 +1312,7 @@ export async function generateDecisions(
           reasoning:
             `Orca LP ${pos.positionMint.slice(0, 8)} ${pos.inRange ? 'near range edge' : 'OUT OF RANGE'} ` +
             `(utilisation: ${pos.rangeUtilisationPct.toFixed(0)}%). Closing and reopening centred on current price.`,
-          params: { positionMint: pos.positionMint, rangeWidthPct: env.orcaLpRangeWidthPct },
+          params: { positionMint: pos.positionMint, whirlpoolAddress: pos.whirlpoolAddress, rangeWidthPct: env.orcaLpRangeWidthPct },
           urgency: pos.inRange ? 'low' : 'medium',
           estimatedImpactUsd: 0,
           intelUsed: [],
@@ -1601,8 +1609,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
       case 'ORCA_LP_REBALANCE': {
         const orca = await import('./orcaService.ts');
-        const { positionMint, rangeWidthPct } = decision.params;
-        const result = await orca.rebalancePosition(positionMint, rangeWidthPct);
+        const { positionMint, whirlpoolAddress, rangeWidthPct } = decision.params;
+        const result = await orca.rebalancePosition(positionMint, rangeWidthPct, whirlpoolAddress);
         markDecision('ORCA_LP_OPEN'); // reuses OPEN cooldown
         return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
       }
@@ -1624,7 +1632,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           ...base,
           executed: true,
           success: loopResult.success,
-          txId: loopResult.txSignatures?.[0],
+          txId: loopResult.txSignatures?.[loopResult.txSignatures.length - 1],
           error: loopResult.error,
         };
       }
@@ -1637,7 +1645,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           ...base,
           executed: true,
           success: unwindResult.success,
-          txId: unwindResult.txSignatures?.[0],
+          txId: unwindResult.txSignatures?.[unwindResult.txSignatures.length - 1],
           error: unwindResult.error,
         };
       }

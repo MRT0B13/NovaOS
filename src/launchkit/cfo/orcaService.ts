@@ -400,6 +400,7 @@ export async function closePosition(positionMint: string): Promise<OrcaCloseResu
 export async function rebalancePosition(
   positionMint: string,
   rangeWidthPct?: number,
+  whirlpoolAddress?: string,
 ): Promise<{ success: boolean; newPositionMint?: string; txSignature?: string; error?: string }> {
   const env = getCFOEnv();
   const width = rangeWidthPct ?? env.orcaLpRangeWidthPct ?? 20;
@@ -427,7 +428,7 @@ export async function rebalancePosition(
 
   // Step 2: Reopen centred on current price using the tokens we got back
   logger.info(`[Orca] Rebalance: reopening with ${solReceived.toFixed(6)} SOL + ${usdcReceived.toFixed(4)} USDC`);
-  const openResult = await openPosition(usdcReceived, solReceived, width);
+  const openResult = await openPosition(usdcReceived, solReceived, width, whirlpoolAddress);
   if (!openResult.success) {
     return { success: false, error: `Reopen failed: ${openResult.error} (closed OK, funds in wallet)` };
   }
