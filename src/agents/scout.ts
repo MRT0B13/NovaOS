@@ -84,6 +84,12 @@ export class ScoutAgent extends BaseAgent {
   private seenHashes: Set<string> = new Set();
   private static MAX_SEEN = 200;
 
+  // Titles of narrative_shift signals already sent — persisted across restarts
+  // Key: normalised title. Value: timestamp when sent (ms).
+  // Prevents re-broadcasting the same topic for 24h even if it stays trending.
+  private sentNarrativeTitles: Map<string, number> = new Map();
+  private static NARRATIVE_TITLE_TTL_MS = 24 * 60 * 60 * 1000; // 24h per title
+
   // ── Search Topics (rotated across scans) ────────────────────────
   private static readonly TOPIC_POOL = [
     // Core crypto narratives
@@ -298,9 +304,17 @@ export class ScoutAgent extends BaseAgent {
 
         for (const r of crossConfirmed) {
           const title = r.crossSignalTitle || r.query.slice(0, 60);
-          const titleKey = title.toLowerCase();
+          const titleKey = title.toLowerCase().replace(/[^a-z0-9 ]/g, '').trim().slice(0, 80);
           if (seenTitles.has(titleKey)) continue;
           seenTitles.add(titleKey);
+
+          // Skip if we've already sent this topic recently (persists across restarts)
+          const lastSentAt = this.sentNarrativeTitles.get(titleKey) ?? 0;
+          if (Date.now() - lastSentAt < ScoutAgent.NARRATIVE_TITLE_TTL_MS) {
+            const hoursAgo = Math.round((Date.now() - lastSentAt) / 3_600_000);
+            logger.debug(`[scout] Skipping already-sent narrative: "${title}" (sent ${hoursAgo}h ago)`);
+            continue;
+          }
 
           // Synthesise into a clean 2-3 sentence alert
           const cleanAlert = await this.synthesiseCrossConfirmed(title, r.result);
@@ -325,6 +339,19 @@ export class ScoutAgent extends BaseAgent {
             resultsCount: cleanAlerts.length,
             immediate: true,
           });
+
+          // Record each sent title so we don't re-broadcast for 24h
+          for (const r of crossConfirmed.slice(0, cleanAlerts.length)) {
+            const titleKey = (r.crossSignalTitle || r.query.slice(0, 60))
+              .toLowerCase().replace(/[^a-z0-9 ]/g, '').trim().slice(0, 80);
+            this.sentNarrativeTitles.set(titleKey, Date.now());
+          }
+
+          // Prune expired entries (keep map bounded)
+          const cutoff = Date.now() - ScoutAgent.NARRATIVE_TITLE_TTL_MS;
+          for (const [k, ts] of this.sentNarrativeTitles) {
+            if (ts < cutoff) this.sentNarrativeTitles.delete(k);
+          }
         }
       }
 
@@ -586,6 +613,8 @@ Be specific, no hype words, no jargon like "cross-confirmed" or "trend pool". Ju
       seenHashes: [...this.seenHashes].slice(-100), // cap to avoid bloat
       // Persist intel buffer so scout doesn't lose accumulated intel on restart
       intelBuffer: this.intelBuffer.slice(-60), // cap to avoid bloat
+      sentNarrativeTitles: [...this.sentNarrativeTitles.entries()]
+        .filter(([, ts]) => Date.now() - ts < ScoutAgent.NARRATIVE_TITLE_TTL_MS), // only save non-expired
     });
   }
 
@@ -598,6 +627,7 @@ Be specific, no hype words, no jargon like "cross-confirmed" or "trend pool". Ju
       lastDigestAt?: number;
       seenHashes?: string[];
       intelBuffer?: Array<{ query: string; result: string; at: number; crossConfirmed: boolean; crossSignalTitle?: string; crossSignalSources?: string }>;
+      sentNarrativeTitles?: Array<[string, number]>;
     }>();
     if (!s) return;
     if (s.cycleCount)      this.cycleCount = s.cycleCount;
@@ -611,7 +641,13 @@ Be specific, no hype words, no jargon like "cross-confirmed" or "trend pool". Ju
       const cutoff = Date.now() - 2 * 60 * 60 * 1000;
       this.intelBuffer = s.intelBuffer.filter(i => i.at > cutoff);
     }
-    logger.info(`[scout] Restored: ${this.cycleCount} cycles, ${this.scanCount} scans, seenHashes=${this.seenHashes.size}, intelBuffer=${this.intelBuffer.length}`);
+    if (s.sentNarrativeTitles) {
+      const cutoff = Date.now() - ScoutAgent.NARRATIVE_TITLE_TTL_MS;
+      this.sentNarrativeTitles = new Map(
+        s.sentNarrativeTitles.filter(([, ts]) => ts > cutoff)
+      );
+    }
+    logger.info(`[scout] Restored: ${this.cycleCount} cycles, seenHashes=${this.seenHashes.size}, sentNarratives=${this.sentNarrativeTitles.size}, intelBuffer=${this.intelBuffer.length}`);
   }
 
   // ── Public API (for direct use if needed) ────────────────────────

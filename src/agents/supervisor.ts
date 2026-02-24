@@ -52,7 +52,7 @@ export class Supervisor extends BaseAgent {
   private pollIntervalMs: number;
   public callbacks: SupervisorCallbacks = {};
   private lastNarrativePostAt = 0;
-  private static NARRATIVE_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours between narrative posts
+  private static NARRATIVE_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours between narrative posts
 
   // ── Outbound Content Filter ──────────────────────────────────
   private outboundFilter: ContentFilter | null = null;
@@ -234,8 +234,18 @@ export class Supervisor extends BaseAgent {
             xPost = `${xPrefix}${xContent}`;
           }
 
-          // Content dedup — don't post same/similar content twice
-          const contentHash = fullChannelContent.toLowerCase().replace(/[^a-z ]/g, '').trim().slice(0, 150);
+          // Content dedup — hash on topic keywords, not synthesised text
+          // (GPT produces different wording for the same event → text hash misses duplicates)
+          const rawTopic = (msg.payload.xSummary || msg.payload.channelSummary || fullChannelContent)
+            .toLowerCase()
+            .replace(/[^a-z0-9 ]/g, '')
+            .trim()
+            // Keep only first 8 significant words as the "topic fingerprint"
+            .split(/\s+/)
+            .filter((w: string) => w.length >= 4)
+            .slice(0, 8)
+            .join(' ');
+          const contentHash = rawTopic || fullChannelContent.toLowerCase().replace(/[^a-z ]/g, '').trim().slice(0, 80);
           if (this.recentXPostHashes.has(contentHash)) {
             logger.debug(`[supervisor] Skipping duplicate narrative post (same content already posted)`);
           } else {
@@ -256,6 +266,10 @@ export class Supervisor extends BaseAgent {
             }
             this.lastNarrativePostAt = now;
             logger.info(`[supervisor] High-priority intel posted: ${intelSource}`);
+            // Persist immediately so cooldown survives restart
+            await this.persistState().catch(err =>
+              logger.debug('[supervisor] Persist after narrative post failed (non-fatal):', err)
+            );
           }
         }
       }
@@ -952,6 +966,8 @@ export class Supervisor extends BaseAgent {
     await this.saveState({
       messagesProcessed: this.messagesProcessed,
       lastBriefingAt: this.lastBriefingAt,
+      lastNarrativePostAt: this.lastNarrativePostAt,
+      recentXPostHashes: [...this.recentXPostHashes],
     });
   }
 
@@ -959,11 +975,19 @@ export class Supervisor extends BaseAgent {
     const s = await this.restoreState<{
       messagesProcessed?: number;
       lastBriefingAt?: number;
+      lastNarrativePostAt?: number;
+      recentXPostHashes?: string[];
     }>();
     if (!s) return;
-    if (s.messagesProcessed) this.messagesProcessed = s.messagesProcessed;
-    if (s.lastBriefingAt)    this.lastBriefingAt = s.lastBriefingAt;
-    logger.info(`[supervisor] Restored: ${this.messagesProcessed} msgs processed, lastBriefing=${this.lastBriefingAt ? new Date(this.lastBriefingAt).toISOString() : 'never'}`);
+    if (s.messagesProcessed)    this.messagesProcessed = s.messagesProcessed;
+    if (s.lastBriefingAt)       this.lastBriefingAt = s.lastBriefingAt;
+    if (s.lastNarrativePostAt)  this.lastNarrativePostAt = s.lastNarrativePostAt;
+    if (s.recentXPostHashes)    this.recentXPostHashes = new Set(s.recentXPostHashes);
+    logger.info(
+      `[supervisor] Restored: ${this.messagesProcessed} msgs processed | ` +
+      `lastNarrative=${this.lastNarrativePostAt ? new Date(this.lastNarrativePostAt).toISOString() : 'never'} | ` +
+      `postHashes=${this.recentXPostHashes.size}`
+    );
   }
 
   // ── Public API ───────────────────────────────────────────────────
