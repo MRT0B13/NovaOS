@@ -35,6 +35,7 @@ export const STRATEGY_CAPS: Record<PositionStrategy, { maxPortfolioFraction: num
   kamino_loop:      { maxPortfolioFraction: 0.15, leverage: 1 },   // 15% collateral loop
   kamino_jito_loop: { maxPortfolioFraction: 0.20, leverage: 3 },   // 20% JitoSOL multiply
   orca_lp:          { maxPortfolioFraction: 0.15, leverage: 1 },   // 15% concentrated LP
+  evm_flash_arb:    { maxPortfolioFraction: 0.00, leverage: 1 },   // 0% — uses Aave capital, not ours
 };
 
 // ============================================================================

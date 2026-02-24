@@ -59,6 +59,7 @@ export type DecisionType =
   | 'KAMINO_JITO_UNWIND'     // unwind the JitoSOL loop (SOL borrow + JitoSOL position)
   | 'ORCA_LP_OPEN'           // open a new concentrated LP position
   | 'ORCA_LP_REBALANCE'      // close out-of-range position and reopen centred on new price
+  | 'EVM_FLASH_ARB'          // Arbitrum: atomic flash loan arb via Aave v3 + DEX spread
   | 'SKIP';            // no action taken (for logging)
 
 /** Approval tier determines whether CFO executes immediately or waits for admin */
@@ -123,6 +124,7 @@ export interface SwarmIntel {
   analystMovers?: Array<{ symbol: string; usd: number; change24hPct: number }>;
   analystTrending?: string[];         // CoinGecko trending tickers
   analystPricesAt?: number;
+  analystArbitrumVolume24h?: number;  // Arbitrum DEX 24h volume USD (DeFiLlama via Analyst)
 
   // Composite score (computed)
   riskMultiplier: number;             // 0.5 (bullish) to 2.0 (danger) — scales hedge aggressiveness
@@ -183,6 +185,11 @@ export interface PortfolioState {
   orcaLpValueUsd: number;            // total value in Orca LP positions
   orcaLpFeeApy: number;              // estimated fee APY on current LP positions
   orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string }>;
+
+  // EVM Flash Arb state
+  evmArbProfit24h: number;        // confirmed flash arb profit last 24h (in-memory)
+  evmArbPoolCount: number;        // number of candidate pools currently tracked
+  evmArbUsdcBalance: number;      // native USDC on Arbitrum (in EVM wallet)
 }
 
 // ============================================================================
@@ -427,6 +434,7 @@ export async function gatherSwarmIntel(pool: any): Promise<SwarmIntel> {
           intel.analystMovers = payload.movers ?? [];
           intel.analystTrending = payload.trending ?? [];
           intel.analystPricesAt = ts;
+          intel.analystArbitrumVolume24h = payload.arbitrumVolume24h;
         }
       }
     }
@@ -627,6 +635,17 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     } catch { /* 0 */ }
   }
 
+  // ── EVM Arb state ─────────────────────────────────────────────────────────
+  let evmArbProfit24h = 0, evmArbPoolCount = 0, evmArbUsdcBalance = 0;
+  if (env.evmArbEnabled) {
+    try {
+      const arbMod = await import('./evmArbService.ts');
+      evmArbProfit24h    = arbMod.getProfit24h();
+      evmArbPoolCount    = arbMod.getCandidatePoolCount();
+      evmArbUsdcBalance  = await arbMod.getArbUsdcBalance();
+    } catch { /* 0 */ }
+  }
+
   // Patch totalPortfolioUsd with Kamino + Orca values gathered above
   totalPortfolioUsd += kaminoNetValueUsd + orcaLpValueUsd;
 
@@ -665,6 +684,9 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     orcaLpValueUsd,
     orcaLpFeeApy,
     orcaPositions,
+    evmArbProfit24h,
+    evmArbPoolCount,
+    evmArbUsdcBalance,
   };
 }
 
@@ -1363,6 +1385,42 @@ export async function generateDecisions(
   const urgencyOrder: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
   decisions.sort((a, b) => urgencyOrder[a.urgency] - urgencyOrder[b.urgency]);
 
+  // ── J) EVM Flash Arbitrage (Arbitrum) ─────────────────────────────────────
+  // Uses dynamic pool list from DeFiLlama. On-chain quotes only — no API latency.
+  // AUTO tier: worst case is a reverted tx (~$0.05 gas). No capital at risk.
+  if (env.evmArbEnabled &&
+      env.evmArbReceiverAddress &&
+      !intel.guardianCritical &&
+      intel.marketCondition !== 'danger' &&
+      checkCooldown('EVM_FLASH_ARB', 60_000)) {
+    try {
+      const arbMod   = await import('./evmArbService.ts');
+      const ethPrice = intel.analystPrices?.['ETH']?.usd ?? 3000;
+      const opp      = await arbMod.scanForOpportunity(ethPrice);
+
+      if (opp && opp.netProfitUsd >= (env.evmArbMinProfitUsdc ?? 2)) {
+        decisions.push({
+          type: 'EVM_FLASH_ARB',
+          reasoning:
+            `Flash arb: ${opp.displayPair} | buy ${opp.buyPool.dex} sell ${opp.sellPool.dex} | ` +
+            `flash $${opp.flashAmountUsd.toLocaleString()} | ` +
+            `gross $${opp.expectedGrossUsd.toFixed(3)} − Aave $${opp.aaveFeeUsd.toFixed(3)} ` +
+            `− gas $${opp.gasEstimateUsd.toFixed(3)} = net $${opp.netProfitUsd.toFixed(3)}`,
+          params: { opportunity: opp },
+          urgency: 'medium',
+          estimatedImpactUsd: opp.netProfitUsd,
+          tier: 'AUTO',
+          intelUsed: [
+            intel.analystPricesAt   ? 'analyst'  : '',
+            intel.guardianReceivedAt ? 'guardian' : '',
+          ].filter(Boolean),
+        });
+      }
+    } catch (err) {
+      logger.debug('[CFO:Decision] EVM arb scan failed (non-fatal):', err);
+    }
+  }
+
   // Log tier breakdown
   const tierCounts = { AUTO: 0, NOTIFY: 0, APPROVAL: 0 };
   for (const d of decisions) tierCounts[d.tier]++;
@@ -1652,6 +1710,15 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
       }
 
+      case 'EVM_FLASH_ARB': {
+        const arb = await import('./evmArbService.ts');
+        const { opportunity } = decision.params;
+        const result = await arb.executeFlashArb(opportunity);
+        markDecision('EVM_FLASH_ARB');
+        if (result.success && result.profitUsd) arb.recordProfit(result.profitUsd);
+        return { ...base, executed: true, success: result.success, txId: result.txHash, error: result.error };
+      }
+
       case 'KAMINO_JITO_LOOP': {
         const kamino = await import('./kaminoService.ts');
         const { jitoSolToDeposit, needsStakeFirst, targetLtv, maxLoops, solPriceUsd } = decision.params;
@@ -1735,6 +1802,7 @@ export function formatDecisionReport(
     KAMINO_JITO_UNWIND: 'JitoSOL Loop Unwind',
     ORCA_LP_OPEN: 'Orca LP Open',
     ORCA_LP_REBALANCE: 'Orca LP Rebalance',
+    EVM_FLASH_ARB: 'Flash Arb (Arbitrum)',
     SKIP: 'No Action',
   };
 

@@ -92,13 +92,14 @@ const TRACKED_TOKENS: Record<string, string> = {
   chainlink: 'LINK',
   aave: 'AAVE',
   uniswap: 'UNI',
+  'arbitrum': 'ARB',   // ARB governance token (CoinGecko id: 'arbitrum')
 };
 
 // Subset shown in compact log lines (rest still tracked + alerted on)
 const LOG_HEADER_TOKENS = ['BTC', 'ETH', 'SOL', 'JUP', 'BONK', 'WIF'];
 
 // ── Chains tracked for TVL / DEX volume ──
-const TRACKED_CHAINS = ['Solana', 'Ethereum', 'Base'] as const;
+const TRACKED_CHAINS = ['Solana', 'Ethereum', 'Arbitrum', 'Base'] as const;
 
 interface TokenPrice {
   id: string;
@@ -688,6 +689,7 @@ export class AnalystAgent extends BaseAgent {
         movers,
         trending: trendingSymbols,
         tokenCount: allPrices.length,
+        arbitrumVolume24h: this.lastVolumes?.chainVolume?.['Arbitrum'] ?? 0,
         at: Date.now(),
       });
 

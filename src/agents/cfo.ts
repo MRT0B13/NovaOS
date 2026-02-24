@@ -558,6 +558,21 @@ export class CFOAgent extends BaseAgent {
             break;
           }
 
+          // ── EVM Flash Arb (Arbitrum) ─────────────────────────
+          case 'EVM_FLASH_ARB': {
+            const arbResult = r as any;
+            await this.repo.insertTransaction({
+              id: `tx-arb-flash-${arbResult.txHash ?? Date.now()}`, timestamp: now,
+              chain: 'arbitrum', strategyTag: 'evm_flash_arb', txType: 'swap',
+              tokenIn: p.flashLoanSymbol ?? 'USDC', amountIn: p.flashAmountUsd ?? 0,
+              tokenOut: p.flashLoanSymbol ?? 'USDC', amountOut: (p.flashAmountUsd ?? 0) + (arbResult.profitUsd ?? 0),
+              feeUsd: p.aaveFeeUsd ?? 0, txHash: arbResult.txHash, walletAddress: '', status: arbResult.success ? 'confirmed' : 'failed',
+              metadata: { pair: p.displayPair, buyDex: p.buyPool?.dex, sellDex: p.sellPool?.dex, netProfitUsd: arbResult.profitUsd, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted EVM_FLASH_ARB: ${p.displayPair} profit=$${(arbResult.profitUsd ?? 0).toFixed(3)} tx=${arbResult.txHash?.slice(0, 10)}`);
+            break;
+          }
+
           // SKIP / REBALANCE_HEDGE — nothing to persist
           default:
             break;
@@ -1255,6 +1270,29 @@ export class CFOAgent extends BaseAgent {
         await notify(result.success
           ? `✅ JitoSOL loop unwound — ${result.txSignatures.length} transaction(s) completed`
           : `❌ JitoSOL unwind failed: ${result.error}`);
+        break;
+      }
+
+      case 'cfo_arb_status': {
+        const arbMod = await import('../launchkit/cfo/evmArbService.ts');
+        const env = getCFOEnv();
+        const [profit24h, poolCount, arbUsdc] = [
+          arbMod.getProfit24h(),
+          arbMod.getCandidatePoolCount(),
+          await arbMod.getArbUsdcBalance(),
+        ];
+        const poolsAge = arbMod.getPoolsRefreshedAt()
+          ? `${Math.round((Date.now() - arbMod.getPoolsRefreshedAt()) / 60_000)}m ago`
+          : 'not yet';
+        await notify(
+          `⚡ *Flash Arb — Arbitrum*\n` +
+          `Enabled: ${env.evmArbEnabled ? '✅' : '❌'}\n` +
+          `Receiver: ${env.evmArbReceiverAddress?.slice(0,10) ?? 'not deployed'}...\n` +
+          `USDC on Arbitrum: $${arbUsdc.toFixed(2)}\n` +
+          `Candidate pools: ${poolCount} (refreshed ${poolsAge})\n` +
+          `Profit 24h: $${profit24h.toFixed(3)}\n` +
+          `Min profit: $${env.evmArbMinProfitUsdc} | Max flash: $${env.evmArbMaxFlashUsd.toLocaleString()}`
+        );
         break;
       }
 

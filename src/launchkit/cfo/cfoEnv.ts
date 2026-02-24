@@ -71,6 +71,14 @@ export interface CFOEnv {
   orcaLpMaxUsd: number;                           // max USD deployed into Orca LP (default 500)
   orcaLpRebalanceTriggerPct: number;              // rebalance when price within X% of range edge (default 5%)
 
+  // ── EVM Flash Arbitrage (Arbitrum) ─────────────────────────────────────
+  evmArbEnabled: boolean;              // enable arb scanning + execution (default false)
+  evmArbMinProfitUsdc: number;         // minimum net profit per trade in USD (default 2)
+  evmArbMaxFlashUsd: number;           // max flash loan size in USD (default 50000)
+  evmArbReceiverAddress: string | undefined;  // deployed ArbFlashReceiver contract address
+  evmArbScanIntervalMs: number;        // how often to scan for opportunities (default 30000)
+  evmArbPoolRefreshMs: number;         // how often to refresh pool list from DeFiLlama (default 14400000)
+
   // ── Jito ─────────────────────────────────────────────────────────
   maxJitoSol: number;                             // max SOL to stake in Jito
 
@@ -171,6 +179,13 @@ export function getCFOEnv(bust = false): CFOEnv {
     orcaLpRangeWidthPct: Number(process.env.CFO_ORCA_LP_RANGE_WIDTH_PCT ?? 20),
     orcaLpMaxUsd: Number(process.env.CFO_ORCA_LP_MAX_USD ?? 500),
     orcaLpRebalanceTriggerPct: Number(process.env.CFO_ORCA_LP_REBALANCE_TRIGGER_PCT ?? 5),
+
+    evmArbEnabled:          process.env.CFO_EVM_ARB_ENABLE === 'true',
+    evmArbMinProfitUsdc:    Number(process.env.CFO_EVM_ARB_MIN_PROFIT_USDC ?? 2),
+    evmArbMaxFlashUsd:      Number(process.env.CFO_EVM_ARB_MAX_FLASH_USD ?? 50_000),
+    evmArbReceiverAddress:  process.env.CFO_EVM_ARB_RECEIVER_ADDRESS,
+    evmArbScanIntervalMs:   Number(process.env.CFO_EVM_ARB_SCAN_INTERVAL_MS ?? 30_000),
+    evmArbPoolRefreshMs:    Number(process.env.CFO_EVM_ARB_POOL_REFRESH_MS ?? 4 * 3600_000),
 
     maxJitoSol: Number(process.env.CFO_MAX_JITO_SOL ?? 5),
 
