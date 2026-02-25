@@ -4,6 +4,28 @@ import type { LaunchPack } from '../model/launchPack.ts';
 import { trackGroup, linkGroupToPack } from '../services/groupTracker.ts';
 import { getEnv } from '../env.ts';
 
+// Cache: telegramChatId → resolved result (TTL 60s)
+// Avoids redundant DB lookups + pack iterations on every message
+type CachedResult =
+  | { type: 'admin' }
+  | { type: 'community' }
+  | { type: 'pack'; pack: LaunchPack }
+  | { type: 'unknown' };
+
+const _contextCache = new Map<string, { result: CachedResult; expiresAt: number }>();
+const CONTEXT_CACHE_TTL_MS = 60_000;
+
+function getCachedContext(chatId: string): CachedResult | null {
+  const entry = _contextCache.get(chatId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { _contextCache.delete(chatId); return null; }
+  return entry.result;
+}
+
+function setCachedContext(chatId: string, result: CachedResult): void {
+  _contextCache.set(chatId, { result, expiresAt: Date.now() + CONTEXT_CACHE_TTL_MS });
+}
+
 /**
  * Helper to normalize telegram chat IDs for comparison
  * Handles both -100XXXXXXXX and -XXXXXXXX formats and plain numbers
@@ -86,13 +108,11 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
     // Get the roomId from the message - this is how ElizaOS identifies conversations
     const roomId = message.roomId;
     
-    // Always log that we're running
     const source = message.content?.source as string | undefined;
     const isTelegram = source?.includes('telegram') || false;
-    console.log(`[GroupContext] *** CALLED *** roomId=${roomId}, source=${source}, isTelegram=${isTelegram}`);
+    logger.debug(`[GroupContext] roomId=${roomId}, source=${source}`);
     
     if (!roomId) {
-      console.log('[GroupContext] No roomId, returning early');
       return {
         data: { isGroupMessage: false },
         values: { isGroupMessage: false },
@@ -105,10 +125,9 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
     try {
       // ElizaOS stores the actual Telegram chat ID in the room's channelId field
       const room = await runtime.getRoom(roomId as any);
-      console.log(`[GroupContext] Room lookup result:`, JSON.stringify(room, null, 2));
       if (room?.channelId) {
         telegramChatId = String(room.channelId);
-        console.log(`[GroupContext] Got channelId from room: ${telegramChatId}`);
+        logger.debug(`[GroupContext] channelId=${telegramChatId}`);
         
         // Track this group in our group tracker
         if (isTelegram && telegramChatId) {
@@ -119,16 +138,93 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
         }
       }
     } catch (e) {
-      console.log(`[GroupContext] Could not get room channelId: ${e}`);
+      logger.debug(`[GroupContext] Could not get room channelId: ${e}`);
     }
 
-    // Get LaunchPack store
+    // ── Fast path: check admin / community BEFORE loading packs ─────────────
+    if (telegramChatId) {
+      // Check cache first
+      const cached = getCachedContext(telegramChatId);
+      if (cached) {
+        if (cached.type === 'admin') {
+          return {
+            data: { isGroupMessage: true, roomId, telegramChatId, isAdminChat: true, linkedPack: null },
+            values: { isGroupMessage: true, isAdminChat: true, hasLinkedPack: false },
+            text: generateAdminChatContext(),
+          };
+        }
+        if (cached.type === 'community') {
+          return {
+            data: { isGroupMessage: true, roomId, telegramChatId, isCommunityGroup: true, linkedPack: null },
+            values: { isGroupMessage: true, isCommunityGroup: true, hasLinkedPack: false },
+            text: generateCommunityGroupContext(),
+          };
+        }
+        if (cached.type === 'pack') {
+          // Use the cached pack — jump to pack-return logic below
+          const packTelegramChatId = (cached.pack.tg as any)?.telegram_chat_id || telegramChatId;
+          const isTelegramGroup = isTelegram && telegramChatId && telegramChatId.startsWith('-');
+          if (!isTelegramGroup) {
+            return {
+              data: { isGroupMessage: false, roomId, linkedPack: null },
+              values: { isGroupMessage: false, hasLinkedPack: false },
+              text: '',
+            };
+          }
+          return {
+            data: {
+              isGroupMessage: true,
+              roomId,
+              telegramChatId: packTelegramChatId,
+              linkedPack: {
+                id: cached.pack.id,
+                name: cached.pack.brand.name,
+                ticker: cached.pack.brand.ticker,
+                mascot: (cached.pack as any).mascot,
+              },
+            },
+            values: {
+              isGroupMessage: true,
+              hasLinkedPack: true,
+              tokenName: cached.pack.brand.name,
+              tokenTicker: cached.pack.brand.ticker,
+              mascotName: (cached.pack as any).mascot?.name || cached.pack.brand.name,
+            },
+            text: generateGroupContext(cached.pack, packTelegramChatId || roomId),
+          };
+        }
+        // cached.type === 'unknown' → fall through to pack search (maybe new pack was linked)
+      }
+
+      if (isAdminChat(telegramChatId)) {
+        logger.debug(`[GroupContext] Admin chat ${telegramChatId}`);
+        setCachedContext(telegramChatId, { type: 'admin' });
+        return {
+          data: { isGroupMessage: true, roomId, telegramChatId, isAdminChat: true, linkedPack: null },
+          values: { isGroupMessage: true, isAdminChat: true, hasLinkedPack: false },
+          text: generateAdminChatContext(),
+        };
+      }
+
+      if (isCommunityGroup(telegramChatId)) {
+        logger.debug(`[GroupContext] Community group ${telegramChatId}`);
+        setCachedContext(telegramChatId, { type: 'community' });
+        return {
+          data: { isGroupMessage: true, roomId, telegramChatId, isCommunityGroup: true, linkedPack: null },
+          values: { isGroupMessage: true, isCommunityGroup: true, hasLinkedPack: false },
+          text: generateCommunityGroupContext(),
+        };
+      }
+    }
+    // ── End fast path ────────────────────────────────────────────────────────
+
+    // Only reach here for token group chats — load packs and find linked one
     const bootstrap = runtime.getService('launchkit_bootstrap') as any;
     const kit = bootstrap?.getLaunchKit?.();
     const store: LaunchPackStore | undefined = kit?.store;
 
     if (!store) {
-      console.log('[GroupContext] LaunchPack store not available');
+      logger.debug('[GroupContext] LaunchPack store not available');
       return {
         data: { isGroupMessage: isTelegram, roomId, linkedPack: null },
         values: { isGroupMessage: isTelegram, hasLinkedPack: false },
@@ -136,74 +232,29 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
       };
     }
 
-    // Find LaunchPack linked to this room
-    // Priority: match telegram_chat_id first (stable), then fall back to roomId
     const packs = await store.list();
-    console.log(`[GroupContext] Loaded ${packs.length} packs from store`);
-    
-    // Debug: log all pack TG info
-    for (const p of packs) {
-      console.log(`[GroupContext] Pack "${p.brand?.name}": tg.chat_id=${(p.tg as any)?.chat_id}, tg.telegram_chat_id=${(p.tg as any)?.telegram_chat_id}`);
-    }
-    
-    let linkedPack = null;
-    
-    // First try to match by telegram_chat_id (the actual Telegram chat ID we stored)
+    let linkedPack: LaunchPack | null = null;
+
     if (telegramChatId) {
       const normalizedRoomId = normalizeTgChatId(telegramChatId);
-      console.log(`[GroupContext] Looking for pack with telegram_chat_id=${telegramChatId} (normalized: ${normalizedRoomId})`);
-      linkedPack = packs.find(
-        (p: LaunchPack) => {
-          const packTgId = (p.tg as any)?.telegram_chat_id;
-          const normalizedPackId = normalizeTgChatId(packTgId);
-          const matches = packTgId === telegramChatId || normalizedPackId === normalizedRoomId;
-          console.log(`[GroupContext] Comparing: pack="${packTgId}" (norm=${normalizedPackId}) vs room="${telegramChatId}" (norm=${normalizedRoomId}) → ${matches ? 'MATCH' : 'no'}`);
-          return matches;
-        }
-      );
+      linkedPack = packs.find((p: LaunchPack) => {
+        const packTgId = (p.tg as any)?.telegram_chat_id;
+        if (!packTgId) return false;
+        return packTgId === telegramChatId || normalizeTgChatId(packTgId) === normalizedRoomId;
+      }) ?? null;
       if (linkedPack) {
-        console.log(`[GroupContext] ✅ Found pack by telegram_chat_id: ${linkedPack.brand.name} ($${linkedPack.brand.ticker})`);
-        // Update group tracker with linked pack info
+        logger.debug(`[GroupContext] ✅ Pack: ${linkedPack.brand.name} ($${linkedPack.brand.ticker})`);
         linkGroupToPack(telegramChatId, linkedPack);
       }
     }
-    
-    // Fall back to matching by roomId ONLY for non-Telegram sources (web client, etc.)
-    // Don't use roomId fallback for Telegram - it causes data leak between tokens
+
     if (!linkedPack && !isTelegram) {
-      console.log(`[GroupContext] Looking for pack with chat_id=${roomId} (non-TG fallback)`);
-      linkedPack = packs.find(
-        (p: LaunchPack) => (p.tg as any)?.chat_id === roomId
-      );
-      if (linkedPack) {
-        console.log(`[GroupContext] ✅ Found pack by roomId: ${linkedPack.brand.name} ($${linkedPack.brand.ticker})`);
-      }
+      linkedPack = packs.find((p: LaunchPack) => (p.tg as any)?.chat_id === roomId) ?? null;
     }
 
     if (!linkedPack) {
-      // Check if this is the admin chat - don't complain about no LaunchPack
-      if (isAdminChat(telegramChatId)) {
-        console.log(`[GroupContext] ✅ This is the ADMIN CHAT (${telegramChatId}) - no LaunchPack needed`);
-        return {
-          data: { isGroupMessage: true, roomId, telegramChatId, isAdminChat: true, linkedPack: null },
-          values: { isGroupMessage: true, isAdminChat: true, hasLinkedPack: false },
-          text: generateAdminChatContext(),
-        };
-      }
-      
-      // Check if this is the community group — give community-specific context
-      if (isCommunityGroup(telegramChatId)) {
-        console.log(`[GroupContext] ✅ This is the COMMUNITY GROUP (${telegramChatId}) - no LaunchPack needed`);
-        return {
-          data: { isGroupMessage: true, roomId, telegramChatId, isCommunityGroup: true, linkedPack: null },
-          values: { isGroupMessage: true, isCommunityGroup: true, hasLinkedPack: false },
-          text: generateCommunityGroupContext(),
-        };
-      }
-
-      console.log(`[GroupContext] ❌ No LaunchPack linked to roomId ${roomId} or telegramChatId ${telegramChatId}`);
-      
-      // Only show unlinked context for Telegram groups
+      logger.debug(`[GroupContext] No pack for chatId=${telegramChatId ?? roomId}`);
+      if (telegramChatId) setCachedContext(telegramChatId, { type: 'unknown' });
       if (isTelegram) {
         return {
           data: { isGroupMessage: true, roomId, telegramChatId, linkedPack: null },
@@ -211,7 +262,6 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
           text: generateUnlinkedGroupContext(),
         };
       }
-      
       return {
         data: { isGroupMessage: false, roomId },
         values: { isGroupMessage: false, hasLinkedPack: false },
@@ -219,9 +269,11 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
       };
     }
 
-    // Use the telegram_chat_id from the pack if we don't have it from room
+    // Found a pack — cache it
+    if (telegramChatId) setCachedContext(telegramChatId, { type: 'pack', pack: linkedPack });
+
     const packTelegramChatId = (linkedPack.tg as any)?.telegram_chat_id || telegramChatId;
-    console.log(`[GroupContext] ✅ Using linked pack: ${linkedPack.brand.name} ($${linkedPack.brand.ticker}) for telegramChatId ${packTelegramChatId}`);
+    logger.debug(`[GroupContext] ✅ Pack: ${linkedPack.brand.name} ($${linkedPack.brand.ticker})`);
 
     // IMPORTANT: Only apply mascot persona in Telegram GROUP chats
     // Nova stays as Nova in: web client, Telegram DMs, X/Twitter, Nova's own channel
@@ -229,7 +281,6 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
     const isTelegramGroup = isTelegram && telegramChatId && telegramChatId.startsWith('-');
     
     if (!isTelegramGroup) {
-      console.log(`[GroupContext] Not a TG group (source=${source}, chatId=${telegramChatId}) - staying as Nova, no mascot persona`);
       return {
         data: { isGroupMessage: false, roomId, linkedPack: null },
         values: { isGroupMessage: false, hasLinkedPack: false },
@@ -262,7 +313,7 @@ export async function getGroupContext(runtime: IAgentRuntime, message: Memory): 
       text: contextText,
     };
   } catch (error) {
-    console.error('[GroupContext] Error:', error);
+    logger.error('[GroupContext] Error:', error);
     return {
       data: { isGroupMessage: false, error: String(error) },
       values: { isGroupMessage: false },
