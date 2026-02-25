@@ -30,6 +30,7 @@
 import { createHmac } from 'crypto';
 import { logger } from '@elizaos/core';
 import { getCFOEnv } from './cfoEnv.ts';
+import { getPrices } from './pythOracleService.ts';
 
 // ============================================================================
 // Constants
@@ -743,49 +744,104 @@ export function kellySize(
 // ============================================================================
 
 /**
+ * Approximate standard normal CDF: P(Z ≤ x)
+ * Abramowitz & Stegun rational approximation, max error ~7.5e-8
+ */
+function approximateNormalCDF(x: number): number {
+  const a1 =  0.254829592;
+  const a2 = -0.284496736;
+  const a3 =  1.421413741;
+  const a4 = -1.453152027;
+  const a5 =  1.061405429;
+  const p  =  0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  const absX = Math.abs(x);
+  const t = 1.0 / (1.0 + p * absX);
+  const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-absX * absX);
+  return 0.5 * (1.0 + sign * y);
+}
+
+/**
  * Estimate the probability of the YES outcome for a given market.
  *
- * Strategy:
- *  1. Use Scout intel if available (passed in as context)
- *  2. Apply market-type heuristics for common crypto questions
- *  3. Fall back to current market price +/- an informed nudge
- *
- * This is intentionally conservative — the edge comes from Nova's
- * narrative intelligence, not from overconfident priors.
+ * For price-target questions (BTC/ETH/SOL) we fetch live prices from Pyth
+ * and use a volatility-adjusted normal CDF to compute P(reach target).
+ * For other market types we fall back to heuristic/sentiment nudges.
  */
-export function estimateProbability(
+export async function estimateProbability(
   market: PolyMarket,
   scoutContext?: {
     cryptoBullish?: boolean;   // Scout's overall crypto sentiment
     btcAbove?: number;         // BTC price estimate at resolution
     relevantNarratives?: string[];
   },
-): { prob: number; confidence: number; rationale: string } {
+): Promise<{ prob: number; confidence: number; rationale: string }> {
   const question = market.question.toLowerCase();
   const yesToken = market.tokens.find((t) => t.outcome === 'Yes');
   const marketPrice = yesToken?.price ?? 0.5;
   const bullish = scoutContext?.cryptoBullish;
 
+  // Fetch live prices for price-target math
+  const priceMap = await getPrices(['SOL/USD', 'ETH/USD', 'BTC/USD']).catch(() => new Map());
+  const liveSOL = priceMap.get('SOL/USD')?.price ?? null;
+  const liveETH = priceMap.get('ETH/USD')?.price ?? null;
+  const liveBTC = priceMap.get('BTC/USD')?.price ?? null;
+
   // ── 1. BTC price milestone ──
-  const btcPriceMatch = question.match(/(?:btc|bitcoin).*(?:above|reach|exceed|hit|surpass|break).*?\$?([\d,]+)\s*k?/);
-  if (btcPriceMatch) {
-    if (scoutContext?.btcAbove !== undefined && bullish !== undefined) {
-      const targetRaw = btcPriceMatch[1].replace(',', '');
-      const target = Number(targetRaw) * (btcPriceMatch[0].includes('k') ? 1000 : 1);
-      if (target > 0 && scoutContext.btcAbove > 0) {
-        const prob = scoutContext.btcAbove > target ? 0.72 : 0.28;
-        return { prob, confidence: 0.6, rationale: `BTC target $${target.toLocaleString()} vs Scout $${scoutContext.btcAbove.toLocaleString()}` };
-      }
+  const btcPriceMatch = question.match(
+    /(?:btc|bitcoin).*(?:above|reach|exceed|hit|surpass|break).*?\$?([\d,]+)\s*k?/
+  );
+  if (btcPriceMatch && liveBTC !== null) {
+    const targetRaw = btcPriceMatch[1].replace(',', '');
+    const target = Number(targetRaw) * (btcPriceMatch[0].includes('k') ? 1000 : 1);
+    if (target > 0) {
+      const daysLeft = Math.max(0, (new Date(market.endDate).getTime() - Date.now()) / 86_400_000);
+      const dailyVol = 0.03;
+      const periodVol = dailyVol * Math.sqrt(Math.max(daysLeft, 0.5));
+      const distancePct = (target - liveBTC) / liveBTC;
+      const z = distancePct / periodVol;
+      const prob = approximateNormalCDF(-z);
+      const confidence = daysLeft < 1 ? 0.75 : daysLeft < 7 ? 0.65 : 0.55;
+      return {
+        prob: Math.max(0.02, Math.min(0.98, prob)),
+        confidence,
+        rationale: `BTC live=$${liveBTC.toFixed(0)} target=$${target.toLocaleString()} dist=${(distancePct * 100).toFixed(1)}% vol=${(periodVol * 100).toFixed(1)}% over ${daysLeft.toFixed(1)}d`,
+      };
     }
   }
 
   // ── 2. ETH/SOL/alt price milestone ──
   const cryptoPriceMatch = question.match(
-    /(?:eth(?:ereum)?|sol(?:ana)?|bnb|avax|dot|ada|xrp|matic|polygon|near|sui|aptos).*(?:above|reach|exceed|hit|break).*?\$?([\d,.]+)/
+    /(?:eth(?:ereum)?|sol(?:ana)?|bnb|avax|xrp|ada|dot|matic|near|sui|aptos).*(?:above|reach|exceed|hit|break).*?\$?([\d,.]+)/
   );
-  if (cryptoPriceMatch && bullish !== undefined) {
-    const prob = bullish ? 0.62 : 0.38;
-    return { prob, confidence: 0.45, rationale: `Crypto price target (${bullish ? 'bullish' : 'bearish'})` };
+  if (cryptoPriceMatch) {
+    const ticker = question.match(/\b(eth(?:ereum)?|sol(?:ana)?|bnb|avax|xrp)\b/)?.[1] ?? '';
+    const isEth = /eth/.test(ticker);
+    const isSol = /sol/.test(ticker);
+    const livePrice = isEth ? liveETH : isSol ? liveSOL : null;
+
+    if (livePrice !== null) {
+      const targetRaw = cryptoPriceMatch[1].replace(/,/g, '');
+      const target = Number(targetRaw);
+      if (target > 0) {
+        const daysLeft = Math.max(0, (new Date(market.endDate).getTime() - Date.now()) / 86_400_000);
+        const dailyVol = isEth ? 0.04 : isSol ? 0.05 : 0.045;
+        const periodVol = dailyVol * Math.sqrt(Math.max(daysLeft, 0.5));
+        const distancePct = (target - livePrice) / livePrice;
+        const z = distancePct / periodVol;
+        const prob = approximateNormalCDF(-z);
+        const confidence = daysLeft < 1 ? 0.72 : daysLeft < 7 ? 0.62 : 0.50;
+        return {
+          prob: Math.max(0.02, Math.min(0.98, prob)),
+          confidence,
+          rationale: `${ticker.toUpperCase()} live=$${livePrice.toFixed(2)} target=$${target} dist=${(distancePct * 100).toFixed(1)}% vol=${(periodVol * 100).toFixed(1)}% over ${daysLeft.toFixed(1)}d`,
+        };
+      }
+    }
+    // Fallback if no live price: use scout sentiment but with low confidence
+    if (bullish !== undefined) {
+      return { prob: bullish ? 0.52 : 0.48, confidence: 0.3, rationale: 'Crypto price target (no live price, sentiment only)' };
+    }
   }
 
   // ── 3. ETF approval / launch ──
@@ -1106,7 +1162,7 @@ export async function scanOpportunities(
 
     if (!yesToken || !noToken) continue;
 
-    const { prob: ourProb, confidence, rationale } = estimateProbability(market, scoutContext);
+    const { prob: ourProb, confidence, rationale } = await estimateProbability(market, scoutContext);
 
     // Log why each market was evaluated (debug visibility)
     logger.debug(
@@ -1120,7 +1176,7 @@ export async function scanOpportunities(
       const edge = effectiveOurProb - marketProb;
 
       if (edge < env.minEdge) continue;
-      if (confidence < 0.2) continue; // Skip only truly no-confidence calls
+      if (confidence < 0.45) continue; // Only act when we have meaningful confidence
 
       const { fraction, usdAmount } = kellySize(
         marketProb,

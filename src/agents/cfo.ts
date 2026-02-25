@@ -727,6 +727,17 @@ export class CFOAgent extends BaseAgent {
       for (const r of results) {
         if (r.pendingApproval && r.decision.tier === 'APPROVAL') {
           const d = r.decision;
+
+          // Dedup: skip if we already have a pending approval for this decision type
+          const alreadyPending = [...this.pendingApprovals.values()].find(
+            (a) => a.decisionJson?.type === d.type
+          );
+          if (alreadyPending) {
+            logger.debug(`[CFO] Skipping duplicate approval for ${d.type} — ${alreadyPending.id} already pending`);
+            approvalIds.set(`${d.type}-${r.decision.urgency}`, alreadyPending.id);
+            continue;
+          }
+
           const action = async () => {
             const { executeDecision } = await import('../launchkit/cfo/decisionEngine.ts');
             const overridden = { ...d, tier: 'AUTO' as const };
@@ -1643,11 +1654,15 @@ export class CFOAgent extends BaseAgent {
       this.emergencyPausedUntil = s.emergencyPausedUntil;
       const remainingMs = s.emergencyPausedUntil - Date.now();
       if (this.autoResumeTimer) clearTimeout(this.autoResumeTimer);
-      this.autoResumeTimer = setTimeout(() => {
+      this.autoResumeTimer = setTimeout(async () => {
         this.paused = false;
         this.emergencyPausedUntil = null;
         this.autoResumeTimer = null;
         logger.info('[CFO] Auto-resumed after emergency cooldown (restored timer)');
+        try {
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce('▶️ CFO auto-resumed after emergency cooldown');
+        } catch { /* best-effort */ }
       }, remainingMs);
       logger.info(`[CFO] Emergency pause restored — auto-resume in ${Math.round(remainingMs / 60_000)}m`);
     }

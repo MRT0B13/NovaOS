@@ -136,6 +136,7 @@ export interface PortfolioState {
   solBalance: number;             // SOL in funding wallet
   solPriceUsd: number;
   solExposureUsd: number;         // solBalance * solPriceUsd
+  solanaUsdcBalance: number;       // USDC available in Solana funding wallet
   jitoSolBalance: number;
   jitoSolValueUsd: number;
 
@@ -505,9 +506,11 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
 
   // SOL balance from Jupiter service
   let solBalance = 0;
+  let solanaUsdcBalance = 0;
   try {
     const jupiter = await import('./jupiterService.ts');
     solBalance = await jupiter.getTokenBalance(jupiter.MINTS.SOL);
+    solanaUsdcBalance = await jupiter.getTokenBalance(jupiter.MINTS.USDC);
   } catch { /* 0 */ }
 
   // Jito position
@@ -653,6 +656,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     solBalance,
     solPriceUsd,
     solExposureUsd,
+    solanaUsdcBalance,
     jitoSolBalance,
     jitoSolValueUsd,
     hlEquity,
@@ -703,6 +707,28 @@ const ORCA_WHIRLPOOLS: Record<string, { address: string; tokenA: string; tokenB:
   'WIF/USDC':  { address: 'ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq', tokenA: 'WIF',  tokenB: 'USDC', tokenADecimals: 6, minLiquidityUsd: 50_000  },
   'JUP/USDC':  { address: 'BoG9sBfBBsGJBJbUqsFPRrmGCJF5i4kk5mMHPzSnVBa4', tokenA: 'JUP',  tokenB: 'USDC', tokenADecimals: 6, minLiquidityUsd: 50_000  },
 };
+
+/**
+ * Compute an adaptive LP range width based on 24h price change of the base token.
+ * Wider range in volatile conditions (less rebalancing), narrower when calm (more fees).
+ * Returns total range width as a percentage (e.g. 20 = ±10%).
+ */
+function adaptiveLpRangeWidthPct(
+  tokenSymbol: string,
+  intel: SwarmIntel,
+  baseWidthPct: number,
+): number {
+  const analystPrice = intel.analystPrices?.[tokenSymbol];
+  if (!analystPrice) return baseWidthPct;
+
+  const absChange = Math.abs(analystPrice.change24h ?? 0);
+
+  if (absChange > 15) return Math.min(baseWidthPct * 2.0, 60);  // very volatile: ±30% max
+  if (absChange > 10) return Math.min(baseWidthPct * 1.5, 40);  // volatile: ±20%
+  if (absChange > 5)  return baseWidthPct;                       // normal: use configured width
+  if (absChange > 2)  return Math.max(baseWidthPct * 0.75, 10); // calm: tighten to ±7.5%
+  return Math.max(baseWidthPct * 0.5, 8);                        // very calm: ±5-6% for max fees
+}
 
 /**
  * Select the best Orca LP pair given current swarm intel.
@@ -1324,6 +1350,7 @@ export async function generateDecisions(
       } else {
         const deployUsd = Math.min(
           orcaHeadroomUsd,
+          state.solanaUsdcBalance * 0.4,  // use up to 40% of Solana USDC for LP
           needsSol ? solAvailableUsd * 2 * 0.8 : Infinity, // cap to 80% of available SOL×2 for SOL/USDC
         );
         if (deployUsd >= 20) {
@@ -1333,13 +1360,19 @@ export async function generateDecisions(
             ? deployUsd / 2 / (intel.analystPrices?.[bestPair.whirlpool.tokenA]?.usd ?? 1)
             : solSide;
 
+          const adaptiveRange = adaptiveLpRangeWidthPct(
+            bestPair.whirlpool.tokenA,
+            intel,
+            env.orcaLpRangeWidthPct,
+          );
+          const baseTokenChange = Math.abs(intel.analystPrices?.[bestPair.whirlpool.tokenA]?.change24h ?? 0);
+
           decisions.push({
             type: 'ORCA_LP_OPEN',
             reasoning:
               `Opening Orca ${bestPair.pair} concentrated LP: $${deployUsd.toFixed(0)} total ` +
-              `(range ±${env.orcaLpRangeWidthPct / 2}%). ` +
-              `Pair selected because: ${bestPair.reasoning}. ` +
-              `Est. fee APY: ~15-25% while in-range.`,
+              `(range ±${adaptiveRange / 2}% — adaptive based on ${baseTokenChange.toFixed(0)}% 24h vol). ` +
+              `Pair selected because: ${bestPair.reasoning}. Est. fee APY: ~15-25% while in-range.`,
             params: {
               pair: bestPair.pair,
               whirlpoolAddress: bestPair.whirlpool.address,
@@ -1348,7 +1381,7 @@ export async function generateDecisions(
               usdcAmount: usdcSide,
               solAmount: bestPair.whirlpool.tokenA === 'SOL' ? solSide : 0,
               tokenAAmount,
-              rangeWidthPct: env.orcaLpRangeWidthPct,
+              rangeWidthPct: adaptiveRange,
             },
             urgency: 'low',
             estimatedImpactUsd: deployUsd * 0.18,
@@ -1371,7 +1404,15 @@ export async function generateDecisions(
           reasoning:
             `Orca LP ${pos.positionMint.slice(0, 8)} ${pos.inRange ? 'near range edge' : 'OUT OF RANGE'} ` +
             `(utilisation: ${pos.rangeUtilisationPct.toFixed(0)}%). Closing and reopening centred on current price.`,
-          params: { positionMint: pos.positionMint, whirlpoolAddress: pos.whirlpoolAddress, rangeWidthPct: env.orcaLpRangeWidthPct },
+          params: {
+            positionMint: pos.positionMint,
+            whirlpoolAddress: pos.whirlpoolAddress,
+            rangeWidthPct: adaptiveLpRangeWidthPct(
+              Object.values(ORCA_WHIRLPOOLS).find(w => w.address === pos.whirlpoolAddress)?.tokenA ?? 'SOL',
+              intel,
+              env.orcaLpRangeWidthPct,
+            ),
+          },
           urgency: pos.inRange ? 'low' : 'medium',
           estimatedImpactUsd: 0,
           intelUsed: [],
