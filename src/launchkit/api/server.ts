@@ -18,7 +18,19 @@ import { createSecretsStore } from '../db/storeFactory.ts';
 import { TelegramPublisherService } from '../services/telegramPublisher.ts';
 import { XPublisherService } from '../services/xPublisher.ts';
 import { cacheTelegramUser } from '../services/telegramCommunity.ts';
-import { areFactoryCommandsReady } from '../services/telegramFactoryCommands.ts';
+import { processUpdate } from '../services/telegramBanHandler.ts';
+
+// Every bot.command() we register — deterministic gate to skip Eliza forwarding.
+// Keeps slash commands from generating fake LLM responses even if registration
+// hasn't completed yet (swarm cold-start, pool not ready, etc.).
+const KNOWN_BOT_COMMANDS = new Set([
+  '/ban', '/kick', '/roseban', '/banned',         // ban handler
+  '/health', '/errors', '/repairs',                // health commands
+  '/scan', '/children',                            // scan commands
+  '/request_agent', '/approve_agent',              // factory commands
+  '/reject_agent', '/my_agents', '/stop_agent',
+  '/cfo',                                          // CFO command
+]);
 import { recordMessageReceived } from '../services/telegramHealthMonitor.ts';
 import { verifyWebhookSignature, isWebhookSecurityEnabled, initTelegramSecurity } from '../services/telegramSecurity.ts';
 import { processReactionUpdate, processTextReply } from '../services/communityVoting.ts';
@@ -334,7 +346,6 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
         // Route update through ALL registered bot.command() handlers via handleUpdate.
         // This covers /ban, /kick, /cfo, /health, /scan, and any other registered commands.
         try {
-          const { processUpdate } = await import('../services/telegramBanHandler.ts');
           await processUpdate(update);
         } catch (cmdErr) {
           console.error('[TG_WEBHOOK] Command handler error:', cmdErr);
@@ -377,12 +388,13 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
         const elizaWebhookUrl = process.env.ELIZA_TELEGRAM_WEBHOOK_URL;
         if (elizaWebhookUrl) {
           const msgText: string = update.message?.text || '';
-          const isSlashCommand = msgText.startsWith('/');
+          // Extract the command token: "/cfo@BotName status" → "/cfo"
+          const cmdToken = msgText.split(/\s/)[0]?.split('@')[0] || '';
 
-          // If it's a slash command AND our handlers are registered, let handleUpdate handle it.
-          // Don't also forward to Eliza — that causes the duplicate LLM response.
-          if (isSlashCommand && areFactoryCommandsReady()) {
-            console.log(`[TG_WEBHOOK] Slash command "${msgText.split(' ')[0]}" handled by bot.command() — skipping Eliza forward`);
+          // If it's a known slash command, skip Eliza forward entirely.
+          // handleUpdate already dispatched it to the correct bot.command() handler above.
+          if (KNOWN_BOT_COMMANDS.has(cmdToken)) {
+            console.log(`[TG_WEBHOOK] Slash command "${cmdToken}" is a known bot command — skipping Eliza forward`);
           } else {
             try {
               await fetch(elizaWebhookUrl, {
