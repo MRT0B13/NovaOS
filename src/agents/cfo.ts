@@ -41,6 +41,27 @@ let _helius:  any = null; const helius  = async () => _helius  ??= await import(
 
 interface ScoutIntel { cryptoBullish?: boolean; btcEstimate?: number; narratives?: string[]; receivedAt: number; }
 
+/**
+ * Symbol → Solana mint address for tokens the CFO can hold via DeFi strategies.
+ * Used to register/deregister CFO exposure with Guardian when positions open/close.
+ * Update when new Orca whirlpool pairs or Kamino collateral types are added.
+ */
+const SOLANA_TOKEN_MINTS: Record<string, string> = {
+  'SOL':     'So11111111111111111111111111111111111111112',
+  'WSOL':    'So11111111111111111111111111111111111111112',
+  'USDC':    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  'JitoSOL': 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',
+  'BONK':    'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+  'WIF':     'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',
+  'JUP':     'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',
+  // Add more as new Orca pairs or Kamino markets are added
+};
+
+/** Derive the set of Solana token mints involved in a given Orca pair string (e.g. "SOL/USDC"). */
+function orcaPairMints(pair: string): string[] {
+  return pair.split('/').map(sym => SOLANA_TOKEN_MINTS[sym]).filter(Boolean);
+}
+
 /** Serializable approval metadata — persisted to DB so approvals survive restarts */
 interface SerializableApproval {
   id: string;
@@ -92,6 +113,10 @@ export class CFOAgent extends BaseAgent {
         this.repo = await PostgresCFORepository.create(dbUrl);
         this.positionManager = new PositionManager(this.repo);
         logger.info('[CFO] Database ready');
+
+        // Reconcile CFO exposure with Guardian based on currently open positions
+        // This ensures correct state after restarts (positions opened before this feature)
+        setTimeout(() => this.reconcileCFOExposure(), 15_000); // slight delay for guardian to be ready
       } catch (err) { logger.warn('[CFO] DB init failed:', err); }
     }
 
@@ -507,6 +532,9 @@ export class CFOAgent extends BaseAgent {
               metadata: { targetLtv, estimatedApy: estApy, reasoning: d.reasoning },
             });
             logger.info(`[CFO] Persisted KAMINO_JITO_LOOP: ${jitoSol} JitoSOL → ${(targetLtv * 100).toFixed(0)}% LTV, est. APY ${(estApy * 100).toFixed(1)}%`);
+            await this.registerCFOExposure([
+              { mint: SOLANA_TOKEN_MINTS['JitoSOL'], ticker: 'JitoSOL' },
+            ]);
             break;
           }
 
@@ -521,6 +549,9 @@ export class CFOAgent extends BaseAgent {
               metadata: { reasoning: d.reasoning },
             });
             logger.info(`[CFO] Persisted KAMINO_JITO_UNWIND`);
+            await this.deregisterCFOExposure([
+              { mint: SOLANA_TOKEN_MINTS['JitoSOL'], ticker: 'JitoSOL' },
+            ]);
             break;
           }
 
@@ -541,6 +572,12 @@ export class CFOAgent extends BaseAgent {
               },
             });
             logger.info(`[CFO] Persisted ORCA_LP_OPEN: $${deployUsd.toFixed(0)} ${pair} LP`);
+            // Register the LP pair tokens with Guardian for targeted alert forwarding
+            const lpMints = orcaPairMints(pair).map(mint => ({
+              mint,
+              ticker: pair.split('/').find(sym => SOLANA_TOKEN_MINTS[sym] === mint) ?? mint.slice(0, 8),
+            }));
+            await this.registerCFOExposure(lpMints);
             break;
           }
 
@@ -1467,6 +1504,90 @@ export class CFOAgent extends BaseAgent {
   setScoutIntel(intel: Omit<ScoutIntel, 'receivedAt'>) { this.scoutIntel = { ...intel, receivedAt: Date.now() }; }
 
   // ── State Persistence (survive restarts) ─────────────────────────
+
+  /**
+   * Register token mints the CFO is actively holding with Guardian.
+   * Guardian will tag these as 'cfo' source and include isCfoExposure=true
+   * in alerts for these tokens, enabling targeted market_crash forwarding.
+   */
+  private async registerCFOExposure(mints: Array<{ mint: string; ticker: string }>): Promise<void> {
+    for (const { mint, ticker } of mints) {
+      if (!mint) continue;
+      await this.sendMessage('nova-guardian', 'command', 'low', {
+        action: 'watch_token',
+        tokenAddress: mint,
+        ticker,
+        source: 'cfo',
+      }).catch(err => logger.debug(`[CFO] Failed to register exposure ${ticker}: ${err}`));
+    }
+    if (mints.length > 0) {
+      logger.info(`[CFO] Registered exposure with Guardian: ${mints.map(m => m.ticker).join(', ')}`);
+    }
+  }
+
+  /**
+   * Deregister a token mint from Guardian's CFO exposure set when the CFO exits a position.
+   * Only removes if source='cfo' — does not remove core/scout watched tokens.
+   */
+  private async deregisterCFOExposure(mints: Array<{ mint: string; ticker: string }>): Promise<void> {
+    for (const { mint, ticker } of mints) {
+      if (!mint) continue;
+      await this.sendMessage('nova-guardian', 'command', 'low', {
+        action: 'unwatch_cfo_token',
+        tokenAddress: mint,
+        ticker,
+      }).catch(err => logger.debug(`[CFO] Failed to deregister exposure ${ticker}: ${err}`));
+    }
+    if (mints.length > 0) {
+      logger.info(`[CFO] Deregistered exposure with Guardian: ${mints.map(m => m.ticker).join(', ')}`);
+    }
+  }
+
+  /**
+   * On startup, read all open DeFi positions from DB and re-register their
+   * token mints with Guardian. This handles restarts and ensures the exposure
+   * registry is always accurate regardless of when this feature was deployed.
+   */
+  private async reconcileCFOExposure(): Promise<void> {
+    if (!this.repo) return;
+    try {
+      const openPositions = await this.repo.getOpenPositions();
+      const mintsToRegister: Array<{ mint: string; ticker: string }> = [];
+
+      for (const pos of openPositions) {
+        // Orca LP positions: asset = "orca-lp-SOL/USDC" etc.
+        if (pos.strategy === 'orca_lp' && pos.asset?.includes('/')) {
+          const pair = pos.asset.replace(/^orca-lp-/, '');
+          orcaPairMints(pair).forEach(mint => {
+            const ticker = pair.split('/').find(sym => SOLANA_TOKEN_MINTS[sym] === mint) ?? mint.slice(0, 8);
+            mintsToRegister.push({ mint, ticker });
+          });
+        }
+
+        // Kamino JitoSOL loop: tokenIn is 'JitoSOL'
+        if ((pos.strategy === 'kamino_jito_loop' || pos.strategy === 'kamino_loop') && pos.status === 'OPEN') {
+          mintsToRegister.push({ mint: SOLANA_TOKEN_MINTS['JitoSOL'], ticker: 'JitoSOL' });
+        }
+      }
+
+      // Deduplicate
+      const seen = new Set<string>();
+      const unique = mintsToRegister.filter(m => {
+        if (!m.mint || seen.has(m.mint)) return false;
+        seen.add(m.mint);
+        return true;
+      });
+
+      if (unique.length > 0) {
+        await this.registerCFOExposure(unique);
+        logger.info(`[CFO] Startup reconciliation: registered ${unique.length} exposure mints with Guardian`);
+      } else {
+        logger.debug('[CFO] Startup reconciliation: no open DeFi positions to register');
+      }
+    } catch (err) {
+      logger.debug('[CFO] Exposure reconciliation failed (non-fatal):', err);
+    }
+  }
 
   private async persistState(): Promise<void> {
     // Serialize pending approvals (strip non-serializable `action` closure)

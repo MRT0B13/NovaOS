@@ -142,7 +142,7 @@ interface WatchedToken {
   lastScore: number;
   lastCheckedAt: number;
   addedAt: number;
-  source: 'core' | 'launched' | 'scout' | 'manual';
+  source: 'core' | 'launched' | 'scout' | 'manual' | 'cfo';
   // Liquidity tracking
   lastLiquidityUsd?: number;
   lastVolume24h?: number;
@@ -415,8 +415,7 @@ export class GuardianAgent extends BaseAgent {
 
       // Detect score degradation (higher score = riskier)
       if (previousScore >= 0 && report.score - previousScore > 20) {
-        await this.reportToSupervisor('alert', 'high', {
-          tokenAddress: mint,
+        await this.reportAlert('high', mint, {
           tokenName: watched.ticker,
           score: report.score,
           previousScore,
@@ -438,8 +437,7 @@ export class GuardianAgent extends BaseAgent {
       if (report.mintAuthority) alerts.push('Mint authority still active');
       if (report.freezeAuthority) alerts.push('Freeze authority still active');
 
-      await this.reportToSupervisor('alert', 'critical', {
-        tokenAddress: mint,
+      await this.reportAlert('critical', mint, {
         tokenName: watched?.ticker,
         score: report.score,
         riskLevel: report.riskLevel,
@@ -449,8 +447,7 @@ export class GuardianAgent extends BaseAgent {
     } else if (!isCore && !safe) {
       // Non-critical but unsafe (skip core tokens — they always score high)
       const alerts = report.risks?.map((r: any) => `${r.level}: ${r.name}`) || [];
-      await this.reportToSupervisor('alert', 'high', {
-        tokenAddress: mint,
+      await this.reportAlert('high', mint, {
         tokenName: watched?.ticker,
         score: report.score,
         riskLevel: report.riskLevel,
@@ -569,8 +566,7 @@ export class GuardianAgent extends BaseAgent {
           const rug = await this.quickRugScan(mint);
           const alertLines = [`LP drained ${dropPct}%: $${this.formatUSD(prevLiq)} → $${this.formatUSD(snapshot.liquidityUsd)}`];
           if (rug.alerts.length) alertLines.push(...rug.alerts.map(a => `RugCheck: ${a}`));
-          await this.reportToSupervisor('alert', dropPct > 80 ? 'critical' : 'high', {
-            tokenAddress: mint,
+          await this.reportAlert(dropPct > 80 ? 'critical' : 'high', mint, {
             tokenName: name,
             alerts: alertLines,
             score: rug.score,
@@ -585,8 +581,7 @@ export class GuardianAgent extends BaseAgent {
 
         // VOLUME SPIKE: 5x the previous volume (potential pump or dump)
         if (prevVol && prevVol > 100 && snapshot.volume24h > prevVol * 5) {
-          await this.reportToSupervisor('alert', 'high', {
-            tokenAddress: mint,
+          await this.reportAlert('high', mint, {
             tokenName: name,
             alerts: [`Volume surged ${Math.round(snapshot.volume24h / prevVol)}x: $${this.formatUSD(snapshot.volume24h)}`],
             volume24h: snapshot.volume24h,
@@ -602,8 +597,7 @@ export class GuardianAgent extends BaseAgent {
           const rug = await this.quickRugScan(mint);
           const alertLines = [`Price crashed ${crashPct}%: $${prevPrice.toFixed(6)} → $${snapshot.priceUsd.toFixed(6)}`];
           if (rug.alerts.length) alertLines.push(...rug.alerts.map(a => `RugCheck: ${a}`));
-          await this.reportToSupervisor('alert', crashPct > 50 ? 'critical' : 'high', {
-            tokenAddress: mint,
+          await this.reportAlert(crashPct > 50 ? 'critical' : 'high', mint, {
             tokenName: name,
             alerts: alertLines,
             score: rug.score,
@@ -779,9 +773,25 @@ export class GuardianAgent extends BaseAgent {
         }
         // Accept watch_token commands from any agent
         if (msg.message_type === 'command' && msg.payload?.action === 'watch_token') {
+          const { tokenAddress, ticker, source } = msg.payload;
+          if (tokenAddress) {
+            const src = (source === 'cfo' || source === 'manual') ? source : 'scout';
+            this.addToWatchList(tokenAddress, ticker, src);
+            logger.debug(`[guardian] watch_token: ${ticker ?? tokenAddress.slice(0, 8)} (source: ${src})`);
+          }
+        }
+
+        if (msg.message_type === 'command' && msg.payload?.action === 'unwatch_cfo_token') {
           const { tokenAddress, ticker } = msg.payload;
           if (tokenAddress) {
-            this.addToWatchList(tokenAddress, ticker, 'scout');
+            const existing = this.watchList.get(tokenAddress);
+            if (existing?.source === 'cfo') {
+              this.removeFromWatchList(tokenAddress);
+              logger.info(`[guardian] Removed CFO exposure token: ${ticker ?? tokenAddress.slice(0, 8)}`);
+              await this.persistState();
+            } else {
+              logger.debug(`[guardian] unwatch_cfo_token: ${tokenAddress.slice(0, 8)} not found or not cfo-source, skipping`);
+            }
           }
         }
         // Security: return full security posture
@@ -817,13 +827,30 @@ export class GuardianAgent extends BaseAgent {
     }
   }
 
+  /**
+   * Wrapper around reportToSupervisor that automatically injects isCfoExposure
+   * so downstream agents can filter alerts by CFO relevance.
+   */
+  private async reportAlert(
+    priority: 'critical' | 'high' | 'medium' | 'low',
+    tokenAddress: string | undefined,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    const watched = tokenAddress ? this.watchList.get(tokenAddress) : undefined;
+    await this.reportToSupervisor('alert', priority, {
+      ...payload,
+      tokenAddress,
+      isCfoExposure: watched?.source === 'cfo',
+    });
+  }
+
   // ── State Persistence (survive restarts) ─────────────────────────
 
   private async persistState(): Promise<void> {
     // Persist scout-added watchList tokens so they survive restarts
     const scoutTokens: Array<{ mint: string; ticker?: string; source: string; addedAt: number }> = [];
     for (const [mint, t] of this.watchList) {
-      if (t.source === 'scout' || t.source === 'manual') {
+      if (t.source === 'scout' || t.source === 'manual' || t.source === 'cfo') {
         scoutTokens.push({ mint, ticker: t.ticker, source: t.source, addedAt: t.addedAt });
       }
     }

@@ -347,27 +347,38 @@ export class Supervisor extends BaseAgent {
         if (this.callbacks.onPostToFarcaster) await this.callbacks.onPostToFarcaster(warning, 'defi');
         logger.warn(`[supervisor] CRITICAL safety alert posted for ${tokenName || tokenAddress}`);
 
-        // Forward critical alerts to CFO for emergency exit evaluation
-        await this.sendMessage('nova-cfo', 'alert', 'critical', {
-          command: 'market_crash',
-          source: 'guardian',
-          tokenAddress,
-          tokenName,
-          score,
-          alerts,
-          message: `Guardian CRITICAL: ${tokenName || tokenAddress} — ${(alerts || []).join(', ')}`,
-        });
+        // Forward to CFO only if the alert token is one CFO holds,
+        // OR if it's a confirmed rug (isRugged=true) which could affect Polymarket positions.
+        const isCfoToken = !!msg.payload.isCfoExposure;
+        const isConfirmedRug = !!msg.payload.isRugged;
+        if (isCfoToken || isConfirmedRug) {
+          await this.sendMessage('nova-cfo', 'alert', 'critical', {
+            command: 'market_crash',
+            source: 'guardian',
+            tokenAddress,
+            tokenName,
+            score,
+            alerts,
+            type: msg.payload.type,
+            isCfoExposure: isCfoToken,
+            message: `Guardian CRITICAL: ${tokenName || tokenAddress} — ${(alerts || []).join(', ')}`,
+          });
+          logger.warn(`[supervisor] Forwarded CRITICAL to CFO (cfoExposure=${isCfoToken}, rug=${isConfirmedRug}): ${tokenName || tokenAddress}`);
+        } else {
+          logger.info(`[supervisor] CRITICAL alert posted to socials — not forwarded to CFO (no CFO exposure): ${tokenName || tokenAddress}`);
+        }
       } else if (msg.priority === 'high') {
         // HIGH: Post to TG channel only
         if (this.callbacks.onPostToChannel) await this.callbacks.onPostToChannel(warning);
         logger.info(`[supervisor] High safety alert posted for ${tokenName || tokenAddress}`);
 
-        // Forward LP drain / price crash events to CFO as market_crash
-        // so CFO can pause trading or close positions defensively
+        // Keep keyword filter as a sanity check, but ALSO require CFO exposure
         const alertTypes = (alerts || []).map((a: string) => a.toLowerCase());
         const hasLpDrain = alertTypes.some((a: string) => a.includes('lp') || a.includes('liquidity') || a.includes('drain'));
-        const hasCrash = alertTypes.some((a: string) => a.includes('crash') || a.includes('dump') || a.includes('plunge'));
-        if (hasLpDrain || hasCrash) {
+        const hasCrash   = alertTypes.some((a: string) => a.includes('crash') || a.includes('dump') || a.includes('plunge'));
+        const isCfoTokenHigh = !!msg.payload.isCfoExposure;
+
+        if ((hasLpDrain || hasCrash) && isCfoTokenHigh) {
           await this.sendMessage('nova-cfo', 'alert', 'high', {
             command: 'market_crash',
             source: 'guardian',
@@ -375,9 +386,13 @@ export class Supervisor extends BaseAgent {
             tokenName,
             score,
             alerts,
-            message: `Guardian HIGH (LP drain/crash): ${tokenName || tokenAddress} — ${(alerts || []).join(', ')}`,
+            type: msg.payload.type,
+            isCfoExposure: true,
+            message: `Guardian HIGH (LP drain/crash, CFO exposure): ${tokenName || tokenAddress} — ${(alerts || []).join(', ')}`,
           });
-          logger.warn(`[supervisor] Forwarded guardian HIGH alert to CFO as market_crash: ${tokenName || tokenAddress}`);
+          logger.warn(`[supervisor] Forwarded HIGH to CFO (LP/crash + CFO exposure): ${tokenName || tokenAddress}`);
+        } else if ((hasLpDrain || hasCrash) && !isCfoTokenHigh) {
+          logger.info(`[supervisor] HIGH LP/crash alert for ${tokenName || tokenAddress} — NOT forwarded to CFO (no CFO exposure)`);
         }
       }
       // Medium/low alerts are logged but not posted (available in DB for reference)

@@ -10,11 +10,16 @@
 import { logger } from '@elizaos/core';
 
 // ── Backup RPCs (order matters — first is tried after current fails) ──
-const BACKUP_RPCS: string[] = [
-  'https://api.mainnet-beta.solana.com',
-  'https://rpc.helius.xyz',
-  'https://mainnet.helius-rpc.com',
-];
+// Build backups dynamically: Helius URLs need an API key, bare URLs always 401.
+function getBackupRpcs(): string[] {
+  const rpcs: string[] = ['https://api.mainnet-beta.solana.com'];
+  const heliusKey = process.env.HELIUS_API_KEY;
+  if (heliusKey) {
+    rpcs.push(`https://rpc.helius.xyz/?api-key=${heliusKey}`);
+    rpcs.push(`https://mainnet.helius-rpc.com/?api-key=${heliusKey}`);
+  }
+  return rpcs;
+}
 
 // ── State ──
 let activeRpcUrl: string =
@@ -47,7 +52,7 @@ export function rotateRpc(): string | null {
 
   // Build candidate list: env var first, then backups
   const envRpc = process.env.SOLANA_RPC_URL || '';
-  const allRpcs = [envRpc, ...BACKUP_RPCS].filter(Boolean);
+  const allRpcs = [envRpc, ...getBackupRpcs()].filter(Boolean);
   // Deduplicate while preserving order
   const unique = [...new Set(allRpcs)];
 
@@ -62,7 +67,8 @@ export function rotateRpc(): string | null {
   activeRpcUrl = unique[rotationIndex];
   lastRotationAt = now;
 
-  logger.info(`[RPC] Rotated: ${previous} → ${activeRpcUrl}`);
+  const redact = (url: string) => url.replace(/api-key=[^&]+/, 'api-key=***');
+  logger.info(`[RPC] Rotated: ${redact(previous)} → ${redact(activeRpcUrl)}`);
   return activeRpcUrl;
 }
 

@@ -22,6 +22,13 @@ const reportCache = new Map<string, { report: RugCheckReport; cachedAt: number }
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_CACHE_SIZE = 100;
 
+// Negative cache: mints that RugCheck can't process (returns 400 "unable to generate report")
+// Many established protocol tokens (RAY, Orca, Drift, JUP, etc.) consistently return 400.
+// Cache these for 6 hours to avoid log spam and wasted API calls.
+const negativeCache = new Set<string>();
+const negativeCacheExpiry = new Map<string, number>();
+const NEGATIVE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
 // Rate limiting: max scans per hour
 let scansThisHour = 0;
 let hourResetAt = 0;
@@ -93,6 +100,12 @@ export async function scanToken(mint: string): Promise<RugCheckReport | null> {
     logger.debug(`[RugCheck] Cache hit for ${mint.slice(0, 8)}...`);
     return cached.report;
   }
+
+  // Check negative cache (tokens RugCheck can't process)
+  const negExpiry = negativeCacheExpiry.get(mint);
+  if (negExpiry && Date.now() < negExpiry) {
+    return null; // Silently skip — already logged on first failure
+  }
   
   // Check rate limit
   if (!checkRateLimit()) return null;
@@ -107,6 +120,15 @@ export async function scanToken(mint: string): Promise<RugCheckReport | null> {
     if (res.status === 429) {
       logger.warn('[RugCheck] API rate limited (429) — backing off');
       scansThisHour = MAX_SCANS_PER_HOUR; // Stop scanning this hour
+      return null;
+    }
+
+    if (res.status === 400) {
+      // RugCheck returns 400 "unable to generate report" for many established
+      // protocol tokens (RAY, Orca, Drift, JUP, etc). Cache to avoid retrying.
+      negativeCache.add(mint);
+      negativeCacheExpiry.set(mint, Date.now() + NEGATIVE_CACHE_TTL_MS);
+      logger.debug(`[RugCheck] API returned 400 for ${mint.slice(0, 8)} — cached for 6h`);
       return null;
     }
 
@@ -144,6 +166,12 @@ export async function getDetailedReport(mint: string): Promise<RugCheckReport | 
   if (cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
     return cached.report;
   }
+
+  // Check negative cache
+  const negExpiry = negativeCacheExpiry.get(mint);
+  if (negExpiry && Date.now() < negExpiry) {
+    return null;
+  }
   
   if (!checkRateLimit()) return null;
   
@@ -157,6 +185,13 @@ export async function getDetailedReport(mint: string): Promise<RugCheckReport | 
     if (res.status === 429) {
       logger.warn('[RugCheck] API rate limited (429) — backing off');
       scansThisHour = MAX_SCANS_PER_HOUR;
+      return null;
+    }
+
+    if (res.status === 400) {
+      negativeCache.add(mint);
+      negativeCacheExpiry.set(mint, Date.now() + NEGATIVE_CACHE_TTL_MS);
+      logger.debug(`[RugCheck] Detailed API returned 400 for ${mint.slice(0, 8)} — cached for 6h`);
       return null;
     }
 
