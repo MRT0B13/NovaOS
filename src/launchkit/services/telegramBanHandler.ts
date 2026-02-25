@@ -23,6 +23,18 @@ import { getEnv } from '../env.ts';
 let isRegistered = false;
 let registeredBot: Telegraf | null = null;
 
+// Every bot.command() we register — if a message starts with one of these,
+// the patched handleMessage must NOT forward it to ElizaOS's LLM pipeline.
+// Mirrors the set in server.ts (webhook Eliza-forward gate).
+const KNOWN_BOT_COMMANDS = new Set([
+  '/ban', '/kick', '/roseban', '/banned',
+  '/health', '/errors', '/repairs',
+  '/scan', '/children',
+  '/request_agent', '/approve_agent',
+  '/reject_agent', '/my_agents', '/stop_agent',
+  '/cfo',
+]);
+
 /**
  * Register ban/kick command handlers on an existing Telegraf bot
  * Call this after ElizaOS has initialized its Telegram service
@@ -179,6 +191,19 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           }
         } catch {
           // Security module not available — don't block messages
+        }
+        
+        // ── Skip ElizaOS LLM processing for known slash commands ────
+        // bot.command() handlers (registered below) will handle these via
+        // the Telegraf middleware chain. If we also call originalHandleMessage,
+        // ElizaOS generates a fake LLM response ("The CFO session has concluded…").
+        {
+          const rawText: string = ((ctx as any).message?.text || '').trim();
+          const cmdToken = rawText.split(/\s/)[0]?.split('@')[0] || '';
+          if (KNOWN_BOT_COMMANDS.has(cmdToken)) {
+            console.log(`[BAN_HANDLER] ⚡ Known command "${cmdToken}" — skipping ElizaOS LLM pipeline`);
+            return; // let bot.command() handle it, don't call originalHandleMessage
+          }
         }
         
         // Call original handleMessage
