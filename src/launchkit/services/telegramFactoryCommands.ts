@@ -228,10 +228,15 @@ export async function registerFactoryCommands(
         const sub = (parts[0] || 'status').toLowerCase();
 
         const sendToCFO = async (command: string, extra: Record<string, any> = {}) => {
-          await pool.query(
-            `INSERT INTO agent_messages (sender, recipient, type, priority, payload) VALUES ($1, $2, $3, $4, $5)`,
-            ['admin-tg', 'nova-cfo', 'command', 'high', JSON.stringify({ command, ...extra })]
-          );
+          try {
+            await pool.query(
+              `INSERT INTO agent_messages (from_agent, to_agent, message_type, priority, payload) VALUES ($1, $2, $3, $4, $5)`,
+              ['admin-tg', 'nova-cfo', 'command', 'high', JSON.stringify({ command, ...extra })]
+            );
+          } catch (err) {
+            console.error('[TG-CMD] sendToCFO INSERT failed:', (err as Error).message);
+            throw err;   // propagate so ctx.reply confirmation doesn't fire
+          }
         };
 
         switch (sub) {
