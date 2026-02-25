@@ -284,136 +284,155 @@ export async function initLaunchKit(
     }
   }
 
-  // Register ban commands after Telegram service has time to initialize
-  // We use a delay because the Telegram plugin starts after this init runs
-  setTimeout(async () => {
-    try {
-      const registered = await registerBanCommands(runtime);
-      if (registered) {
-        logger.info('[LaunchKit] Telegram ban commands registered (/ban, /kick, /roseban)');
-      } else {
-        logger.warn('[LaunchKit] Could not register ban commands - Telegram service may not be available');
-      }
-    } catch (banErr) {
-      logger.warn({ error: banErr }, 'Failed to register ban commands (non-fatal)');
-    }
+  // Retry command registration until the Telegram bot is ready.
+  // On cold starts the bot handshake can take 10-20s, so a single 5s
+  // setTimeout is a race condition. We poll every 3s for up to 45s.
+  (async () => {
+    const MAX_ATTEMPTS = 15;
+    const RETRY_INTERVAL_MS = 3_000;
+    const INITIAL_DELAY_MS = 5_000;
 
-    // Also register health commands (/health, /errors, /repairs, /approve, /reject)
-    try {
-      const healthRegistered = await registerHealthCommands(runtime);
-      if (healthRegistered) {
-        logger.info('[LaunchKit] 🏥 Health TG commands registered (/health, /errors, /repairs)');
-      }
-    } catch (healthErr) {
-      logger.warn({ error: healthErr }, 'Failed to register health TG commands (non-fatal)');
-    }
+    await new Promise(r => setTimeout(r, INITIAL_DELAY_MS));
 
-    // Wire Supervisor callbacks now that X/TG services are ready
-    if (_swarmHandle) {
-      // Lazy-load Farcaster publisher (only imported if enabled)
-      let farcasterPost: ((content: string, channel: string) => Promise<void>) | undefined;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // Gate: only proceed if bot is actually available
+      const tgService = runtime.getService('telegram') as any;
+      const bot = tgService?.messageManager?.bot;
+
+      if (!bot) {
+        logger.debug(`[LaunchKit] TG bot not ready — attempt ${attempt}/${MAX_ATTEMPTS}, retrying in ${RETRY_INTERVAL_MS / 1000}s`);
+        await new Promise(r => setTimeout(r, RETRY_INTERVAL_MS));
+        continue;
+      }
+
+      // ── Bot is ready — run all registrations ──
+
       try {
-        const fc = await import('./services/farcasterPublisher.ts');
-        if (fc.isFarcasterEnabled()) {
-          farcasterPost = async (content: string, channel: string) => {
-            await fc.postCast(content, channel as any);
-          };
-          logger.info('[LaunchKit] 📣 Farcaster publisher enabled');
+        const registered = await registerBanCommands(runtime);
+        if (registered) {
+          logger.info('[LaunchKit] Telegram ban commands registered (/ban, /kick, /roseban)');
+        } else {
+          logger.warn('[LaunchKit] Could not register ban commands - Telegram service may not be available');
         }
-      } catch { /* Farcaster not configured — skip */ }
+      } catch (banErr) {
+        logger.warn({ error: banErr }, 'Failed to register ban commands (non-fatal)');
+      }
 
-      _swarmHandle.supervisor.setCallbacks({
-        onPostToX: async (content: string) => {
-          try {
-            // Check quota before attempting — avoids noisy error logs when exhausted
-            const { canWrite, getDailyWritesRemaining } = await import('./services/xRateLimiter.ts');
-            if (!canWrite()) {
-              logger.info(`[swarm] Supervisor → X post skipped: daily quota exhausted (${getDailyWritesRemaining()} remaining)`);
-              return;
-            }
-            await xPublisher.tweet(content);
-          } catch (err) {
-            logger.warn('[swarm] Supervisor → X post failed:', err);
-          }
-        },
-        onPostToTelegram: async (chatId: string, content: string) => {
-          try {
-            const tgService = runtime.getService('telegram') as any;
-            const bot = tgService?.messageManager?.bot;
-            if (bot) {
-              await bot.telegram.sendMessage(chatId, content, { parse_mode: 'Markdown' });
-            } else {
-              logger.warn('[swarm] Supervisor → TG: no bot instance available');
-            }
-          } catch (err) {
-            logger.warn('[swarm] Supervisor → TG post failed:', err);
-          }
-        },
-        onPostToAdmin: async (content: string) => {
-          try {
-            const { notifyAdminForce } = await import('./services/adminNotify.ts');
-            await notifyAdminForce(content);
-          } catch (err) {
-            logger.warn('[swarm] Supervisor → Admin post failed:', err);
-          }
-        },
-        onPostToChannel: async (content: string) => {
-          try {
-            const { sendToCommunity } = await import('./services/novaChannel.ts');
-            const result = await sendToCommunity(content);
-            if (result.success) {
-              logger.info(`[swarm] Supervisor → Community: ${content.slice(0, 80)}...`);
-            } else {
-              logger.debug(`[swarm] Supervisor → Community skipped (novaChannel disabled or no group configured)`);
-            }
-          } catch (err) {
-            logger.warn('[swarm] Supervisor → Community post failed:', err);
-          }
-        },
-        onPostToFarcaster: farcasterPost,
-      });
-      logger.info('[LaunchKit] 🐝 Supervisor callbacks wired (X + TG + Channel + Farcaster)');
-
-      // Wire Guardian security callbacks (incident alerts → admin notification)
       try {
-        _swarmHandle.guardian.setSecurityCallbacks({
-          onAdminAlert: async (message: string, severity: string) => {
+        const healthRegistered = await registerHealthCommands(runtime);
+        if (healthRegistered) {
+          logger.info('[LaunchKit] 🏥 Health TG commands registered (/health, /errors, /repairs)');
+        }
+      } catch (healthErr) {
+        logger.warn({ error: healthErr }, 'Failed to register health TG commands (non-fatal)');
+      }
+
+      if (_swarmHandle) {
+        let farcasterPost: ((content: string, channel: string) => Promise<void>) | undefined;
+        try {
+          const fc = await import('./services/farcasterPublisher.ts');
+          if (fc.isFarcasterEnabled()) {
+            farcasterPost = async (content: string, channel: string) => {
+              await fc.postCast(content, channel as any);
+            };
+            logger.info('[LaunchKit] 📣 Farcaster publisher enabled');
+          }
+        } catch { /* Farcaster not configured — skip */ }
+
+        _swarmHandle.supervisor.setCallbacks({
+          onPostToX: async (content: string) => {
             try {
-              const { notifyAdminForce } = await import('./services/adminNotify.ts');
-              await notifyAdminForce(`🛡️ SECURITY ${severity.toUpperCase()}\n\n${message}`);
+              const { canWrite, getDailyWritesRemaining } = await import('./services/xRateLimiter.ts');
+              if (!canWrite()) {
+                logger.info(`[swarm] Supervisor → X post skipped: daily quota exhausted (${getDailyWritesRemaining()} remaining)`);
+                return;
+              }
+              await xPublisher.tweet(content);
             } catch (err) {
-              logger.warn('[swarm] Guardian → Admin security alert failed:', err);
+              logger.warn('[swarm] Supervisor → X post failed:', err);
             }
           },
+          onPostToTelegram: async (chatId: string, content: string) => {
+            try {
+              const tgSvc = runtime.getService('telegram') as any;
+              const b = tgSvc?.messageManager?.bot;
+              if (b) {
+                await b.telegram.sendMessage(chatId, content, { parse_mode: 'Markdown' });
+              } else {
+                logger.warn('[swarm] Supervisor → TG: no bot instance available');
+              }
+            } catch (err) {
+              logger.warn('[swarm] Supervisor → TG post failed:', err);
+            }
+          },
+          onPostToAdmin: async (content: string) => {
+            try {
+              const { notifyAdminForce } = await import('./services/adminNotify.ts');
+              await notifyAdminForce(content);
+            } catch (err) {
+              logger.warn('[swarm] Supervisor → Admin post failed:', err);
+            }
+          },
+          onPostToChannel: async (content: string) => {
+            try {
+              const { sendToCommunity } = await import('./services/novaChannel.ts');
+              const result = await sendToCommunity(content);
+              if (result.success) {
+                logger.info(`[swarm] Supervisor → Community: ${content.slice(0, 80)}...`);
+              } else {
+                logger.debug(`[swarm] Supervisor → Community skipped (novaChannel disabled or no group configured)`);
+              }
+            } catch (err) {
+              logger.warn('[swarm] Supervisor → Community post failed:', err);
+            }
+          },
+          onPostToFarcaster: farcasterPost,
         });
-        logger.info('[LaunchKit] 🛡️ Guardian security callbacks wired');
-      } catch (secErr) {
-        logger.warn('[LaunchKit] Security callbacks failed (non-fatal):', secErr);
-      }
+        logger.info('[LaunchKit] 🐝 Supervisor callbacks wired (X + TG + Channel + Farcaster)');
 
-      // Register /scan and /children TG commands
-      try {
-        const scanRegistered = await registerScanCommand(runtime, _swarmHandle.supervisor);
-        if (scanRegistered) {
-          logger.info('[LaunchKit] 🔍 Scan TG commands registered (/scan, /children)');
-        }
-      } catch (scanErr) {
-        logger.warn({ error: scanErr }, 'Failed to register scan commands (non-fatal)');
-      }
-
-      // Register /request_agent, /approve_agent, /reject_agent, /my_agents, /stop_agent
-      if (pool) {
         try {
-          const factoryRegistered = await registerFactoryCommands(runtime, _swarmHandle.supervisor, pool);
-          if (factoryRegistered) {
-            logger.info('[LaunchKit] 🏭 Factory TG commands registered (/request_agent, /approve_agent, /my_agents)');
+          _swarmHandle.guardian.setSecurityCallbacks({
+            onAdminAlert: async (message: string, severity: string) => {
+              try {
+                const { notifyAdminForce } = await import('./services/adminNotify.ts');
+                await notifyAdminForce(`🛡️ SECURITY ${severity.toUpperCase()}\n\n${message}`);
+              } catch (err) {
+                logger.warn('[swarm] Guardian → Admin security alert failed:', err);
+              }
+            },
+          });
+          logger.info('[LaunchKit] 🛡️ Guardian security callbacks wired');
+        } catch (secErr) {
+          logger.warn('[LaunchKit] Security callbacks failed (non-fatal):', secErr);
+        }
+
+        try {
+          const scanRegistered = await registerScanCommand(runtime, _swarmHandle.supervisor);
+          if (scanRegistered) {
+            logger.info('[LaunchKit] 🔍 Scan TG commands registered (/scan, /children)');
           }
-        } catch (factoryErr) {
-          logger.warn({ error: factoryErr }, 'Failed to register factory commands (non-fatal)');
+        } catch (scanErr) {
+          logger.warn({ error: scanErr }, 'Failed to register scan commands (non-fatal)');
+        }
+
+        if (pool) {
+          try {
+            const factoryRegistered = await registerFactoryCommands(runtime, _swarmHandle.supervisor, pool);
+            if (factoryRegistered) {
+              logger.info('[LaunchKit] 🏭 Factory TG commands registered (/request_agent, /approve_agent, /my_agents, /cfo)');
+            }
+          } catch (factoryErr) {
+            logger.warn({ error: factoryErr }, 'Failed to register factory commands (non-fatal)');
+          }
         }
       }
+
+      logger.info(`[LaunchKit] ✅ TG commands registered successfully (attempt ${attempt})`);
+      return; // done — stop retrying
     }
-  }, 5000); // Wait 5 seconds for Telegram service to initialize
+
+    logger.error('[LaunchKit] ❌ TG command registration failed after all attempts — /cfo and other commands will not work until restart');
+  })();
 
   // Start system reporter FIRST (initializes PostgreSQL for metric tracking)
   // Must be before TG/X schedulers so recordTGPostSent()/recordTweetSent() can use PostgreSQL
