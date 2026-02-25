@@ -245,8 +245,9 @@ export async function registerFactoryCommands(
     // ── /cfo <subcommand> — CFO Agent controls (admin only) ────────
     bot.command('cfo', async (ctx: any) => {
       try {
+        logger.info(`[TG:factory] /cfo command handler fired — chat=${ctx.chat?.id}, from=${ctx.from?.id}`);
         if (!isAdmin(ctx.chat.id)) {
-          logger.warn(`[TG:factory] Unauthorized command from chat ${ctx.chat.id}`);
+          logger.warn(`[TG:factory] Unauthorized /cfo from chat ${ctx.chat.id} (admin check failed)`);
           await ctx.reply(`⛔ Unauthorized. (chat id: ${ctx.chat.id})`).catch(() => {});
           return;
         }

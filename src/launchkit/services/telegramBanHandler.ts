@@ -35,6 +35,19 @@ const KNOWN_BOT_COMMANDS = new Set([
   '/cfo',
 ]);
 
+// ── Command dispatch registry ──────────────────────────────────────────────
+// ElizaOS registers bot.on('message') BEFORE our bot.command() handlers,
+// and doesn't call next(). So bot.command() handlers are unreachable.
+// Instead, we store command handlers here and dispatch them directly
+// from the patched handleMessage when a known command is detected.
+const _commandHandlers = new Map<string, (ctx: any) => Promise<void>>();
+
+/** Register a command handler for direct dispatch from the handleMessage patch */
+export function registerCommandHandler(command: string, handler: (ctx: any) => Promise<void>): void {
+  _commandHandlers.set(command, handler);
+  console.log(`[BAN_HANDLER] 📌 Registered dispatch handler for /${command}`);
+}
+
 /**
  * Register ban/kick command handlers on an existing Telegraf bot
  * Call this after ElizaOS has initialized its Telegram service
@@ -74,6 +87,22 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
     }
     
     registeredBot = bot;
+    
+    // ── Monkey-patch bot.command() to auto-register dispatch handlers ──────
+    // ElizaOS's bot.on('message') runs before bot.command() handlers and
+    // doesn't call next(), so bot.command() middleware never fires.
+    // By patching bot.command(), every handler registered via bot.command()
+    // is also added to our _commandHandlers map for direct dispatch from
+    // our patched handleMessage.
+    const originalBotCommand = bot.command.bind(bot);
+    bot.command = (command: string | string[], handler: (ctx: any) => Promise<void>) => {
+      const names = Array.isArray(command) ? command : [command];
+      for (const name of names) {
+        _commandHandlers.set(name, handler);
+      }
+      return originalBotCommand(command, handler);
+    };
+    console.log('[BAN_HANDLER] 🔧 Patched bot.command() for auto-dispatch registration');
     
     // CRITICAL: Patch messageManager.handleMessage to intercept ALL messages
     // We can't use bot.use() because it's registered after bot.launch()
@@ -193,16 +222,27 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           // Security module not available — don't block messages
         }
         
-        // ── Skip ElizaOS LLM processing for known slash commands ────
-        // bot.command() handlers (registered below) will handle these via
-        // the Telegraf middleware chain. If we also call originalHandleMessage,
-        // ElizaOS generates a fake LLM response ("The CFO session has concluded…").
+        // ── Dispatch known slash commands directly ─────────────────────
+        // ElizaOS registers bot.on('message') BEFORE our bot.command() handlers
+        // and doesn't call next(), so bot.command() never fires.
+        // We dispatch to the registered handler directly from here.
         {
           const rawText: string = ((ctx as any).message?.text || '').trim();
           const cmdToken = rawText.split(/\s/)[0]?.split('@')[0] || '';
           if (KNOWN_BOT_COMMANDS.has(cmdToken)) {
-            console.log(`[BAN_HANDLER] ⚡ Known command "${cmdToken}" — skipping ElizaOS LLM pipeline`);
-            return; // let bot.command() handle it, don't call originalHandleMessage
+            const cmdName = cmdToken.slice(1); // "/cfo" → "cfo"
+            const handler = _commandHandlers.get(cmdName);
+            if (handler) {
+              console.log(`[BAN_HANDLER] ⚡ Dispatching "${cmdToken}" to registered handler`);
+              try {
+                await handler(ctx);
+              } catch (err: any) {
+                console.error(`[BAN_HANDLER] Command handler error for ${cmdToken}:`, err.message);
+              }
+            } else {
+              console.log(`[BAN_HANDLER] ⚡ Known command "${cmdToken}" — no handler registered yet, skipping LLM`);
+            }
+            return; // don't call originalHandleMessage (prevents LLM pipeline)
           }
         }
         
