@@ -11,6 +11,11 @@ import { getEnv } from '../env.ts';
 let isRegistered = false;
 let _factory: AgentFactory | null = null;
 
+/** Returns true once all factory commands (including /cfo) are registered on the bot */
+export function areFactoryCommandsReady(): boolean {
+  return isRegistered;
+}
+
 /** Get the singleton Factory instance */
 export function getFactory(): AgentFactory | null {
   return _factory;

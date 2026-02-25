@@ -18,7 +18,6 @@ import { createSecretsStore } from '../db/storeFactory.ts';
 import { TelegramPublisherService } from '../services/telegramPublisher.ts';
 import { XPublisherService } from '../services/xPublisher.ts';
 import { cacheTelegramUser } from '../services/telegramCommunity.ts';
-import { processUpdate as processBanUpdate } from '../services/telegramBanHandler.ts';
 import { recordMessageReceived } from '../services/telegramHealthMonitor.ts';
 import { verifyWebhookSignature, isWebhookSecurityEnabled, initTelegramSecurity } from '../services/telegramSecurity.ts';
 import { processReactionUpdate, processTextReply } from '../services/communityVoting.ts';
@@ -331,12 +330,13 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
           console.log(`[TG_WEBHOOK] Cached user ${from.id} (@${from.username || from.first_name}) for chat ${chatId}`);
         }
         
-        // Process /ban and /kick commands through our handler
-        // This gives us access to reply_to_message.from.id for banning
+        // Route update through ALL registered bot.command() handlers via handleUpdate.
+        // This covers /ban, /kick, /cfo, /health, /scan, and any other registered commands.
         try {
-          await processBanUpdate(update);
-        } catch (banErr) {
-          console.error('[TG_WEBHOOK] Ban handler error:', banErr);
+          const { processUpdate } = await import('../services/telegramBanHandler.ts');
+          await processUpdate(update);
+        } catch (cmdErr) {
+          console.error('[TG_WEBHOOK] Command handler error:', cmdErr);
         }
         
         // Process message reactions for community voting
@@ -371,16 +371,29 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
         }
         
         // Forward to ElizaOS webhook if configured
+        // Skip forwarding slash commands that are handled by our own bot.command() handlers —
+        // if we forward them, ElizaOS processes them as conversation and generates fake responses.
         const elizaWebhookUrl = process.env.ELIZA_TELEGRAM_WEBHOOK_URL;
         if (elizaWebhookUrl) {
-          try {
-            await fetch(elizaWebhookUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(update),
-            });
-          } catch (fwdErr) {
-            console.error('[TG_WEBHOOK] Failed to forward to ElizaOS:', fwdErr);
+          const msgText: string = update.message?.text || '';
+          const isSlashCommand = msgText.startsWith('/');
+
+          const { areFactoryCommandsReady } = await import('../services/telegramFactoryCommands.ts');
+
+          // If it's a slash command AND our handlers are registered, let handleUpdate handle it.
+          // Don't also forward to Eliza — that causes the duplicate LLM response.
+          if (isSlashCommand && areFactoryCommandsReady()) {
+            console.log(`[TG_WEBHOOK] Slash command "${msgText.split(' ')[0]}" handled by bot.command() — skipping Eliza forward`);
+          } else {
+            try {
+              await fetch(elizaWebhookUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(update),
+              });
+            } catch (fwdErr) {
+              console.error('[TG_WEBHOOK] Failed to forward to ElizaOS:', fwdErr);
+            }
           }
         }
         
