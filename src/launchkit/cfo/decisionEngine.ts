@@ -1879,44 +1879,49 @@ export function formatDecisionReport(
   const typeName: Record<string, string> = {
     OPEN_HEDGE: 'Open Hedge',
     CLOSE_HEDGE: 'Close Hedge',
+    CLOSE_LOSING: 'Close Losing Position',
     REBALANCE_HEDGE: 'Rebalance Hedge',
-    AUTO_STAKE: 'Stake SOL',
-    UNSTAKE_JITO: 'Unstake JitoSOL',
+    AUTO_STAKE: 'Stake SOL → JitoSOL',
+    UNSTAKE_JITO: 'Unstake JitoSOL → SOL',
     POLY_BET: 'Prediction Bet',
     POLY_EXIT: 'Close Prediction',
-    KAMINO_BORROW_DEPLOY: 'Kamino Borrow+Deploy',
+    KAMINO_BORROW_DEPLOY: 'Kamino Borrow & Deploy',
     KAMINO_REPAY: 'Kamino Repay',
     KAMINO_JITO_LOOP: 'JitoSOL Multiply Loop',
     KAMINO_JITO_UNWIND: 'JitoSOL Loop Unwind',
-    ORCA_LP_OPEN: 'Orca LP Open',
-    ORCA_LP_REBALANCE: 'Orca LP Rebalance',
+    ORCA_LP_OPEN: 'Open Orca LP',
+    ORCA_LP_REBALANCE: 'Rebalance Orca LP',
     EVM_FLASH_ARB: 'Flash Arb (Arbitrum)',
     SKIP: 'No Action',
   };
 
   // ── Header ──
-  L.push(`🧠 *CFO Report*${dryRun ? '  _(simulation)_' : ''}`);
+  L.push(`🧠 *CFO Report*${dryRun ? '  _(dry run)_' : ''}`);
 
-  // ── Intel (compact, only if present) ──
+  // ── Market Intel ──
   if (intel && (intel.scoutReceivedAt || intel.guardianReceivedAt || intel.analystReceivedAt)) {
-    const parts: string[] = [];
-    if (intel.scoutReceivedAt) parts.push(`Scout ${intel.scoutBullish ? 'bullish' : 'bearish'}`);
-    if (intel.guardianReceivedAt) parts.push(`Guard ${intel.guardianCritical ? 'alert' : 'clear'}`);
-    if (intel.analystReceivedAt) parts.push(`Analyst ${intel.analystVolumeSpike ? 'spike' : 'normal'}`);
-    L.push(`📡 ${intel.marketCondition} · risk ×${intel.riskMultiplier.toFixed(1)} · ${parts.join(' · ')}`);
+    const condition = (intel.marketCondition ?? 'neutral').charAt(0).toUpperCase() + (intel.marketCondition ?? 'neutral').slice(1);
+    const riskLabel = intel.riskMultiplier <= 0.5 ? 'High risk' : intel.riskMultiplier <= 1 ? 'Normal risk' : 'Low risk';
+    L.push(`📡 *Market:* ${condition} · ${riskLabel}`);
+    const details: string[] = [];
+    if (intel.scoutReceivedAt) details.push(intel.scoutBullish ? '🟢 Scout bullish' : '🔴 Scout bearish');
+    if (intel.guardianReceivedAt) details.push(intel.guardianCritical ? '🔴 Guardian alert' : '🛡 Guardian clear');
+    if (intel.analystReceivedAt) details.push(intel.analystVolumeSpike ? '📊 Volume spike' : '📊 Volume normal');
+    L.push(`    ${details.join(' · ')}`);
   }
 
   // ── Portfolio ──
-  const bal: string[] = [`SOL ${state.solBalance.toFixed(2)} ($${state.solExposureUsd.toFixed(0)})`];
-  if (state.jitoSolBalance > 0) bal.push(`JitoSOL $${state.jitoSolValueUsd.toFixed(0)}`);
-  if (state.hlEquity > 0) bal.push(`HL $${state.hlEquity.toFixed(0)}`);
-  if (state.polyDeployedUsd > 0 || state.polyPositionCount > 0) bal.push(`Poly $${state.polyDeployedUsd.toFixed(0)}`);
-  L.push(`💰 *$${state.totalPortfolioUsd.toFixed(0)}* — ${bal.join(' · ')}`);
-  L.push(`🛡 Hedge ${(state.hedgeRatio * 100).toFixed(0)}% · SOL @ $${state.solPriceUsd.toFixed(0)}`);
+  L.push(``);
+  L.push(`💰 *Portfolio: $${state.totalPortfolioUsd.toFixed(0)}*`);
+  L.push(`    ◽ ${state.solBalance.toFixed(2)} SOL ($${state.solExposureUsd.toFixed(0)})`);
+  if (state.jitoSolBalance > 0) L.push(`    ◽ ${state.jitoSolBalance.toFixed(2)} JitoSOL ($${state.jitoSolValueUsd.toFixed(0)})`);
+  if (state.hlEquity > 0) L.push(`    ◽ Hyperliquid $${state.hlEquity.toFixed(0)}`);
+  if (state.polyDeployedUsd > 0 || state.polyPositionCount > 0) L.push(`    ◽ Polymarket $${state.polyDeployedUsd.toFixed(0)}`);
+  L.push(`🛡 ${(state.hedgeRatio * 100).toFixed(0)}% hedged · SOL @ $${state.solPriceUsd.toFixed(0)}`);
 
   // ── Decisions ──
   if (results.length === 0) {
-    L.push(`\n✅ Portfolio balanced — no actions required.`);
+    L.push(`\n✅ Portfolio balanced — no actions needed.`);
   } else {
     L.push('');
     for (const r of results) {
@@ -1924,25 +1929,21 @@ export function formatDecisionReport(
       const name = typeName[d.type] ?? d.type;
       const icon = r.pendingApproval ? '⏳' : r.success ? (r.executed ? '✅' : '📋') : '❌';
 
-      const status = r.pendingApproval
+      const statusLabel = r.pendingApproval
         ? 'awaiting approval'
-        : r.dryRun ? 'simulated'
-          : r.executed ? (r.success ? 'complete' : 'failed') : 'skipped';
+        : r.dryRun ? 'dry run'
+          : r.executed ? (r.success ? 'done' : 'failed') : 'skipped';
 
-      L.push(`${icon} *${name}* — ${status}`);
-
-      // Detail line: amount + short reason
       const reason = _shortReason(d);
       const amt = Math.abs(d.estimatedImpactUsd);
-      if (amt > 0) {
-        L.push(`     $${amt.toFixed(0)} · ${reason}`);
-      } else {
-        L.push(`     ${reason}`);
-      }
+      const amtStr = amt > 0 ? ` · $${amt.toFixed(0)}` : '';
+
+      L.push(`${icon} *${name}*${amtStr} — _${statusLabel}_`);
+      L.push(`    ${reason}`);
 
       // Error line (only on failure)
-      if (r.error && !r.success) L.push(`     ⚠️ ${r.error}`);
-      if (r.txId) L.push(`     🔗 ${r.txId}`);
+      if (r.error && !r.success) L.push(`    ⚠️ ${r.error}`);
+      if (r.txId) L.push(`    🔗 ${r.txId}`);
     }
   }
 
