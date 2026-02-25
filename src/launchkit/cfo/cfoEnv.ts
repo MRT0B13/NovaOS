@@ -71,6 +71,13 @@ export interface CFOEnv {
   orcaLpMaxUsd: number;                           // max USD deployed into Orca LP (default 500)
   orcaLpRebalanceTriggerPct: number;              // rebalance when price within X% of range edge (default 5%)
 
+  // ── Kamino-funded LP (borrow → LP → fees repay loan) ─────────────
+  kaminoBorrowLpEnabled: boolean;                 // enable borrow-for-LP strategy (default false)
+  kaminoBorrowLpMaxUsd: number;                   // max USD borrowed for LP (default 200 — conservative)
+  kaminoBorrowLpMinSpreadPct: number;             // LP fee APY must beat borrow cost by this % (default 5)
+  kaminoBorrowLpMaxLtvPct: number;                // won't borrow if post-borrow LTV exceeds this (default 55)
+  kaminoBorrowLpCapacityPct: number;              // use at most X% of remaining borrow headroom (default 20)
+
   // ── EVM Flash Arbitrage (Arbitrum) ─────────────────────────────────────
   evmArbEnabled: boolean;              // enable arb scanning + execution (default false)
   evmArbMinProfitUsdc: number;         // minimum net profit per trade in USD (default 2)
@@ -179,6 +186,12 @@ export function getCFOEnv(bust = false): CFOEnv {
     orcaLpRangeWidthPct: Number(process.env.CFO_ORCA_LP_RANGE_WIDTH_PCT ?? 20),
     orcaLpMaxUsd: Number(process.env.CFO_ORCA_LP_MAX_USD ?? 500),
     orcaLpRebalanceTriggerPct: Number(process.env.CFO_ORCA_LP_REBALANCE_TRIGGER_PCT ?? 5),
+
+    kaminoBorrowLpEnabled: process.env.CFO_KAMINO_BORROW_LP_ENABLE === 'true',
+    kaminoBorrowLpMaxUsd: Number(process.env.CFO_KAMINO_BORROW_LP_MAX_USD ?? 200),
+    kaminoBorrowLpMinSpreadPct: Number(process.env.CFO_KAMINO_BORROW_LP_MIN_SPREAD_PCT ?? 5),
+    kaminoBorrowLpMaxLtvPct: Number(process.env.CFO_KAMINO_BORROW_LP_MAX_LTV_PCT ?? 55),
+    kaminoBorrowLpCapacityPct: Number(process.env.CFO_KAMINO_BORROW_LP_CAPACITY_PCT ?? 20),
 
     evmArbEnabled:          process.env.CFO_EVM_ARB_ENABLE === 'true',
     evmArbMinProfitUsdc:    Number(process.env.CFO_EVM_ARB_MIN_PROFIT_USDC ?? 2),

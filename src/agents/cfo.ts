@@ -595,6 +595,41 @@ export class CFOAgent extends BaseAgent {
             break;
           }
 
+          // ── Kamino Borrow → Orca LP ────────────────────────────
+          case 'KAMINO_BORROW_LP': {
+            const borrowUsd = p.borrowUsd ?? 0;
+            // Record the borrow transaction
+            await this.repo.insertTransaction({
+              id: `tx-kamino-borrow-lp-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'kamino_loop', txType: 'borrow',
+              tokenIn: 'collateral', amountIn: 0,
+              tokenOut: 'USDC', amountOut: borrowUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { deployTarget: 'orca_lp', borrowApy: p.borrowApy, spreadPct: p.spreadPct, reasoning: d.reasoning },
+            });
+            // Record the LP deployment
+            await this.repo.insertTransaction({
+              id: `tx-orca-lp-borrowed-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'orca_lp', txType: 'liquidity_add',
+              tokenIn: 'USDC(borrowed)', amountIn: borrowUsd,
+              tokenOut: 'orca-lp-SOL/USDC', amountOut: borrowUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: {
+                pair: 'SOL/USDC', fundingSource: 'kamino_borrow',
+                borrowUsd, estimatedLpApy: p.estimatedLpApy, borrowApy: p.borrowApy,
+                rangeWidthPct: p.rangeWidthPct, reasoning: d.reasoning,
+              },
+            });
+            logger.info(`[CFO] Persisted KAMINO_BORROW_LP: borrowed $${borrowUsd.toFixed(0)} → SOL/USDC LP`);
+            // Register SOL + USDC with Guardian
+            const lpMintsBorrow = orcaPairMints('SOL/USDC').map(mint => ({
+              mint,
+              ticker: ['SOL', 'USDC'].find(sym => SOLANA_TOKEN_MINTS[sym] === mint) ?? mint.slice(0, 8),
+            }));
+            await this.registerCFOExposure(lpMintsBorrow);
+            break;
+          }
+
           // ── EVM Flash Arb (Arbitrum) ─────────────────────────
           case 'EVM_FLASH_ARB': {
             const arbResult = r as any;
@@ -625,6 +660,23 @@ export class CFOAgent extends BaseAgent {
   private async monitorPositions(): Promise<void> {
     if (!this.running || this.paused || !this.positionManager) return;
     const env = getCFOEnv();
+
+    // ── Refresh Hyperliquid position prices ──
+    try {
+      const hl = await import('../launchkit/cfo/hyperliquidService.ts');
+      const summary = await hl.getAccountSummary();
+      if (summary.positions.length > 0) {
+        const actions = await this.positionManager.updateHyperliquidPrices(summary.positions);
+        for (const action of actions) {
+          if (action.urgency === 'critical') {
+            const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+            await notifyAdminForce(`⚠️ CFO HL: ${action.reason}`);
+          }
+        }
+      }
+    } catch (err) { logger.debug('[CFO] HL price refresh error:', err); }
+
+    // ── Refresh Polymarket position prices ──
     if (!env.polymarketEnabled) return;
 
     try {
@@ -1484,23 +1536,101 @@ export class CFOAgent extends BaseAgent {
 
   private async sendStatusReport(): Promise<void> {
     const env = getCFOEnv();
-    const lines = [`🏦 *CFO Status*\n`, `Paused: ${this.paused ? 'YES ⚠️' : 'No ✅'}`, `Dry Run: ${env.dryRun}`, `Cycles: ${this.cycleCount}`];
+    const lines: string[] = [];
 
-    if (this.positionManager) {
-      const m = await this.positionManager.getPortfolioMetrics();
-      lines.push(`\nPositions: ${m.totalOpenPositions} | PnL: ${m.totalUnrealizedPnlUsd >= 0 ? '+' : ''}$${m.totalUnrealizedPnlUsd.toFixed(2)} unrealized | ${m.totalRealizedPnlUsd >= 0 ? '+' : ''}$${m.totalRealizedPnlUsd.toFixed(2)} realized`);
+    lines.push(`🏦 *CFO Status*`);
+    lines.push(``);
+
+    // ── Mode ──
+    lines.push(`*Mode:* ${this.paused ? '⚠️ PAUSED' : '✅ Active'}${env.dryRun ? ' · Dry Run' : ''}`);
+    lines.push(`*Cycles:* ${this.cycleCount}`);
+
+    // ── Live Portfolio Snapshot (fetch everything in parallel) ──
+    try {
+      const { getPortfolioSnapshot } = await import('../launchkit/cfo/portfolioService.ts');
+      const snap = await getPortfolioSnapshot(this.repo);
+
+      // Prices
+      if (snap.prices.SOL > 0) {
+        lines.push(``);
+        lines.push(`📈 *Prices*`);
+        lines.push(`    SOL $${snap.prices.SOL.toFixed(2)} · ETH $${snap.prices.ETH.toFixed(0)} · BTC $${snap.prices.BTC.toFixed(0)}`);
+      }
+
+      // Wallets
+      lines.push(``);
+      lines.push(`💰 *Wallets — $${snap.totalWalletUsd.toFixed(0)}*`);
+      for (const c of snap.chains) {
+        if (c.totalUsd < 0.01) continue;
+        const parts: string[] = [];
+        if (c.native > 0.001) parts.push(`${c.native.toFixed(c.nativeSymbol === 'SOL' ? 2 : 3)} ${c.nativeSymbol}`);
+        if (c.usdc > 0.01) parts.push(`$${c.usdc.toFixed(2)} USDC`);
+        for (const other of c.other) parts.push(`${other.amount.toFixed(2)} ${other.symbol}`);
+        const chainName = c.chain.charAt(0).toUpperCase() + c.chain.slice(1);
+        lines.push(`    ${chainName}: ${parts.join(' · ')}  ($${c.totalUsd.toFixed(0)})`);
+      }
+
+      // Strategies
+      if (snap.strategies.length > 0) {
+        lines.push(``);
+        lines.push(`📊 *Strategies — $${snap.totalDeployedUsd.toFixed(0)} deployed*`);
+        for (const s of snap.strategies.sort((a, b) => b.valueUsd - a.valueUsd)) {
+          const pnl = s.unrealizedPnlUsd !== 0
+            ? ` · P&L ${s.unrealizedPnlUsd >= 0 ? '+' : ''}$${s.unrealizedPnlUsd.toFixed(2)}`
+            : '';
+          const alloc = snap.totalPortfolioUsd > 0 ? ` (${s.allocationPct.toFixed(0)}%)` : '';
+          const statusIcon = s.status === 'active' ? '🟢' : s.status === 'idle' ? '⚪' : '🔴';
+          lines.push(`    ${statusIcon} ${s.name}: $${s.valueUsd.toFixed(0)}${alloc}${pnl}`);
+          if (s.details) lines.push(`        _${s.details}_`);
+        }
+      }
+
+      // Orca LP (not in portfolioService yet, fetch separately)
+      if (env.orcaLpEnabled) {
+        try {
+          const orcaMod = await import('../launchkit/cfo/orcaService.ts');
+          const positions = await orcaMod.getPositions();
+          if (positions.length > 0) {
+            const totalLp = positions.reduce((s: number, p: any) => s + p.liquidityUsd, 0);
+            const inRange = positions.filter((p: any) => p.inRange).length;
+            lines.push(`    🟢 Orca LP: ${positions.length} position(s) · ${inRange}/${positions.length} in range`);
+            if (totalLp > 0) lines.push(`        _$${totalLp.toFixed(0)} liquidity_`);
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      // Totals
+      lines.push(``);
+      lines.push(`💎 *Total Portfolio: $${snap.totalPortfolioUsd.toFixed(0)}*`);
+      if (snap.totalUnrealizedPnlUsd !== 0) {
+        lines.push(`    Unrealized: ${snap.totalUnrealizedPnlUsd >= 0 ? '+' : ''}$${snap.totalUnrealizedPnlUsd.toFixed(2)}`);
+      }
+      if (snap.totalRealizedPnlUsd !== 0) {
+        lines.push(`    Realized: ${snap.totalRealizedPnlUsd >= 0 ? '+' : ''}$${snap.totalRealizedPnlUsd.toFixed(2)}`);
+      }
+
+      // Risk
+      if (snap.cashReservePct < 10) {
+        lines.push(`    ⚠️ Cash reserve low: ${snap.cashReservePct.toFixed(0)}%`);
+      }
+
+      // Errors
+      if (snap.errors.length > 0) {
+        lines.push(``);
+        lines.push(`⚠️ _${snap.errors.length} data error(s)_`);
+      }
+    } catch (err) {
+      lines.push(``);
+      lines.push(`⚠️ _Snapshot error: ${(err as Error).message}_`);
     }
 
-    if (env.polymarketEnabled) {
-      try {
-        const s = await (await evm()).getWalletStatus();
-        lines.push(`\nPolygon: $${s.usdcBalance.toFixed(2)} USDC | ${s.maticBalance.toFixed(3)} MATIC ${s.gasOk ? '✅' : '⚠️'}`);
-      } catch { /* non-fatal */ }
-    }
-
+    // ── Pending approvals ──
     if (this.pendingApprovals.size > 0) {
-      lines.push(`\n⏳ ${this.pendingApprovals.size} pending approval(s):`);
-      for (const [id, a] of this.pendingApprovals) lines.push(`  /cfo approve ${id} — ${a.description}`);
+      lines.push(``);
+      lines.push(`⏳ *${this.pendingApprovals.size} Pending Approval(s)*`);
+      for (const [id, a] of this.pendingApprovals) {
+        lines.push(`    /cfo approve ${id} — ${a.description.split(':')[0]}`);
+      }
     }
 
     const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');

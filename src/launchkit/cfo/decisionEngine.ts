@@ -59,6 +59,7 @@ export type DecisionType =
   | 'KAMINO_JITO_UNWIND'     // unwind the JitoSOL loop (SOL borrow + JitoSOL position)
   | 'ORCA_LP_OPEN'           // open a new concentrated LP position
   | 'ORCA_LP_REBALANCE'      // close out-of-range position and reopen centred on new price
+  | 'KAMINO_BORROW_LP'       // borrow from Kamino → swap → open Orca LP, fees repay loan
   | 'EVM_FLASH_ARB'          // Arbitrum: atomic flash loan arb via Aave v3 + DEX spread
   | 'SKIP';            // no action taken (for logging)
 
@@ -1509,6 +1510,105 @@ export async function generateDecisions(
     }
   }
 
+  // ── K) Kamino-funded Orca LP — borrow USDC → SOL/USDC LP, fees repay loan ──
+  //
+  // Prerequisite: Kamino has active collateral (from Section G jito-loop or deposits).
+  // Borrows a CONSERVATIVE fraction of remaining capacity and deploys into Orca LP.
+  // LP fee yield (~15-25% in-range) should comfortably exceed borrow cost (~3-8%).
+  // Safety: tiny capacity fraction (20%), strict LTV cap, large spread requirement,
+  //         APPROVAL tier. The CFO should never go crazy with borrowed money.
+  //
+  if (
+    env.kaminoBorrowLpEnabled &&
+    env.orcaLpEnabled &&
+    env.kaminoBorrowEnabled &&
+    intel.marketCondition !== 'bearish' &&
+    intel.marketCondition !== 'danger'
+  ) {
+    const borrowLpSkip = (reason: string) =>
+      logger.info(`[CFO:Decision] Section K skip: ${reason}`);
+
+    if (!state.kaminoJitoLoopActive && state.kaminoDepositValueUsd < 10) {
+      borrowLpSkip('no Kamino collateral — deposit or start Jito loop first');
+    } else if (state.kaminoHealthFactor < 2.0) {
+      borrowLpSkip(`health factor ${state.kaminoHealthFactor.toFixed(2)} < 2.0 — too risky to borrow more`);
+    } else if (state.kaminoLtv >= (env.kaminoBorrowLpMaxLtvPct / 100) * 0.90) {
+      borrowLpSkip(`LTV ${(state.kaminoLtv * 100).toFixed(1)}% too close to cap ${env.kaminoBorrowLpMaxLtvPct}%`);
+    } else if (state.orcaPositions.length > 0) {
+      borrowLpSkip('already have an active Orca LP — one at a time');
+    } else if (!checkCooldown('KAMINO_BORROW_LP', 24 * 3600_000)) {
+      borrowLpSkip('cooldown (24h)');
+    } else {
+      // Calculate safe borrow amount: X% of remaining headroom, capped by config
+      const maxBorrowLtv = (env.kaminoBorrowLpMaxLtvPct) / 100;
+      const headroomUsd = Math.max(0,
+        state.kaminoDepositValueUsd * maxBorrowLtv - state.kaminoBorrowValueUsd,
+      );
+      const fractionToUse = (env.kaminoBorrowLpCapacityPct ?? 20) / 100;
+      const borrowUsd = Math.min(
+        headroomUsd * fractionToUse,       // tiny fraction of capacity
+        env.kaminoBorrowLpMaxUsd ?? 200,   // hard USD cap
+        env.orcaLpMaxUsd - state.orcaLpValueUsd, // Orca headroom
+      );
+
+      // Spread check: estimated LP fee APY vs borrow cost
+      // Conservative: use 15% base fee APY estimate for in-range SOL/USDC LP
+      const estimatedLpFeeApy = 0.15;
+      const borrowCost = state.kaminoBorrowApy > 0 ? state.kaminoBorrowApy : 0.08;
+      const spreadPct = (estimatedLpFeeApy - borrowCost) * 100;
+
+      if (borrowUsd < 20) {
+        borrowLpSkip(`borrow amount $${borrowUsd.toFixed(0)} too small (need ≥$20)`);
+      } else if (spreadPct < (env.kaminoBorrowLpMinSpreadPct ?? 5)) {
+        borrowLpSkip(`spread ${spreadPct.toFixed(1)}% < min ${env.kaminoBorrowLpMinSpreadPct ?? 5}% (LP ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow ~${(borrowCost * 100).toFixed(0)}%)`);
+      } else {
+        const usdcSide = borrowUsd / 2;
+        const solSide = borrowUsd / 2 / state.solPriceUsd;
+        const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct);
+
+        decisions.push({
+          type: 'KAMINO_BORROW_LP',
+          reasoning:
+            `Borrow $${borrowUsd.toFixed(0)} USDC from Kamino (${(fractionToUse * 100).toFixed(0)}% of headroom) → ` +
+            `deploy into SOL/USDC concentrated LP (range ±${adaptiveRange / 2}%). ` +
+            `Est. LP fee yield ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow cost ~${(borrowCost * 100).toFixed(0)}% ` +
+            `= ${spreadPct.toFixed(1)}% spread. Post-borrow LTV: ~${((state.kaminoLtv + borrowUsd / state.kaminoDepositValueUsd) * 100).toFixed(0)}%. ` +
+            `LP fees accrue → close LP → repay borrow → keep profit.`,
+          params: {
+            borrowUsd,
+            usdcAmount: usdcSide,
+            solAmount: solSide,
+            rangeWidthPct: adaptiveRange,
+            estimatedLpApy: estimatedLpFeeApy,
+            borrowApy: borrowCost,
+            spreadPct,
+            postBorrowLtv: state.kaminoLtv + borrowUsd / Math.max(state.kaminoDepositValueUsd, 1),
+          },
+          urgency: 'low',
+          estimatedImpactUsd: borrowUsd * (estimatedLpFeeApy - borrowCost),
+          intelUsed: [
+            intel.guardianReceivedAt ? 'guardian' : '',
+            intel.analystPricesAt ? 'analyst' : '',
+          ].filter(Boolean),
+          tier: 'APPROVAL',   // ALWAYS require admin approval for borrowed money
+        });
+
+        logger.info(
+          `[CFO:Decision] Section K: KAMINO_BORROW_LP — borrow $${borrowUsd.toFixed(0)} → SOL/USDC LP ` +
+          `(spread ${spreadPct.toFixed(1)}%, post-LTV ${((state.kaminoLtv + borrowUsd / state.kaminoDepositValueUsd) * 100).toFixed(0)}%)`,
+        );
+      }
+    }
+  } else if (env.kaminoBorrowLpEnabled) {
+    const missing: string[] = [];
+    if (!env.orcaLpEnabled) missing.push('orcaLpEnabled=false');
+    if (!env.kaminoBorrowEnabled) missing.push('kaminoBorrowEnabled=false');
+    if (intel.marketCondition === 'bearish' || intel.marketCondition === 'danger') missing.push(`market=${intel.marketCondition}`);
+    if (missing.length > 0) {
+      logger.info(`[CFO:Decision] Section K skip: prerequisite not met — ${missing.join(', ')}`);
+    }
+  }
+
   // Log tier breakdown
   const tierCounts = { AUTO: 0, NOTIFY: 0, APPROVAL: 0 };
   for (const d of decisions) tierCounts[d.tier]++;
@@ -1798,6 +1898,48 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
       }
 
+      case 'KAMINO_BORROW_LP': {
+        // Step 1: Borrow USDC from Kamino
+        const kamino = await import('./kaminoService.ts');
+        const { borrowUsd, usdcAmount, solAmount, rangeWidthPct } = decision.params;
+        const borrowResult = await kamino.borrow('USDC', borrowUsd);
+        if (!borrowResult.success) {
+          return { ...base, executed: true, success: false, error: `Borrow failed: ${borrowResult.error}` };
+        }
+        logger.info(`[CFO] KAMINO_BORROW_LP step 1: borrowed $${borrowUsd.toFixed(0)} USDC | tx: ${borrowResult.txSignature}`);
+
+        // Step 2: Swap half of USDC to SOL for the LP's A-side
+        const jupMod = await import('./jupiterService.ts');
+        const swapResult = await jupMod.swapUsdcToSol(usdcAmount, 100); // 1% slippage for safety
+        if (!swapResult.success) {
+          // Borrow succeeded but swap failed — repay the USDC to unwind
+          logger.warn(`[CFO] KAMINO_BORROW_LP swap failed — repaying borrowed USDC`);
+          await kamino.repay('USDC', borrowUsd * 0.995).catch(() => {});
+          return { ...base, executed: true, success: false, error: `Swap USDC→SOL failed: ${swapResult.error}` };
+        }
+        const solReceived = swapResult.outputAmount || solAmount;
+        logger.info(`[CFO] KAMINO_BORROW_LP step 2: swapped $${usdcAmount.toFixed(0)} USDC → ${solReceived.toFixed(4)} SOL`);
+
+        // Step 3: Open Orca concentrated LP with both sides
+        const orca = await import('./orcaService.ts');
+        const lpResult = await orca.openPosition(usdcAmount, solReceived, rangeWidthPct);
+        if (!lpResult.success) {
+          // Swap succeeded but LP failed — we have SOL + USDC sitting in wallet.
+          // Don't auto-repay; admin can decide. Log prominently.
+          logger.error(`[CFO] KAMINO_BORROW_LP LP open failed after borrow+swap — manual intervention needed`);
+          return { ...base, executed: true, success: false, error: `LP open failed: ${lpResult.error}. Borrowed USDC is in wallet.` };
+        }
+
+        markDecision('KAMINO_BORROW_LP');
+        logger.info(`[CFO] KAMINO_BORROW_LP step 3: opened Orca LP | tx: ${lpResult.txSignature}`);
+        return {
+          ...base,
+          executed: true,
+          success: true,
+          txId: lpResult.txSignature,
+        };
+      }
+
       case 'EVM_FLASH_ARB': {
         const arb = await import('./evmArbService.ts');
         const { opportunity } = decision.params;
@@ -1891,6 +2033,7 @@ export function formatDecisionReport(
     KAMINO_JITO_UNWIND: 'JitoSOL Loop Unwind',
     ORCA_LP_OPEN: 'Open Orca LP',
     ORCA_LP_REBALANCE: 'Rebalance Orca LP',
+    KAMINO_BORROW_LP: 'Borrow → Orca LP',
     EVM_FLASH_ARB: 'Flash Arb (Arbitrum)',
     SKIP: 'No Action',
   };
@@ -1982,6 +2125,8 @@ function _shortReason(d: Decision): string {
       return `Unwind JitoSOL/SOL multiply loop`;
     case 'ORCA_LP_OPEN':
       return `SOL/USDC LP $${((p.usdcAmount ?? 0) * 2).toFixed(0)} ±${(p.rangeWidthPct ?? 20) / 2}% range`;
+    case 'KAMINO_BORROW_LP':
+      return `Borrow $${p.borrowUsd?.toFixed(0) ?? '?'} → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread, LTV → ${((p.postBorrowLtv ?? 0) * 100).toFixed(0)}%)`;
     case 'ORCA_LP_REBALANCE':
       return `Rebalance LP ${(p.positionMint ?? '').slice(0, 8)} to current price`;
     default:
