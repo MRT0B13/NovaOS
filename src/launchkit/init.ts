@@ -162,6 +162,8 @@ export async function initLaunchKit(
     } catch (engErr) {
       logger.warn({ error: engErr }, '[LaunchKit] Engagement tracker init failed (non-fatal)');
     }
+
+    logger.info(`[LaunchKit] DB init complete: pool=${!!pool}, swarm=${!!_swarmHandle}`);
   }
 
   const copyService = new CopyGeneratorService(store, runtime);
@@ -415,15 +417,20 @@ export async function initLaunchKit(
           logger.warn({ error: scanErr }, 'Failed to register scan commands (non-fatal)');
         }
 
+        logger.info(`[LaunchKit] 🏭 Factory pre-check: pool=${!!pool}, swarm=${!!_swarmHandle}`);
         if (pool) {
           try {
             const factoryRegistered = await registerFactoryCommands(runtime, _swarmHandle.supervisor, pool);
             if (factoryRegistered) {
               logger.info('[LaunchKit] 🏭 Factory TG commands registered (/request_agent, /approve_agent, /my_agents, /cfo)');
+            } else {
+              logger.warn('[LaunchKit] 🏭 registerFactoryCommands returned false — bot or telegramService unavailable?');
             }
           } catch (factoryErr) {
             logger.warn({ error: factoryErr }, 'Failed to register factory commands (non-fatal)');
           }
+        } else {
+          logger.warn('[LaunchKit] 🏭 Skipping factory commands — pool is null (DB not connected?)');
         }
       }
 
