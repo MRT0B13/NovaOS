@@ -99,6 +99,7 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
       const names = Array.isArray(command) ? command : [command];
       for (const name of names) {
         _commandHandlers.set(name, handler);
+        console.log(`[BAN_HANDLER] 📌 Auto-registered dispatch for /${name}`);
       }
       return originalBotCommand(command, handler);
     };
