@@ -1198,13 +1198,29 @@ export async function generateDecisions(
 
   // Section F skip diagnostics
   if (env.kaminoEnabled && env.kaminoBorrowEnabled) {
-    if (state.kaminoBorrowableUsd < 10) {
-      logger.debug(`[CFO:Decision] Section F skip: kaminoBorrowableUsd=$${state.kaminoBorrowableUsd.toFixed(0)} (need ≥$10) | deposits=$${state.kaminoDepositValueUsd.toFixed(0)}`);
+    if (state.kaminoDepositValueUsd < 1 && state.jitoSolBalance >= 0.1) {
+      logger.info(
+        `[CFO:Decision] Section F skip: no Kamino collateral deposited yet. ` +
+        `JitoSOL in wallet: ${state.jitoSolBalance.toFixed(4)} ($${state.jitoSolValueUsd.toFixed(0)}). ` +
+        `Section G (Jito Loop) will deposit it automatically if spread is profitable.`
+      );
+    } else if (state.kaminoBorrowableUsd < 10) {
+      logger.info(`[CFO:Decision] Section F skip: kaminoBorrowableUsd=$${state.kaminoBorrowableUsd.toFixed(0)} (need ≥$10) | deposits=$${state.kaminoDepositValueUsd.toFixed(0)}`);
     } else if (state.kaminoHealthFactor <= 1.8) {
-      logger.debug(`[CFO:Decision] Section F skip: healthFactor=${state.kaminoHealthFactor.toFixed(2)} (need >1.8)`);
+      logger.info(`[CFO:Decision] Section F skip: healthFactor=${state.kaminoHealthFactor.toFixed(2)} (need >1.8)`);
+    } else {
+      // Passed pre-checks but spread check may have failed
+      const borrowCostDiag = state.kaminoBorrowApy;
+      const deployYieldDiag = state.kaminoUsdcSupplyApy;
+      const spreadDiag = (deployYieldDiag - borrowCostDiag) * 100;
+      if (spreadDiag < (env.kaminoBorrowMinSpreadPct ?? 3)) {
+        logger.info(
+          `[CFO:Decision] Section F skip: spread=${spreadDiag.toFixed(1)}% (supply=${(deployYieldDiag * 100).toFixed(1)}% - borrow=${(borrowCostDiag * 100).toFixed(1)}%) — need ≥${env.kaminoBorrowMinSpreadPct ?? 3}%`
+        );
+      }
     }
   } else if (env.kaminoEnabled && !env.kaminoBorrowEnabled) {
-    logger.debug('[CFO:Decision] Section F skip: CFO_KAMINO_BORROW_ENABLE=false');
+    logger.info('[CFO:Decision] Section F skip: CFO_KAMINO_BORROW_ENABLE=false');
   }
 
   // ── G) JitoSOL/SOL Multiply loop ─────────────────────────────────────────
@@ -1223,12 +1239,17 @@ export async function generateDecisions(
     intel.marketCondition !== 'danger'
   ) {
     if (checkCooldown('KAMINO_JITO_LOOP', 24 * 3600_000)) {
-      // Only initiate when spread is profitable
-      const loopSpread = state.kaminoJitoSupplyApy - state.kaminoSolBorrowApy;
+      // JitoSOL value = staking rewards (~7% base + 1-2% MEV tips) ≈ 8%.
+      // The Kamino supply APY (kaminoJitoSupplyApy) only reflects the lending pool rate
+      // (people paying to borrow JitoSOL), NOT the staking yield the token accrues.
+      // Real return = MAX(kamino_supply_apy, staking_yield).
+      const JITOSOL_STAKING_YIELD = 0.08; // ~8% APY (base staking + MEV tips)
+      const effectiveJitoApy = Math.max(state.kaminoJitoSupplyApy, JITOSOL_STAKING_YIELD);
+      const loopSpread = effectiveJitoApy - state.kaminoSolBorrowApy;
       if (loopSpread > 0.01) { // need at least 1% spread
         const targetLtv = (env.kaminoJitoLoopTargetLtv ?? 65) / 100;
         const leverage = 1 / (1 - targetLtv);
-        const estimatedApy = leverage * state.kaminoJitoSupplyApy - (leverage - 1) * state.kaminoSolBorrowApy;
+        const estimatedApy = leverage * effectiveJitoApy - (leverage - 1) * state.kaminoSolBorrowApy;
         const jitoSolToCommit = jitoSolAvailable;
         const needsStakeFirst = state.jitoSolBalance < 0.1; // stake from wallet before looping
 
@@ -1237,10 +1258,10 @@ export async function generateDecisions(
           reasoning:
             `JitoSOL/SOL Multiply: deposit ${jitoSolToCommit.toFixed(3)} JitoSOL + loop to ${(targetLtv * 100).toFixed(0)}% LTV ` +
             `(~${leverage.toFixed(1)}x leverage). ` +
-            `JitoSOL supply: ${(state.kaminoJitoSupplyApy * 100).toFixed(1)}%, ` +
+            `JitoSOL yield: ${(effectiveJitoApy * 100).toFixed(1)}% (staking+MEV), ` +
             `SOL borrow: ${(state.kaminoSolBorrowApy * 100).toFixed(1)}%, ` +
             `est. loop APY: ${(estimatedApy * 100).toFixed(1)}% ` +
-            `(vs ${(state.kaminoJitoSupplyApy * 100).toFixed(1)}% unlevered). ` +
+            `(vs ${(effectiveJitoApy * 100).toFixed(1)}% unlevered). ` +
             `Market: ${intel.marketCondition}`,
           params: {
             jitoSolToDeposit: jitoSolToCommit,
@@ -1260,11 +1281,18 @@ export async function generateDecisions(
   }
 
   // Section G skip diagnostics
-  if (env.kaminoEnabled && env.kaminoJitoLoopEnabled) {
+  if (env.kaminoEnabled && env.kaminoJitoLoopEnabled && !state.kaminoJitoLoopActive) {
+    const JITOSOL_STAKING_YIELD_DIAG = 0.08;
+    const effectiveJitoApyDiag = Math.max(state.kaminoJitoSupplyApy, JITOSOL_STAKING_YIELD_DIAG);
+    const loopSpreadDiag = effectiveJitoApyDiag - state.kaminoSolBorrowApy;
     if (jitoSolAvailable < 0.1) {
-      logger.debug(`[CFO:Decision] Section G skip: jitoSolBalance=${state.jitoSolBalance.toFixed(4)}, idleSol=${state.idleSolForStaking.toFixed(4)} (need ≥0.1 combined)`);
+      logger.info(`[CFO:Decision] Section G skip: jitoSolBalance=${state.jitoSolBalance.toFixed(4)}, idleSol=${state.idleSolForStaking.toFixed(4)} (need ≥0.1 combined)`);
     } else if (state.kaminoHealthFactor <= 2.0) {
-      logger.debug(`[CFO:Decision] Section G skip: healthFactor=${state.kaminoHealthFactor.toFixed(2)} (need >2.0)`);
+      logger.info(`[CFO:Decision] Section G skip: healthFactor=${state.kaminoHealthFactor.toFixed(2)} (need >2.0)`);
+    } else if (loopSpreadDiag <= 0.01) {
+      logger.info(`[CFO:Decision] Section G skip: spread=${(loopSpreadDiag * 100).toFixed(2)}% (jitoApy=${(effectiveJitoApyDiag * 100).toFixed(1)}% - solBorrow=${(state.kaminoSolBorrowApy * 100).toFixed(1)}%) — need >1%`);
+    } else {
+      logger.info(`[CFO:Decision] Section G skip: cooldown not elapsed (24h between loop attempts)`);
     }
   }
 
@@ -1429,17 +1457,29 @@ export async function generateDecisions(
   // ── J) EVM Flash Arbitrage (Arbitrum) ─────────────────────────────────────
   // Uses dynamic pool list from DeFiLlama. On-chain quotes only — no API latency.
   // AUTO tier: worst case is a reverted tx (~$0.05 gas). No capital at risk.
-  if (env.evmArbEnabled &&
-      env.evmArbReceiverAddress &&
-      !intel.guardianCritical &&
-      intel.marketCondition !== 'danger' &&
-      checkCooldown('EVM_FLASH_ARB', 60_000)) {
+  if (!env.evmArbEnabled) {
+    logger.info('[CFO:Decision] Section J skip: evmArbEnabled=false');
+  } else if (!env.evmArbReceiverAddress) {
+    logger.info('[CFO:Decision] Section J skip: no receiver contract address (CFO_EVM_ARB_RECEIVER_ADDRESS)');
+  } else if (intel.guardianCritical) {
+    logger.info('[CFO:Decision] Section J skip: guardian critical alert active');
+  } else if (intel.marketCondition === 'danger') {
+    logger.info('[CFO:Decision] Section J skip: market condition = danger');
+  } else if (!checkCooldown('EVM_FLASH_ARB', 60_000)) {
+    logger.info('[CFO:Decision] Section J skip: cooldown (scanned <60s ago)');
+  } else {
     try {
       const arbMod   = await import('./evmArbService.ts');
       const ethPrice = intel.analystPrices?.['ETH']?.usd ?? 3000;
+      const poolCount = arbMod.getCandidatePoolCount();
+      logger.info(`[CFO:Decision] Section J: scanning ${poolCount} Arbitrum pools (ETH=$${ethPrice.toFixed(0)})...`);
       const opp      = await arbMod.scanForOpportunity(ethPrice);
 
       if (opp && opp.netProfitUsd >= (env.evmArbMinProfitUsdc ?? 2)) {
+        logger.info(
+          `[CFO:Decision] Section J: 💡 ARB FOUND — ${opp.displayPair} net=$${opp.netProfitUsd.toFixed(3)} ` +
+          `(min=$${env.evmArbMinProfitUsdc ?? 2})`,
+        );
         decisions.push({
           type: 'EVM_FLASH_ARB',
           reasoning:
@@ -1456,9 +1496,16 @@ export async function generateDecisions(
             intel.guardianReceivedAt ? 'guardian' : '',
           ].filter(Boolean),
         });
+      } else if (opp) {
+        logger.info(
+          `[CFO:Decision] Section J: opportunity found but below threshold — ` +
+          `${opp.displayPair} net=$${opp.netProfitUsd.toFixed(3)} < min=$${env.evmArbMinProfitUsdc ?? 2}`,
+        );
+      } else {
+        logger.info(`[CFO:Decision] Section J: no profitable arb found this cycle (${poolCount} pools scanned)`);
       }
     } catch (err) {
-      logger.debug('[CFO:Decision] EVM arb scan failed (non-fatal):', err);
+      logger.info('[CFO:Decision] Section J: scan failed (non-fatal):', err);
     }
   }
 
