@@ -18,6 +18,7 @@ import { createSecretsStore } from '../db/storeFactory.ts';
 import { TelegramPublisherService } from '../services/telegramPublisher.ts';
 import { XPublisherService } from '../services/xPublisher.ts';
 import { cacheTelegramUser } from '../services/telegramCommunity.ts';
+import { areFactoryCommandsReady } from '../services/telegramFactoryCommands.ts';
 import { recordMessageReceived } from '../services/telegramHealthMonitor.ts';
 import { verifyWebhookSignature, isWebhookSecurityEnabled, initTelegramSecurity } from '../services/telegramSecurity.ts';
 import { processReactionUpdate, processTextReply } from '../services/communityVoting.ts';
@@ -377,8 +378,6 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
         if (elizaWebhookUrl) {
           const msgText: string = update.message?.text || '';
           const isSlashCommand = msgText.startsWith('/');
-
-          const { areFactoryCommandsReady } = await import('../services/telegramFactoryCommands.ts');
 
           // If it's a slash command AND our handlers are registered, let handleUpdate handle it.
           // Don't also forward to Eliza — that causes the duplicate LLM response.
