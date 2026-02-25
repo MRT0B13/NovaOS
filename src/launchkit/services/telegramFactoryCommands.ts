@@ -40,10 +40,20 @@ export async function registerFactoryCommands(
     const ownerChatId = process.env.ADMIN_CHAT_ID;
     const adminIds = (getEnv().TELEGRAM_ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 
+    // Normalize Telegram chat IDs before comparing.
+    // Supergroups have two formats: "-1001728082579" (stored in env) vs
+    // "1728082579" (returned by ctx.chat.id at runtime). Strip the -100 prefix
+    // so both forms compare equal. Same logic as groupContextProvider.ts.
+    const normalizeTgId = (id: string): string => {
+      if (id.startsWith('-100')) return id.slice(4);
+      if (id.startsWith('-'))   return id.slice(1);
+      return id;
+    };
+
     const isAdmin = (chatId: string | number): boolean => {
-      const id = String(chatId);
-      if (ownerChatId && id === ownerChatId) return true;
-      return adminIds.includes(id);
+      const id = normalizeTgId(String(chatId));
+      if (ownerChatId && id === normalizeTgId(ownerChatId)) return true;
+      return adminIds.map(normalizeTgId).includes(id);
     };
 
     // ── /request_agent <description> — request a new agent ─────────
@@ -108,7 +118,11 @@ export async function registerFactoryCommands(
 
     // ── /approve_agent <id> — admin approves + spawns ──────────────
     bot.command('approve_agent', async (ctx: any) => {
-      if (!isAdmin(ctx.chat.id)) return;
+      if (!isAdmin(ctx.chat.id)) {
+        logger.warn(`[TG:factory] Unauthorized command from chat ${ctx.chat.id}`);
+        await ctx.reply(`⛔ Unauthorized. (chat id: ${ctx.chat.id})`).catch(() => {});
+        return;
+      }
 
       try {
         const specId = ctx.message?.text?.replace(/^\/approve_agent\s*/i, '').trim();
@@ -145,7 +159,11 @@ export async function registerFactoryCommands(
 
     // ── /reject_agent <id> [reason] — admin rejects ────────────────
     bot.command('reject_agent', async (ctx: any) => {
-      if (!isAdmin(ctx.chat.id)) return;
+      if (!isAdmin(ctx.chat.id)) {
+        logger.warn(`[TG:factory] Unauthorized command from chat ${ctx.chat.id}`);
+        await ctx.reply(`⛔ Unauthorized. (chat id: ${ctx.chat.id})`).catch(() => {});
+        return;
+      }
 
       try {
         const text = ctx.message?.text?.replace(/^\/reject_agent\s*/i, '').trim();
@@ -222,7 +240,11 @@ export async function registerFactoryCommands(
     // ── /cfo <subcommand> — CFO Agent controls (admin only) ────────
     bot.command('cfo', async (ctx: any) => {
       try {
-        if (!isAdmin(ctx.chat.id)) return;
+        if (!isAdmin(ctx.chat.id)) {
+          logger.warn(`[TG:factory] Unauthorized command from chat ${ctx.chat.id}`);
+          await ctx.reply(`⛔ Unauthorized. (chat id: ${ctx.chat.id})`).catch(() => {});
+          return;
+        }
         const text = (ctx.message?.text || '').trim();
         const parts = text.split(/\s+/).slice(1);  // remove "/cfo"
         const sub = (parts[0] || 'status').toLowerCase();

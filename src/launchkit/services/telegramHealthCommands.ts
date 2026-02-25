@@ -32,11 +32,17 @@ export async function registerHealthCommands(runtime: IAgentRuntime): Promise<bo
     const ownerChatId = process.env.ADMIN_CHAT_ID;
     const adminIds = (getEnv().TELEGRAM_ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 
+    const normalizeTgId = (id: string): string => {
+      if (id.startsWith('-100')) return id.slice(4);
+      if (id.startsWith('-'))   return id.slice(1);
+      return id;
+    };
+
     // Simple auth check — only owner/admins can use health commands
     const isAuthorized = (chatId: string | number): boolean => {
-      const id = String(chatId);
-      if (ownerChatId && id === ownerChatId) return true;
-      return adminIds.includes(id);
+      const id = normalizeTgId(String(chatId));
+      if (ownerChatId && id === normalizeTgId(ownerChatId)) return true;
+      return adminIds.map(normalizeTgId).includes(id);
     };
 
     const statusEmoji = (s: string) => (
