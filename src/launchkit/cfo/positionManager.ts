@@ -126,6 +126,44 @@ export class PositionManager {
     txHash?: string;
   }): Promise<CFOPosition> {
     const now = new Date().toISOString();
+
+    // ── Check for existing OPEN position with same tokenId ──────────
+    // Prevents row fragmentation: multiple orders for the same market
+    // outcome get aggregated into one position row with combined cost basis.
+    const existingPositions = await this.repo.getOpenPositions('polymarket');
+    const existing = existingPositions.find(
+      (p) => p.asset === params.tokenId && p.status === 'OPEN',
+    );
+
+    if (existing) {
+      // Aggregate into existing position
+      const addedUnits = params.sizeUsd / params.entryPrice;
+      const newCost = existing.costBasisUsd + params.sizeUsd;
+      const newUnits = existing.sizeUnits + addedUnits;
+      // Weighted average entry price
+      const newEntryPrice = newCost / newUnits;
+
+      existing.costBasisUsd = newCost;
+      existing.currentValueUsd = existing.currentValueUsd + params.sizeUsd; // fresh value updated by monitor
+      existing.sizeUnits = newUnits;
+      existing.entryPrice = newEntryPrice;
+      existing.unrealizedPnlUsd = 0;
+      existing.updatedAt = now;
+      existing.metadata = {
+        ...existing.metadata,
+        lastOrderId: params.orderId,
+        lastOrderTxHash: params.txHash,
+        orderCount: ((existing.metadata as any)?.orderCount ?? 1) + 1,
+      };
+
+      await this.repo.upsertPosition(existing);
+      logger.info(
+        `[PositionManager] Aggregated into ${existing.id}: +$${params.sizeUsd} → total $${newCost.toFixed(2)} (${newUnits.toFixed(1)} units)`,
+      );
+      return existing;
+    }
+
+    // ── New position ────────────────────────────────────────────────
     const id = `poly-${params.conditionId.slice(0, 12)}-${Date.now()}`;
 
     const pos: CFOPosition = {
@@ -148,6 +186,7 @@ export class PositionManager {
         conditionId: params.conditionId,
         tokenId: params.tokenId,
         outcome: params.outcome,
+        orderCount: 1,
       },
       openedAt: now,
       updatedAt: now,
