@@ -32,10 +32,13 @@ export const STRATEGY_CAPS: Record<PositionStrategy, { maxPortfolioFraction: num
   kamino:        { maxPortfolioFraction: 0.30, leverage: 1 },   // 30%
   jito:          { maxPortfolioFraction: 0.25, leverage: 1 },   // 25%
   jupiter_swap:  { maxPortfolioFraction: 0.10, leverage: 1 },   // 10%
-  kamino_loop:      { maxPortfolioFraction: 0.15, leverage: 1 },   // 15% collateral loop
-  kamino_jito_loop: { maxPortfolioFraction: 0.20, leverage: 3 },   // 20% JitoSOL multiply
-  orca_lp:          { maxPortfolioFraction: 0.15, leverage: 1 },   // 15% concentrated LP
-  evm_flash_arb:    { maxPortfolioFraction: 0.00, leverage: 1 },   // 0% — uses Aave capital, not ours
+  kamino_loop:           { maxPortfolioFraction: 0.15, leverage: 1 },   // 15% collateral loop
+  kamino_jito_loop:      { maxPortfolioFraction: 0.20, leverage: 3 },   // 20% JitoSOL multiply
+  kamino_msol_loop:      { maxPortfolioFraction: 0.20, leverage: 3 },   // 20% mSOL multiply
+  kamino_bsol_loop:      { maxPortfolioFraction: 0.20, leverage: 3 },   // 20% bSOL multiply
+  kamino_multiply_vault: { maxPortfolioFraction: 0.20, leverage: 3 },   // 20% managed vault
+  orca_lp:               { maxPortfolioFraction: 0.15, leverage: 1 },   // 15% concentrated LP
+  evm_flash_arb:         { maxPortfolioFraction: 0.00, leverage: 1 },   // 0% — uses Aave capital, not ours
 };
 
 // ============================================================================

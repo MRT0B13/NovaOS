@@ -51,6 +51,8 @@ const SOLANA_TOKEN_MINTS: Record<string, string> = {
   'WSOL':    'So11111111111111111111111111111111111111112',
   'USDC':    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
   'JitoSOL': 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',
+  'mSOL':    'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',
+  'bSOL':    'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1',
   'BONK':    'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
   'WIF':     'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',
   'JUP':     'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',
@@ -551,6 +553,69 @@ export class CFOAgent extends BaseAgent {
             await this.deregisterCFOExposure([
               { mint: SOLANA_TOKEN_MINTS['JitoSOL'], ticker: 'JitoSOL' },
             ]);
+            break;
+          }
+
+          // ── Multi-LST Loop OPEN (mSOL / bSOL / JitoSOL) ───────
+          case 'KAMINO_LST_LOOP': {
+            const lst       = p.lst ?? 'JitoSOL';
+            const lstAmount = p.lstAmount ?? 0;
+            const targetLtv = p.targetLtv ?? 0.65;
+            const estApy    = p.estimatedApy ?? 0;
+            await this.repo.insertTransaction({
+              id: `tx-kamino-lst-loop-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: `kamino_${lst.toLowerCase()}_loop` as PositionStrategy, txType: 'stake',
+              tokenIn: lst, amountIn: lstAmount,
+              tokenOut: `${lst}-leveraged`, amountOut: lstAmount / (1 - targetLtv),
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { lst, targetLtv, estimatedApy: estApy, needsSwap: p.needsSwap, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted KAMINO_LST_LOOP: ${lstAmount} ${lst} → ${(targetLtv * 100).toFixed(0)}% LTV, est. APY ${(estApy * 100).toFixed(1)}%`);
+            // Register LST exposure with Guardian
+            const lstMint = SOLANA_TOKEN_MINTS[lst];
+            if (lstMint) {
+              await this.registerCFOExposure([{ mint: lstMint, ticker: lst }]);
+            }
+            break;
+          }
+
+          // ── Multi-LST Loop UNWIND ──────────────────────────────
+          case 'KAMINO_LST_UNWIND': {
+            const lst = p.lst ?? 'JitoSOL';
+            await this.repo.insertTransaction({
+              id: `tx-kamino-lst-unwind-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: `kamino_${lst.toLowerCase()}_loop` as PositionStrategy, txType: 'unstake',
+              tokenIn: `${lst}-leveraged`, amountIn: 0,
+              tokenOut: lst, amountOut: 0,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { lst, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted KAMINO_LST_UNWIND: ${lst}`);
+            const lstMint = SOLANA_TOKEN_MINTS[lst];
+            if (lstMint) {
+              await this.deregisterCFOExposure([{ mint: lstMint, ticker: lst }]);
+            }
+            break;
+          }
+
+          // ── Kamino Multiply Vault deposit ──────────────────────
+          case 'KAMINO_MULTIPLY_VAULT': {
+            const vaultName = p.vaultName ?? 'Unknown';
+            const depositAmt = p.depositAmount ?? 0;
+            const collateral = p.collateralToken ?? 'LST';
+            await this.repo.insertTransaction({
+              id: `tx-kamino-vault-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'kamino_multiply_vault' as PositionStrategy, txType: 'stake',
+              tokenIn: collateral, amountIn: depositAmt,
+              tokenOut: `kamino-vault-${vaultName}`, amountOut: depositAmt,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: {
+                vaultAddress: p.vaultAddress, vaultName, collateral,
+                estimatedApy: p.estimatedApy, leverage: p.leverage, tvl: p.tvl,
+                reasoning: d.reasoning,
+              },
+            });
+            logger.info(`[CFO] Persisted KAMINO_MULTIPLY_VAULT: ${depositAmt} ${collateral} → "${vaultName}"`);
             break;
           }
 

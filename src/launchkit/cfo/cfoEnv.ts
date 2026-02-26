@@ -65,6 +65,8 @@ export interface CFOEnv {
   kaminoJitoLoopTargetLtv: number;                 // target LTV % for the loop (default 65)
   kaminoJitoLoopMaxLoops: number;                  // max iterations (default 3, ~2.85x leverage at 65% LTV)
   kaminoJitoLoopMaxLtvPct: number;                 // max LTV for the JitoSOL/SOL loop (default 72 — well below 95% liq threshold)
+  kaminoLstLoopEnabled: boolean;                   // enable multi-LST loop comparison — picks best spread among JitoSOL/mSOL/bSOL (default false)
+  kaminoMultiplyVaultEnabled: boolean;             // enable Kamino Multiply vault deposits — managed auto-leveraged vaults (default false)
   // ── Orca Concentrated LP ──────────────────────────────────────────
   orcaLpEnabled: boolean;                         // enable Orca concentrated LP (default false)
   orcaLpRangeWidthPct: number;                    // range width as % of current price (default 20%)
@@ -182,6 +184,8 @@ export function getCFOEnv(bust = false): CFOEnv {
     kaminoJitoLoopTargetLtv: Number(process.env.CFO_KAMINO_JITO_LOOP_TARGET_LTV ?? 65),
     kaminoJitoLoopMaxLoops: Number(process.env.CFO_KAMINO_JITO_LOOP_MAX_LOOPS ?? 3),
     kaminoJitoLoopMaxLtvPct: Number(process.env.CFO_KAMINO_JITO_LOOP_MAX_LTV_PCT ?? 72),
+    kaminoLstLoopEnabled: process.env.CFO_KAMINO_LST_LOOP_ENABLE === 'true',
+    kaminoMultiplyVaultEnabled: process.env.CFO_KAMINO_MULTIPLY_VAULT_ENABLE === 'true',
     orcaLpEnabled: process.env.CFO_ORCA_LP_ENABLE === 'true',
     orcaLpRangeWidthPct: Number(process.env.CFO_ORCA_LP_RANGE_WIDTH_PCT ?? 20),
     orcaLpMaxUsd: Number(process.env.CFO_ORCA_LP_MAX_USD ?? 500),

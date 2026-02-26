@@ -57,6 +57,9 @@ export type DecisionType =
   | 'KAMINO_REPAY'           // repay Kamino borrow (scheduled, or LTV rising)
   | 'KAMINO_JITO_LOOP'       // JitoSOL/SOL Multiply — leverage staking yield 2-3x
   | 'KAMINO_JITO_UNWIND'     // unwind the JitoSOL loop (SOL borrow + JitoSOL position)
+  | 'KAMINO_LST_LOOP'        // Generic LST/SOL Multiply — best-spread among JitoSOL/mSOL/bSOL
+  | 'KAMINO_LST_UNWIND'      // unwind a generic LST loop
+  | 'KAMINO_MULTIPLY_VAULT'  // deposit into a Kamino Multiply vault (managed auto-leverage)
   | 'ORCA_LP_OPEN'           // open a new concentrated LP position
   | 'ORCA_LP_REBALANCE'      // close out-of-range position and reopen centred on new price
   | 'KAMINO_BORROW_LP'       // borrow from Kamino → swap → open Orca LP, fees repay loan
@@ -141,6 +144,9 @@ export interface PortfolioState {
   jitoSolBalance: number;
   jitoSolValueUsd: number;
 
+  // Multi-LST balances (wallet token balances, not Kamino deposits)
+  lstBalances: Record<string, { balance: number; valueUsd: number }>; // JitoSOL, mSOL, bSOL
+
   // Hyperliquid
   hlEquity: number;
   hlAvailableMargin: number;
@@ -182,6 +188,17 @@ export interface PortfolioState {
   kaminoBorrowableUsd: number;       // how much more we can borrow at max LTV
   kaminoJitoLoopActive: boolean;     // true when JitoSOL deposits + SOL borrows are both present
   kaminoJitoLoopApy: number;         // estimated current loop APY (0 if loop not active)
+  kaminoActiveLstLoop: string | null; // which LST is in an active loop ('JitoSOL', 'mSOL', 'bSOL', or null)
+
+  // Kamino Multiply Vault state
+  kaminoMultiplyVaults: Array<{
+    name: string;
+    collateralToken: string;
+    apy: number;
+    tvl: number;
+    leverage: number;
+    address: string;
+  }>;
 
   // Orca concentrated LP state
   orcaLpValueUsd: number;            // total value in Orca LP positions
@@ -519,6 +536,25 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     } catch { /* 0 */ }
   }
 
+  // Multi-LST wallet balances (mSOL, bSOL — JitoSOL covered above)
+  const lstBalances: Record<string, { balance: number; valueUsd: number }> = {
+    JitoSOL: { balance: jitoSolBalance, valueUsd: jitoSolValueUsd },
+  };
+  if (env.kaminoEnabled && (env.kaminoLstLoopEnabled || env.kaminoMultiplyVaultEnabled)) {
+    try {
+      const jupiter = await import('./jupiterService.ts');
+      const kamino = await import('./kaminoService.ts');
+      for (const lst of kamino.LST_ASSETS) {
+        if (lst === 'JitoSOL') continue; // already fetched via jitoStakingService
+        const mint = kamino.LST_MINTS[lst];
+        const balance = await jupiter.getTokenBalance(mint);
+        // LSTs are roughly 1:1 with SOL (with a small premium from staking rewards)
+        const valueUsd = balance * solPriceUsd * 1.02; // ~2% staking premium
+        lstBalances[lst] = { balance, valueUsd };
+      }
+    } catch { /* non-fatal */ }
+  }
+
   // Hyperliquid state
   let hlEquity = 0;
   let hlAvailableMargin = 0;
@@ -576,6 +612,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
   let kaminoLtv = 0, kaminoHealthFactor = 999, kaminoBorrowApy = 0.12, kaminoSupplyApy = 0.08;
   let kaminoSolBorrowApy = 0.10, kaminoJitoSupplyApy = 0.07, kaminoUsdcSupplyApy = 0.08;
   let kaminoBorrowableUsd = 0, kaminoJitoLoopActive = false, kaminoJitoLoopApy = 0;
+  let kaminoActiveLstLoop: string | null = null;
   if (env.kaminoEnabled) {
     try {
       const kamino = await import('./kaminoService.ts');
@@ -608,6 +645,32 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
         const leverage = kaminoNetValueUsd > 0 ? jitoDepositUsd / kaminoNetValueUsd : 1;
         kaminoJitoLoopApy = leverage * kaminoJitoSupplyApy - (leverage - 1) * kaminoSolBorrowApy;
       }
+
+      // Detect ANY active LST loop (JitoSOL, mSOL, or bSOL with SOL borrow)
+      const lstAssets = ['JitoSOL', 'mSOL', 'bSOL'] as const;
+      for (const lst of lstAssets) {
+        if (pos.deposits.some(d => d.asset === lst) && hasSolBorrow) {
+          kaminoActiveLstLoop = lst;
+          break;
+        }
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // Kamino Multiply vault data
+  let kaminoMultiplyVaults: PortfolioState['kaminoMultiplyVaults'] = [];
+  if (env.kaminoEnabled && env.kaminoMultiplyVaultEnabled) {
+    try {
+      const kamino = await import('./kaminoService.ts');
+      const vaults = await kamino.getMultiplyVaults();
+      kaminoMultiplyVaults = vaults.slice(0, 5).map(v => ({
+        name: v.name,
+        collateralToken: v.collateralToken,
+        apy: v.apy,
+        tvl: v.tvl,
+        leverage: v.leverage,
+        address: v.address,
+      }));
     } catch { /* non-fatal */ }
   }
 
@@ -653,6 +716,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     solanaUsdcBalance,
     jitoSolBalance,
     jitoSolValueUsd,
+    lstBalances,
     hlEquity,
     hlAvailableMargin,
     hlPositions,
@@ -679,6 +743,8 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     kaminoBorrowableUsd,
     kaminoJitoLoopActive,
     kaminoJitoLoopApy,
+    kaminoActiveLstLoop,
+    kaminoMultiplyVaults,
     orcaLpValueUsd,
     orcaLpFeeApy,
     orcaPositions,
@@ -1326,30 +1392,218 @@ export async function generateDecisions(
     }
   }
 
+  // ── G2) Multi-LST loop comparison — pick best spread among JitoSOL/mSOL/bSOL ─
+  // Only runs when CFO_KAMINO_LST_LOOP_ENABLE=true. Compares all LSTs and picks the
+  // one with the best (yield - SOL borrow cost) spread. Falls back to Section G logic
+  // if only kaminoJitoLoopEnabled is set.
+  if (
+    env.kaminoEnabled && env.kaminoBorrowEnabled && env.kaminoLstLoopEnabled &&
+    !state.kaminoActiveLstLoop &&     // no LST loop already active
+    state.kaminoHealthFactor > 2.0 &&
+    intel.marketCondition !== 'danger' &&
+    checkCooldown('KAMINO_LST_LOOP', 24 * 3600_000)
+  ) {
+    try {
+      const kamino = await import('./kaminoService.ts');
+      const apys = await kamino.getApys();
+
+      // Evaluate each LST: find best spread
+      type LstCandidate = {
+        lst: string; balance: number; valueUsd: number;
+        effectiveYield: number; spread: number; estimatedApy: number;
+        needsSwap: boolean; // true if we need to swap SOL → LST first
+      };
+
+      const targetLtv = (env.kaminoJitoLoopTargetLtv ?? 65) / 100;
+      const leverage = 1 / (1 - targetLtv);
+      const solBorrowApy = apys.SOL?.borrowApy ?? state.kaminoSolBorrowApy;
+
+      const candidates: LstCandidate[] = [];
+
+      for (const lst of kamino.LST_ASSETS) {
+        const walletBal = state.lstBalances[lst];
+        const balance = walletBal?.balance ?? 0;
+        const valueUsd = walletBal?.valueUsd ?? 0;
+
+        // Can use wallet LST balance OR idle SOL (swap to LST)
+        const available = balance >= 0.1
+          ? balance
+          : state.idleSolForStaking >= 0.1
+            ? state.idleSolForStaking * 0.9
+            : 0;
+
+        if (available < 0.1) continue;
+
+        const baseYield = kamino.LST_BASE_STAKING_YIELD[lst];
+        const kaminoSupply = apys[lst]?.supplyApy ?? 0;
+        const effectiveYield = Math.max(kaminoSupply, baseYield);
+        const spread = effectiveYield - solBorrowApy;
+        const estimatedApy = leverage * effectiveYield - (leverage - 1) * solBorrowApy;
+
+        candidates.push({
+          lst, balance: available,
+          valueUsd: available * state.solPriceUsd * 1.02,
+          effectiveYield, spread, estimatedApy,
+          needsSwap: balance < 0.1, // need to swap SOL → LST
+        });
+      }
+
+      // Sort by spread descending — pick the best
+      candidates.sort((a, b) => b.spread - a.spread);
+
+      if (candidates.length > 0) {
+        const best = candidates[0];
+        const comparison = candidates.map(c =>
+          `${c.lst}: ${(c.spread * 100).toFixed(1)}% spread (${(c.effectiveYield * 100).toFixed(1)}% yield)`
+        ).join(', ');
+
+        if (best.spread > 0.01) {
+          // Profitable — create a KAMINO_LST_LOOP decision
+          decisions.push({
+            type: 'KAMINO_LST_LOOP',
+            reasoning:
+              `Best LST loop: ${best.lst}/SOL Multiply — deposit ${best.balance.toFixed(3)} ${best.lst} ` +
+              `(~$${best.valueUsd.toFixed(0)}) + loop to ${(targetLtv * 100).toFixed(0)}% LTV (~${leverage.toFixed(1)}x). ` +
+              `${best.lst} yield: ${(best.effectiveYield * 100).toFixed(1)}%, SOL borrow: ${(solBorrowApy * 100).toFixed(1)}%, ` +
+              `est. loop APY: ${(best.estimatedApy * 100).toFixed(1)}%. ` +
+              `Compared: ${comparison}. Market: ${intel.marketCondition}`,
+            params: {
+              lst: best.lst,
+              lstAmount: best.balance,
+              needsSwap: best.needsSwap,
+              targetLtv,
+              maxLoops: env.kaminoJitoLoopMaxLoops ?? 3,
+              solPriceUsd: state.solPriceUsd,
+              estimatedApy: best.estimatedApy,
+              allCandidates: candidates.map(c => ({ lst: c.lst, spread: c.spread, apy: c.estimatedApy })),
+            },
+            urgency: 'low',
+            estimatedImpactUsd: best.valueUsd * (best.estimatedApy - best.effectiveYield),
+            intelUsed: [],
+            tier: 'APPROVAL',
+          });
+        } else if (env.dryRun) {
+          // Dry-run: show the comparison even when all spreads are negative
+          const breakEvenRate = best.effectiveYield - 0.01;
+          decisions.push({
+            type: 'KAMINO_LST_LOOP',
+            reasoning:
+              `⏸ BLOCKED — best spread is ${(best.spread * 100).toFixed(1)}% (${best.lst}, need >1%). ` +
+              `All spreads: ${comparison}. SOL borrow: ${(solBorrowApy * 100).toFixed(1)}%. ` +
+              `Break-even: SOL borrow needs to drop below ${(breakEvenRate * 100).toFixed(1)}%.`,
+            params: {
+              lst: best.lst,
+              lstAmount: best.balance,
+              blocked: true,
+              blockReason: 'negative_spread',
+              currentSpreadPct: best.spread * 100,
+              breakEvenBorrowRate: breakEvenRate,
+              allCandidates: candidates.map(c => ({ lst: c.lst, spread: c.spread, apy: c.estimatedApy })),
+            },
+            urgency: 'low',
+            estimatedImpactUsd: 0,
+            intelUsed: [],
+            tier: 'NOTIFY',
+          });
+        }
+      } else {
+        logger.debug('[CFO:Decision] Section G2 skip: no LST available (JitoSOL, mSOL, bSOL all < 0.1)');
+      }
+    } catch (err) {
+      logger.debug('[CFO:Decision] Section G2 scan failed (non-fatal):', err);
+    }
+  }
+
+  // ── G3) Kamino Multiply Vault — managed auto-leveraged deposit ────────────
+  // Alternative to manual loop: Kamino manages the leverage automatically.
+  // We pick the best vault by APY and suggest depositing LST into it.
+  if (
+    env.kaminoEnabled && env.kaminoMultiplyVaultEnabled &&
+    !state.kaminoActiveLstLoop &&       // don't double up with manual loop
+    state.kaminoHealthFactor > 2.0 &&
+    intel.marketCondition !== 'danger' &&
+    checkCooldown('KAMINO_MULTIPLY_VAULT', 24 * 3600_000)
+  ) {
+    const bestVault = state.kaminoMultiplyVaults.find(
+      v => v.tvl >= 100_000 && v.apy > 0.05,
+    );
+    if (bestVault) {
+      // Find matching LST in wallet
+      const lstKey = bestVault.collateralToken as keyof typeof state.lstBalances;
+      const walletLst = state.lstBalances[lstKey];
+      const lstAvailable = walletLst?.balance ?? 0;
+      const canUseIdleSol = state.idleSolForStaking >= 0.1;
+
+      if (lstAvailable >= 0.1 || canUseIdleSol) {
+        const depositAmt = lstAvailable >= 0.1 ? lstAvailable : state.idleSolForStaking * 0.9;
+        const depositValueUsd = depositAmt * state.solPriceUsd * 1.02;
+        const needsSwap = lstAvailable < 0.1;
+
+        const vaultSummary = state.kaminoMultiplyVaults.slice(0, 3).map(
+          v => `${v.name} ${(v.apy * 100).toFixed(1)}% APY ($${(v.tvl / 1e6).toFixed(1)}M TVL)`,
+        ).join(' | ');
+
+        decisions.push({
+          type: 'KAMINO_MULTIPLY_VAULT',
+          reasoning:
+            `Kamino Multiply vault: deposit ${depositAmt.toFixed(3)} ${bestVault.collateralToken} ` +
+            `(~$${depositValueUsd.toFixed(0)}) into "${bestVault.name}" — ` +
+            `${(bestVault.apy * 100).toFixed(1)}% APY at ${bestVault.leverage.toFixed(1)}x leverage, ` +
+            `$${(bestVault.tvl / 1e6).toFixed(1)}M TVL. ` +
+            `Kamino auto-manages rebalancing${needsSwap ? ` (swap SOL→${bestVault.collateralToken} first)` : ''}. ` +
+            `Top vaults: ${vaultSummary}`,
+          params: {
+            vaultAddress: bestVault.address,
+            vaultName: bestVault.name,
+            collateralToken: bestVault.collateralToken,
+            depositAmount: depositAmt,
+            needsSwap,
+            estimatedApy: bestVault.apy,
+            leverage: bestVault.leverage,
+            tvl: bestVault.tvl,
+          },
+          urgency: 'low',
+          estimatedImpactUsd: depositValueUsd * bestVault.apy,
+          intelUsed: [],
+          tier: 'APPROVAL',
+        });
+      } else {
+        logger.debug(`[CFO:Decision] Section G3 skip: no ${bestVault.collateralToken} in wallet and no idle SOL`);
+      }
+    } else if (state.kaminoMultiplyVaults.length > 0) {
+      logger.debug(`[CFO:Decision] Section G3 skip: no vault with TVL≥$100k and APY>5% found (${state.kaminoMultiplyVaults.length} vaults checked)`);
+    } else {
+      logger.debug('[CFO:Decision] Section G3 skip: no multiply vault data available');
+    }
+  }
+
   // ── H) Auto-repay / unwind — LTV breached or loop unprofitable ────────────
   if (env.kaminoEnabled) {
     // Use separate thresholds for each strategy:
-    // JitoSOL loop targets 65-72% LTV with ~95% liquidation threshold — 1.5 health factor is normal
+    // LST loop (JitoSOL/mSOL/bSOL) targets 65-72% LTV with ~95% liquidation threshold — 1.5 health factor is normal
     // Simple USDC loop targets <60% LTV with ~75% liquidation threshold — 1.5 is a real warning
-    const ltvBreached = state.kaminoJitoLoopActive
+    const anyLstLoopActive = state.kaminoJitoLoopActive || !!state.kaminoActiveLstLoop;
+    const ltvBreached = anyLstLoopActive
       ? state.kaminoLtv > (env.kaminoJitoLoopMaxLtvPct / 100)
       : state.kaminoLtv > (env.kaminoBorrowMaxLtvPct / 100);
-    const healthDanger = state.kaminoJitoLoopActive
-      ? state.kaminoHealthFactor < 1.2   // JitoSOL: danger is ~77% LTV (0.90/0.77 ≈ 1.17)
+    const healthDanger = anyLstLoopActive
+      ? state.kaminoHealthFactor < 1.2   // LST loop: danger is ~77% LTV (0.90/0.77 ≈ 1.17)
       : state.kaminoHealthFactor < 1.5;  // simple loop: tighter — liquidation is at 75%
-    const loopUnprofitable = state.kaminoJitoLoopActive && state.kaminoJitoLoopApy < 0;
+    const loopUnprofitable = anyLstLoopActive && state.kaminoJitoLoopApy < 0;
 
     if ((ltvBreached || healthDanger) && state.kaminoBorrowValueUsd > 0) {
       const urgency: Decision['urgency'] = state.kaminoHealthFactor < 1.3 ? 'critical' : 'high';
 
-      if (state.kaminoJitoLoopActive) {
-        // JitoSOL loop: correct response is full unwind (can't just repay USDC — borrow is SOL)
+      if (anyLstLoopActive) {
+        // LST loop: correct response is full unwind (can't just repay USDC — borrow is SOL)
+        const activeLst = state.kaminoActiveLstLoop ?? 'JitoSOL';
+        const unwindType = state.kaminoJitoLoopActive ? 'KAMINO_JITO_UNWIND' : 'KAMINO_LST_UNWIND';
         decisions.push({
-          type: 'KAMINO_JITO_UNWIND',
+          type: unwindType as DecisionType,
           reasoning:
-            `JitoSOL loop health degrading — LTV ${(state.kaminoLtv * 100).toFixed(1)}%, ` +
+            `${activeLst} loop health degrading — LTV ${(state.kaminoLtv * 100).toFixed(1)}%, ` +
             `health factor ${state.kaminoHealthFactor.toFixed(2)}. Unwinding loop.`,
-          params: {},
+          params: { lst: activeLst },
           urgency,
           estimatedImpactUsd: state.kaminoBorrowValueUsd,
           intelUsed: [],
@@ -1374,12 +1628,14 @@ export async function generateDecisions(
         }
       }
     } else if (loopUnprofitable && checkCooldown('KAMINO_JITO_UNWIND', 12 * 3600_000)) {
+      const activeLst = state.kaminoActiveLstLoop ?? 'JitoSOL';
+      const unwindType = state.kaminoJitoLoopActive ? 'KAMINO_JITO_UNWIND' : 'KAMINO_LST_UNWIND';
       decisions.push({
-        type: 'KAMINO_JITO_UNWIND',
+        type: unwindType as DecisionType,
         reasoning:
-          `JitoSOL loop unprofitable — current APY ${(state.kaminoJitoLoopApy * 100).toFixed(1)}% ` +
-          `(SOL borrow rate exceeds JitoSOL staking yield). Unwinding.`,
-        params: {},
+          `${activeLst} loop unprofitable — current APY ${(state.kaminoJitoLoopApy * 100).toFixed(1)}% ` +
+          `(SOL borrow rate exceeds ${activeLst} staking yield). Unwinding.`,
+        params: { lst: activeLst },
         urgency: 'low',
         estimatedImpactUsd: 0,
         intelUsed: [],
@@ -2066,6 +2322,61 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         };
       }
 
+      case 'KAMINO_LST_LOOP': {
+        const kamino = await import('./kaminoService.ts');
+        const { lst, lstAmount, needsSwap, targetLtv, maxLoops, solPriceUsd } = decision.params;
+        const lstAsset = lst as import('./kaminoService.ts').LstAsset;
+
+        // If we need to acquire the LST first (swap SOL → LST via Jupiter)
+        if (needsSwap && lstAsset !== 'JitoSOL') {
+          // For JitoSOL, loopLst handles Jito staking internally
+          // For mSOL/bSOL, loopLst handles Jupiter swap internally
+          logger.info(`[CFO] LST loop: will acquire ${lstAmount.toFixed(4)} ${lst} via swap`);
+        }
+
+        // Deposit initial LST as collateral, then loop
+        const depositResult = await kamino.deposit(lstAsset, lstAmount);
+        if (!depositResult.success) {
+          return { ...base, executed: true, success: false, error: `Initial ${lst} deposit failed: ${depositResult.error}` };
+        }
+
+        const loopResult = await kamino.loopLst(lstAsset, targetLtv, maxLoops, solPriceUsd);
+        markDecision('KAMINO_LST_LOOP');
+        return {
+          ...base,
+          executed: true,
+          success: loopResult.success,
+          txId: loopResult.txSignatures?.[loopResult.txSignatures.length - 1],
+          error: loopResult.error,
+        };
+      }
+
+      case 'KAMINO_LST_UNWIND': {
+        const kamino = await import('./kaminoService.ts');
+        const lstAsset = (decision.params.lst ?? 'JitoSOL') as import('./kaminoService.ts').LstAsset;
+        const unwindResult = await kamino.unwindLstLoop(lstAsset);
+        markDecision('KAMINO_LST_UNWIND');
+        return {
+          ...base,
+          executed: true,
+          success: unwindResult.success,
+          txId: unwindResult.txSignatures?.[unwindResult.txSignatures.length - 1],
+          error: unwindResult.error,
+        };
+      }
+
+      case 'KAMINO_MULTIPLY_VAULT': {
+        // Multiply vault deposits require the Kamino SDK — log-only for now
+        logger.info(`[CFO] Multiply vault opportunity: ${decision.params.vaultName} — ${(decision.params.estimatedApy * 100).toFixed(1)}% APY (execution pending SDK integration)`);
+        markDecision('KAMINO_MULTIPLY_VAULT');
+        return {
+          ...base,
+          executed: true,
+          success: true,
+          error: 'Vault deposit not yet implemented — logged opportunity',
+        };
+      }
+
       default:
         return { ...base, executed: false, error: `Unknown decision type: ${decision.type}` };
     }
@@ -2192,6 +2503,18 @@ function _humanAction(d: Decision, state: PortfolioState): string {
       return `*Leverage JitoSOL* — deposit ${p.jitoSolToDeposit?.toFixed(2) ?? '?'} JitoSOL, loop to ${((p.targetLtv ?? 0.65) * 100).toFixed(0)}% LTV for ~${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY`;
     case 'KAMINO_JITO_UNWIND':
       return `*Unwind JitoSOL loop* — closing leveraged position`;
+    case 'KAMINO_LST_LOOP': {
+      if (p.blocked) {
+        const spreads = (p.allCandidates ?? []).map((c: any) => `${c.lst} ${(c.spread * 100).toFixed(1)}%`).join(', ');
+        return `⏸ *LST Loop waiting* — best spread is ${p.currentSpreadPct?.toFixed(1) ?? '?'}% (${p.lst ?? '?'}, need >1%). All: ${spreads}`;
+      }
+      const runners = (p.allCandidates ?? []).filter((c: any) => c.lst !== p.lst).map((c: any) => `${c.lst} ${(c.spread * 100).toFixed(1)}%`).join(', ');
+      return `*Leverage ${p.lst ?? '?'}* — deposit ${p.lstAmount?.toFixed(2) ?? '?'} ${p.lst ?? 'LST'}, loop to ${((p.targetLtv ?? 0.65) * 100).toFixed(0)}% LTV for ~${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY${runners ? ` (vs ${runners})` : ''}`;
+    }
+    case 'KAMINO_LST_UNWIND':
+      return `*Unwind ${p.lst ?? 'LST'} loop* — closing leveraged ${p.lst ?? 'LST'}/SOL position`;
+    case 'KAMINO_MULTIPLY_VAULT':
+      return `*Kamino Vault* — deposit ${p.depositAmount?.toFixed(2) ?? '?'} ${p.collateralToken ?? 'LST'} into "${p.vaultName ?? 'Multiply'}" (${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY, ${p.leverage?.toFixed(1) ?? '?'}x)${p.needsSwap ? ' (swap SOL first)' : ''}`;
     case 'ORCA_LP_OPEN':
       return `*Open LP* — $${((p.usdcAmount ?? 0) * 2).toFixed(0)} in ${p.pair ?? 'SOL/USDC'} (±${(p.rangeWidthPct ?? 20) / 2}% range)`;
     case 'ORCA_LP_REBALANCE':

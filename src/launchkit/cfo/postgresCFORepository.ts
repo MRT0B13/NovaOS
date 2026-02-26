@@ -20,7 +20,7 @@ import { logger } from '@elizaos/core';
 // ============================================================================
 
 export type PositionStatus = 'OPEN' | 'PARTIAL_EXIT' | 'CLOSED' | 'STOP_HIT' | 'EXPIRED';
-export type PositionStrategy = 'polymarket' | 'hyperliquid' | 'kamino' | 'kamino_loop' | 'kamino_jito_loop' | 'orca_lp' | 'jito' | 'jupiter_swap' | 'evm_flash_arb';
+export type PositionStrategy = 'polymarket' | 'hyperliquid' | 'kamino' | 'kamino_loop' | 'kamino_jito_loop' | 'kamino_msol_loop' | 'kamino_bsol_loop' | 'kamino_multiply_vault' | 'orca_lp' | 'jito' | 'jupiter_swap' | 'evm_flash_arb';
 
 export interface CFOPosition {
   id: string;

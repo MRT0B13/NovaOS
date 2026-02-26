@@ -43,6 +43,8 @@ const KAMINO_MAIN_MARKET_ADDR: any = '7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5P
 
 // ── Token mints (verified mainnet) ──────────────────────────────────────────
 const JITOSOL_MINT = 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn';
+const MSOL_MINT    = 'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So';
+const BSOL_MINT    = 'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1';
 const JUP_MINT     = 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN';
 const USDC_MINT    = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const USDT_MINT    = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
@@ -57,19 +59,34 @@ const SOL_MINT     = 'So11111111111111111111111111111111111111112';
  * before any deposit/borrow on those assets. The SDK throws if address is wrong.
  * USDC and SOL addresses are already confirmed correct.
  */
-export type KaminoAsset = 'USDC' | 'USDT' | 'SOL' | 'JitoSOL' | 'JUP';
+export type KaminoAsset = 'USDC' | 'USDT' | 'SOL' | 'JitoSOL' | 'mSOL' | 'bSOL' | 'JUP';
+
+/** Subset of KaminoAsset that are liquid staking tokens (correlated to SOL). */
+export type LstAsset = 'JitoSOL' | 'mSOL' | 'bSOL';
+
+/** All supported LSTs for the Multiply / leverage loop strategy. */
+export const LST_ASSETS: LstAsset[] = ['JitoSOL', 'mSOL', 'bSOL'];
+
+/** Token mint address for each LST (re-exported for consumers). */
+export const LST_MINTS: Record<LstAsset, string> = {
+  JitoSOL: JITOSOL_MINT,
+  mSOL:    MSOL_MINT,
+  bSOL:    BSOL_MINT,
+};
 
 const KAMINO_RESERVES: Record<KaminoAsset, string> = {
   USDC:    'D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59',  // confirmed via SDK enum
   SOL:     'd4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q',   // confirmed via SDK enum
   USDT:    'H3t6qZ1JkguCNTi9uzVKqQ7dvt2cum4XiXWom6Gn5e5S',   // confirmed via SDK enum
   JitoSOL: 'EVbyPKrHG6WBfm4dLxLMJpUDY43cCAcHSpV3KYjKsktW',  // confirmed via SDK enum
+  mSOL:    'GHHkGpW22PFQTQqT8fp6ZuDvmjSzBCZoMmzbkCPJ5hSi',  // VERIFY: https://api.kamino.finance/kamino-market/.../reserves
+  bSOL:    '3JLPCS1qM2zRw3Dp6V4hZnYHd4toMNPkNesXdX9tg6KM',  // VERIFY: https://api.kamino.finance/kamino-market/.../reserves
   JUP:     '4AFAGAm5G8fkcKy7QerL88E7BiSE22ZRbvJzvaKjayor',   // confirmed via SDK enum
 };
 
 // Token decimals
 const ASSET_DECIMALS: Record<KaminoAsset, number> = {
-  USDC: 6, USDT: 6, SOL: 9, JitoSOL: 9, JUP: 6,
+  USDC: 6, USDT: 6, SOL: 9, JitoSOL: 9, mSOL: 9, bSOL: 9, JUP: 6,
 };
 
 /**
@@ -80,10 +97,19 @@ const ASSET_DECIMALS: Record<KaminoAsset, number> = {
  */
 const SAFE_BORROW_LTV: Record<KaminoAsset, number> = {
   JitoSOL: 0.75,  // high — correlated with the SOL borrow, liq threshold ~95%
-  SOL:     0.75,  // when borrowed against JitoSOL collateral — liq threshold ~95%, 0.75 is conservative
+  mSOL:    0.75,  // same as JitoSOL — SOL-correlated, liq threshold ~95%
+  bSOL:    0.75,  // same as JitoSOL — SOL-correlated, liq threshold ~95%
+  SOL:     0.75,  // when borrowed against LST collateral — liq threshold ~95%, 0.75 is conservative
   USDC:    0.70,
   USDT:    0.70,
   JUP:     0.45,  // volatile — conservative
+};
+
+/** Base staking yield for each LST (base staking + MEV tips / validator yield). */
+export const LST_BASE_STAKING_YIELD: Record<LstAsset, number> = {
+  JitoSOL: 0.08,   // ~8% APY (base staking + MEV tips)
+  mSOL:    0.075,  // ~7.5% APY (Marinade native staking)
+  bSOL:    0.07,   // ~7% APY (BlazeStake validator set)
 };
 
 // Mint-to-asset reverse lookup for position parsing
@@ -92,6 +118,8 @@ const MINT_TO_ASSET: Record<string, KaminoAsset> = {
   [USDT_MINT]:    'USDT',
   [SOL_MINT]:     'SOL',
   [JITOSOL_MINT]: 'JitoSOL',
+  [MSOL_MINT]:    'mSOL',
+  [BSOL_MINT]:    'bSOL',
   [JUP_MINT]:     'JUP',
 };
 // Also map by reserve address for SDK obligation parsing
@@ -144,6 +172,8 @@ export interface KaminoMarketApy {
   USDT:    { supplyApy: number; borrowApy: number };
   SOL:     { supplyApy: number; borrowApy: number };
   JitoSOL: { supplyApy: number; borrowApy: number };
+  mSOL:    { supplyApy: number; borrowApy: number };
+  bSOL:    { supplyApy: number; borrowApy: number };
   JUP:     { supplyApy: number; borrowApy: number };
 }
 
@@ -249,6 +279,8 @@ async function fetchKaminoApys(): Promise<KaminoMarketApy> {
     USDT:    { supplyApy: 0.07, borrowApy: 0.11 },
     SOL:     { supplyApy: 0.06, borrowApy: 0.10 },
     JitoSOL: { supplyApy: 0.07, borrowApy: 0.09 }, // borrow cheap — assets correlated
+    mSOL:    { supplyApy: 0.065, borrowApy: 0.09 },
+    bSOL:    { supplyApy: 0.06, borrowApy: 0.09 },
     JUP:     { supplyApy: 0.05, borrowApy: 0.14 },
   };
 
@@ -264,7 +296,8 @@ async function fetchKaminoApys(): Promise<KaminoMarketApy> {
 
     // Map API symbol names to our KaminoAsset type
     const symbolMap: Record<string, KaminoAsset> = {
-      USDC: 'USDC', USDT: 'USDT', SOL: 'SOL', JITOSOL: 'JitoSOL', JUP: 'JUP',
+      USDC: 'USDC', USDT: 'USDT', SOL: 'SOL', JITOSOL: 'JitoSOL',
+      MSOL: 'mSOL', BSOL: 'bSOL', JUP: 'JUP',
     };
 
     for (const reserve of data) {
@@ -1115,4 +1148,285 @@ export async function unwindJitoSolLoop(): Promise<{ success: boolean; txSignatu
   }
 
   return { success: true, txSignatures: txSigs };
+}
+
+// ============================================================================
+// Generic LST/SOL Multiply Loop — works for JitoSOL, mSOL, bSOL
+// ============================================================================
+
+/**
+ * Generic LST/SOL Multiply loop.
+ * Same mechanic as loopJitoSol but for any supported LST:
+ *   1. Deposit LST as collateral
+ *   2. Borrow SOL against it
+ *   3. Swap SOL → LST (via Jupiter)
+ *   4. Re-deposit LST
+ *   5. Repeat
+ *
+ * For JitoSOL specifically, the SOL→JitoSOL step can use Jito's staking pool
+ * (better rate). For mSOL/bSOL we use Jupiter swap.
+ */
+export async function loopLst(
+  lst: LstAsset,
+  targetLtv = 0.65,
+  maxLoops = 3,
+  solPriceUsd = 80,
+): Promise<JitoSolLoopResult> {
+  // JitoSOL path uses the existing optimised function
+  if (lst === 'JitoSOL') return loopJitoSol(targetLtv, maxLoops, solPriceUsd);
+
+  const env = getCFOEnv();
+  const txSigs: string[] = [];
+
+  if (!env.kaminoBorrowEnabled) {
+    return { success: false, loopsCompleted: 0, jitoSolDeposited: 0, solBorrowed: 0, effectiveLtv: 0, estimatedApy: 0, txSignatures: [], error: 'Borrowing disabled' };
+  }
+
+  if (env.dryRun) {
+    const apys = await fetchKaminoApys();
+    const leverage = 1 / (1 - targetLtv);
+    const baseYield = LST_BASE_STAKING_YIELD[lst];
+    const supplyApy = Math.max(apys[lst]?.supplyApy ?? 0, baseYield);
+    const estimatedApy = leverage * supplyApy - (leverage - 1) * apys.SOL.borrowApy;
+    logger.info(`[Kamino:Loop:${lst}] DRY RUN — would loop to ${(targetLtv * 100).toFixed(0)}% LTV, est. APY ${(estimatedApy * 100).toFixed(1)}%`);
+    return { success: true, loopsCompleted: maxLoops, jitoSolDeposited: 0, solBorrowed: 0, effectiveLtv: targetLtv, estimatedApy, txSignatures: [`dry-loop-${lst}-${Date.now()}`] };
+  }
+
+  if (targetLtv > 0.80) throw new Error(`targetLtv exceeds safe maximum of 0.80 for ${lst} loop`);
+
+  let totalLstDeposited = 0;
+  let totalSolBorrowed = 0;
+  let loopsCompleted = 0;
+
+  for (let i = 0; i < maxLoops; i++) {
+    const pos = await getPosition();
+    const currentLtv = pos.ltv;
+
+    if (currentLtv >= targetLtv * 0.95) {
+      logger.info(`[Kamino:Loop:${lst}] Target LTV ${(targetLtv * 100).toFixed(0)}% reached (current: ${(currentLtv * 100).toFixed(1)}%) after ${i} loops`);
+      break;
+    }
+
+    const depositValUsd = pos.deposits.reduce((s, d) => s + d.valueUsd, 0);
+    const currentBorrowValUsd = pos.borrows.reduce((s, b) => s + b.valueUsd, 0);
+    const targetBorrowValUsd = depositValUsd * targetLtv;
+    const canBorrowUsd = Math.max(0, targetBorrowValUsd - currentBorrowValUsd) * 0.9;
+
+    if (canBorrowUsd < 1) { logger.info(`[Kamino:Loop:${lst}] Headroom too small ($${canBorrowUsd.toFixed(2)}) — stopping`); break; }
+
+    const solToBorrow = canBorrowUsd / solPriceUsd;
+
+    // Step 1: Borrow SOL
+    const borrowResult = await borrow('SOL', solToBorrow);
+    if (!borrowResult.success) {
+      logger.error(`[Kamino:Loop:${lst}] Borrow SOL failed: ${borrowResult.error}`);
+      break;
+    }
+    if (borrowResult.txSignature) txSigs.push(borrowResult.txSignature);
+    totalSolBorrowed += solToBorrow;
+
+    // Step 2: Swap SOL → LST via Jupiter
+    const lstMint = LST_MINTS[lst];
+    try {
+      const jupiter = await import('./jupiterService.ts');
+      const quote = await jupiter.getQuote(jupiter.MINTS.SOL, lstMint, solToBorrow, 100); // 1% slippage
+      if (!quote) throw new Error('No Jupiter quote');
+      const swapResult = await jupiter.executeSwap(quote, { maxPriceImpactPct: 1.5 });
+      if (!swapResult.success) throw new Error(swapResult.error);
+      if (swapResult.txSignature) txSigs.push(swapResult.txSignature);
+
+      const lstReceived = swapResult.outputAmount;
+      logger.info(`[Kamino:Loop:${lst}] Swapped ${solToBorrow.toFixed(4)} SOL → ${lstReceived.toFixed(4)} ${lst}`);
+
+      await new Promise(r => setTimeout(r, 2000));
+
+      // Step 3: Deposit LST back into Kamino
+      const depositResult = await deposit(lst, lstReceived);
+      if (!depositResult.success) {
+        logger.error(`[Kamino:Loop:${lst}] Deposit failed: ${depositResult.error}`);
+        // Attempt to repay the borrow to unwind this iteration
+        await repay('SOL', solToBorrow).catch(() => {});
+        break;
+      }
+      if (depositResult.txSignature) txSigs.push(depositResult.txSignature);
+      totalLstDeposited += lstReceived;
+      loopsCompleted++;
+    } catch (err) {
+      logger.error(`[Kamino:Loop:${lst}] Jupiter swap failed:`, err);
+      // Attempt to repay the borrow
+      await repay('SOL', solToBorrow).catch(() => {});
+      break;
+    }
+  }
+
+  const finalPos = await getPosition();
+  const apys = await fetchKaminoApys();
+  const baseYield = LST_BASE_STAKING_YIELD[lst];
+  const effectiveSupplyApy = Math.max(apys[lst]?.supplyApy ?? 0, baseYield);
+  const leverage = finalPos.netValueUsd > 0
+    ? finalPos.deposits.filter(d => d.asset === lst).reduce((s, d) => s + d.valueUsd, 0) / finalPos.netValueUsd
+    : 1;
+  const estimatedApy = leverage * effectiveSupplyApy - (leverage - 1) * apys.SOL.borrowApy;
+
+  return {
+    success: loopsCompleted > 0,
+    loopsCompleted,
+    jitoSolDeposited: totalLstDeposited,   // field name kept for compat but represents any LST
+    solBorrowed: totalSolBorrowed,
+    effectiveLtv: finalPos.ltv,
+    estimatedApy,
+    txSignatures: txSigs,
+  };
+}
+
+/**
+ * Unwind any LST/SOL loop — withdraw LST → swap to SOL → repay SOL borrow.
+ * Works for JitoSOL, mSOL, bSOL.
+ */
+export async function unwindLstLoop(lst: LstAsset): Promise<{ success: boolean; txSignatures: string[]; error?: string }> {
+  if (lst === 'JitoSOL') return unwindJitoSolLoop();
+
+  const env = getCFOEnv();
+  const txSigs: string[] = [];
+
+  if (env.dryRun) {
+    logger.info(`[Kamino:Unwind:${lst}] DRY RUN — would unwind ${lst} loop`);
+    return { success: true, txSignatures: ['dry-unwind'] };
+  }
+
+  for (let i = 0; i < 6; i++) {
+    const pos = await getPosition();
+    const solBorrow = pos.borrows.find(b => b.asset === 'SOL');
+    if (!solBorrow || solBorrow.amount < 0.001) { logger.info(`[Kamino:Unwind:${lst}] Fully unwound`); break; }
+
+    const lstDeposit = pos.deposits.find(d => d.asset === lst);
+    if (!lstDeposit || lstDeposit.amount < 0.001) break;
+
+    const withdrawAmt = Math.min(lstDeposit.amount * 0.4, lstDeposit.amount - 0.001);
+    const withdrawResult = await withdraw(lst, withdrawAmt);
+    if (!withdrawResult.success) { logger.error(`[Kamino:Unwind:${lst}] Withdraw failed: ${withdrawResult.error}`); break; }
+    if (withdrawResult.txSignature) txSigs.push(withdrawResult.txSignature);
+
+    // Swap LST → SOL via Jupiter
+    try {
+      const jupiter = await import('./jupiterService.ts');
+      const quote = await jupiter.getQuote(LST_MINTS[lst], jupiter.MINTS.SOL, withdrawAmt * 0.999, 100);
+      if (!quote) throw new Error('No quote');
+      const swapResult = await jupiter.executeSwap(quote, { maxPriceImpactPct: 1.5 });
+      if (!swapResult.success) throw new Error(swapResult.error);
+      if (swapResult.txSignature) txSigs.push(swapResult.txSignature);
+
+      const solReceived = swapResult.outputAmount;
+      const repayAmt = Math.min(solReceived, solBorrow.amount);
+      if (repayAmt < 0.001) break;
+      const repayResult = await repay('SOL', repayAmt);
+      if (repayResult.txSignature) txSigs.push(repayResult.txSignature);
+
+      logger.info(`[Kamino:Unwind:${lst}] Step ${i + 1}: withdrew ${withdrawAmt.toFixed(4)} ${lst}, repaid ${repayAmt.toFixed(4)} SOL`);
+    } catch (err) {
+      logger.error(`[Kamino:Unwind:${lst}] Swap/repay failed:`, err);
+      break;
+    }
+  }
+
+  return { success: true, txSignatures: txSigs };
+}
+
+// ============================================================================
+// Kamino Multiply Vaults — managed leverage, auto-rebalancing
+// ============================================================================
+
+/** A Kamino Multiply vault — pre-built auto-managed leverage strategy. */
+export interface KaminoMultiplyVault {
+  address: string;       // vault pubkey
+  name: string;          // e.g. "JitoSOL-SOL Multiply"
+  collateralToken: string;  // e.g. "JitoSOL"
+  debtToken: string;     // e.g. "SOL"
+  leverage: number;      // current effective leverage (e.g. 3.0)
+  maxLeverage: number;   // protocol max leverage
+  apy: number;           // estimated APY (already leveraged)
+  tvl: number;           // total value locked in USD
+  status: 'active' | 'paused';
+}
+
+/** Cache for vault data (refresh every 10 min) */
+let _vaultCache: { data: KaminoMultiplyVault[]; at: number } | null = null;
+
+/**
+ * Fetch available Kamino Multiply vaults from the public API.
+ * Returns vaults sorted by APY descending with LST/SOL pairs prioritised.
+ */
+export async function getMultiplyVaults(): Promise<KaminoMultiplyVault[]> {
+  if (_vaultCache && Date.now() - _vaultCache.at < 10 * 60_000) return _vaultCache.data;
+
+  const vaults: KaminoMultiplyVault[] = [];
+
+  try {
+    // Kamino Multiply API endpoint (public, no auth)
+    const resp = await fetch(
+      'https://api.kamino.finance/strategies/metrics?env=mainnet-beta&status=LIVE&strategyType=MULTIPLY',
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (!resp.ok) throw new Error(`Kamino Vault API ${resp.status}`);
+
+    const data = await resp.json() as any[];
+
+    // Map known LST symbols
+    const lstSymbols = new Set(['JITOSOL', 'MSOL', 'BSOL', 'JUPSOL', 'INF', 'WSOL']);
+
+    for (const vault of data) {
+      const collateralSymbol = (vault.tokenASymbol ?? vault.collateralTokenSymbol ?? '').toUpperCase();
+      const debtSymbol = (vault.tokenBSymbol ?? vault.debtTokenSymbol ?? '').toUpperCase();
+
+      // We only care about LST/SOL multiply vaults
+      if (!lstSymbols.has(collateralSymbol) && !lstSymbols.has(debtSymbol)) continue;
+
+      // Normalise symbol names to our convention
+      const nameMap: Record<string, string> = {
+        JITOSOL: 'JitoSOL', MSOL: 'mSOL', BSOL: 'bSOL', WSOL: 'SOL',
+        JUPSOL: 'jupSOL', INF: 'INF', SOL: 'SOL',
+      };
+      const collateral = nameMap[collateralSymbol] ?? collateralSymbol;
+      const debt = nameMap[debtSymbol] ?? debtSymbol;
+
+      vaults.push({
+        address: vault.address ?? vault.strategy ?? '',
+        name: `${collateral}-${debt} Multiply`,
+        collateralToken: collateral,
+        debtToken: debt,
+        leverage: Number(vault.leverage ?? vault.currentLeverage ?? 2),
+        maxLeverage: Number(vault.maxLeverage ?? 5),
+        apy: Number(vault.apy ?? vault.totalApy ?? vault.strategyApy ?? 0),
+        tvl: Number(vault.tvl ?? vault.tvlUsd ?? 0),
+        status: 'active',
+      });
+    }
+
+    // Sort: highest APY first
+    vaults.sort((a, b) => b.apy - a.apy);
+  } catch (err) {
+    logger.debug('[Kamino:Vaults] Failed to fetch multiply vaults (non-fatal):', err);
+
+    // Return hardcoded fallback so the decision engine still has data
+    vaults.push(
+      { address: '', name: 'JitoSOL-SOL Multiply', collateralToken: 'JitoSOL', debtToken: 'SOL', leverage: 3.0, maxLeverage: 5, apy: 0.18, tvl: 50_000_000, status: 'active' },
+      { address: '', name: 'mSOL-SOL Multiply',    collateralToken: 'mSOL',    debtToken: 'SOL', leverage: 3.0, maxLeverage: 5, apy: 0.16, tvl: 20_000_000, status: 'active' },
+      { address: '', name: 'bSOL-SOL Multiply',    collateralToken: 'bSOL',    debtToken: 'SOL', leverage: 3.0, maxLeverage: 5, apy: 0.15, tvl: 10_000_000, status: 'active' },
+    );
+  }
+
+  _vaultCache = { data: vaults, at: Date.now() };
+  return vaults;
+}
+
+/**
+ * Get the best-yield Multiply vault among our supported LSTs.
+ * Returns the vault with highest APY that has sufficient TVL (>$100k).
+ */
+export async function getBestMultiplyVault(minTvl = 100_000): Promise<KaminoMultiplyVault | null> {
+  const vaults = await getMultiplyVaults();
+  const supportedCollateral = new Set(['JitoSOL', 'mSOL', 'bSOL']);
+  return vaults.find(
+    v => v.status === 'active' && supportedCollateral.has(v.collateralToken) && v.debtToken === 'SOL' && v.tvl >= minTvl,
+  ) ?? null;
 }
