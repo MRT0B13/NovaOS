@@ -293,9 +293,22 @@ export function getDecisionConfig(): DecisionConfig {
 
 const lastDecisionAt: Record<string, number> = {};
 
+/**
+ * Dry-run cooldown: shorter (2h) to prevent immediate repeats without
+ * going silent for the full 24h production cooldown window.
+ */
+const _dryRunCooldowns: Record<string, number> = {};
+const DRY_RUN_COOLDOWN_MS = 2 * 3600_000; // 2 hours
+
 function checkCooldown(type: string, cooldownMs: number): boolean {
   const last = lastDecisionAt[type] ?? 0;
-  return Date.now() - last >= cooldownMs;
+  if (Date.now() - last < cooldownMs) return false;
+
+  // Also check dry-run cooldowns (shorter window)
+  const dryLast = _dryRunCooldowns[type] ?? 0;
+  if (Date.now() - dryLast < DRY_RUN_COOLDOWN_MS) return false;
+
+  return true;
 }
 
 function markDecision(type: string): void {
@@ -2084,17 +2097,18 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
   }
 
   // Dry run — log but don't execute.
-  // Still mark cooldown so we don't re-recommend the same action every cycle.
+  // Mark a separate dry-run cooldown (2h) so we don't re-recommend the same
+  // action every 30-min cycle. This is shorter than production cooldowns (24h)
+  // to ensure varied recommendations without going completely silent.
   if (env.dryRun) {
     logger.info(
       `[CFO:Decision] DRY RUN — ${decision.type} [${decision.tier}]: ${decision.reasoning}`,
     );
-    // Derive the same cooldown key that the execution branch would use
     const cooldownKey =
       (decision.type === 'OPEN_HEDGE' || decision.type === 'CLOSE_HEDGE')
         ? `${decision.type}_${decision.params.coin ?? 'SOL'}`
         : decision.type;
-    markDecision(cooldownKey);
+    _dryRunCooldowns[cooldownKey] = Date.now();
     return { ...base, executed: false, success: true };
   }
 
