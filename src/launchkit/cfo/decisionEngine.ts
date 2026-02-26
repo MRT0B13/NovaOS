@@ -1248,7 +1248,7 @@ export async function generateDecisions(
             urgency: 'low',
             estimatedImpactUsd: borrowUsd * (spreadPct / 100),
             intelUsed: intel.scoutBullish !== undefined ? ['scout'] : [],
-            tier: 'APPROVAL',
+            tier: classifyTier('KAMINO_BORROW_DEPLOY', 'low', borrowUsd * (spreadPct / 100), config, intel.marketCondition),
           });
         }
       }
@@ -1338,7 +1338,7 @@ export async function generateDecisions(
           urgency: 'low',
           estimatedImpactUsd: state.jitoSolValueUsd * (estimatedApy - state.kaminoJitoSupplyApy),
           intelUsed: [],
-          tier: 'APPROVAL',
+          tier: classifyTier('KAMINO_JITO_LOOP', 'low', state.jitoSolValueUsd * (estimatedApy - state.kaminoJitoSupplyApy), config, intel.marketCondition),
         });
       } else if (env.dryRun) {
         // ── Dry-run simulation: show what Kamino WOULD do if rates were favourable ──
@@ -1491,7 +1491,7 @@ export async function generateDecisions(
             urgency: 'low',
             estimatedImpactUsd: best.valueUsd * (best.estimatedApy - best.effectiveYield),
             intelUsed: [],
-            tier: 'APPROVAL',
+            tier: classifyTier('KAMINO_LST_LOOP', 'low', best.valueUsd * (best.estimatedApy - best.effectiveYield), config, intel.marketCondition),
           });
         } else if (env.dryRun) {
           // Dry-run: show the comparison even when all spreads are negative
@@ -1576,7 +1576,7 @@ export async function generateDecisions(
           urgency: 'low',
           estimatedImpactUsd: depositValueUsd * bestVault.apy,
           intelUsed: [],
-          tier: 'APPROVAL',
+          tier: classifyTier('KAMINO_LST_LOOP', 'low', depositValueUsd * bestVault.apy, config, intel.marketCondition),
         });
       } else {
         logger.debug(`[CFO:Decision] Section G3 skip: no ${bestVault.collateralToken} in wallet and no idle SOL`);
@@ -1752,7 +1752,7 @@ export async function generateDecisions(
               intel.analystPricesAt ? 'analyst' : '',
               intel.scoutReceivedAt ? 'scout' : '',
             ].filter(Boolean),
-            tier: 'APPROVAL',
+            tier: classifyTier('ORCA_LP_OPEN', 'low', deployUsd * 0.18, config, intel.marketCondition),
           });
         }
       }
