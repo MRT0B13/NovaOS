@@ -41,6 +41,31 @@ import { logger } from '@elizaos/core';
 import { getCFOEnv, type CFOEnv } from './cfoEnv.ts';
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+/**
+ * Maps SOL LST (Liquid Staking Token) symbols to their underlying HL-tradeable asset.
+ * During treasury enrichment, LSTs are folded into the underlying entry so the hedge
+ * engine sees combined SOL-equivalent exposure and hedges via SOL-PERP (not JITOSOL-PERP
+ * which doesn't exist on Hyperliquid).
+ */
+const SOL_LST_UNDERLYING: Record<string, string> = {
+  JITOSOL: 'SOL',
+  MSOL: 'SOL',
+  BSOL: 'SOL',
+  JUPSOL: 'SOL',
+  VSOL: 'SOL',
+  HUBSOL: 'SOL',
+  COMPASSSOL: 'SOL',
+  INFINITYSOL: 'SOL',
+  BONKSOL: 'SOL',
+  LAINESOL: 'SOL',
+  EDGESOL: 'SOL',
+  PATHSOL: 'SOL',
+};
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -2931,7 +2956,12 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
     }
 
     // Build enriched treasury exposures
+    // SOL LSTs (JitoSOL, mSOL, bSOL, etc.) are folded into the underlying SOL entry
+    // so the hedge engine sees combined SOL-equivalent exposure and hedges via SOL-PERP.
+    // Min-exposure filter is applied AFTER aggregation so $41 SOL + $225 JitoSOL = $266
+    // passes the $50 threshold even though each token alone might not.
     const exposures: PortfolioState['treasuryExposures'] = [];
+    const lstContributions: string[] = []; // track LST details for logging
     for (const wb of walletBalances) {
       if (!wb.symbol) continue; // skip unknown tokens
       const sym = wb.symbol.toUpperCase();
@@ -2943,14 +2973,42 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
       // Resolve USD value
       let valueUsd = 0;
       if (sym === 'SOL') {
-        // Raw SOL only — LSTs (JitoSOL, mSOL, bSOL) appear as separate entries
         valueUsd = wb.balance * state.solPriceUsd;
       } else if (priceMap[sym]) {
         valueUsd = wb.balance * priceMap[sym];
       }
 
-      // Apply min-exposure filter
-      if (valueUsd < env.hlHedgeMinExposureUsd) continue;
+      if (valueUsd < 1) continue; // skip true dust
+
+      // Fold SOL LSTs into their underlying asset for correct hedge aggregation
+      const underlying = SOL_LST_UNDERLYING[sym];
+      if (underlying) {
+        lstContributions.push(`${wb.balance.toFixed(4)} ${sym}($${valueUsd.toFixed(0)})`);
+        const idx = exposures.findIndex(e => e.symbol === underlying);
+        if (idx >= 0) {
+          exposures[idx].valueUsd += valueUsd;
+          exposures[idx].balance += valueUsd / state.solPriceUsd; // SOL-equivalent units
+        } else {
+          exposures.push({
+            symbol: underlying,
+            mint: wb.mint,
+            balance: valueUsd / state.solPriceUsd, // SOL-equivalent units
+            valueUsd,
+            hlListed: hlCoinSet.has(underlying),
+          });
+        }
+        continue;
+      }
+
+      // For raw SOL, merge with any existing SOL entry (may have been created by an LST above)
+      if (sym === 'SOL') {
+        const idx = exposures.findIndex(e => e.symbol === 'SOL');
+        if (idx >= 0) {
+          exposures[idx].valueUsd += valueUsd;
+          exposures[idx].balance += wb.balance;
+          continue;
+        }
+      }
 
       exposures.push({
         symbol: sym,
@@ -2961,15 +3019,18 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
       });
     }
 
+    // Apply min-exposure filter AFTER LST aggregation
+    const filteredExposures = exposures.filter(e => e.valueUsd >= env.hlHedgeMinExposureUsd);
+
     // Sort by value descending — highest exposure first
-    exposures.sort((a, b) => b.valueUsd - a.valueUsd);
+    filteredExposures.sort((a, b) => b.valueUsd - a.valueUsd);
 
     // Only override if we got results; keep SOL fallback otherwise
-    if (exposures.length > 0) {
-      state.treasuryExposures = exposures;
+    if (filteredExposures.length > 0) {
+      state.treasuryExposures = filteredExposures;
 
       // Recalculate hedgeRatio with enriched data
-      const totalHedgeable = exposures
+      const totalHedgeable = filteredExposures
         .filter((e) => e.hlListed)
         .reduce((s, e) => s + e.valueUsd, 0);
       if (totalHedgeable > 0) {
@@ -2977,9 +3038,11 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
       }
     }
 
+    const lstSuffix = lstContributions.length > 0 ? ` [LST→SOL: ${lstContributions.join(' + ')}]` : '';
     logger.info(
       `[CFO:Treasury] ${state.treasuryExposures.length} asset(s): ` +
-      state.treasuryExposures.map((e) => `${e.symbol}=$${e.valueUsd.toFixed(0)}${e.hlListed ? '(HL)' : ''}`).join(', '),
+      state.treasuryExposures.map((e) => `${e.symbol}=$${e.valueUsd.toFixed(0)}${e.hlListed ? '(HL)' : ''}`).join(', ') +
+      lstSuffix,
     );
   } catch (err) {
     logger.warn('[CFO:Treasury] Multi-asset scan failed (falling back to SOL-only):', err);
