@@ -2866,9 +2866,11 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
 
   // 1. Gather portfolio state
   const state = await gatherPortfolioState();
+  const rawSolUsd = state.solBalance * state.solPriceUsd;
   logger.info(
     `[CFO:Decision] Portfolio: $${state.totalPortfolioUsd.toFixed(0)} | ` +
-    `SOL: ${state.solBalance.toFixed(2)} ($${state.solExposureUsd.toFixed(0)}) | ` +
+    `SOL: ${state.solBalance.toFixed(2)} ($${rawSolUsd.toFixed(0)}) | ` +
+    `JitoSOL: ${state.jitoSolBalance.toFixed(2)} ($${state.jitoSolValueUsd.toFixed(0)}) | ` +
     `hedge: ${(state.hedgeRatio * 100).toFixed(0)}% | HL equity: $${state.hlEquity.toFixed(0)}`,
   );
   logger.debug(
@@ -2941,8 +2943,8 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
       // Resolve USD value
       let valueUsd = 0;
       if (sym === 'SOL') {
-        // SOL exposure already includes LSTs
-        valueUsd = state.solExposureUsd;
+        // Raw SOL only — LSTs (JitoSOL, mSOL, bSOL) appear as separate entries
+        valueUsd = wb.balance * state.solPriceUsd;
       } else if (priceMap[sym]) {
         valueUsd = wb.balance * priceMap[sym];
       }
