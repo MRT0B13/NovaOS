@@ -813,6 +813,8 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
   whirlpoolAddress: string;
   tokenA: string;
   tokenB: string;
+  tokenAMint: string;
+  tokenBMint: string;
   tokenADecimals: number;
   tokenBDecimals: number;
   score: number;
@@ -825,6 +827,8 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
     whirlpoolAddress: 'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ',
     tokenA: 'SOL',
     tokenB: 'USDC',
+    tokenAMint: 'So11111111111111111111111111111111111111112',
+    tokenBMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
     tokenADecimals: 9,
     tokenBDecimals: 6,
     score: 50,
@@ -859,6 +863,8 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
       whirlpoolAddress: p.whirlpoolAddress,
       tokenA: p.tokenA.symbol,
       tokenB: p.tokenB.symbol,
+      tokenAMint: p.tokenA.mint,
+      tokenBMint: p.tokenB.mint,
       tokenADecimals: p.tokenA.decimals,
       tokenBDecimals: p.tokenB.decimals,
       score: selection.score,
@@ -1661,31 +1667,38 @@ export async function generateDecisions(
     ) {
       // Dynamic pool selection — discovers and scores 50+ Orca pools from DeFiLlama + Orca API
       const bestPair = await selectBestOrcaPairDynamic(intel);
-      const needsSol = bestPair.tokenA === 'SOL';
       const solAvailableUsd = state.solBalance * state.solPriceUsd;
 
-      // For SOL/USDC: need SOL for the A-side. For token pairs (BONK/WIF/JUP): no SOL required.
-      if (needsSol && solAvailableUsd < 10) {
+      if (solAvailableUsd < 10) {
         logger.debug(`[CFO:Decision] ORCA_LP_OPEN skipped — insufficient SOL ($${solAvailableUsd.toFixed(2)} available, need >$10 for ${bestPair.pair} LP)`);
       } else {
-        // Available capital: wallet SOL (will auto-swap half to USDC) + existing USDC
-        const solCapitalUsd = needsSol ? solAvailableUsd * 0.8 : 0;  // 80% of SOL (keep buffer)
+        // Available capital: wallet SOL (base capital, can be swapped to either side) + existing USDC
+        const solCapitalUsd = solAvailableUsd * 0.8; // keep 20% SOL buffer
         const usdcCapitalUsd = state.solanaUsdcBalance;
         const totalCapitalUsd = solCapitalUsd + usdcCapitalUsd;
 
-        // How much USDC we already have vs need — swap SOL→USDC for the shortfall
+        // Build both LP sides from base capital. If tokenA isn't SOL, swap SOL→tokenA.
         const deployUsd = Math.min(orcaHeadroomUsd, totalCapitalUsd);
         if (deployUsd >= 20) {
           const usdcSide = deployUsd / 2;
-          const solSide = deployUsd / 2 / state.solPriceUsd;
+          const tokenASideUsd = deployUsd / 2;
+
+          const tokenAPriceUsd =
+            bestPair.tokenA === 'SOL'
+              ? state.solPriceUsd
+              : (intel.analystPrices?.[bestPair.tokenA]?.usd ?? 1);
+          const tokenAAmount = tokenASideUsd / Math.max(tokenAPriceUsd, 1e-9);
+          const solSide = bestPair.tokenA === 'SOL' ? tokenAAmount : 0;
+
+          // USDC side funding: use wallet USDC first, then SOL→USDC for shortfall.
           const usdcShortfall = Math.max(0, usdcSide - state.solanaUsdcBalance);
-          // needsSwap: true when we need to swap SOL→USDC to fund the USDC side
           const needsSwapForUsdc = usdcShortfall > 1;
-          // SOL to swap = shortfall in USDC terms, converted to SOL
-          const solToSwap = needsSwapForUsdc ? usdcShortfall / state.solPriceUsd : 0;
-          const tokenAAmount = bestPair.tokenA !== 'SOL'
-            ? deployUsd / 2 / (intel.analystPrices?.[bestPair.tokenA]?.usd ?? 1)
-            : solSide;
+          const solToSwapForUsdc = needsSwapForUsdc ? usdcShortfall / state.solPriceUsd : 0;
+
+          // tokenA side funding: if tokenA is not SOL, swap SOL→tokenA for full A-side.
+          const needsSwapForTokenA = bestPair.tokenA !== 'SOL' && tokenAAmount > 0;
+          const solToSwapForTokenA = needsSwapForTokenA ? tokenASideUsd / state.solPriceUsd : 0;
+          const totalSolToSwap = solToSwapForUsdc + solToSwapForTokenA;
 
           const adaptiveRange = adaptiveLpRangeWidthPct(
             bestPair.tokenA,
@@ -1703,7 +1716,12 @@ export async function generateDecisions(
             reasoning:
               `Opening Orca ${bestPair.pair} concentrated LP: $${deployUsd.toFixed(0)} total ` +
               `(range ±${adaptiveRange / 2}% — adaptive based on ${baseTokenChange.toFixed(0)}% 24h vol). ` +
-              (needsSwapForUsdc ? `Auto-swap ${solToSwap.toFixed(3)} SOL → $${usdcShortfall.toFixed(0)} USDC first. ` : '') +
+              (needsSwapForUsdc
+                ? `Auto-swap ${solToSwapForUsdc.toFixed(3)} SOL → $${usdcShortfall.toFixed(0)} USDC. `
+                : '') +
+              (needsSwapForTokenA
+                ? `Auto-swap ${solToSwapForTokenA.toFixed(3)} SOL → ${bestPair.tokenA} for LP A-side. `
+                : '') +
               `Pool score: ${bestPair.score}/100 — ${bestPair.reasoning}. ` +
               (bestPair.tvlUsd > 0 ? `TVL: $${(bestPair.tvlUsd / 1e6).toFixed(1)}M. ` : '') +
               `${estApyStr} while in-range.`,
@@ -1712,14 +1730,20 @@ export async function generateDecisions(
               whirlpoolAddress: bestPair.whirlpoolAddress,
               tokenA: bestPair.tokenA,
               tokenB: bestPair.tokenB,
+              tokenAMint: bestPair.tokenAMint,
+              tokenBMint: bestPair.tokenBMint,
               tokenADecimals: bestPair.tokenADecimals,
               tokenBDecimals: bestPair.tokenBDecimals,
               usdcAmount: usdcSide,
-              solAmount: bestPair.tokenA === 'SOL' ? solSide : 0,
+              solAmount: solSide,
               tokenAAmount,
               rangeWidthPct: adaptiveRange,
-              needsSwap: needsSwapForUsdc,
-              solToSwap,
+              needsSwap: needsSwapForUsdc || needsSwapForTokenA,
+              needsSwapForUsdc,
+              needsSwapForTokenA,
+              solToSwapForUsdc,
+              solToSwapForTokenA,
+              totalSolToSwap,
             },
             urgency: 'low',
             estimatedImpactUsd: deployUsd * 0.18,
@@ -2238,7 +2262,21 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       }
 
       case 'ORCA_LP_OPEN': {
-        const { usdcAmount, solAmount, tokenAAmount, rangeWidthPct, whirlpoolAddress, tokenADecimals, tokenBDecimals, needsSwap: lpNeedsSwap, solToSwap: lpSolToSwap } = decision.params;
+        const {
+          tokenA,
+          tokenAMint,
+          usdcAmount,
+          solAmount,
+          tokenAAmount,
+          rangeWidthPct,
+          whirlpoolAddress,
+          tokenADecimals,
+          tokenBDecimals,
+          needsSwapForUsdc: lpNeedsSwapForUsdc,
+          needsSwapForTokenA: lpNeedsSwapForTokenA,
+          solToSwapForUsdc: lpSolToSwapForUsdc,
+          solToSwapForTokenA: lpSolToSwapForTokenA,
+        } = decision.params;
 
         // Register decimals for this pool so orcaService can read positions correctly
         if (whirlpoolAddress && tokenADecimals != null && tokenBDecimals != null) {
@@ -2246,21 +2284,35 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           orcaSvc.registerPoolDecimals(whirlpoolAddress, tokenADecimals, tokenBDecimals);
         }
 
-        // Step 1: Auto-swap SOL → USDC if wallet doesn't have enough USDC for the B-side
-        if (lpNeedsSwap && lpSolToSwap > 0) {
-          const jupMod = await import('./jupiterService.ts');
-          const swapResult = await jupMod.swapSolToUsdc(lpSolToSwap, 100); // 1% slippage
+        const jupMod = await import('./jupiterService.ts');
+
+        // Step 1: Auto-swap SOL → USDC for B-side shortfall
+        if (lpNeedsSwapForUsdc && lpSolToSwapForUsdc > 0) {
+          const swapResult = await jupMod.swapSolToUsdc(lpSolToSwapForUsdc, 100); // 1% slippage
           if (!swapResult.success) {
             return { ...base, executed: true, success: false, error: `Auto-swap SOL→USDC failed: ${swapResult.error}` };
           }
-          logger.info(`[CFO] ORCA_LP_OPEN: swapped ${lpSolToSwap.toFixed(4)} SOL → $${(swapResult.outputAmount ?? usdcAmount).toFixed(2)} USDC`);
+          logger.info(`[CFO] ORCA_LP_OPEN: swapped ${lpSolToSwapForUsdc.toFixed(4)} SOL → $${(swapResult.outputAmount ?? usdcAmount).toFixed(2)} USDC`);
         }
 
-        // Step 2: Open the LP position
+        // Step 2: Auto-swap SOL → tokenA when selected pool A-side is non-SOL
+        let tokenAInputAmount = tokenAAmount ?? solAmount;
+        if (tokenA !== 'SOL' && lpNeedsSwapForTokenA && lpSolToSwapForTokenA > 0 && tokenAMint) {
+          const quote = await jupMod.getQuote(jupMod.MINTS.SOL, tokenAMint, lpSolToSwapForTokenA, 100);
+          if (!quote) {
+            return { ...base, executed: true, success: false, error: `Auto-swap SOL→${tokenA} quote failed` };
+          }
+          const swapResult = await jupMod.executeSwap(quote, { maxPriceImpactPct: 3 });
+          if (!swapResult.success) {
+            return { ...base, executed: true, success: false, error: `Auto-swap SOL→${tokenA} failed: ${swapResult.error}` };
+          }
+          tokenAInputAmount = swapResult.outputAmount;
+          logger.info(`[CFO] ORCA_LP_OPEN: swapped ${lpSolToSwapForTokenA.toFixed(4)} SOL → ${tokenAInputAmount.toFixed(4)} ${tokenA}`);
+        }
+
+        // Step 3: Open the LP position
         const orca = await import('./orcaService.ts');
-        // Use tokenA amount if available (for non-SOL pairs), otherwise fall back to solAmount
-        const amountA = tokenAAmount ?? solAmount;
-        const result = await orca.openPosition(usdcAmount, amountA, rangeWidthPct, whirlpoolAddress, tokenADecimals ?? 9, tokenBDecimals ?? 6);
+        const result = await orca.openPosition(usdcAmount, tokenAInputAmount, rangeWidthPct, whirlpoolAddress, tokenADecimals ?? 9, tokenBDecimals ?? 6);
         markDecision('ORCA_LP_OPEN');
         return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
       }
