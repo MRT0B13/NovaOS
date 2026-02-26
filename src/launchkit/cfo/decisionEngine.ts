@@ -1118,13 +1118,23 @@ export async function generateDecisions(
       // Case 1: Under-hedged — need to open/increase SHORT
       if (coinHedgeRatio < adjustedHedgeTarget - config.hedgeRebalanceThreshold) {
         const hedgeNeeded = coinTargetHedgeUsd - coinShortUsd;
-        const capped = Math.min(hedgeNeeded, env.maxHyperliquidUsd - state.hlTotalShortUsd);
+        let capped = Math.min(hedgeNeeded, env.maxHyperliquidUsd - state.hlTotalShortUsd);
 
         // Gate: need enough HL margin to open the position (size / leverage)
-        const marginRequired = capped / Math.min(2, env.maxHyperliquidLeverage);
+        // If full hedge doesn't fit, scale down to what margin supports (instead of skipping)
+        const leverage = Math.min(2, env.maxHyperliquidLeverage);
+        const marginRequired = capped / leverage;
         if (state.hlAvailableMargin < marginRequired) {
-          logger.debug(`[CFO:Hedge] Skipping OPEN_HEDGE ${asset.symbol} — need $${marginRequired.toFixed(0)} margin but only $${state.hlAvailableMargin.toFixed(0)} available on HL`);
-        } else if (capped > 10 && checkCooldown(cooldownKeyOpen, config.hedgeCooldownMs)) {
+          // Scale hedge down to what we can afford: affordableSize = margin × leverage × 80% (buffer)
+          const affordableHedge = state.hlAvailableMargin * leverage * 0.8;
+          if (affordableHedge >= 10) {
+            logger.info(`[CFO:Hedge] Scaling OPEN_HEDGE ${asset.symbol} from $${capped.toFixed(0)} → $${affordableHedge.toFixed(0)} (margin: $${state.hlAvailableMargin.toFixed(0)})`);
+            capped = affordableHedge;
+          } else {
+            logger.info(`[CFO:Hedge] Skip OPEN_HEDGE ${asset.symbol} — margin $${state.hlAvailableMargin.toFixed(0)} too low (need ~$${(10 / leverage).toFixed(0)} for min $10 hedge)`);
+          }
+        }
+        if (capped > 10 && checkCooldown(cooldownKeyOpen, config.hedgeCooldownMs)) {
           const d: Decision = {
             type: 'OPEN_HEDGE',
             reasoning:
@@ -2069,6 +2079,66 @@ export async function generateDecisions(
     logger.info(
       `[CFO:Decision] Tier breakdown: 🟢 AUTO=${tierCounts.AUTO} | 🟡 NOTIFY=${tierCounts.NOTIFY} | 🔴 APPROVAL=${tierCounts.APPROVAL}`,
     );
+  } else {
+    // ── Diagnostic summary: explain why no decisions were generated ────────
+    const diag: string[] = [];
+
+    // B: Hedging
+    if (!config.autoHedge) diag.push('Hedge:off');
+    else if (!env.hyperliquidEnabled) diag.push('Hedge:HL-disabled');
+    else {
+      const hedgeableCount = state.treasuryExposures.filter(
+        e => e.hlListed && e.valueUsd >= config.hedgeMinSolExposureUsd,
+      ).length;
+      if (hedgeableCount === 0) diag.push('Hedge:no-eligible-assets');
+      else if (state.hedgeRatio >= adjustedHedgeTarget - config.hedgeRebalanceThreshold)
+        diag.push(`Hedge:OK(${(state.hedgeRatio * 100).toFixed(0)}%)`);
+      else if (state.hlAvailableMargin < 10)
+        diag.push(`Hedge:margin($${state.hlAvailableMargin.toFixed(0)})`);
+      else if (!checkCooldown('OPEN_HEDGE_SOL', config.hedgeCooldownMs))
+        diag.push('Hedge:cooldown');
+    }
+
+    // C: Staking
+    if (config.autoStake && env.jitoEnabled) {
+      if (state.idleSolForStaking < config.stakeMinAmountSol)
+        diag.push(`Stake:idle=${state.idleSolForStaking.toFixed(2)}<${config.stakeMinAmountSol}`);
+      else if (!checkCooldown('AUTO_STAKE', config.stakeCooldownMs))
+        diag.push('Stake:cooldown');
+    } else {
+      diag.push('Stake:off');
+    }
+
+    // E: Polymarket
+    if (config.autoPolymarket && env.polymarketEnabled) {
+      if (state.polyHeadroomUsd < 2) diag.push(`Poly:headroom($${state.polyHeadroomUsd.toFixed(0)})`);
+      else if (!checkCooldown('POLY_BET', config.polyBetCooldownMs)) diag.push('Poly:cooldown');
+      else diag.push('Poly:no-edge');
+    } else {
+      diag.push('Poly:off');
+    }
+
+    // G/G2: Kamino loops
+    if (env.kaminoEnabled && env.kaminoBorrowEnabled) {
+      const loopKey = env.kaminoLstLoopEnabled ? 'KAMINO_LST_LOOP' : 'KAMINO_JITO_LOOP';
+      const loopLabel = env.kaminoLstLoopEnabled ? 'LSTloop' : 'JitoLoop';
+      if (state.kaminoJitoLoopActive || state.kaminoActiveLstLoop)
+        diag.push(`${loopLabel}:active`);
+      else if (!checkCooldown(loopKey, 24 * 3600_000)) diag.push(`${loopLabel}:cooldown`);
+      else diag.push(`${loopLabel}:spread?`);
+    }
+
+    // I: Orca LP
+    if (env.orcaLpEnabled) {
+      if (state.orcaPositions.length > 0) diag.push(`OrcaLP:active(${state.orcaPositions.length})`);
+      else if (!checkCooldown('ORCA_LP_OPEN', 24 * 3600_000)) diag.push('OrcaLP:cooldown');
+      else diag.push('OrcaLP:conditions?');
+    }
+
+    // J: Arb
+    if (env.evmArbEnabled) diag.push('Arb:no-opportunity');
+
+    logger.info(`[CFO:Decision] Skip reasons: ${diag.join(' | ')}`);
   }
 
   // Cap to maxDecisionsPerCycle
