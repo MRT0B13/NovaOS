@@ -402,6 +402,79 @@ export async function getTokenBalance(mint: string): Promise<number> {
 }
 
 // ============================================================================
+// Wallet Token Scanner
+// ============================================================================
+
+export interface WalletTokenBalance {
+  mint: string;
+  symbol: string | null;    // null if unknown — caller resolves via guardian/analyst intel
+  balance: number;          // human-readable
+  decimals: number;
+}
+
+/**
+ * Scan the agent's Solana wallet and return all SPL token balances above `minBalance`.
+ * SOL is always included (as pseudo-mint So11...112).
+ * Used by the CFO to discover what's in the treasury without hardcoding symbols.
+ */
+export async function getWalletTokenBalances(
+  minBalanceUsd = 10,
+  priceMap?: Map<string, number>,
+): Promise<WalletTokenBalance[]> {
+  try {
+    const wallet = loadWallet();
+    const rpcUrl = getRpcUrl();
+    const connection = new Connection(rpcUrl, 'confirmed');
+    const { TOKEN_PROGRAM_ID } = await import('@solana/spl-token' as string);
+
+    const results: WalletTokenBalance[] = [];
+
+    // Always include native SOL
+    const solLamports = await connection.getBalance(wallet.publicKey);
+    const solBalance = solLamports / LAMPORTS_PER_SOL;
+    results.push({ mint: MINTS.SOL, symbol: 'SOL', balance: solBalance, decimals: 9 });
+
+    // All SPL tokens
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+      wallet.publicKey,
+      { programId: TOKEN_PROGRAM_ID },
+    );
+
+    for (const { account } of tokenAccounts.value) {
+      const parsed = account.data.parsed?.info;
+      if (!parsed) continue;
+      const uiAmount = Number(parsed.tokenAmount?.uiAmount ?? 0);
+      if (uiAmount <= 0) continue;
+
+      // Skip Orca LP position NFTs (amount = 1, decimals = 0)
+      const decimals = parsed.tokenAmount?.decimals ?? 0;
+      if (decimals === 0 && uiAmount === 1) continue;
+
+      const mint: string = parsed.mint;
+
+      // Known mints → symbol lookup
+      const knownSymbol: Record<string, string> = {
+        [MINTS.USDC]: 'USDC',
+        [MINTS.USDT]: 'USDT',
+        // JitoSOL, mSOL, etc. will be symbol=null until resolved by guardian intel
+      };
+
+      results.push({
+        mint,
+        symbol: knownSymbol[mint] ?? null,
+        balance: uiAmount,
+        decimals,
+      });
+    }
+
+    return results;
+  } catch (err) {
+    logger.warn('[Jupiter] getWalletTokenBalances error:', err);
+    return [];
+  }
+}
+
+// ============================================================================
 // Utilities
 // ============================================================================
 

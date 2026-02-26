@@ -53,6 +53,8 @@ export interface CFOEnv {
   hyperliquidTestnet: boolean;
   maxHyperliquidUsd: number;
   maxHyperliquidLeverage: number;                // hard cap (architecture doc: 5x)
+  hlHedgeCoins: string[];                        // coins eligible for hedging (default: auto from treasury + HL listing)
+  hlHedgeMinExposureUsd: number;                 // minimum USD exposure per coin to bother hedging (default: 50)
 
   // ── Kamino ────────────────────────────────────────────────────────
   maxKaminoUsd: number;
@@ -173,6 +175,9 @@ export function getCFOEnv(bust = false): CFOEnv {
     hyperliquidTestnet: process.env.CFO_HYPERLIQUID_TESTNET === 'true',
     maxHyperliquidUsd: Number(process.env.CFO_MAX_HYPERLIQUID_USD ?? 500),
     maxHyperliquidLeverage: Math.min(5, Number(process.env.CFO_MAX_HYPERLIQUID_LEVERAGE ?? 3)),
+    hlHedgeCoins: (process.env.CFO_HL_HEDGE_COINS ?? '')
+      .split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+    hlHedgeMinExposureUsd: Number(process.env.CFO_HL_HEDGE_MIN_EXPOSURE_USD ?? 50),
 
     maxKaminoUsd: Number(process.env.CFO_MAX_KAMINO_USD ?? 1000),
     kaminoMaxLtvPct: Number(process.env.CFO_KAMINO_MAX_LTV_PCT ?? 60),

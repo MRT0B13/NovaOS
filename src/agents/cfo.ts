@@ -406,51 +406,61 @@ export class CFOAgent extends BaseAgent {
 
           // ── Hyperliquid OPEN hedge ─────────────────────────────
           case 'OPEN_HEDGE': {
-            const sizeUsd = p.solExposureUsd ?? d.estimatedImpactUsd;
+            const coin = p.coin ?? 'SOL';
+            const sizeUsd = p.exposureUsd ?? p.solExposureUsd ?? d.estimatedImpactUsd;
             const leverage = p.leverage ?? 1;
-            // Fetch current SOL price for entry
+            // Fetch current price for entry
             let entryPrice = 0;
             try {
-              const pythMod = await import('../launchkit/cfo/pythOracleService.ts');
-              entryPrice = await pythMod.getSolPrice();
+              if (coin === 'SOL') {
+                const pythMod = await import('../launchkit/cfo/pythOracleService.ts');
+                entryPrice = await pythMod.getSolPrice();
+              } else {
+                // For non-SOL coins, use HL mid price as entry estimate
+                const hlMod = await import('../launchkit/cfo/hyperliquidService.ts');
+                const summary = await hlMod.getAccountSummary();
+                const pos = summary.positions.find((pp: any) => pp.coin === coin);
+                if (pos) entryPrice = pos.markPrice;
+              }
             } catch { /* non-fatal */ }
             await this.positionManager.openHyperliquidPosition({
-              coin: 'SOL', side: 'SHORT', sizeUsd, entryPrice, leverage,
+              coin, side: 'SHORT', sizeUsd, entryPrice, leverage,
               orderId: r.txId ? Number(r.txId) : undefined, txHash: r.txId,
             });
             await this.repo.insertTransaction({
               id: `tx-hl-hedge-${r.txId ?? Date.now()}`, timestamp: now,
               chain: 'arbitrum', strategyTag: 'hyperliquid', txType: 'swap',
               tokenIn: 'USDC', amountIn: sizeUsd / leverage,
-              tokenOut: 'SOL-PERP-SHORT', amountOut: sizeUsd,
+              tokenOut: `${coin}-PERP-SHORT`, amountOut: sizeUsd,
               feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
-              metadata: { leverage, reasoning: d.reasoning },
+              metadata: { coin, leverage, reasoning: d.reasoning },
             });
-            logger.info(`[CFO] Persisted OPEN_HEDGE: SHORT SOL $${sizeUsd} @ ${leverage}x`);
+            logger.info(`[CFO] Persisted OPEN_HEDGE: SHORT ${coin} $${sizeUsd} @ ${leverage}x`);
             break;
           }
 
           // ── Hyperliquid CLOSE hedge ────────────────────────────
           case 'CLOSE_HEDGE': {
+            const coin = p.coin ?? 'SOL';
             const reduceUsd = p.reduceUsd ?? d.estimatedImpactUsd;
             // Find matching open HL position and close it
             const openHL = await this.repo.getOpenPositions('hyperliquid' as PositionStrategy);
-            const solShort = openHL.find(pos =>
-              (pos.metadata as any)?.coin === 'SOL' && (pos.metadata as any)?.side === 'SHORT',
+            const coinShort = openHL.find(pos =>
+              (pos.metadata as any)?.coin === coin && (pos.metadata as any)?.side === 'SHORT',
             );
-            if (solShort) {
-              const pnl = reduceUsd - solShort.costBasisUsd;
-              await this.positionManager.closePosition(solShort.id, 0, r.txId ?? '', reduceUsd);
-              logger.info(`[CFO] Persisted CLOSE_HEDGE: closed ${solShort.id} PnL $${pnl.toFixed(2)}`);
+            if (coinShort) {
+              const pnl = reduceUsd - coinShort.costBasisUsd;
+              await this.positionManager.closePosition(coinShort.id, 0, r.txId ?? '', reduceUsd);
+              logger.info(`[CFO] Persisted CLOSE_HEDGE: closed ${coinShort.id} (${coin}) PnL $${pnl.toFixed(2)}`);
             }
             await this.repo.insertTransaction({
               id: `tx-hl-close-${r.txId ?? Date.now()}`, timestamp: now,
               chain: 'arbitrum', strategyTag: 'hyperliquid', txType: 'swap',
-              tokenIn: 'SOL-PERP-SHORT', amountIn: reduceUsd,
+              tokenIn: `${coin}-PERP-SHORT`, amountIn: reduceUsd,
               tokenOut: 'USDC', amountOut: reduceUsd,
               feeUsd: 0, txHash: r.txId, walletAddress: '',
-              positionId: solShort?.id, status: 'confirmed',
-              metadata: { reasoning: d.reasoning },
+              positionId: coinShort?.id, status: 'confirmed',
+              metadata: { coin, reasoning: d.reasoning },
             });
             break;
           }

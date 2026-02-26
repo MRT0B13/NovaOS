@@ -59,8 +59,10 @@ export interface HLAccountSummary {
 }
 
 export interface HedgeParams {
-  /** SOL value to hedge (USD) — we SHORT this amount notional */
-  solExposureUsd: number;
+  /** Coin to SHORT on HL (e.g. 'SOL', 'JUP', 'WIF') */
+  coin: string;
+  /** USD notional to hedge */
+  exposureUsd: number;
   /** Leverage to use (max CFO_MAX_HYPERLIQUID_LEVERAGE) */
   leverage?: number;
   /** Stop loss % above entry (default 8%) */
@@ -150,22 +152,32 @@ export async function getAccountSummary(): Promise<HLAccountSummary> {
 }
 
 // ============================================================================
-// Hedge SOL treasury
+// Hedge treasury exposure (generic — any HL-listed coin)
 // ============================================================================
 
-/**
- * Open a SHORT SOL-PERP position to hedge against SOL treasury downside risk.
- * This is the primary use case for Hyperliquid in the CFO.
- *
- * Example: Nova holds 5 SOL in treasury @ $200/SOL = $1,000 exposure.
- * To hedge 50%: SHORT $500 notional of SOL-PERP.
- * If SOL drops 20% → treasury loses $200, short gains ~$200 → net flat.
- */
-export async function hedgeSolTreasury(params: HedgeParams): Promise<HLOrderResult> {
-  const env = getCFOEnv();
+/** Returns all coins currently listed as perps on Hyperliquid, from meta().universe */
+export async function getHLListedCoins(): Promise<string[]> {
+  try {
+    const { info } = await loadHL();
+    const meta = await info.meta();
+    const universe = (meta as any).universe ?? [];
+    return universe.map((u: any) => u.name as string);
+  } catch (err) {
+    logger.warn('[Hyperliquid] getHLListedCoins error:', err);
+    return [];
+  }
+}
 
-  if (params.solExposureUsd <= 0) {
-    return { success: false, error: 'solExposureUsd must be positive' };
+/**
+ * Open a SHORT perp position on Hyperliquid to hedge treasury exposure.
+ * Works for any coin listed on HL (SOL, JUP, WIF, BTC, ETH, etc.)
+ */
+export async function hedgeTreasury(params: HedgeParams): Promise<HLOrderResult> {
+  const env = getCFOEnv();
+  const { coin, exposureUsd } = params;
+
+  if (exposureUsd <= 0) {
+    return { success: false, error: 'exposureUsd must be positive' };
   }
 
   const leverage = Math.min(params.leverage ?? 2, env.maxHyperliquidLeverage);
@@ -174,7 +186,7 @@ export async function hedgeSolTreasury(params: HedgeParams): Promise<HLOrderResu
 
   if (env.dryRun) {
     logger.info(
-      `[Hyperliquid] DRY RUN — would SHORT SOL-PERP $${params.solExposureUsd} ` +
+      `[Hyperliquid] DRY RUN — would SHORT ${coin}-PERP $${exposureUsd} ` +
       `at ${leverage}x leverage (SL: +${stopLossPct}%, TP: -${takeProfitPct}%)`,
     );
     return { success: true, orderId: 0, cloid: `dry-${Date.now()}` };
@@ -183,46 +195,46 @@ export async function hedgeSolTreasury(params: HedgeParams): Promise<HLOrderResu
   try {
     const { exchange, info, wallet } = await loadHL();
 
-    // Get current SOL mark price
     const mids = await info.allMids();
-    const solPrice = Number(mids['SOL'] ?? 150);
+    const coinPrice = Number(mids[coin] ?? 0);
+    if (coinPrice <= 0) {
+      return { success: false, error: `${coin} not found in HL allMids — not listed or delisted` };
+    }
 
-    // Resolve SOL asset info from meta (szDecimals determines size precision)
     const meta = await info.meta();
     const universe = (meta as any).universe ?? [];
-    const solAsset = universe.findIndex((u: any) => u.name === 'SOL');
-    if (solAsset < 0) return { success: false, error: 'SOL not found in HL meta' };
-    const szDecimals: number = universe[solAsset].szDecimals ?? 1;
+    const assetIdx = universe.findIndex((u: any) => u.name === coin);
+    if (assetIdx < 0) {
+      return { success: false, error: `${coin} not found in HL universe` };
+    }
+    const szDecimals: number = universe[assetIdx].szDecimals ?? 1;
     const szStep = Math.pow(10, szDecimals);
 
-    const sizeInSol = params.solExposureUsd / solPrice;
-    const sizeFmt = Math.floor(sizeInSol * szStep) / szStep; // round DOWN to HL precision
+    const sizeInCoin = exposureUsd / coinPrice;
+    const sizeFmt = Math.floor(sizeInCoin * szStep) / szStep;
 
     if (sizeFmt <= 0) {
       return { success: false, error: `Position too small after rounding to ${szDecimals} decimals` };
     }
-    // HL minimum notional is ~$10
-    if (sizeFmt * solPrice < 10) {
-      return { success: false, error: `Notional $${(sizeFmt * solPrice).toFixed(2)} below HL minimum $10` };
+    if (sizeFmt * coinPrice < 10) {
+      return { success: false, error: `Notional $${(sizeFmt * coinPrice).toFixed(2)} below HL minimum $10` };
     }
 
-    // Set leverage first
     await exchange.updateLeverage({
-      asset: solAsset,
-      isCross: false,  // isolated margin
+      asset: assetIdx,
+      isCross: false,
       leverage,
     });
 
-    // Place limit SHORT slightly below mid to fill quickly
-    const limitPrice = (solPrice * 0.9995).toFixed(2); // 0.05% below mid
+    const limitPrice = (coinPrice * 0.9995).toFixed(2);
 
     const order = await exchange.order({
       orders: [{
-        a: solAsset,           // asset ID
-        b: false,              // false = SHORT
-        p: limitPrice,         // price
-        s: sizeFmt.toString(), // size
-        r: false,              // reduce only
+        a: assetIdx,
+        b: false,           // SHORT
+        p: limitPrice,
+        s: sizeFmt.toString(),
+        r: false,
         t: { limit: { tif: 'Gtc' as const } },
         c: `0x${Buffer.from(`cfo-hedge-${Date.now()}`).toString('hex').padEnd(32, '0').slice(0, 32)}`,
       }],
@@ -238,16 +250,20 @@ export async function hedgeSolTreasury(params: HedgeParams): Promise<HLOrderResu
     const avgPrice = Number((result as any).filled?.avgPx ?? limitPrice);
 
     logger.info(
-      `[Hyperliquid] SOL hedge opened: SHORT ${sizeFmt} SOL @ ~$${avgPrice} ` +
-      `($${params.solExposureUsd} exposure, ${leverage}x): order ${orderId}`,
+      `[Hyperliquid] ${coin} hedge opened: SHORT ${sizeFmt} ${coin} @ ~$${avgPrice} ` +
+      `($${exposureUsd} exposure, ${leverage}x): order ${orderId}`,
     );
 
     return { success: true, orderId, avgPrice };
   } catch (err) {
-    logger.error('[Hyperliquid] hedgeSolTreasury error:', err);
+    logger.error('[Hyperliquid] hedgeTreasury error:', err);
     return { success: false, error: (err as Error).message };
   }
 }
+
+// Backward-compat alias so nothing else breaks if called externally
+export const hedgeSolTreasury = (p: { solExposureUsd: number; leverage?: number }) =>
+  hedgeTreasury({ coin: 'SOL', exposureUsd: p.solExposureUsd, leverage: p.leverage });
 
 // ============================================================================
 // Close position

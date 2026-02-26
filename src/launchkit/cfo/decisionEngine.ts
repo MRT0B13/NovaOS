@@ -45,8 +45,8 @@ import { getCFOEnv, type CFOEnv } from './cfoEnv.ts';
 // ============================================================================
 
 export type DecisionType =
-  | 'OPEN_HEDGE'       // SHORT SOL on HL to protect treasury
-  | 'CLOSE_HEDGE'      // close or reduce SOL hedge
+  | 'OPEN_HEDGE'       // SHORT any coin on HL to protect treasury
+  | 'CLOSE_HEDGE'      // close or reduce a hedge position
   | 'AUTO_STAKE'       // stake idle SOL into Jito
   | 'UNSTAKE_JITO'     // pull SOL out of Jito for runway
   | 'CLOSE_LOSING'     // close HL position hitting stop-loss
@@ -159,7 +159,7 @@ export interface PortfolioState {
     liquidationPrice: number;
     markPrice: number;
   }>;
-  hlTotalShortUsd: number;        // total SHORT SOL exposure on HL
+  hlTotalShortUsd: number;        // total SHORT USD across ALL hedged coins on HL
   hlTotalPnl: number;
 
   // Polymarket
@@ -170,9 +170,18 @@ export interface PortfolioState {
 
   // Computed
   totalPortfolioUsd: number;
-  hedgeRatio: number;             // hlTotalShortUsd / solExposureUsd (0 = unhedged, 1 = fully hedged)
+  hedgeRatio: number;             // hlTotalShortUsd / totalHedgeableUsd (0 = unhedged, 1 = fully hedged)
   idleSolForStaking: number;      // SOL above reserve that could be staked
   timestamp: number;
+
+  // Treasury token exposures (dynamic — all wallet tokens with prices)
+  treasuryExposures: Array<{
+    symbol: string;       // HL coin name (e.g. 'SOL', 'JUP', 'WIF')
+    mint: string;         // Solana mint address
+    balance: number;      // token units
+    valueUsd: number;     // balance * price
+    hlListed: boolean;    // true if tradeable as perp on HL
+  }>;
 
   // Kamino lending state
   kaminoDepositValueUsd: number;     // total deposited collateral value
@@ -284,12 +293,12 @@ export function getDecisionConfig(): DecisionConfig {
 
 const lastDecisionAt: Record<string, number> = {};
 
-function checkCooldown(type: DecisionType, cooldownMs: number): boolean {
+function checkCooldown(type: string, cooldownMs: number): boolean {
   const last = lastDecisionAt[type] ?? 0;
   return Date.now() - last >= cooldownMs;
 }
 
-function markDecision(type: DecisionType): void {
+function markDecision(type: string): void {
   lastDecisionAt[type] = Date.now();
 }
 
@@ -600,14 +609,28 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
   const lstTotalUsd = Object.values(lstBalances).reduce((s, v) => s + v.valueUsd, 0);
   const solExposureUsd = rawSolUsd + lstTotalUsd;
 
+  // Total SHORT across ALL treasury coins (not just SOL)
   const hlTotalShortUsd = hlPositions
-    .filter((p) => p.coin === 'SOL' && p.side === 'SHORT')
+    .filter((p) => p.side === 'SHORT')
     .reduce((s, p) => s + p.sizeUsd, 0);
+
+  // Treasury exposures will be populated later (needs intel for prices)
+  // Start with SOL as minimum fallback
+  let treasuryExposures: PortfolioState['treasuryExposures'] = [{
+    symbol: 'SOL',
+    mint: 'So11111111111111111111111111111111111111112',
+    balance: solBalance,
+    valueUsd: solExposureUsd, // includes LSTs
+    hlListed: true,
+  }];
+
+  // hedgeable exposure = sum of all treasury tokens that are HL-listed (updated after scan)
+  const totalHedgeableUsd = solExposureUsd; // initial; overwritten after treasury scan in cycle
 
   // Preliminary total — Kamino & Orca not yet known; patched below after gathering
   // Note: lstTotalUsd already includes jitoSolValueUsd via lstBalances
   let totalPortfolioUsd = solExposureUsd + hlEquity + polyDeployedUsd + polyUsdcBalance;
-  const hedgeRatio = solExposureUsd > 0 ? hlTotalShortUsd / solExposureUsd : 0;
+  const hedgeRatio = totalHedgeableUsd > 0 ? hlTotalShortUsd / totalHedgeableUsd : 0;
 
   // Idle SOL available for staking (above reserve)
   const reserveNeeded = Number(process.env.CFO_STAKE_RESERVE_SOL ?? 0.5);
@@ -757,6 +780,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     evmArbProfit24h,
     evmArbPoolCount,
     evmArbUsdcBalance,
+    treasuryExposures,
   };
 }
 
@@ -1047,34 +1071,53 @@ export async function generateDecisions(
     }
   }
 
-  // ── B) Hedging decisions (uses intel-adjusted target) ─────────────
+  // ── B) Hedging decisions — per-asset treasury hedge (uses intel-adjusted target) ──
   if (config.autoHedge && env.hyperliquidEnabled) {
-    const targetHedgeUsd = state.solExposureUsd * adjustedHedgeTarget;
-    const currentHedgeUsd = state.hlTotalShortUsd;
-    const drift = Math.abs(state.hedgeRatio - adjustedHedgeTarget);
+    const hedgeableAssets = state.treasuryExposures.filter((e) => {
+      if (!e.hlListed) return false;
+      if (e.valueUsd < config.hedgeMinSolExposureUsd) return false;
+      // If whitelist is set, only hedge those coins
+      if (env.hlHedgeCoins.length > 0 && !env.hlHedgeCoins.includes(e.symbol)) return false;
+      return true;
+    });
 
-    // Only hedge if SOL exposure is significant enough
-    if (state.solExposureUsd >= config.hedgeMinSolExposureUsd) {
+    // Total exposure across all hedgeable assets
+    const totalHedgeableUsd = hedgeableAssets.reduce((s, e) => s + e.valueUsd, 0);
+
+    for (const asset of hedgeableAssets) {
+      // Per-coin HL position
+      const coinShortUsd = state.hlPositions
+        .filter((p) => p.coin === asset.symbol && p.side === 'SHORT')
+        .reduce((s, p) => s + p.sizeUsd, 0);
+
+      // Per-coin target hedge proportional to its share of total hedgeable
+      const assetWeight = totalHedgeableUsd > 0 ? asset.valueUsd / totalHedgeableUsd : 0;
+      const coinTargetHedgeUsd = asset.valueUsd * adjustedHedgeTarget;
+      const coinHedgeRatio = asset.valueUsd > 0 ? coinShortUsd / asset.valueUsd : 0;
+      const coinDrift = Math.abs(coinHedgeRatio - adjustedHedgeTarget);
+
+      const cooldownKeyOpen = `OPEN_HEDGE_${asset.symbol}`;
+      const cooldownKeyClose = `CLOSE_HEDGE_${asset.symbol}`;
 
       // Case 1: Under-hedged — need to open/increase SHORT
-      if (state.hedgeRatio < adjustedHedgeTarget - config.hedgeRebalanceThreshold) {
-        const hedgeNeeded = targetHedgeUsd - currentHedgeUsd;
-        const capped = Math.min(hedgeNeeded, env.maxHyperliquidUsd - currentHedgeUsd);
+      if (coinHedgeRatio < adjustedHedgeTarget - config.hedgeRebalanceThreshold) {
+        const hedgeNeeded = coinTargetHedgeUsd - coinShortUsd;
+        const capped = Math.min(hedgeNeeded, env.maxHyperliquidUsd - state.hlTotalShortUsd);
 
         // Gate: need enough HL margin to open the position (size / leverage)
         const marginRequired = capped / Math.min(2, env.maxHyperliquidLeverage);
         if (state.hlAvailableMargin < marginRequired) {
-          logger.debug(`[CFO:Hedge] Skipping OPEN_HEDGE — need $${marginRequired.toFixed(0)} margin but only $${state.hlAvailableMargin.toFixed(0)} available on HL`);
-        } else if (capped > 10 && checkCooldown('OPEN_HEDGE', config.hedgeCooldownMs)) {
+          logger.debug(`[CFO:Hedge] Skipping OPEN_HEDGE ${asset.symbol} — need $${marginRequired.toFixed(0)} margin but only $${state.hlAvailableMargin.toFixed(0)} available on HL`);
+        } else if (capped > 10 && checkCooldown(cooldownKeyOpen, config.hedgeCooldownMs)) {
           const d: Decision = {
             type: 'OPEN_HEDGE',
             reasoning:
-              `SOL exposure: $${state.solExposureUsd.toFixed(0)} (${state.solBalance.toFixed(2)} SOL + ${state.jitoSolBalance.toFixed(2)} JitoSOL + LSTs @ $${state.solPriceUsd.toFixed(0)}). ` +
-              `Current hedge: $${currentHedgeUsd.toFixed(0)} (${(state.hedgeRatio * 100).toFixed(0)}%). ` +
+              `${asset.symbol} exposure: $${asset.valueUsd.toFixed(0)} (${asset.balance.toFixed(4)} ${asset.symbol} @ wallet). ` +
+              `Current hedge: $${coinShortUsd.toFixed(0)} (${(coinHedgeRatio * 100).toFixed(0)}%). ` +
               `Target: ${(adjustedHedgeTarget * 100).toFixed(0)}%${adjustedHedgeTarget !== config.hedgeTargetRatio ? ` (adjusted from ${(config.hedgeTargetRatio * 100).toFixed(0)}% — market: ${intel.marketCondition})` : ''}. ` +
-              `Opening SHORT $${capped.toFixed(0)} SOL-PERP to protect downside.`,
-            params: { solExposureUsd: capped, leverage: Math.min(2, env.maxHyperliquidLeverage) },
-            urgency: drift > 0.3 ? 'high' : 'medium',
+              `Opening SHORT $${capped.toFixed(0)} ${asset.symbol}-PERP to protect downside.`,
+            params: { coin: asset.symbol, exposureUsd: capped, leverage: Math.min(2, env.maxHyperliquidLeverage) },
+            urgency: coinDrift > 0.3 ? 'high' : 'medium',
             estimatedImpactUsd: capped,
             intelUsed: intelSources,
             tier: 'AUTO',
@@ -1084,18 +1127,18 @@ export async function generateDecisions(
         }
       }
 
-      // Case 2: Over-hedged — reduce SHORT (SOL balance dropped or hedge grew)
-      if (state.hedgeRatio > adjustedHedgeTarget + config.hedgeRebalanceThreshold) {
-        const excessHedgeUsd = currentHedgeUsd - targetHedgeUsd;
+      // Case 2: Over-hedged — reduce SHORT
+      if (coinHedgeRatio > adjustedHedgeTarget + config.hedgeRebalanceThreshold) {
+        const excessHedgeUsd = coinShortUsd - coinTargetHedgeUsd;
 
-        if (excessHedgeUsd > 10 && checkCooldown('CLOSE_HEDGE', config.hedgeCooldownMs)) {
+        if (excessHedgeUsd > 10 && checkCooldown(cooldownKeyClose, config.hedgeCooldownMs)) {
           const d: Decision = {
             type: 'CLOSE_HEDGE',
             reasoning:
-              `Over-hedged: $${currentHedgeUsd.toFixed(0)} SHORT vs $${state.solExposureUsd.toFixed(0)} SOL exposure ` +
-              `(${(state.hedgeRatio * 100).toFixed(0)}% vs target ${(adjustedHedgeTarget * 100).toFixed(0)}%). ` +
-              `Reducing hedge by $${excessHedgeUsd.toFixed(0)} to rebalance.`,
-            params: { reduceUsd: excessHedgeUsd },
+              `Over-hedged ${asset.symbol}: $${coinShortUsd.toFixed(0)} SHORT vs $${asset.valueUsd.toFixed(0)} exposure ` +
+              `(${(coinHedgeRatio * 100).toFixed(0)}% vs target ${(adjustedHedgeTarget * 100).toFixed(0)}%). ` +
+              `Reducing ${asset.symbol}-PERP hedge by $${excessHedgeUsd.toFixed(0)} to rebalance.`,
+            params: { coin: asset.symbol, reduceUsd: excessHedgeUsd },
             urgency: 'medium',
             estimatedImpactUsd: excessHedgeUsd,
             intelUsed: intelSources,
@@ -2049,11 +2092,14 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
     switch (decision.type) {
       case 'OPEN_HEDGE': {
         const hl = await import('./hyperliquidService.ts');
-        const result = await hl.hedgeSolTreasury({
-          solExposureUsd: decision.params.solExposureUsd,
+        const coin = decision.params.coin ?? 'SOL';
+        const exposureUsd = decision.params.exposureUsd ?? decision.params.solExposureUsd;
+        const result = await hl.hedgeTreasury({
+          coin,
+          exposureUsd,
           leverage: decision.params.leverage,
         });
-        markDecision('OPEN_HEDGE');
+        markDecision(`OPEN_HEDGE_${coin}`);
         return {
           ...base,
           executed: true,
@@ -2064,20 +2110,21 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       }
 
       case 'CLOSE_HEDGE': {
-        // Find the SOL SHORT position and reduce it
+        // Find the coin's SHORT position and reduce it
         const hl = await import('./hyperliquidService.ts');
+        const coin = decision.params.coin ?? 'SOL';
         const summary = await hl.getAccountSummary();
-        const solShort = summary.positions.find(
-          (p) => p.coin === 'SOL' && p.side === 'SHORT',
+        const coinShort = summary.positions.find(
+          (p) => p.coin === coin && p.side === 'SHORT',
         );
-        if (!solShort) {
-          return { ...base, executed: false, error: 'No SOL SHORT position found to reduce' };
+        if (!coinShort) {
+          return { ...base, executed: false, error: `No ${coin} SHORT position found to reduce` };
         }
 
-        const reduceUsd = Math.min(decision.params.reduceUsd, solShort.sizeUsd);
-        const reduceSizeCoin = reduceUsd / solShort.markPrice;
-        const result = await hl.closePosition('SOL', reduceSizeCoin, true); // buy back to reduce short
-        markDecision('CLOSE_HEDGE');
+        const reduceUsd = Math.min(decision.params.reduceUsd, coinShort.sizeUsd);
+        const reduceSizeCoin = reduceUsd / coinShort.markPrice;
+        const result = await hl.closePosition(coin, reduceSizeCoin, true); // buy back to reduce short
+        markDecision(`CLOSE_HEDGE_${coin}`);
         return {
           ...base,
           executed: true,
@@ -2589,12 +2636,18 @@ export function formatDecisionReport(
 function _humanAction(d: Decision, state: PortfolioState): string {
   const p = d.params ?? {};
   switch (d.type) {
-    case 'OPEN_HEDGE':
-      return `*Hedge SOL* — short $${Math.abs(d.estimatedImpactUsd).toFixed(0)} SOL-PERP to protect $${state.solExposureUsd.toFixed(0)} SOL exposure (${state.solBalance.toFixed(1)} SOL + ${state.jitoSolBalance.toFixed(1)} JitoSOL)`;
-    case 'CLOSE_HEDGE':
-      return `*Reduce hedge* — SOL exposure dropped, closing excess short`;
-    case 'REBALANCE_HEDGE':
-      return `*Rebalance hedge* — adjusting short size to match current SOL`;
+    case 'OPEN_HEDGE': {
+      const coin = p.coin ?? 'SOL';
+      return `*Hedge ${coin}* — short $${Math.abs(d.estimatedImpactUsd).toFixed(0)} ${coin}-PERP to protect $${(state.treasuryExposures?.find(e => e.symbol === coin)?.valueUsd ?? state.solExposureUsd).toFixed(0)} ${coin} exposure`;
+    }
+    case 'CLOSE_HEDGE': {
+      const coin = p.coin ?? 'SOL';
+      return `*Reduce ${coin} hedge* — ${coin} exposure changed, closing excess short`;
+    }
+    case 'REBALANCE_HEDGE': {
+      const coin = p.coin ?? 'SOL';
+      return `*Rebalance ${coin} hedge* — adjusting short size to match current ${coin}`;
+    }
     case 'CLOSE_LOSING':
       return `*Close losing position* — cutting loss before it gets worse`;
     case 'AUTO_STAKE':
@@ -2736,6 +2789,89 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
   }
 
   logger.info(`[CFO:Intel] Market: ${intel.marketCondition} (risk×${intel.riskMultiplier.toFixed(2)})`);
+
+  // 1.8. Enrich treasury exposures with multi-asset scan
+  // (needs intel for price resolution & HL listing check)
+  try {
+    const jupiter = await import('./jupiterService.ts');
+    const hl = await import('./hyperliquidService.ts');
+
+    const [walletBalances, hlCoins] = await Promise.all([
+      jupiter.getWalletTokenBalances(),
+      hl.getHLListedCoins(),
+    ]);
+    const hlCoinSet = new Set(hlCoins.map((c: string) => c.toUpperCase()));
+
+    // Build price map from analyst/guardian intel + known prices
+    const priceMap: Record<string, number> = { SOL: state.solPriceUsd };
+    if (intel.analystPrices) {
+      for (const [sym, info] of Object.entries(intel.analystPrices)) {
+        const price = typeof info === 'number' ? info : info?.usd;
+        if (typeof price === 'number' && price > 0) priceMap[sym.toUpperCase()] = price;
+      }
+    }
+    if (intel.guardianTokens) {
+      for (const gt of intel.guardianTokens) {
+        const sym = (gt.ticker ?? '').toUpperCase();
+        if (sym && gt.priceUsd > 0) priceMap[sym] = gt.priceUsd;
+      }
+    }
+
+    // Build enriched treasury exposures
+    const exposures: PortfolioState['treasuryExposures'] = [];
+    for (const wb of walletBalances) {
+      if (!wb.symbol) continue; // skip unknown tokens
+      const sym = wb.symbol.toUpperCase();
+      // Skip stablecoins — not hedgeable
+      if (['USDC', 'USDT', 'DAI', 'BUSD'].includes(sym)) continue;
+      // Skip dust
+      if (wb.balance < 0.000001) continue;
+
+      // Resolve USD value
+      let valueUsd = 0;
+      if (sym === 'SOL') {
+        // SOL exposure already includes LSTs
+        valueUsd = state.solExposureUsd;
+      } else if (priceMap[sym]) {
+        valueUsd = wb.balance * priceMap[sym];
+      }
+
+      // Apply min-exposure filter
+      if (valueUsd < env.hlHedgeMinExposureUsd) continue;
+
+      exposures.push({
+        symbol: sym,
+        mint: wb.mint,
+        balance: wb.balance,
+        valueUsd,
+        hlListed: hlCoinSet.has(sym),
+      });
+    }
+
+    // Sort by value descending — highest exposure first
+    exposures.sort((a, b) => b.valueUsd - a.valueUsd);
+
+    // Only override if we got results; keep SOL fallback otherwise
+    if (exposures.length > 0) {
+      state.treasuryExposures = exposures;
+
+      // Recalculate hedgeRatio with enriched data
+      const totalHedgeable = exposures
+        .filter((e) => e.hlListed)
+        .reduce((s, e) => s + e.valueUsd, 0);
+      if (totalHedgeable > 0) {
+        (state as any).hedgeRatio = state.hlTotalShortUsd / totalHedgeable;
+      }
+    }
+
+    logger.info(
+      `[CFO:Treasury] ${state.treasuryExposures.length} asset(s): ` +
+      state.treasuryExposures.map((e) => `${e.symbol}=$${e.valueUsd.toFixed(0)}${e.hlListed ? '(HL)' : ''}`).join(', '),
+    );
+  } catch (err) {
+    logger.warn('[CFO:Treasury] Multi-asset scan failed (falling back to SOL-only):', err);
+    // treasuryExposures retains the SOL-only fallback from gatherPortfolioState
+  }
 
   // 2+3. Assess + Decide (with intel)
   const decisions = await generateDecisions(state, config, env, intel);
