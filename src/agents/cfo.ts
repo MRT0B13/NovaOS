@@ -219,7 +219,6 @@ export class CFOAgent extends BaseAgent {
     // Decision engine handles Polymarket bets now (with tier gating + scout intel)
     const config = getDecisionConfig();
     if (config.enabled) {
-      logger.info('[CFO] Polymarket scan → routing through decision engine (tier-gated)');
       await this.runAutonomousDecisionCycle();
       return;
     }
@@ -760,7 +759,13 @@ export class CFOAgent extends BaseAgent {
 
     try {
       await this.updateStatus('deciding');
-      const { state, decisions, results, report, intel } = await runDecisionCycle(this.pool);
+      const { state, decisions, results, report, intel, traceId } = await runDecisionCycle(this.pool);
+
+      // Cycle was skipped (concurrent lock) — nothing to do
+      if (traceId === 'skipped') {
+        await this.updateStatus('idle');
+        return;
+      }
 
       // ── Hydrate scoutIntel from swarm intel (covers restarts + missed messages) ──
       if (intel.scoutReceivedAt && intel.scoutBullish !== undefined) {

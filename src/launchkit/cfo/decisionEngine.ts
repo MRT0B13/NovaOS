@@ -481,13 +481,6 @@ export async function gatherSwarmIntel(pool: any): Promise<SwarmIntel> {
     intel.marketCondition = 'neutral';
   }
 
-  logger.info(
-    `[CFO:Intel] Market: ${intel.marketCondition} (risk×${intel.riskMultiplier.toFixed(2)}) | ` +
-    `Scout: ${intel.scoutBullish !== undefined ? (intel.scoutBullish ? '🟢 bullish' : '🔴 bearish') : '⚪ no data'} | ` +
-    `Guardian: ${intel.guardianCritical ? '🚨 CRITICAL' : (intel.guardianAlerts?.length ? `⚠️ ${intel.guardianAlerts.length} alert(s)` : '✅ clear')} | ` +
-    `Analyst: ${intel.analystVolumeSpike ? '📊 volume spike' : (intel.analystPriceAlert ? '📉 price alert' : '📊 normal')}`,
-  );
-
   return intel;
 }
 
@@ -1200,28 +1193,27 @@ export async function generateDecisions(
   // Section F skip diagnostics
   if (env.kaminoEnabled && env.kaminoBorrowEnabled) {
     if (state.kaminoDepositValueUsd < 1 && state.jitoSolBalance >= 0.1) {
-      logger.info(
+      logger.debug(
         `[CFO:Decision] Section F skip: no Kamino collateral deposited yet. ` +
         `JitoSOL in wallet: ${state.jitoSolBalance.toFixed(4)} ($${state.jitoSolValueUsd.toFixed(0)}). ` +
         `Section G (Jito Loop) will deposit it automatically if spread is profitable.`
       );
     } else if (state.kaminoBorrowableUsd < 10) {
-      logger.info(`[CFO:Decision] Section F skip: kaminoBorrowableUsd=$${state.kaminoBorrowableUsd.toFixed(0)} (need ≥$10) | deposits=$${state.kaminoDepositValueUsd.toFixed(0)}`);
+      logger.debug(`[CFO:Decision] Section F skip: kaminoBorrowableUsd=$${state.kaminoBorrowableUsd.toFixed(0)} (need ≥$10) | deposits=$${state.kaminoDepositValueUsd.toFixed(0)}`);
     } else if (state.kaminoHealthFactor <= 1.8) {
-      logger.info(`[CFO:Decision] Section F skip: healthFactor=${state.kaminoHealthFactor.toFixed(2)} (need >1.8)`);
+      logger.debug(`[CFO:Decision] Section F skip: healthFactor=${state.kaminoHealthFactor.toFixed(2)} (need >1.8)`);
     } else {
-      // Passed pre-checks but spread check may have failed
       const borrowCostDiag = state.kaminoBorrowApy;
       const deployYieldDiag = state.kaminoUsdcSupplyApy;
       const spreadDiag = (deployYieldDiag - borrowCostDiag) * 100;
       if (spreadDiag < (env.kaminoBorrowMinSpreadPct ?? 3)) {
-        logger.info(
+        logger.debug(
           `[CFO:Decision] Section F skip: spread=${spreadDiag.toFixed(1)}% (supply=${(deployYieldDiag * 100).toFixed(1)}% - borrow=${(borrowCostDiag * 100).toFixed(1)}%) — need ≥${env.kaminoBorrowMinSpreadPct ?? 3}%`
         );
       }
     }
   } else if (env.kaminoEnabled && !env.kaminoBorrowEnabled) {
-    logger.info('[CFO:Decision] Section F skip: CFO_KAMINO_BORROW_ENABLE=false');
+    logger.debug('[CFO:Decision] Section F skip: CFO_KAMINO_BORROW_ENABLE=false');
   }
 
   // ── G) JitoSOL/SOL Multiply loop ─────────────────────────────────────────
@@ -1287,13 +1279,13 @@ export async function generateDecisions(
     const effectiveJitoApyDiag = Math.max(state.kaminoJitoSupplyApy, JITOSOL_STAKING_YIELD_DIAG);
     const loopSpreadDiag = effectiveJitoApyDiag - state.kaminoSolBorrowApy;
     if (jitoSolAvailable < 0.1) {
-      logger.info(`[CFO:Decision] Section G skip: jitoSolBalance=${state.jitoSolBalance.toFixed(4)}, idleSol=${state.idleSolForStaking.toFixed(4)} (need ≥0.1 combined)`);
+      logger.debug(`[CFO:Decision] Section G skip: jitoSolBalance=${state.jitoSolBalance.toFixed(4)}, idleSol=${state.idleSolForStaking.toFixed(4)} (need ≥0.1 combined)`);
     } else if (state.kaminoHealthFactor <= 2.0) {
-      logger.info(`[CFO:Decision] Section G skip: healthFactor=${state.kaminoHealthFactor.toFixed(2)} (need >2.0)`);
+      logger.debug(`[CFO:Decision] Section G skip: healthFactor=${state.kaminoHealthFactor.toFixed(2)} (need >2.0)`);
     } else if (loopSpreadDiag <= 0.01) {
-      logger.info(`[CFO:Decision] Section G skip: spread=${(loopSpreadDiag * 100).toFixed(2)}% (jitoApy=${(effectiveJitoApyDiag * 100).toFixed(1)}% - solBorrow=${(state.kaminoSolBorrowApy * 100).toFixed(1)}%) — need >1%`);
+      logger.debug(`[CFO:Decision] Section G skip: spread=${(loopSpreadDiag * 100).toFixed(2)}% (jitoApy=${(effectiveJitoApyDiag * 100).toFixed(1)}% - solBorrow=${(state.kaminoSolBorrowApy * 100).toFixed(1)}%) — need >1%`);
     } else {
-      logger.info(`[CFO:Decision] Section G skip: cooldown not elapsed (24h between loop attempts)`);
+      logger.debug(`[CFO:Decision] Section G skip: cooldown not elapsed (24h between loop attempts)`);
     }
   }
 
@@ -1461,19 +1453,19 @@ export async function generateDecisions(
   if (!env.evmArbEnabled) {
     logger.info('[CFO:Decision] Section J skip: evmArbEnabled=false');
   } else if (!env.evmArbReceiverAddress) {
-    logger.info('[CFO:Decision] Section J skip: no receiver contract address (CFO_EVM_ARB_RECEIVER_ADDRESS)');
+    logger.debug('[CFO:Decision] Section J skip: no receiver contract address (CFO_EVM_ARB_RECEIVER_ADDRESS)');
   } else if (intel.guardianCritical) {
-    logger.info('[CFO:Decision] Section J skip: guardian critical alert active');
+    logger.debug('[CFO:Decision] Section J skip: guardian critical alert active');
   } else if (intel.marketCondition === 'danger') {
-    logger.info('[CFO:Decision] Section J skip: market condition = danger');
+    logger.debug('[CFO:Decision] Section J skip: market condition = danger');
   } else if (!checkCooldown('EVM_FLASH_ARB', 60_000)) {
-    logger.info('[CFO:Decision] Section J skip: cooldown (scanned <60s ago)');
+    logger.debug('[CFO:Decision] Section J skip: cooldown (scanned <60s ago)');
   } else {
     try {
       const arbMod   = await import('./evmArbService.ts');
       const ethPrice = intel.analystPrices?.['ETH']?.usd ?? 3000;
       const poolCount = arbMod.getCandidatePoolCount();
-      logger.info(`[CFO:Decision] Section J: scanning ${poolCount} Arbitrum pools (ETH=$${ethPrice.toFixed(0)})...`);
+      logger.debug(`[CFO:Decision] Section J: scanning ${poolCount} Arbitrum pools (ETH=$${ethPrice.toFixed(0)})...`);
       const opp      = await arbMod.scanForOpportunity(ethPrice);
 
       if (opp && opp.netProfitUsd >= (env.evmArbMinProfitUsdc ?? 2)) {
@@ -1498,15 +1490,15 @@ export async function generateDecisions(
           ].filter(Boolean),
         });
       } else if (opp) {
-        logger.info(
+        logger.debug(
           `[CFO:Decision] Section J: opportunity found but below threshold — ` +
           `${opp.displayPair} net=$${opp.netProfitUsd.toFixed(3)} < min=$${env.evmArbMinProfitUsdc ?? 2}`,
         );
       } else {
-        logger.info(`[CFO:Decision] Section J: no profitable arb found this cycle (${poolCount} pools scanned)`);
+        logger.debug(`[CFO:Decision] Section J: no profitable arb found this cycle (${poolCount} pools scanned)`);
       }
     } catch (err) {
-      logger.info('[CFO:Decision] Section J: scan failed (non-fatal):', err);
+      logger.debug('[CFO:Decision] Section J: scan failed (non-fatal):', err);
     }
   }
 
@@ -1526,7 +1518,7 @@ export async function generateDecisions(
     intel.marketCondition !== 'danger'
   ) {
     const borrowLpSkip = (reason: string) =>
-      logger.info(`[CFO:Decision] Section K skip: ${reason}`);
+      logger.debug(`[CFO:Decision] Section K skip: ${reason}`);
 
     if (!state.kaminoJitoLoopActive && state.kaminoDepositValueUsd < 10) {
       borrowLpSkip('no Kamino collateral — deposit or start Jito loop first');
@@ -1605,7 +1597,7 @@ export async function generateDecisions(
     if (!env.kaminoBorrowEnabled) missing.push('kaminoBorrowEnabled=false');
     if (intel.marketCondition === 'bearish' || intel.marketCondition === 'danger') missing.push(`market=${intel.marketCondition}`);
     if (missing.length > 0) {
-      logger.info(`[CFO:Decision] Section K skip: prerequisite not met — ${missing.join(', ')}`);
+      logger.debug(`[CFO:Decision] Section K skip: prerequisite not met — ${missing.join(', ')}`);
     }
   }
 
@@ -2017,74 +2009,67 @@ export function formatDecisionReport(
 ): string {
   const L: string[] = [];
 
-  // ── Human-readable type names ──
-  const typeName: Record<string, string> = {
-    OPEN_HEDGE: 'Open Hedge',
-    CLOSE_HEDGE: 'Close Hedge',
-    CLOSE_LOSING: 'Close Losing Position',
-    REBALANCE_HEDGE: 'Rebalance Hedge',
-    AUTO_STAKE: 'Stake SOL → JitoSOL',
-    UNSTAKE_JITO: 'Unstake JitoSOL → SOL',
-    POLY_BET: 'Prediction Bet',
-    POLY_EXIT: 'Close Prediction',
-    KAMINO_BORROW_DEPLOY: 'Kamino Borrow & Deploy',
-    KAMINO_REPAY: 'Kamino Repay',
-    KAMINO_JITO_LOOP: 'JitoSOL Multiply Loop',
-    KAMINO_JITO_UNWIND: 'JitoSOL Loop Unwind',
-    ORCA_LP_OPEN: 'Open Orca LP',
-    ORCA_LP_REBALANCE: 'Rebalance Orca LP',
-    KAMINO_BORROW_LP: 'Borrow → Orca LP',
-    EVM_FLASH_ARB: 'Flash Arb (Arbitrum)',
-    SKIP: 'No Action',
-  };
-
   // ── Header ──
   L.push(`🧠 *CFO Report*${dryRun ? '  _(dry run)_' : ''}`);
 
-  // ── Market Intel ──
-  if (intel && (intel.scoutReceivedAt || intel.guardianReceivedAt || intel.analystReceivedAt)) {
-    const condition = (intel.marketCondition ?? 'neutral').charAt(0).toUpperCase() + (intel.marketCondition ?? 'neutral').slice(1);
-    const riskLabel = intel.riskMultiplier <= 0.5 ? 'High risk' : intel.riskMultiplier <= 1 ? 'Normal risk' : 'Low risk';
-    L.push(`📡 *Market:* ${condition} · ${riskLabel}`);
-    const details: string[] = [];
-    if (intel.scoutReceivedAt) details.push(intel.scoutBullish ? '🟢 Scout bullish' : '🔴 Scout bearish');
-    if (intel.guardianReceivedAt) details.push(intel.guardianCritical ? '🔴 Guardian alert' : '🛡 Guardian clear');
-    if (intel.analystReceivedAt) details.push(intel.analystVolumeSpike ? '📊 Volume spike' : '📊 Volume normal');
-    L.push(`    ${details.join(' · ')}`);
+  // ── Market Summary — single human-readable sentence ──
+  if (intel) {
+    const mood = intel.marketCondition ?? 'neutral';
+    const moodIcon = mood === 'bullish' ? '🟢' : mood === 'bearish' ? '🔴' : mood === 'danger' ? '🚨' : '⚪';
+    const alerts: string[] = [];
+    if (intel.guardianCritical) alerts.push('security alert active');
+    else if (intel.guardianAlerts?.length) alerts.push(`${intel.guardianAlerts.length} watch alert${intel.guardianAlerts.length > 1 ? 's' : ''}`);
+    if (intel.analystVolumeSpike) alerts.push('volume spike');
+    const moverStr = intel.analystMovers?.length
+      ? ` · Top mover: ${intel.analystMovers[0].symbol} ${intel.analystMovers[0].change24hPct > 0 ? '+' : ''}${intel.analystMovers[0].change24hPct.toFixed(0)}%`
+      : '';
+    L.push(`${moodIcon} Market ${mood}${alerts.length ? ` — ${alerts.join(', ')}` : ''}${moverStr}`);
   }
 
-  // ── Portfolio ──
-  L.push(``);
-  L.push(`💰 *Portfolio: $${state.totalPortfolioUsd.toFixed(0)}*`);
-  L.push(`    ◽ ${state.solBalance.toFixed(2)} SOL ($${state.solExposureUsd.toFixed(0)})`);
-  if (state.jitoSolBalance > 0) L.push(`    ◽ ${state.jitoSolBalance.toFixed(2)} JitoSOL ($${state.jitoSolValueUsd.toFixed(0)})`);
-  if (state.hlEquity > 0) L.push(`    ◽ Hyperliquid $${state.hlEquity.toFixed(0)}`);
-  if (state.polyDeployedUsd > 0 || state.polyPositionCount > 0) L.push(`    ◽ Polymarket $${state.polyDeployedUsd.toFixed(0)}`);
-  L.push(`🛡 ${(state.hedgeRatio * 100).toFixed(0)}% hedged · SOL @ $${state.solPriceUsd.toFixed(0)}`);
+  // ── Portfolio — wallet balances ──
+  L.push('');
+  L.push(`💰 *$${state.totalPortfolioUsd.toFixed(0)}* total`);
+  const holdings: string[] = [];
+  holdings.push(`${state.solBalance.toFixed(2)} SOL ($${state.solExposureUsd.toFixed(0)})`);
+  if (state.jitoSolBalance > 0.01) holdings.push(`${state.jitoSolBalance.toFixed(2)} JitoSOL ($${state.jitoSolValueUsd.toFixed(0)})`);
+  if (state.hlEquity > 1) holdings.push(`$${state.hlEquity.toFixed(0)} on Hyperliquid`);
+  if (state.polyDeployedUsd > 1) holdings.push(`$${state.polyDeployedUsd.toFixed(0)} on Polymarket`);
+  if (state.orcaLpValueUsd > 1) holdings.push(`$${state.orcaLpValueUsd.toFixed(0)} in Orca LP`);
+  if (state.kaminoDepositValueUsd > 1) holdings.push(`$${state.kaminoDepositValueUsd.toFixed(0)} in Kamino`);
+  L.push(`    ${holdings.join(' · ')}`);
 
-  // ── Decisions ──
+  // Risk line — tells user if portfolio protection is adequate
+  const hedgePct = (state.hedgeRatio * 100).toFixed(0);
+  if (state.hedgeRatio < 0.1 && state.solExposureUsd > 20) {
+    L.push(`⚠️ *Unhedged* — ${hedgePct}% of SOL protected (SOL @ $${state.solPriceUsd.toFixed(0)})`);
+  } else if (state.hedgeRatio >= 0.4) {
+    L.push(`🛡 ${hedgePct}% hedged · SOL @ $${state.solPriceUsd.toFixed(0)}`);
+  } else {
+    L.push(`🔸 ${hedgePct}% hedged · SOL @ $${state.solPriceUsd.toFixed(0)}`);
+  }
+
+  // ── Actions — what the CFO is doing / recommending ──
   if (results.length === 0) {
-    L.push(`\n✅ Portfolio balanced — no actions needed.`);
+    L.push('');
+    L.push(`✅ All good — nothing to do right now.`);
   } else {
     L.push('');
     for (const r of results) {
       const d = r.decision;
-      const name = typeName[d.type] ?? d.type;
       const icon = r.pendingApproval ? '⏳' : r.success ? (r.executed ? '✅' : '📋') : '❌';
 
-      const statusLabel = r.pendingApproval
-        ? 'awaiting approval'
+      const tag = r.pendingApproval ? 'needs approval'
         : r.dryRun ? 'dry run'
-          : r.executed ? (r.success ? 'done' : 'failed') : 'skipped';
+        : r.executed ? (r.success ? 'done' : 'failed')
+        : 'skipped';
 
-      const reason = _shortReason(d);
+      const what = _humanAction(d, state);
       const amt = Math.abs(d.estimatedImpactUsd);
-      const amtStr = amt > 0 ? ` · $${amt.toFixed(0)}` : '';
+      const amtStr = amt >= 1 ? ` · $${amt.toFixed(0)}` : '';
 
-      L.push(`${icon} *${name}*${amtStr} — _${statusLabel}_`);
-      L.push(`    ${reason}`);
+      L.push(`${icon} ${what}${amtStr} — _${tag}_`);
 
-      // Error line (only on failure)
+      // Error detail (only on failure)
       if (r.error && !r.success) L.push(`    ⚠️ ${r.error}`);
       if (r.txId) L.push(`    🔗 ${r.txId}`);
     }
@@ -2093,44 +2078,49 @@ export function formatDecisionReport(
   return L.join('\n');
 }
 
-/** Shorten reasoning to one clean line */
-function _shortReason(d: Decision): string {
-  const t = d.type;
+/**
+ * Turn a Decision into a single plain-English sentence that
+ * explains WHAT and WHY to a non-technical admin.
+ */
+function _humanAction(d: Decision, state: PortfolioState): string {
   const p = d.params ?? {};
-  switch (t) {
+  switch (d.type) {
     case 'OPEN_HEDGE':
-      return `Short SOL-PERP → ${p.targetHedgeRatio ? (p.targetHedgeRatio * 100).toFixed(0) + '% hedge' : 'hedge'}`;
+      return `*Hedge SOL* — short $${Math.abs(d.estimatedImpactUsd).toFixed(0)} SOL-PERP to protect the ${state.solBalance.toFixed(1)} SOL ($${state.solExposureUsd.toFixed(0)}) in the treasury`;
     case 'CLOSE_HEDGE':
-      return `Reduce hedge exposure`;
+      return `*Reduce hedge* — SOL exposure dropped, closing excess short`;
+    case 'REBALANCE_HEDGE':
+      return `*Rebalance hedge* — adjusting short size to match current SOL`;
+    case 'CLOSE_LOSING':
+      return `*Close losing position* — cutting loss before it gets worse`;
     case 'AUTO_STAKE':
-      return `${p.amount?.toFixed(2) ?? '?'} SOL → JitoSOL (≈7% APY)`;
+      return `*Stake ${p.amount?.toFixed(2) ?? '?'} SOL* → JitoSOL for ~7% APY`;
     case 'UNSTAKE_JITO':
-      return `${p.amount?.toFixed(2) ?? '?'} JitoSOL → SOL`;
+      return `*Unstake ${p.amount?.toFixed(2) ?? '?'} JitoSOL* → SOL (need runway)`;
     case 'POLY_BET': {
-      const q = (p.marketQuestion ?? '').slice(0, 55);
-      const edge = p.edge ? `${(p.edge * 100).toFixed(0)}% edge` : '';
-      return q ? `${q}${edge ? ` · ${edge}` : ''}` : edge || 'Prediction bet';
+      const q = (p.marketQuestion ?? '').slice(0, 50);
+      return `*Prediction bet* — ${q || 'placing bet'}`;
     }
     case 'POLY_EXIT':
-      return `Exit prediction position`;
-    case 'KAMINO_BORROW_DEPLOY': {
-      const target = p.deployTarget === 'polymarket' ? 'Polymarket' : 'Kamino supply';
-      return `Borrow $${p.borrowUsd?.toFixed(0) ?? '?'} USDC → ${target} (spread ${p.spreadPct?.toFixed(1) ?? '?'}%)`;
-    }
+      return `*Close prediction* — exiting position`;
+    case 'KAMINO_BORROW_DEPLOY':
+      return `*Borrow & deploy* — $${p.borrowUsd?.toFixed(0) ?? '?'} USDC from Kamino → yield (${p.spreadPct?.toFixed(1) ?? '?'}% spread)`;
     case 'KAMINO_REPAY':
-      return `Repay $${p.repayUsd?.toFixed(0) ?? '?'} USDC (LTV management)`;
+      return `*Repay loan* — $${p.repayUsd?.toFixed(0) ?? '?'} USDC back to Kamino`;
     case 'KAMINO_JITO_LOOP':
-      return `JitoSOL loop ${p.jitoSolToDeposit?.toFixed(2) ?? '?'} JitoSOL → ${((p.targetLtv ?? 0.65) * 100).toFixed(0)}% LTV (est. ${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY)`;
+      return `*Leverage JitoSOL* — deposit ${p.jitoSolToDeposit?.toFixed(2) ?? '?'} JitoSOL, loop to ${((p.targetLtv ?? 0.65) * 100).toFixed(0)}% LTV for ~${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY`;
     case 'KAMINO_JITO_UNWIND':
-      return `Unwind JitoSOL/SOL multiply loop`;
+      return `*Unwind JitoSOL loop* — closing leveraged position`;
     case 'ORCA_LP_OPEN':
-      return `SOL/USDC LP $${((p.usdcAmount ?? 0) * 2).toFixed(0)} ±${(p.rangeWidthPct ?? 20) / 2}% range`;
-    case 'KAMINO_BORROW_LP':
-      return `Borrow $${p.borrowUsd?.toFixed(0) ?? '?'} → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread, LTV → ${((p.postBorrowLtv ?? 0) * 100).toFixed(0)}%)`;
+      return `*Open LP* — $${((p.usdcAmount ?? 0) * 2).toFixed(0)} in ${p.pair ?? 'SOL/USDC'} (±${(p.rangeWidthPct ?? 20) / 2}% range)`;
     case 'ORCA_LP_REBALANCE':
-      return `Rebalance LP ${(p.positionMint ?? '').slice(0, 8)} to current price`;
+      return `*Rebalance LP* — price moved out of range, re-centering`;
+    case 'KAMINO_BORROW_LP':
+      return `*Borrow → LP* — $${p.borrowUsd?.toFixed(0) ?? '?'} from Kamino → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
+    case 'EVM_FLASH_ARB':
+      return `*Flash arb* — atomic arb on Arbitrum`;
     default:
-      return d.reasoning.length > 80 ? d.reasoning.slice(0, 77) + '…' : d.reasoning;
+      return `*${d.type}* — ${d.reasoning.length > 60 ? d.reasoning.slice(0, 57) + '…' : d.reasoning}`;
   }
 }
 
@@ -2138,7 +2128,38 @@ function _shortReason(d: Decision): string {
 // Main entry: run one decision cycle
 // ============================================================================
 
+let _cycleRunning = false;
+
 export async function runDecisionCycle(pool?: any): Promise<{
+  state: PortfolioState;
+  decisions: Decision[];
+  results: DecisionResult[];
+  report: string;
+  intel: SwarmIntel;
+  traceId: string;
+}> {
+  // Prevent concurrent / duplicate cycles (e.g. SIGTERM race, timer overlap)
+  if (_cycleRunning) {
+    logger.debug('[CFO:Decision] Cycle already in progress — skipping duplicate');
+    return {
+      state: {} as PortfolioState,
+      decisions: [],
+      results: [],
+      report: '',
+      intel: { riskMultiplier: 1.0, marketCondition: 'neutral' },
+      traceId: 'skipped',
+    };
+  }
+  _cycleRunning = true;
+
+  try {
+    return await _runDecisionCycleInner(pool);
+  } finally {
+    _cycleRunning = false;
+  }
+}
+
+async function _runDecisionCycleInner(pool?: any): Promise<{
   state: PortfolioState;
   decisions: Decision[];
   results: DecisionResult[];
@@ -2181,21 +2202,7 @@ export async function runDecisionCycle(pool?: any): Promise<{
     logger.debug('[CFO:Decision] No DB pool provided — skipping swarm intel');
   }
 
-  // Log enriched intel summary
-  const tokenSummary = intel.guardianTokens?.length
-    ? `${intel.guardianTokens.length} tokens watched`
-    : 'no token data';
-  const topMover = intel.analystMovers?.length
-    ? `top mover: ${intel.analystMovers[0].symbol} ${intel.analystMovers[0].change24hPct > 0 ? '+' : ''}${intel.analystMovers[0].change24hPct.toFixed(0)}%`
-    : '';
-  const trendingStr = intel.analystTrending?.slice(0, 3).join(', ') || '';
-  logger.info(
-    `[CFO:Intel] Market: ${intel.marketCondition} (risk×${intel.riskMultiplier.toFixed(2)}) | ` +
-    `Scout: ${intel.scoutBullish === true ? '🟢 bullish' : intel.scoutBullish === false ? '🔴 bearish' : '⚪ no data'} | ` +
-    `Guardian: ${intel.guardianCritical ? '🚨 CRITICAL' : intel.guardianAlerts?.length ? `⚠️ ${intel.guardianAlerts.length} alerts` : '✅ clear'} (${tokenSummary}) | ` +
-    `Analyst: ${intel.analystVolumeSpike ? '📈 vol spike' : '📊 normal'}${topMover ? ` | ${topMover}` : ''}` +
-    `${trendingStr ? ` | trending: ${trendingStr}` : ''}`,
-  );
+  logger.info(`[CFO:Intel] Market: ${intel.marketCondition} (risk×${intel.riskMultiplier.toFixed(2)})`);
 
   // 2+3. Assess + Decide (with intel)
   const decisions = await generateDecisions(state, config, env, intel);
