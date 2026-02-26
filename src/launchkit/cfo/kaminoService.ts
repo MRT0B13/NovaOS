@@ -143,6 +143,12 @@ let _registryCache: KaminoReserveInfo[] | null = null;
 let _registryCacheTime = 0;
 const REGISTRY_TTL_MS = 10 * 60 * 1000; // 10 min
 
+// Backoff state for registry fetch failures
+let _registryFailCount = 0;
+let _registryLastFailTime = 0;
+const REGISTRY_BACKOFF_BASE_MS = 30_000; // 30s initial backoff
+const REGISTRY_MAX_BACKOFF_MS = 10 * 60 * 1000; // 10 min max backoff
+
 /**
  * Fetch ALL reserves from the Kamino API. Cached for 10 min.
  * Returns enriched KaminoReserveInfo[] with all fields populated.
@@ -152,10 +158,20 @@ export async function getReserveRegistry(forceRefresh = false): Promise<KaminoRe
     return _registryCache;
   }
 
+  // Exponential backoff: skip fetch if we recently failed and still within cooldown
+  if (_registryFailCount > 0 && !forceRefresh) {
+    const backoffMs = Math.min(REGISTRY_BACKOFF_BASE_MS * Math.pow(2, _registryFailCount - 1), REGISTRY_MAX_BACKOFF_MS);
+    const elapsed = Date.now() - _registryLastFailTime;
+    if (elapsed < backoffMs) {
+      if (_registryCache) return _registryCache;
+      return _buildSeedRegistry();
+    }
+  }
+
   try {
     const resp = await fetch(
       `https://api.kamino.finance/kamino-market/${KAMINO_MAIN_MARKET_ADDR}/reserves/metrics`,
-      { signal: AbortSignal.timeout(8000) },
+      { signal: AbortSignal.timeout(15_000) },
     );
     if (!resp.ok) throw new Error(`Kamino API ${resp.status}`);
     const data = await resp.json() as any[];
@@ -183,10 +199,15 @@ export async function getReserveRegistry(forceRefresh = false): Promise<KaminoRe
     });
 
     _registryCacheTime = Date.now();
+    _registryFailCount = 0; // Reset backoff on success
     logger.debug(`[Kamino] Registry refreshed: ${_registryCache.length} reserves`);
     return _registryCache;
   } catch (err) {
-    logger.warn('[Kamino] Registry fetch failed, using seed fallback:', err);
+    _registryFailCount++;
+    _registryLastFailTime = Date.now();
+    const nextBackoff = Math.min(REGISTRY_BACKOFF_BASE_MS * Math.pow(2, _registryFailCount - 1), REGISTRY_MAX_BACKOFF_MS) / 1000;
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[Kamino] Registry fetch failed (attempt #${_registryFailCount}, next retry in ${nextBackoff}s): ${errMsg}`);
     if (_registryCache) return _registryCache;
     return _buildSeedRegistry();
   }
@@ -412,7 +433,7 @@ async function fetchKaminoApys(): Promise<KaminoMarketApy> {
   try {
     const resp = await fetch(
       `https://api.kamino.finance/kamino-market/${KAMINO_MAIN_MARKET_ADDR}/reserves/metrics`,
-      { signal: AbortSignal.timeout(5000) },
+      { signal: AbortSignal.timeout(15_000) },
     );
     if (!resp.ok) throw new Error(`Kamino API ${resp.status}`);
 
