@@ -312,7 +312,7 @@ export class PostgresCFORepository {
     await this.pool.query(
       `UPDATE cfo_positions
        SET current_price = $2, current_value_usd = $3,
-           unrealized_pnl_usd = $3 - $4, updated_at = NOW()
+           unrealized_pnl_usd = $3::numeric - $4::numeric, updated_at = NOW()
        WHERE id = $1`,
       [id, currentPrice, currentValueUsd, costBasis],
     );
