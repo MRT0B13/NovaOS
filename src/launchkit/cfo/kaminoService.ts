@@ -59,73 +59,206 @@ const SOL_MINT     = 'So11111111111111111111111111111111111111112';
  * before any deposit/borrow on those assets. The SDK throws if address is wrong.
  * USDC and SOL addresses are already confirmed correct.
  */
-export type KaminoAsset = 'USDC' | 'USDT' | 'SOL' | 'JitoSOL' | 'mSOL' | 'bSOL' | 'JUP';
-
-/** Subset of KaminoAsset that are liquid staking tokens (correlated to SOL). */
-export type LstAsset = 'JitoSOL' | 'mSOL' | 'bSOL';
-
-/** All supported LSTs for the Multiply / leverage loop strategy. */
-export const LST_ASSETS: LstAsset[] = ['JitoSOL', 'mSOL', 'bSOL'];
-
-/** Token mint address for each LST (re-exported for consumers). */
-export const LST_MINTS: Record<LstAsset, string> = {
-  JitoSOL: JITOSOL_MINT,
-  mSOL:    MSOL_MINT,
-  bSOL:    BSOL_MINT,
-};
-
-const KAMINO_RESERVES: Record<KaminoAsset, string> = {
-  USDC:    'D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59',  // confirmed via SDK enum
-  SOL:     'd4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q',   // confirmed via SDK enum
-  USDT:    'H3t6qZ1JkguCNTi9uzVKqQ7dvt2cum4XiXWom6Gn5e5S',   // confirmed via SDK enum
-  JitoSOL: 'EVbyPKrHG6WBfm4dLxLMJpUDY43cCAcHSpV3KYjKsktW',  // confirmed via SDK enum
-  mSOL:    'GHHkGpW22PFQTQqT8fp6ZuDvmjSzBCZoMmzbkCPJ5hSi',  // VERIFY: https://api.kamino.finance/kamino-market/.../reserves
-  bSOL:    '3JLPCS1qM2zRw3Dp6V4hZnYHd4toMNPkNesXdX9tg6KM',  // VERIFY: https://api.kamino.finance/kamino-market/.../reserves
-  JUP:     '4AFAGAm5G8fkcKy7QerL88E7BiSE22ZRbvJzvaKjayor',   // confirmed via SDK enum
-};
-
-// Token decimals
-const ASSET_DECIMALS: Record<KaminoAsset, number> = {
-  USDC: 6, USDT: 6, SOL: 9, JitoSOL: 9, mSOL: 9, bSOL: 9, JUP: 6,
-};
 
 /**
- * Max safe borrow LTV per collateral asset.
- * These are conservative — well below Kamino's actual liquidation thresholds.
- * JitoSOL is high because SOL and JitoSOL are tightly price-correlated:
- * Kamino's liquidation LTV for JitoSOL/SOL positions is ~95%.
+ * KaminoAsset: now a plain string — any symbol the registry returns is valid.
+ * Kept as a type alias for readability; no more hard-coded union.
  */
-const SAFE_BORROW_LTV: Record<KaminoAsset, number> = {
-  JitoSOL: 0.75,  // high — correlated with the SOL borrow, liq threshold ~95%
-  mSOL:    0.75,  // same as JitoSOL — SOL-correlated, liq threshold ~95%
-  bSOL:    0.75,  // same as JitoSOL — SOL-correlated, liq threshold ~95%
-  SOL:     0.75,  // when borrowed against LST collateral — liq threshold ~95%, 0.75 is conservative
-  USDC:    0.70,
-  USDT:    0.70,
-  JUP:     0.45,  // volatile — conservative
-};
+export type KaminoAsset = string;
 
-/** Base staking yield for each LST (base staking + MEV tips / validator yield). */
-export const LST_BASE_STAKING_YIELD: Record<LstAsset, number> = {
-  JitoSOL: 0.08,   // ~8% APY (base staking + MEV tips)
-  mSOL:    0.075,  // ~7.5% APY (Marinade native staking)
-  bSOL:    0.07,   // ~7% APY (BlazeStake validator set)
-};
+/** Subset of KaminoAsset that are liquid staking tokens (correlated to SOL). */
+export type LstAsset = string;
 
-// Mint-to-asset reverse lookup for position parsing
-const MINT_TO_ASSET: Record<string, KaminoAsset> = {
-  [USDC_MINT]:    'USDC',
-  [USDT_MINT]:    'USDT',
-  [SOL_MINT]:     'SOL',
+// ── Dynamic Reserve Registry ────────────────────────────────────────────────
+// Fetches ALL reserves from the Kamino API so we never hard-code pairs.
+
+export interface KaminoReserveInfo {
+  symbol: string;
+  mint: string;
+  reserveAddress: string;
+  decimals: number;
+  liqLtv: number;          // liquidation LTV from API
+  safeBorrowLtv: number;   // conservative cap (liqLtv * 0.82)
+  supplyApy: number;
+  borrowApy: number;
+  isLst: boolean;
+  baseStakingYield: number; // seed from LST_YIELD_MAP or 0
+}
+
+/** Well-known mint addresses for reverse lookup. */
+const WELL_KNOWN_MINTS: Record<string, string> = {
   [JITOSOL_MINT]: 'JitoSOL',
   [MSOL_MINT]:    'mSOL',
   [BSOL_MINT]:    'bSOL',
   [JUP_MINT]:     'JUP',
+  [USDC_MINT]:    'USDC',
+  [USDT_MINT]:    'USDT',
+  [SOL_MINT]:     'SOL',
+  'jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v': 'jupSOL',
+  'CgNTsyMnhbxMKLFCboo5a6HMRkMDqJnQBWcdfXe5JwG':  'stkeSOL',
+  'fpSoL8EJ7UA5yJxFKWk1MFiNi9dXeFiq63v68n5AAIQ':   'fwdSOL',
+  'EjmyN6qEC1Tf1JxiG1ae7HTCdNGGykPmzYGJcjud5G7J': 'PYUSD',
+  '6DNSN2BJsaPFdDBBYZieXS9cTJdimAaot3xrmFG5HPdn': 'cbBTC',
 };
-// Also map by reserve address for SDK obligation parsing
-for (const [asset, addr] of Object.entries(KAMINO_RESERVES)) {
-  MINT_TO_ASSET[addr] = asset as KaminoAsset;
+
+/** Well-known decimals for tokens (API doesn't return this). */
+const WELL_KNOWN_DECIMALS: Record<string, number> = {
+  SOL: 9, JitoSOL: 9, mSOL: 9, bSOL: 9, jupSOL: 9, stkeSOL: 9, fwdSOL: 9,
+  hSOL: 9, dSOL: 9, vSOL: 9, pSOL: 9, bonkSOL: 9, bbSOL: 9, picoSOL: 9,
+  cgntSOL: 9, nxSOL: 9, adraSOL: 9, hubSOL: 9, strongSOL: 9, laineSOL: 9,
+  lanternSOL: 9, cdcSOL: 9, bnSOL: 9, dfdvSOL: 9, STSOL: 9, jSOL: 9,
+  USDC: 6, USDT: 6, PYUSD: 6, EURC: 6, USDH: 6, UXD: 6, FDUSD: 6,
+  CASH: 6, USD1: 6, USDS: 6, USDG: 6,
+  JUP: 6, JTO: 6, STEP: 6, xSTEP: 6,
+  WBTC: 8, cbBTC: 8, tBTC: 8, fBTC: 8, xBTC: 8,
+  ETH: 8, wstETH: 8,
+  JLP: 6, CHAI: 6,
+};
+
+/** Canonical symbol casing for API normalization. */
+const SYMBOL_NORMALISE: Record<string, string> = {
+  JITOSOL: 'JitoSOL', MSOL: 'mSOL', BSOL: 'bSOL', JUPSOL: 'jupSOL',
+  STKESOL: 'stkeSOL', FWDSOL: 'fwdSOL', INF: 'INF',
+  HSOL: 'hSOL', DSOL: 'dSOL', VSOL: 'vSOL', PSOL: 'pSOL',
+  PICOSOL: 'picoSOL', BBSOL: 'bbSOL', BNSOL: 'bnSOL', CGNTSOL: 'cgntSOL',
+  BONKSOL: 'bonkSOL', NXSOL: 'nxSOL', ADRASOL: 'adraSOL', HUBSOL: 'hubSOL',
+  STRONGSOL: 'strongSOL', LAINESOL: 'laineSOL', LANTERNSOL: 'lanternSOL',
+  CDCSOL: 'cdcSOL', DFDVSOL: 'dfdvSOL', JSOL: 'jSOL',
+};
+
+/** Base staking yield seeds for LSTs (updated periodically). */
+const LST_YIELD_MAP: Record<string, number> = {
+  JitoSOL: 0.08, mSOL: 0.075, bSOL: 0.07, jupSOL: 0.075,
+  stkeSOL: 0.07, fwdSOL: 0.06, INF: 0.07,
+  hSOL: 0.07, dSOL: 0.07, vSOL: 0.07, pSOL: 0.07, picoSOL: 0.07,
+  hubSOL: 0.07, bbSOL: 0.07, bonkSOL: 0.07, cgntSOL: 0.07,
+  strongSOL: 0.07, laineSOL: 0.07, lanternSOL: 0.07,
+  adraSOL: 0.07, nxSOL: 0.07, cdcSOL: 0.07, dfdvSOL: 0.07,
+  bnSOL: 0.07, jSOL: 0.07,
+};
+
+const KNOWN_LST_SYMBOLS = new Set(Object.keys(LST_YIELD_MAP));
+
+let _registryCache: KaminoReserveInfo[] | null = null;
+let _registryCacheTime = 0;
+const REGISTRY_TTL_MS = 10 * 60 * 1000; // 10 min
+
+/**
+ * Fetch ALL reserves from the Kamino API. Cached for 10 min.
+ * Returns enriched KaminoReserveInfo[] with all fields populated.
+ */
+export async function getReserveRegistry(forceRefresh = false): Promise<KaminoReserveInfo[]> {
+  if (!forceRefresh && _registryCache && Date.now() - _registryCacheTime < REGISTRY_TTL_MS) {
+    return _registryCache;
+  }
+
+  try {
+    const resp = await fetch(
+      `https://api.kamino.finance/kamino-market/${KAMINO_MAIN_MARKET_ADDR}/reserves/metrics`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (!resp.ok) throw new Error(`Kamino API ${resp.status}`);
+    const data = await resp.json() as any[];
+
+    _registryCache = data.map((r: any) => {
+      const rawSymbol: string = r.liquidityToken ?? '';
+      const symbol = SYMBOL_NORMALISE[rawSymbol.toUpperCase()] ?? rawSymbol;
+      const mint: string = r.liquidityTokenMint ?? '';
+      const reserveAddress: string = r.reserve ?? '';
+      // API doesn't return decimals — infer from well-known tokens
+      const decimals: number = WELL_KNOWN_DECIMALS[symbol] ?? WELL_KNOWN_DECIMALS[rawSymbol] ?? 6;
+      const liqLtv = Number(r.maxLtv ?? 0.75);
+      const safeBorrowLtv = Math.round(liqLtv * 82) / 100;
+      const supplyApy = Number(r.supplyApy ?? 0);
+      const borrowApy = Number(r.borrowApy ?? 0);
+      const isLst = KNOWN_LST_SYMBOLS.has(symbol);
+      const baseStakingYield = LST_YIELD_MAP[symbol] ?? 0;
+
+      // Enrich WELL_KNOWN_MINTS if we discover new mints
+      if (mint && !(mint in WELL_KNOWN_MINTS)) {
+        WELL_KNOWN_MINTS[mint] = symbol;
+      }
+
+      return { symbol, mint, reserveAddress, decimals, liqLtv, safeBorrowLtv, supplyApy, borrowApy, isLst, baseStakingYield };
+    });
+
+    _registryCacheTime = Date.now();
+    logger.debug(`[Kamino] Registry refreshed: ${_registryCache.length} reserves`);
+    return _registryCache;
+  } catch (err) {
+    logger.warn('[Kamino] Registry fetch failed, using seed fallback:', err);
+    if (_registryCache) return _registryCache;
+    return _buildSeedRegistry();
+  }
 }
+
+function _buildSeedRegistry(): KaminoReserveInfo[] {
+  // Reserve addresses and LTVs from Kamino Main Market API (2025-02)
+  const seeds: Array<[string, string, string, number, number]> = [
+    ['USDC', USDC_MINT, 'D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59', 6, 0.80],
+    ['USDT', USDT_MINT, 'H3t6qZ1JkguCNTi9uzVKqQ7dvt2cum4XiXWom6Gn5e5S', 6, 0.80],
+    ['SOL',  SOL_MINT,  'd4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q',  9, 0.74],
+    ['JitoSOL', JITOSOL_MINT, 'EVbyPKrHG6WBfm4dLxLMJpUDY43cCAcHSpV3KYjKsktW', 9, 0.59],
+    ['mSOL', MSOL_MINT, 'FBSyPnxtHKLBZ4UeeUyAnbtFuAmTHLtso9YtsqRDRWpM', 9, 0.59],
+    ['bSOL', BSOL_MINT, 'H9vmCVd77NHkpLz2WqBAHSMhEMD7kSNfaPdmu2jiPctF', 9, 0.45],
+    ['jupSOL', 'jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v', 'DGQZWCY17gSdHHkhXDFMitr8rBHnxZPHCbFhLXNqg6bP', 9, 0.59],
+    ['JUP',  JUP_MINT,  '4AFAGAm5G8fkcKy7QerL88E7BiSE22ZRbvJzvaKjayor',  6, 0.00],
+  ];
+  return seeds.map(([symbol, mint, reserveAddress, decimals, liqLtv]) => ({
+    symbol, mint, reserveAddress, decimals, liqLtv,
+    safeBorrowLtv: Math.round(liqLtv * 82) / 100,
+    supplyApy: 0.06, borrowApy: 0.10,
+    isLst: KNOWN_LST_SYMBOLS.has(symbol),
+    baseStakingYield: LST_YIELD_MAP[symbol] ?? 0,
+  }));
+}
+
+// ── Convenience lookups ─────────────────────────────────────────────────────
+
+/** Get a single reserve by symbol (e.g. 'JitoSOL', 'USDC'). */
+export async function getReserve(symbol: string): Promise<KaminoReserveInfo | undefined> {
+  const registry = await getReserveRegistry();
+  return registry.find(r => r.symbol === symbol);
+}
+
+/** Get a reserve by mint address. */
+export async function getReserveByMint(mint: string): Promise<KaminoReserveInfo | undefined> {
+  const registry = await getReserveRegistry();
+  return registry.find(r => r.mint === mint);
+}
+
+/** Get all LST reserves (isLst=true). */
+export async function getLstAssets(): Promise<KaminoReserveInfo[]> {
+  const registry = await getReserveRegistry();
+  return registry.filter(r => r.isLst);
+}
+
+/** Get all asset symbols in the registry. */
+export async function getAllAssetSymbols(): Promise<string[]> {
+  const registry = await getReserveRegistry();
+  return registry.map(r => r.symbol);
+}
+
+/** Mint address → symbol. */
+export function mintToSymbol(mint: string): string {
+  return WELL_KNOWN_MINTS[mint] ?? mint.slice(0, 8);
+}
+
+/** Symbol → mint address (from registry). */
+export async function symbolToMint(sym: string): Promise<string | undefined> {
+  const r = await getReserve(sym);
+  return r?.mint;
+}
+
+// ── Backward-compatible sync exports (deprecated — use registry) ────────────
+/** @deprecated Use getLstAssets() */
+export const LST_ASSETS: string[] = ['JitoSOL', 'mSOL', 'bSOL'];
+/** @deprecated Use getReserve(lst)?.mint */
+export const LST_MINTS: Record<string, string> = {
+  JitoSOL: JITOSOL_MINT, mSOL: MSOL_MINT, bSOL: BSOL_MINT,
+};
+/** @deprecated Use getReserve(lst)?.baseStakingYield */
+export const LST_BASE_STAKING_YIELD: Record<string, number> = { ...LST_YIELD_MAP };
 
 // ============================================================================
 // Types
@@ -167,15 +300,7 @@ export interface KaminoPosition {
   maxLtv: number;        // maximum allowed LTV
 }
 
-export interface KaminoMarketApy {
-  USDC:    { supplyApy: number; borrowApy: number };
-  USDT:    { supplyApy: number; borrowApy: number };
-  SOL:     { supplyApy: number; borrowApy: number };
-  JitoSOL: { supplyApy: number; borrowApy: number };
-  mSOL:    { supplyApy: number; borrowApy: number };
-  bSOL:    { supplyApy: number; borrowApy: number };
-  JUP:     { supplyApy: number; borrowApy: number };
-}
+export type KaminoMarketApy = { [symbol: string]: { supplyApy: number; borrowApy: number } };
 
 export interface KaminoBorrowResult {
   success: boolean;
@@ -294,19 +419,13 @@ async function fetchKaminoApys(): Promise<KaminoMarketApy> {
     const data = await resp.json() as any[];
     const result: KaminoMarketApy = { ...fallback };
 
-    // Map API symbol names to our KaminoAsset type
-    const symbolMap: Record<string, KaminoAsset> = {
-      USDC: 'USDC', USDT: 'USDT', SOL: 'SOL', JITOSOL: 'JitoSOL',
-      MSOL: 'mSOL', BSOL: 'bSOL', JUP: 'JUP',
-    };
-
     for (const reserve of data) {
-      const rawSymbol: string = (reserve.symbol ?? '').toUpperCase();
-      const asset = symbolMap[rawSymbol];
+      const rawSymbol: string = (reserve.symbol ?? '');
+      const asset = SYMBOL_NORMALISE[rawSymbol.toUpperCase()] ?? rawSymbol;
       if (asset) {
         result[asset] = {
-          supplyApy: Number(reserve.supplyInterestAPY ?? reserve.supplyApy ?? fallback[asset].supplyApy),
-          borrowApy: Number(reserve.borrowInterestAPY ?? reserve.borrowApy ?? fallback[asset].borrowApy),
+          supplyApy: Number(reserve.supplyInterestAPY ?? reserve.supplyApy ?? fallback[asset]?.supplyApy ?? 0.06),
+          borrowApy: Number(reserve.borrowInterestAPY ?? reserve.borrowApy ?? fallback[asset]?.borrowApy ?? 0.10),
         };
       }
     }
@@ -341,7 +460,7 @@ export async function deposit(asset: KaminoAsset, amount: number): Promise<Kamin
 
   if (env.dryRun) {
     const apys = await fetchKaminoApys();
-    logger.info(`[Kamino] DRY RUN — would deposit ${amount} ${asset} at ${(apys[asset].supplyApy * 100).toFixed(1)}% APY`);
+    logger.info(`[Kamino] DRY RUN — would deposit ${amount} ${asset} at ${((apys[asset]?.supplyApy ?? 0) * 100).toFixed(1)}% APY`);
     return { success: true, asset, amountDeposited: amount, kTokensReceived: amount, txSignature: `dry-${Date.now()}` };
   }
 
@@ -365,12 +484,13 @@ export async function deposit(asset: KaminoAsset, amount: number): Promise<Kamin
       400, // recent slot duration ms
     );
 
-    const reserveAddress = KAMINO_RESERVES[asset];
-    const reserve = market!.getReserveByAddress(reserveAddress as any);
+    const reserveInfo = await getReserve(asset);
+    if (!reserveInfo) throw new Error(`Unknown asset: ${asset} — not in Kamino registry`);
+    const reserve = market!.getReserveByAddress(reserveInfo.reserveAddress as any);
     if (!reserve) throw new Error(`Reserve ${asset} not found in market`);
 
     const walletAddr = { address: wallet.publicKey.toBase58() } as any;
-    const baseAmount = Math.floor(amount * 10 ** ASSET_DECIMALS[asset]).toString();
+    const baseAmount = Math.floor(amount * 10 ** reserveInfo.decimals).toString();
     const kaminoAction = await klend.KaminoAction.buildDepositTxns(
       market!,
       baseAmount,
@@ -444,12 +564,13 @@ export async function withdraw(asset: KaminoAsset, amount: number): Promise<Kami
     const rpc = getRpcV2();
 
     const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
-    const reserveAddress = KAMINO_RESERVES[asset];
-    const reserve = market!.getReserveByAddress(reserveAddress as any);
+    const reserveInfo = await getReserve(asset);
+    if (!reserveInfo) throw new Error(`Unknown asset: ${asset} — not in Kamino registry`);
+    const reserve = market!.getReserveByAddress(reserveInfo.reserveAddress as any);
     if (!reserve) throw new Error(`Reserve ${asset} not found`);
 
     const walletAddr = { address: wallet.publicKey.toBase58() } as any;
-    const baseAmount = Math.floor(amount * 10 ** ASSET_DECIMALS[asset]).toString();
+    const baseAmount = Math.floor(amount * 10 ** reserveInfo.decimals).toString();
     const kaminoAction = await klend.KaminoAction.buildWithdrawTxns(
       market!,
       baseAmount,
@@ -519,23 +640,35 @@ export async function getPosition(): Promise<KaminoPosition> {
     }
 
     const apys = await fetchKaminoApys();
+    const registry = await getReserveRegistry();
     const deposits: KaminoPosition['deposits'] = [];
     const borrows: KaminoPosition['borrows'] = [];
 
     // Helper: safely convert SDK Decimal / number / null to a finite number
     const num = (v: any): number => { const x = Number(v ?? 0); return isFinite(x) ? x : 0; };
 
+    // Helper: resolve mint or reserve address → symbol + decimals from registry
+    const resolveAsset = (mint: string, reserveAddr?: string): { symbol: string; decimals: number } => {
+      const byMint = registry.find(r => r.mint === mint);
+      if (byMint) return { symbol: byMint.symbol, decimals: byMint.decimals };
+      if (reserveAddr) {
+        const byRes = registry.find(r => r.reserveAddress === reserveAddr);
+        if (byRes) return { symbol: byRes.symbol, decimals: byRes.decimals };
+      }
+      const sym = WELL_KNOWN_MINTS[mint] ?? mint.slice(0, 8);
+      return { symbol: sym, decimals: 9 };
+    };
+
     // ── Parse deposits ─────────────────────────────────────────────────────
     // SDK v7: obligation.deposits is Map<reserveAddr, {mintAddress, amount (base units), marketValueRefreshed (USD)}>
     if (obligation.deposits instanceof Map) {
       for (const [reserveAddr, dep] of obligation.deposits) {
         const mint = String(dep.mintAddress ?? '');
-        const asset = MINT_TO_ASSET[mint] ?? MINT_TO_ASSET[reserveAddr] ?? 'UNKNOWN';
-        const decimals = ASSET_DECIMALS[asset as KaminoAsset] ?? 9;
+        const { symbol: asset, decimals } = resolveAsset(mint, reserveAddr);
         const amount = num(dep.amount) / (10 ** decimals);
         const valueUsd = num(dep.marketValueRefreshed);
         if (amount > 0.000001) {
-          deposits.push({ asset, amount, valueUsd, apy: apys[asset as KaminoAsset]?.supplyApy ?? 0.08 });
+          deposits.push({ asset, amount, valueUsd, apy: apys[asset]?.supplyApy ?? 0.08 });
         }
       }
     } else if (obligation.deposits && typeof obligation.deposits[Symbol.iterator] === 'function') {
@@ -543,11 +676,11 @@ export async function getPosition(): Promise<KaminoPosition> {
       for (const entry of obligation.deposits) {
         const dep = Array.isArray(entry) ? entry[1] : entry;
         const mint = String(dep?.mintAddress ?? '');
-        const asset = MINT_TO_ASSET[mint] ?? 'UNKNOWN';
+        const { symbol: asset } = resolveAsset(mint);
         const amount = num(dep?.amount);
         const valueUsd = num(dep?.marketValueRefreshed ?? dep?.marketValue ?? 0);
         if (amount > 0) {
-          deposits.push({ asset, amount, valueUsd, apy: apys[asset as KaminoAsset]?.supplyApy ?? 0.08 });
+          deposits.push({ asset, amount, valueUsd, apy: apys[asset]?.supplyApy ?? 0.08 });
         }
       }
     }
@@ -556,23 +689,22 @@ export async function getPosition(): Promise<KaminoPosition> {
     if (obligation.borrows instanceof Map) {
       for (const [reserveAddr, brw] of obligation.borrows) {
         const mint = String(brw.mintAddress ?? '');
-        const asset = MINT_TO_ASSET[mint] ?? MINT_TO_ASSET[reserveAddr] ?? 'UNKNOWN';
-        const decimals = ASSET_DECIMALS[asset as KaminoAsset] ?? 6;
+        const { symbol: asset, decimals } = resolveAsset(mint, reserveAddr);
         const amount = num(brw.amount) / (10 ** decimals);
         const valueUsd = num(brw.marketValueRefreshed);
         if (amount > 0.000001) {
-          borrows.push({ asset, amount, valueUsd, apy: apys[asset as KaminoAsset]?.borrowApy ?? 0.12 });
+          borrows.push({ asset, amount, valueUsd, apy: apys[asset]?.borrowApy ?? 0.12 });
         }
       }
     } else if (obligation.borrows && typeof obligation.borrows[Symbol.iterator] === 'function') {
       for (const entry of obligation.borrows) {
         const brw = Array.isArray(entry) ? entry[1] : entry;
         const mint = String(brw?.mintAddress ?? '');
-        const asset = MINT_TO_ASSET[mint] ?? 'UNKNOWN';
+        const { symbol: asset } = resolveAsset(mint);
         const amount = num(brw?.amount);
         const valueUsd = num(brw?.marketValueRefreshed ?? brw?.marketValue ?? 0);
         if (amount > 0) {
-          borrows.push({ asset, amount, valueUsd, apy: apys[asset as KaminoAsset]?.borrowApy ?? 0.12 });
+          borrows.push({ asset, amount, valueUsd, apy: apys[asset]?.borrowApy ?? 0.12 });
         }
       }
     }
@@ -703,13 +835,16 @@ export async function borrow(
 
   // LTV guard — fetch position directly to avoid checkLtvHealth()'s kaminoMaxLtvPct threshold,
   // which is calibrated for alerts, not for gating borrow calls.
-  // SOL borrows are always for the JitoSOL loop and use a higher LTV cap (correlated collateral).
+  // SOL borrows are always for the LST loop and use a higher LTV cap (correlated collateral).
+  const reserveInfo = await getReserve(asset);
+  if (!reserveInfo) return { success: false, asset, amountBorrowed: 0, error: `Unknown asset: ${asset}` };
+
   const pos = await getPosition();
-  const isJitoLoopBorrow = asset === 'SOL';
-  const configuredCap = isJitoLoopBorrow
+  const isLstLoopBorrow = asset === 'SOL';
+  const configuredCap = isLstLoopBorrow
     ? (env.kaminoJitoLoopMaxLtvPct ?? 72) / 100
     : (env.kaminoBorrowMaxLtvPct ?? 60) / 100;
-  const borrowLtvCap = Math.min(SAFE_BORROW_LTV[asset], configuredCap);
+  const borrowLtvCap = Math.min(reserveInfo.safeBorrowLtv, configuredCap);
   if (pos.ltv > borrowLtvCap) {
     return {
       success: false, asset, amountBorrowed: 0,
@@ -724,12 +859,11 @@ export async function borrow(
     const rpc = getRpcV2();
 
     const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
-    const reserveAddress = KAMINO_RESERVES[asset];
-    const reserve = market!.getReserveByAddress(reserveAddress as any);
+    const reserve = market!.getReserveByAddress(reserveInfo.reserveAddress as any);
     if (!reserve) throw new Error(`Reserve ${asset} not found`);
 
     const walletAddr = { address: wallet.publicKey.toBase58() } as any;
-    const baseAmount = Math.floor(amount * 10 ** ASSET_DECIMALS[asset]).toString();
+    const baseAmount = Math.floor(amount * 10 ** reserveInfo.decimals).toString();
     const kaminoAction = await klend.KaminoAction.buildBorrowTxns(
       market!,
       baseAmount,
@@ -804,12 +938,13 @@ export async function repay(
     const rpc = getRpcV2();
 
     const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
-    const reserveAddress = KAMINO_RESERVES[asset];
-    const reserve = market!.getReserveByAddress(reserveAddress as any);
+    const reserveInfo = await getReserve(asset);
+    if (!reserveInfo) throw new Error(`Unknown asset: ${asset} — not in Kamino registry`);
+    const reserve = market!.getReserveByAddress(reserveInfo.reserveAddress as any);
     if (!reserve) throw new Error(`Reserve ${asset} not found`);
 
     const walletAddr = { address: wallet.publicKey.toBase58() } as any;
-    const baseAmount = Math.floor(repayAmount * 10 ** ASSET_DECIMALS[asset]).toString();
+    const baseAmount = Math.floor(repayAmount * 10 ** reserveInfo.decimals).toString();
     const kaminoAction = await klend.KaminoAction.buildRepayTxns(
       market!,
       baseAmount,
@@ -892,14 +1027,19 @@ export async function repayAndWithdraw(
 
     const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
 
-    const repayReserve = market!.getReserveByAddress(KAMINO_RESERVES[repayAsset] as any);
-    const withdrawReserve = market!.getReserveByAddress(KAMINO_RESERVES[withdrawAsset] as any);
+    const repayReserveInfo = await getReserve(repayAsset);
+    const withdrawReserveInfo = await getReserve(withdrawAsset);
+    if (!repayReserveInfo) throw new Error(`Unknown repay asset: ${repayAsset}`);
+    if (!withdrawReserveInfo) throw new Error(`Unknown withdraw asset: ${withdrawAsset}`);
+
+    const repayReserve = market!.getReserveByAddress(repayReserveInfo.reserveAddress as any);
+    const withdrawReserve = market!.getReserveByAddress(withdrawReserveInfo.reserveAddress as any);
     if (!repayReserve) throw new Error(`Repay reserve ${repayAsset} not found`);
     if (!withdrawReserve) throw new Error(`Withdraw reserve ${withdrawAsset} not found`);
 
     const walletAddr = { address: wallet.publicKey.toBase58() } as any;
-    const repayBase = Math.floor(repayAmount * 10 ** ASSET_DECIMALS[repayAsset]).toString();
-    const withdrawBase = Math.floor(withdrawAmount * 10 ** ASSET_DECIMALS[withdrawAsset]).toString();
+    const repayBase = Math.floor(repayAmount * 10 ** repayReserveInfo.decimals).toString();
+    const withdrawBase = Math.floor(withdrawAmount * 10 ** withdrawReserveInfo.decimals).toString();
 
     // SDK v7 needs current slot as BigInt for exchange-rate estimation
     const currentSlot = BigInt(await connection.getSlot('confirmed'));
@@ -913,6 +1053,8 @@ export async function repayAndWithdraw(
       walletAddr,
       currentSlot as any,
       new klend.VanillaObligation(klend.PROGRAM_ID),   // obligation type
+      false,       // useV2Ixs
+      undefined,   // scopeRefreshConfig
     );
 
     // Multi-token action: correct instruction ordering is critical.
@@ -1185,9 +1327,10 @@ export async function loopLst(
   if (env.dryRun) {
     const apys = await fetchKaminoApys();
     const leverage = 1 / (1 - targetLtv);
-    const baseYield = LST_BASE_STAKING_YIELD[lst];
+    const lstDryInfo = await getReserve(lst);
+    const baseYield = lstDryInfo?.baseStakingYield ?? 0.07;
     const supplyApy = Math.max(apys[lst]?.supplyApy ?? 0, baseYield);
-    const estimatedApy = leverage * supplyApy - (leverage - 1) * apys.SOL.borrowApy;
+    const estimatedApy = leverage * supplyApy - (leverage - 1) * (apys.SOL?.borrowApy ?? 0);
     logger.info(`[Kamino:Loop:${lst}] DRY RUN — would loop to ${(targetLtv * 100).toFixed(0)}% LTV, est. APY ${(estimatedApy * 100).toFixed(1)}%`);
     return { success: true, loopsCompleted: maxLoops, jitoSolDeposited: 0, solBorrowed: 0, effectiveLtv: targetLtv, estimatedApy, txSignatures: [`dry-loop-${lst}-${Date.now()}`] };
   }
@@ -1226,7 +1369,9 @@ export async function loopLst(
     totalSolBorrowed += solToBorrow;
 
     // Step 2: Swap SOL → LST via Jupiter
-    const lstMint = LST_MINTS[lst];
+    const lstSwapInfo = await getReserve(lst);
+    if (!lstSwapInfo?.mint) { logger.error(`[Kamino:Loop:${lst}] No mint found for ${lst}`); break; }
+    const lstMint = lstSwapInfo.mint;
     try {
       const jupiter = await import('./jupiterService.ts');
       const quote = await jupiter.getQuote(jupiter.MINTS.SOL, lstMint, solToBorrow, 100); // 1% slippage
@@ -1261,7 +1406,8 @@ export async function loopLst(
 
   const finalPos = await getPosition();
   const apys = await fetchKaminoApys();
-  const baseYield = LST_BASE_STAKING_YIELD[lst];
+  const lstFinalInfo = await getReserve(lst);
+  const baseYield = lstFinalInfo?.baseStakingYield ?? 0.07;
   const effectiveSupplyApy = Math.max(apys[lst]?.supplyApy ?? 0, baseYield);
   const leverage = finalPos.netValueUsd > 0
     ? finalPos.deposits.filter(d => d.asset === lst).reduce((s, d) => s + d.valueUsd, 0) / finalPos.netValueUsd
@@ -1310,7 +1456,9 @@ export async function unwindLstLoop(lst: LstAsset): Promise<{ success: boolean; 
     // Swap LST → SOL via Jupiter
     try {
       const jupiter = await import('./jupiterService.ts');
-      const quote = await jupiter.getQuote(LST_MINTS[lst], jupiter.MINTS.SOL, withdrawAmt * 0.999, 100);
+      const lstUnwindInfo = await getReserve(lst);
+      if (!lstUnwindInfo?.mint) throw new Error(`No mint for ${lst}`);
+      const quote = await jupiter.getQuote(lstUnwindInfo.mint, jupiter.MINTS.SOL, withdrawAmt * 0.999, 100);
       if (!quote) throw new Error('No quote');
       const swapResult = await jupiter.executeSwap(quote, { maxPriceImpactPct: 1.5 });
       if (!swapResult.success) throw new Error(swapResult.error);

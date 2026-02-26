@@ -26,16 +26,16 @@ import type { HLPosition } from './hyperliquidService.ts';
 // Strategy caps (from architecture doc)
 // ============================================================================
 
-export const STRATEGY_CAPS: Record<PositionStrategy, { maxPortfolioFraction: number; leverage: number }> = {
+/** Default cap for dynamically-discovered LST loop strategies not listed below. */
+const DEFAULT_LST_LOOP_CAP = { maxPortfolioFraction: 0.20, leverage: 3 };
+
+export const STRATEGY_CAPS: Partial<Record<PositionStrategy, { maxPortfolioFraction: number; leverage: number }>> = {
   polymarket:    { maxPortfolioFraction: 0.15, leverage: 1 },   // 15% of portfolio
   hyperliquid:   { maxPortfolioFraction: 0.20, leverage: 5 },   // 20%, max 5x
   kamino:        { maxPortfolioFraction: 0.30, leverage: 1 },   // 30%
   jito:          { maxPortfolioFraction: 0.25, leverage: 1 },   // 25%
   jupiter_swap:  { maxPortfolioFraction: 0.10, leverage: 1 },   // 10%
   kamino_loop:           { maxPortfolioFraction: 0.15, leverage: 1 },   // 15% collateral loop
-  kamino_jito_loop:      { maxPortfolioFraction: 0.20, leverage: 3 },   // 20% JitoSOL multiply
-  kamino_msol_loop:      { maxPortfolioFraction: 0.20, leverage: 3 },   // 20% mSOL multiply
-  kamino_bsol_loop:      { maxPortfolioFraction: 0.20, leverage: 3 },   // 20% bSOL multiply
   kamino_multiply_vault: { maxPortfolioFraction: 0.20, leverage: 3 },   // 20% managed vault
   orca_lp:               { maxPortfolioFraction: 0.15, leverage: 1 },   // 15% concentrated LP
   evm_flash_arb:         { maxPortfolioFraction: 0.00, leverage: 1 },   // 0% — uses Aave capital, not ours
@@ -82,7 +82,8 @@ export class PositionManager {
     newPositionUsd: number,
     totalPortfolioUsd: number,
   ): Promise<ExposureCheck> {
-    const cap = STRATEGY_CAPS[strategy];
+    const cap = STRATEGY_CAPS[strategy] ?? (strategy.endsWith('_loop') ? DEFAULT_LST_LOOP_CAP : undefined);
+    if (!cap) return { allowed: true, currentExposureUsd: 0, capUsd: Infinity, headroomUsd: Infinity };
     const capUsd = cap.maxPortfolioFraction * totalPortfolioUsd;
 
     const openPositions = await this.repo.getOpenPositions(strategy);

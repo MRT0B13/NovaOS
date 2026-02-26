@@ -47,17 +47,39 @@ interface ScoutIntel { cryptoBullish?: boolean; btcEstimate?: number; narratives
  * Update when new Orca whirlpool pairs or Kamino collateral types are added.
  */
 const SOLANA_TOKEN_MINTS: Record<string, string> = {
+  // Core
   'SOL':     'So11111111111111111111111111111111111111112',
   'WSOL':    'So11111111111111111111111111111111111111112',
   'USDC':    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  'USDT':    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+  // LSTs
   'JitoSOL': 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',
   'mSOL':    'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',
   'bSOL':    'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1',
+  'jupSOL':  '27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4',
+  'stkeSOL': '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs',
+  // DEX tokens
   'BONK':    'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
   'WIF':     'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',
   'JUP':     'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',
-  // Add more as new Orca pairs or Kamino markets are added
+  // Dynamically enriched from Kamino reserve registry at startup
 };
+
+/** Lazily enrich SOLANA_TOKEN_MINTS from the Kamino reserve registry. */
+let _mintsEnriched = false;
+async function enrichTokenMints(): Promise<void> {
+  if (_mintsEnriched) return;
+  try {
+    const kamino = await import('../launchkit/cfo/kaminoService.ts');
+    const registry = await kamino.getReserveRegistry();
+    for (const info of Object.values(registry)) {
+      if (info.mint && info.symbol && !(info.symbol in SOLANA_TOKEN_MINTS)) {
+        SOLANA_TOKEN_MINTS[info.symbol] = info.mint;
+      }
+    }
+    _mintsEnriched = true;
+  } catch (_e) { /* registry unavailable — use seeds */ }
+}
 
 /** Derive the set of Solana token mints involved in a given Orca pair string (e.g. "SOL/USDC"). */
 function orcaPairMints(pair: string): string[] {
@@ -821,6 +843,9 @@ export class CFOAgent extends BaseAgent {
 
     const config = getDecisionConfig();
     if (!config.enabled) return;
+
+    // Lazily enrich SOLANA_TOKEN_MINTS from Kamino registry (first cycle only)
+    await enrichTokenMints();
 
     try {
       await this.updateStatus('deciding');

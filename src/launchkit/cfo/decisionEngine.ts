@@ -544,13 +544,14 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     try {
       const jupiter = await import('./jupiterService.ts');
       const kamino = await import('./kaminoService.ts');
-      for (const lst of kamino.LST_ASSETS) {
-        if (lst === 'JitoSOL') continue; // already fetched via jitoStakingService
-        const mint = kamino.LST_MINTS[lst];
-        const balance = await jupiter.getTokenBalance(mint);
+      // Dynamic: fetch all LSTs from the reserve registry
+      const lstReserves = await kamino.getLstAssets();
+      for (const r of lstReserves) {
+        if (r.symbol === 'JitoSOL') continue; // already fetched via jitoStakingService
+        const balance = await jupiter.getTokenBalance(r.mint);
         // LSTs are roughly 1:1 with SOL (with a small premium from staking rewards)
         const valueUsd = balance * solPriceUsd * 1.02; // ~2% staking premium
-        lstBalances[lst] = { balance, valueUsd };
+        lstBalances[r.symbol] = { balance, valueUsd };
       }
     } catch { /* non-fatal */ }
   }
@@ -646,11 +647,11 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
         kaminoJitoLoopApy = leverage * kaminoJitoSupplyApy - (leverage - 1) * kaminoSolBorrowApy;
       }
 
-      // Detect ANY active LST loop (JitoSOL, mSOL, or bSOL with SOL borrow)
-      const lstAssets = ['JitoSOL', 'mSOL', 'bSOL'] as const;
-      for (const lst of lstAssets) {
-        if (pos.deposits.some(d => d.asset === lst) && hasSolBorrow) {
-          kaminoActiveLstLoop = lst;
+      // Detect ANY active LST loop (any LST deposit + SOL borrow)
+      for (const dep of pos.deposits) {
+        const lstInfo = await kamino.getReserve(dep.asset);
+        if (lstInfo?.isLst && hasSolBorrow) {
+          kaminoActiveLstLoop = dep.asset;
           break;
         }
       }
@@ -1298,12 +1299,15 @@ export async function generateDecisions(
     intel.marketCondition !== 'danger'
   ) {
     if (checkCooldown('KAMINO_JITO_LOOP', 24 * 3600_000)) {
-      // JitoSOL value = staking rewards (~7% base + 1-2% MEV tips) ≈ 8%.
+      // JitoSOL value = staking rewards (~7% base + 1-2% MEV tips).
       // The Kamino supply APY (kaminoJitoSupplyApy) only reflects the lending pool rate
       // (people paying to borrow JitoSOL), NOT the staking yield the token accrues.
       // Real return = MAX(kamino_supply_apy, staking_yield).
-      const JITOSOL_STAKING_YIELD = 0.08; // ~8% APY (base staking + MEV tips)
-      const effectiveJitoApy = Math.max(state.kaminoJitoSupplyApy, JITOSOL_STAKING_YIELD);
+      // Use the dynamic registry instead of a hardcoded 8% constant.
+      const kamino = await import('./kaminoService.ts');
+      const jitoReserve = await kamino.getReserve('JitoSOL');
+      const jitoStakingYield = jitoReserve?.baseStakingYield ?? 0.08;
+      const effectiveJitoApy = Math.max(state.kaminoJitoSupplyApy, jitoStakingYield);
       const loopSpread = effectiveJitoApy - state.kaminoSolBorrowApy;
       if (loopSpread > 0.01) { // need at least 1% spread
         const targetLtv = (env.kaminoJitoLoopTargetLtv ?? 65) / 100;
@@ -1378,8 +1382,10 @@ export async function generateDecisions(
 
   // Section G skip diagnostics
   if (env.kaminoEnabled && env.kaminoJitoLoopEnabled && !state.kaminoJitoLoopActive) {
-    const JITOSOL_STAKING_YIELD_DIAG = 0.08;
-    const effectiveJitoApyDiag = Math.max(state.kaminoJitoSupplyApy, JITOSOL_STAKING_YIELD_DIAG);
+    const kaminoDiag = await import('./kaminoService.ts');
+    const jitoReserveDiag = await kaminoDiag.getReserve('JitoSOL');
+    const jitoStakingYieldDiag = jitoReserveDiag?.baseStakingYield ?? 0.08;
+    const effectiveJitoApyDiag = Math.max(state.kaminoJitoSupplyApy, jitoStakingYieldDiag);
     const loopSpreadDiag = effectiveJitoApyDiag - state.kaminoSolBorrowApy;
     if (jitoSolAvailable < 0.1) {
       logger.debug(`[CFO:Decision] Section G skip: jitoSolBalance=${state.jitoSolBalance.toFixed(4)}, idleSol=${state.idleSolForStaking.toFixed(4)} (need ≥0.1 combined)`);
@@ -1392,10 +1398,10 @@ export async function generateDecisions(
     }
   }
 
-  // ── G2) Multi-LST loop comparison — pick best spread among JitoSOL/mSOL/bSOL ─
-  // Only runs when CFO_KAMINO_LST_LOOP_ENABLE=true. Compares all LSTs and picks the
-  // one with the best (yield - SOL borrow cost) spread. Falls back to Section G logic
-  // if only kaminoJitoLoopEnabled is set.
+  // ── G2) Multi-LST loop comparison — pick best spread among ALL Kamino LSTs ──
+  // Only runs when CFO_KAMINO_LST_LOOP_ENABLE=true. Dynamically discovers all LSTs
+  // from the Kamino reserve registry and picks the one with the best
+  // (yield - SOL borrow cost) spread.
   if (
     env.kaminoEnabled && env.kaminoBorrowEnabled && env.kaminoLstLoopEnabled &&
     !state.kaminoActiveLstLoop &&     // no LST loop already active
@@ -1406,6 +1412,7 @@ export async function generateDecisions(
     try {
       const kamino = await import('./kaminoService.ts');
       const apys = await kamino.getApys();
+      const lstReserves = await kamino.getLstAssets();
 
       // Evaluate each LST: find best spread
       type LstCandidate = {
@@ -1420,7 +1427,8 @@ export async function generateDecisions(
 
       const candidates: LstCandidate[] = [];
 
-      for (const lst of kamino.LST_ASSETS) {
+      for (const r of lstReserves) {
+        const lst = r.symbol;
         const walletBal = state.lstBalances[lst];
         const balance = walletBal?.balance ?? 0;
         const valueUsd = walletBal?.valueUsd ?? 0;
@@ -1433,8 +1441,10 @@ export async function generateDecisions(
             : 0;
 
         if (available < 0.1) continue;
+        // Skip LSTs without a reserve address (can't deposit into Kamino)
+        if (!r.reserveAddress) continue;
 
-        const baseYield = kamino.LST_BASE_STAKING_YIELD[lst];
+        const baseYield = r.baseStakingYield;
         const kaminoSupply = apys[lst]?.supplyApy ?? 0;
         const effectiveYield = Math.max(kaminoSupply, baseYield);
         const spread = effectiveYield - solBorrowApy;
