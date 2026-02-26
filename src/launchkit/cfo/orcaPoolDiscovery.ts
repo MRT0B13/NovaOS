@@ -27,7 +27,7 @@ const DEFILLAMA_YIELDS_URL = 'https://yields.llama.fi/pools';
 const ORCA_WHIRLPOOL_LIST_URL = 'https://api.mainnet.orca.so/v1/whirlpool/list';
 
 // Well-known Solana token mints
-const KNOWN_MINTS: Record<string, string> = {
+export const KNOWN_MINTS: Record<string, string> = {
   So11111111111111111111111111111111111111112: 'SOL',
   EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: 'USDC',
   Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: 'USDT',

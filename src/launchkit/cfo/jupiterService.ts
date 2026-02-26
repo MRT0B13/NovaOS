@@ -452,12 +452,8 @@ export async function getWalletTokenBalances(
 
       const mint: string = parsed.mint;
 
-      // Known mints → symbol lookup
-      const knownSymbol: Record<string, string> = {
-        [MINTS.USDC]: 'USDC',
-        [MINTS.USDT]: 'USDT',
-        // JitoSOL, mSOL, etc. will be symbol=null until resolved by guardian intel
-      };
+      // Known mints → symbol lookup (30+ mints from Orca pool discovery)
+      const { KNOWN_MINTS: knownSymbol } = await import('./orcaPoolDiscovery.ts');
 
       results.push({
         mint,
