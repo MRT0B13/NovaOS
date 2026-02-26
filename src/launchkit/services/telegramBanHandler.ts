@@ -283,7 +283,7 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
     // Register /help command — lists all available commands
     bot.command('help', async (ctx) => {
       try {
-        const lines: string[] = ['📋 *Available Commands*', ''];
+        const lines: string[] = ['📋 <b>Available Commands</b>', ''];
         const cats: Record<string, string[]> = {
           '🛡 Moderation': ['ban', 'kick', 'roseban', 'banned'],
           '🔧 System': ['health', 'errors', 'repairs', 'scan', 'children'],
@@ -291,7 +291,7 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
           '💰 CFO': ['cfo'],
         };
         for (const [cat, cmds] of Object.entries(cats)) {
-          lines.push(`*${cat}*`);
+          lines.push(`<b>${cat}</b>`);
           for (const cmd of cmds) {
             if (_commandHandlers.has(cmd)) {
               const desc = COMMAND_DESCRIPTIONS[cmd] ?? '';
@@ -305,14 +305,14 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
         categorised.add('help');
         const extras = [..._commandHandlers.keys()].filter(c => !categorised.has(c));
         if (extras.length) {
-          lines.push('*📌 Other*');
+          lines.push('<b>📌 Other</b>');
           for (const cmd of extras) {
             const desc = COMMAND_DESCRIPTIONS[cmd] ?? '';
             lines.push(`  /${cmd}${desc ? ` — ${desc}` : ''}`);
           }
           lines.push('');
         }
-        await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+        await ctx.reply(lines.join('\n'), { parse_mode: 'HTML' });
       } catch (err) {
         console.error('[BAN_HANDLER] /help error:', err);
         await ctx.reply('Failed to list commands.').catch(() => {});
