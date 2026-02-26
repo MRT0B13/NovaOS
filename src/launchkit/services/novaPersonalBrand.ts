@@ -198,6 +198,71 @@ export function recordXPost(): void {
   lastXPostAt = Date.now();
 }
 
+// ── Content similarity dedup ────────────────────────────────────────────────
+// Prevents near-identical posts from going out (same data → same GPT output).
+// Stores normalised fingerprints of the last N posts across ALL platforms.
+const RECENT_FINGERPRINTS: { fp: string; platform: string; ts: number }[] = [];
+const MAX_FINGERPRINTS = 20;
+const SIMILARITY_THRESHOLD = 0.55; // 55% word overlap → too similar
+
+/**
+ * Normalise text into a bag-of-words fingerprint:
+ *   lowercase, strip emoji/punctuation/numbers-under-5, deduplicate words.
+ */
+function fingerprint(text: string): string {
+  return [...new Set(
+    text
+      .toLowerCase()
+      .replace(/[\u{1F600}-\u{1FFFF}]/gu, '') // strip emoji
+      .replace(/https?:\/\/\S+/g, '')          // strip URLs
+      .replace(/[^a-z\s]/g, ' ')               // strip punctuation & digits
+      .split(/\s+/)
+      .filter(w => w.length > 3),              // skip tiny words
+  )].sort().join(' ');
+}
+
+/** Jaccard similarity between two fingerprints (0-1). */
+function similarity(a: string, b: string): number {
+  const setA = new Set(a.split(' '));
+  const setB = new Set(b.split(' '));
+  if (setA.size === 0 || setB.size === 0) return 0;
+  let intersection = 0;
+  for (const w of setA) if (setB.has(w)) intersection++;
+  return intersection / (setA.size + setB.size - intersection);
+}
+
+/**
+ * Returns true if `content` is too similar to a recent post.
+ * Call this BEFORE posting to X or TG.
+ */
+function isDuplicateContent(content: string, platform: string): boolean {
+  const fp = fingerprint(content);
+  if (!fp) return false;
+  // Only compare against posts from the last 12 hours
+  const cutoff = Date.now() - 12 * 60 * 60_000;
+  for (const entry of RECENT_FINGERPRINTS) {
+    if (entry.ts < cutoff) continue;
+    const sim = similarity(fp, entry.fp);
+    if (sim >= SIMILARITY_THRESHOLD) {
+      logger.warn(
+        `[NovaPersonalBrand] Duplicate content blocked (${(sim * 100).toFixed(0)}% similar to recent ${entry.platform} post): "${content.substring(0, 60)}..."`,
+      );
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Record a posted fingerprint so future posts are checked against it. */
+function recordFingerprint(content: string, platform: string): void {
+  const fp = fingerprint(content);
+  if (!fp) return;
+  RECENT_FINGERPRINTS.push({ fp, platform, ts: Date.now() });
+  if (RECENT_FINGERPRINTS.length > MAX_FINGERPRINTS) {
+    RECENT_FINGERPRINTS.splice(0, RECENT_FINGERPRINTS.length - MAX_FINGERPRINTS);
+  }
+}
+
 // Stats cache to avoid re-fetching all token prices on every post
 let cachedStats: NovaStats | null = null;
 let cachedStatsAt = 0;
@@ -369,10 +434,10 @@ function getTimeOfDayMood(): TimeOfDayMood {
 }
 
 const MOOD_CONTEXT: Record<TimeOfDayMood, string> = {
-  morning: `TIME OF DAY: Morning. Analytical, market-scanning tone. "Here's what happened overnight on pump.fun..." Share data from overnight activity, graduation rates, volume. Set up the day with observations, not cheerfulness.`,
-  afternoon: `TIME OF DAY: Afternoon. Active, launch-focused. Short announcements, RugCheck data, real-time market observations. This is when things happen — be sharp and concise.`,
-  evening: `TIME OF DAY: Evening. Reflective, honest. P&L updates, lessons learned from today's data. "Today's numbers tell an interesting story..." Own the results.`,
-  latenight: `TIME OF DAY: Late night. Slightly more philosophical but still data-grounded. "Building an autonomous agent that launches meme coins at 2am. The things I've seen on-chain..." Observations from the trenches.`,
+  morning: `TIME OF DAY: Morning. Analytical, market-scanning tone. Lead with a specific data point from overnight activity — a price move, a graduation, a volume spike. No greeting fluff.`,
+  afternoon: `TIME OF DAY: Afternoon. Active, launch-focused. Short announcements, RugCheck data, real-time observations. Be sharp and concise — one observation, one take.`,
+  evening: `TIME OF DAY: Evening. Reflective, honest. Share a specific lesson or result from today — a trade outcome, a pattern noticed, a number that surprised you. Own the results without cliché openers.`,
+  latenight: `TIME OF DAY: Late night. Slightly philosophical but data-grounded. One specific on-chain observation or pattern — not a vibe post. Reference a real number.`,
 };
 
 // ============================================================================
@@ -1590,11 +1655,11 @@ ${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. Gr
   // Show what was recently posted to avoid repetition
   const recentXPosts = state.posts
     .filter(p => p.platform === 'x')
-    .slice(-3)
-    .map(p => `- [${p.type}] "${p.content.substring(0, 60)}..."`)
+    .slice(-5)
+    .map(p => `- [${p.type}] "${p.content.substring(0, 120)}"`)
     .join('\n');
   const recentContext = recentXPosts 
-    ? `\nYOUR RECENT POSTS (DO NOT repeat similar themes or phrasing):\n${recentXPosts}` 
+    ? `\n\nYOUR RECENT POSTS (DO NOT repeat similar themes, openers, or phrasing — write something DIFFERENT):\n${recentXPosts}` 
     : '';
   
   // Check for active narrative arc
@@ -1617,7 +1682,7 @@ ${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. Gr
           { role: 'user', content: prompt },
         ],
         max_tokens: platform === 'x' ? 200 : 500, // Give GPT room — we trim to 280 chars after
-        temperature: 0.7,
+        temperature: 0.85, // Higher temp for variety — dedup filter catches if still too similar
       }),
     });
     
@@ -2435,6 +2500,11 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
     logger.info(`[NovaPersonalBrand] X posting skipped — global 5-min gap (${waitSec}s remaining)`);
     return { success: false };
   }
+
+  // Content similarity dedup — block near-identical posts
+  if (isDuplicateContent(content, 'x')) {
+    return { success: false };
+  }
   
   // Circuit breaker: pause after consecutive failures
   if (consecutiveXFailures >= X_CIRCUIT_BREAKER_THRESHOLD) {
@@ -2555,6 +2625,8 @@ export async function postToX(content: string, type: NovaPostType): Promise<{ su
       
       // Update global write gate timestamp
       recordXPost();
+      // Record fingerprint for dedup
+      recordFingerprint(fullTweet, 'x');
       
       // Record the post
       const post: NovaPost = {
@@ -2621,6 +2693,11 @@ export async function postToXThread(
   if (!canPostToX()) {
     const waitSec = Math.ceil((X_MIN_GAP_MS - (Date.now() - lastXPostAt)) / 1000);
     logger.info(`[NovaPersonalBrand] X thread skipped — global 5-min gap (${waitSec}s remaining)`);
+    return { success: false };
+  }
+
+  // Content similarity dedup — use first tweet as fingerprint for the thread
+  if (isDuplicateContent(tweets[0], 'x')) {
     return { success: false };
   }
   
@@ -2735,6 +2812,7 @@ export async function postToXThread(
       // Trim memory: keep only last 50 posts
       if (state.posts.length > 50) state.posts = state.posts.slice(-50);
       consecutiveXFailures = 0; // Reset circuit breaker on success
+      recordFingerprint(tweets[0], 'x'); // Dedup by first tweet in thread
       
       logger.info(`[NovaPersonalBrand] ✅ Thread posted: ${tweetIds.length} tweets`);
       return { success: true, tweetIds };
@@ -2775,6 +2853,11 @@ export async function postToTelegram(
   }
   
   const routing = TG_ROUTING[type] || 'channel';
+
+  // Content similarity dedup — block near-identical posts
+  if (isDuplicateContent(content, 'telegram')) {
+    return { success: false };
+  }
   
   // Determine target(s)
   const targets: { id: string; label: string }[] = [];
@@ -2871,6 +2954,7 @@ export async function postToTelegram(
   
   // Record the post
   if (lastResult.success) {
+    recordFingerprint(content, 'telegram');
     const post: NovaPost = {
       id: `tg_${Date.now()}`,
       type,
@@ -2917,16 +3001,17 @@ export async function postGm(): Promise<void> {
   
   const env = getEnv();
   
+  // Generate content ONCE, then adapt for each platform (avoids near-identical GPT dupes)
+  const baseContent = await generateAIContent('gm', stats, undefined, 'x') || generateGmContent(stats);
+  
   // Post to X (short, punchy)
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    const xContent = await generateAIContent('gm', stats, undefined, 'x') || generateGmContent(stats);
-    await postToX(xContent, 'gm');
+    await postToX(baseContent, 'gm');
   }
   
-  // Post to TG (rich, with reactions)
+  // Post to TG (reuse same content — dedup filter protects against identical posts)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    const tgContent = await generateAIContent('gm', stats, undefined, 'telegram') || generateGmContent(stats);
-    await postToTelegram(tgContent, 'gm');
+    await postToTelegram(baseContent, 'gm');
   }
   
   state.lastGmDate = today;
@@ -3048,16 +3133,15 @@ export async function postNovaTease(): Promise<void> {
   
   const env = getEnv();
   
-  // Post to X (short, punchy)
+  // Generate content ONCE, then post to both platforms
+  const baseContent = await generateAIContent('builder_insight', stats, undefined, 'x') || generateBuilderInsightContent(stats);
+  
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    const xContent = await generateAIContent('builder_insight', stats, undefined, 'x') || generateBuilderInsightContent(stats);
-    await postToX(xContent, 'builder_insight');
+    await postToX(baseContent, 'builder_insight');
   }
   
-  // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    const tgContent = await generateAIContent('builder_insight', stats, undefined, 'telegram') || generateBuilderInsightContent(stats);
-    await postToTelegram(tgContent, 'builder_insight');
+    await postToTelegram(baseContent, 'builder_insight');
   }
   
   state.novaTeaseCount++;
@@ -3069,16 +3153,15 @@ export async function postMarketCommentary(observation: string): Promise<void> {
   
   const env = getEnv();
   
-  // Post to X (short, punchy)
+  // Generate content ONCE, then post to both platforms
+  const baseContent = await generateAIContent('market_commentary', stats, observation, 'x') || generateMarketCommentaryContent(observation);
+  
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    const xContent = await generateAIContent('market_commentary', stats, observation, 'x') || generateMarketCommentaryContent(observation);
-    await postToX(xContent, 'market_commentary');
+    await postToX(baseContent, 'market_commentary');
   }
   
-  // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    const tgContent = await generateAIContent('market_commentary', stats, observation, 'telegram') || generateMarketCommentaryContent(observation);
-    await postToTelegram(tgContent, 'market_commentary');
+    await postToTelegram(baseContent, 'market_commentary');
   }
 }
 
@@ -3092,16 +3175,15 @@ export async function postMilestone(milestone: string): Promise<void> {
   
   const env = getEnv();
   
-  // Post to X (short, punchy)
+  // Generate content ONCE, then post to both platforms
+  const baseContent = await generateAIContent('milestone', stats, milestone, 'x') || generateMilestoneContent(milestone, stats);
+  
   if (env.NOVA_PERSONAL_X_ENABLE === 'true') {
-    const xContent = await generateAIContent('milestone', stats, milestone, 'x') || generateMilestoneContent(milestone, stats);
-    await postToX(xContent, 'milestone');
+    await postToX(baseContent, 'milestone');
   }
   
-  // Post to TG (rich, with reactions)
   if (env.NOVA_PERSONAL_TG_ENABLE === 'true') {
-    const tgContent = await generateAIContent('milestone', stats, milestone, 'telegram') || generateMilestoneContent(milestone, stats);
-    await postToTelegram(tgContent, 'milestone');
+    await postToTelegram(baseContent, 'milestone');
   }
   
   state.milestones.push(milestone);
@@ -3571,10 +3653,10 @@ export function startNovaPersonalScheduler(): void {
       const recapTime = env.NOVA_RECAP_POST_TIME || '22:00';
       if (isWithinWindow(currentTime, recapTime, 15)) {
         if (env.autonomousDryRun) {
-          // Dry run mode: skip portfolio recap threads (repetitive with no real launches).
-          // Post a builder insight or market commentary instead — more valuable content.
-          logger.info('[NovaPersonalBrand] Dry run active — skipping portfolio recap, posting builder insight instead');
-          await postNovaTease();
+          // Dry run mode: skip portfolio recap (no real launches).
+          // Don't call postNovaTease() here — it already fires at 12:00.
+          // The dedup filter would catch it anyway, but better to not waste a GPT call.
+          logger.debug('[NovaPersonalBrand] Dry run — skipping recap slot (builder insight already posted at 12:00)');
         } else {
           await postDailyRecap();
         }

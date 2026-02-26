@@ -52,6 +52,10 @@ export type TransactionType =
   | 'deposit'
   | 'withdraw'
   | 'bridge'
+  | 'borrow'
+  | 'repay'
+  | 'liquidity_add'
+  | 'liquidity_rebalance'
   | 'prediction_buy'
   | 'prediction_sell'
   | 'fee_collect';

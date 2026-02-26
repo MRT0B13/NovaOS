@@ -574,7 +574,7 @@ export class CFOAgent extends BaseAgent {
             // Register the LP pair tokens with Guardian for targeted alert forwarding
             const lpMints = orcaPairMints(pair).map(mint => ({
               mint,
-              ticker: pair.split('/').find(sym => SOLANA_TOKEN_MINTS[sym] === mint) ?? mint.slice(0, 8),
+              ticker: pair.split('/').find((sym: string) => SOLANA_TOKEN_MINTS[sym] === mint) ?? mint.slice(0, 8),
             }));
             await this.registerCFOExposure(lpMints);
             break;
