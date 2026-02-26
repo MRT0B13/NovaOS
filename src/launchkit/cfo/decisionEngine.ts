@@ -764,15 +764,17 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
 // STEP 2 + 3: Assess risk & decide
 // ============================================================================
 
-// Known Orca Whirlpool addresses for CFO-approved pairs (0.3% fee tier)
-// NOTE: Verify addresses against https://orca.so/pools before deploying.
-// SOL/USDC is confirmed. Others must be verified against live on-chain data.
-const ORCA_WHIRLPOOLS: Record<string, { address: string; tokenA: string; tokenB: string; tokenADecimals: number; minLiquidityUsd: number }> = {
-  'SOL/USDC':  { address: 'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ', tokenA: 'SOL',  tokenB: 'USDC', tokenADecimals: 9, minLiquidityUsd: 500_000 },
-  'BONK/USDC': { address: 'Fy6SnHPbDxMhVj8j7BNKMiNaVVesCzK8qcFNmRKokFgT', tokenA: 'BONK', tokenB: 'USDC', tokenADecimals: 5, minLiquidityUsd: 100_000 },
-  'WIF/USDC':  { address: 'ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq', tokenA: 'WIF',  tokenB: 'USDC', tokenADecimals: 6, minLiquidityUsd: 50_000  },
-  'JUP/USDC':  { address: 'BoG9sBfBBsGJBJbUqsFPRrmGCJF5i4kk5mMHPzSnVBa4', tokenA: 'JUP',  tokenB: 'USDC', tokenADecimals: 6, minLiquidityUsd: 50_000  },
-};
+// ── Dynamic Orca pool discovery (replaces hardcoded ORCA_WHIRLPOOLS) ─────
+// Pool list fetched from DeFiLlama yields API + Orca whirlpool API.
+// See orcaPoolDiscovery.ts for scoring, cross-referencing, and caching.
+import {
+  discoverOrcaPools,
+  selectBestPool as selectBestOrcaPool,
+  getPoolByAddress,
+  type OrcaPoolCandidate,
+  type PoolSelection,
+} from './orcaPoolDiscovery.ts';
+import { registerPoolDecimalsBulk } from './orcaService.ts';
 
 /**
  * Compute an adaptive LP range width based on 24h price change of the base token.
@@ -797,92 +799,77 @@ function adaptiveLpRangeWidthPct(
 }
 
 /**
- * Select the best Orca LP pair given current swarm intel.
- * Scoring: 40% volume momentum, 30% price trend, 20% liquidity depth, 10% rug safety
+ * Select the best Orca LP pool using dynamic discovery + multi-factor scoring.
+ *
+ * Replaces the old hardcoded 4-pool selectBestOrcaPair().
+ * Now discovers 50+ eligible pools from DeFiLlama + Orca API,
+ * scores them on APY, volume, TVL, ML predictions, volatility, IL risk,
+ * and adjusts for market conditions + swarm intel.
+ *
+ * Fallback: if discovery fails, returns a SOL/USDC hardcoded entry.
  */
-function selectBestOrcaPair(intel: SwarmIntel): {
+async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
   pair: string;
-  whirlpool: typeof ORCA_WHIRLPOOLS[string];
+  whirlpoolAddress: string;
+  tokenA: string;
+  tokenB: string;
+  tokenADecimals: number;
+  tokenBDecimals: number;
   score: number;
   reasoning: string;
-} {
-  const defaultPair = {
+  apyBase7d: number;
+  tvlUsd: number;
+}> {
+  const fallback = {
     pair: 'SOL/USDC',
-    whirlpool: ORCA_WHIRLPOOLS['SOL/USDC'],
+    whirlpoolAddress: 'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ',
+    tokenA: 'SOL',
+    tokenB: 'USDC',
+    tokenADecimals: 9,
+    tokenBDecimals: 6,
     score: 50,
-    reasoning: 'Default SOL/USDC — no enriched intel available',
+    reasoning: 'Fallback SOL/USDC — pool discovery unavailable',
+    apyBase7d: 0,
+    tvlUsd: 0,
   };
 
-  if (!intel.guardianTokens?.length && !intel.analystPrices) {
-    return defaultPair;
+  try {
+    // Run discovery (cached — only fetches every 2h)
+    const pools = await discoverOrcaPools();
+
+    // Register decimals for all discovered pools so orcaService can read them
+    registerPoolDecimalsBulk(pools);
+
+    // Select best pool using market condition + swarm intel
+    const selection = await selectBestOrcaPool({
+      marketCondition: intel.marketCondition,
+      guardianTokens: intel.guardianTokens,
+      analystPrices: intel.analystPrices,
+      analystTrending: intel.analystTrending,
+    });
+
+    if (!selection) {
+      logger.warn('[CFO:Decision] Pool selection returned null — using SOL/USDC fallback');
+      return fallback;
+    }
+
+    const p = selection.pool;
+    return {
+      pair: p.pair,
+      whirlpoolAddress: p.whirlpoolAddress,
+      tokenA: p.tokenA.symbol,
+      tokenB: p.tokenB.symbol,
+      tokenADecimals: p.tokenA.decimals,
+      tokenBDecimals: p.tokenB.decimals,
+      score: selection.score,
+      reasoning: `${selection.reasoning} (${selection.alternativesConsidered} pools evaluated)`,
+      apyBase7d: p.apyBase7d,
+      tvlUsd: p.tvlUsd,
+    };
+  } catch (err) {
+    logger.warn('[CFO:Decision] Dynamic pool selection failed:', err);
+    return fallback;
   }
-
-  const candidates: Array<{ pair: string; score: number; reasoning: string[] }> = [];
-
-  for (const [pairName, pool] of Object.entries(ORCA_WHIRLPOOLS)) {
-    const tokenSymbol = pool.tokenA;
-    let score = 0;
-    const reasons: string[] = [];
-
-    // ── Volume score (from Guardian watchlist) ──
-    const guardianToken = intel.guardianTokens?.find(t => t.ticker === tokenSymbol);
-    if (guardianToken) {
-      if (guardianToken.volume24h > 1_000_000) { score += 40; reasons.push(`high vol $${(guardianToken.volume24h / 1e6).toFixed(1)}M`); }
-      else if (guardianToken.volume24h > 100_000) { score += 20; reasons.push(`vol $${(guardianToken.volume24h / 1e3).toFixed(0)}k`); }
-      else if (guardianToken.volume24h > 10_000) { score += 10; }
-
-      // Liquidity depth
-      if (guardianToken.liquidityUsd >= pool.minLiquidityUsd) {
-        score += 20; reasons.push(`liq $${(guardianToken.liquidityUsd / 1e3).toFixed(0)}k`);
-      } else {
-        score -= 20;
-        reasons.push('low liq');
-      }
-
-      // Rug safety
-      if (tokenSymbol === 'SOL') {
-        score += 10;
-      } else if (!guardianToken.safe) {
-        score -= 30;
-        reasons.push('rug risk');
-      } else {
-        score += 10; reasons.push('clean');
-      }
-    }
-
-    // ── Price trend score (from Analyst) ──
-    const analystPrice = intel.analystPrices?.[tokenSymbol];
-    if (analystPrice) {
-      const change = analystPrice.change24h;
-      if (change > 10) { score += 30; reasons.push(`+${change.toFixed(0)}% 24h`); }
-      else if (change > 5) { score += 20; reasons.push(`+${change.toFixed(0)}% 24h`); }
-      else if (change > 0) { score += 10; }
-      else if (change < -10) { score -= 15; reasons.push(`${change.toFixed(0)}% 24h`); }
-    }
-
-    // ── Trending bonus (from Analyst CoinGecko trending) ──
-    if (intel.analystTrending?.includes(tokenSymbol)) {
-      score += 15; reasons.push('trending');
-    }
-
-    // ── Market condition modifier ──
-    if (intel.marketCondition === 'bearish' || intel.marketCondition === 'danger') {
-      if (tokenSymbol !== 'SOL') score -= 20;
-    }
-
-    candidates.push({ pair: pairName, score, reasoning: reasons });
-  }
-
-  candidates.sort((a, b) => b.score - a.score);
-  const best = candidates[0];
-  if (!best || best.score < 30) return defaultPair;
-
-  return {
-    pair: best.pair,
-    whirlpool: ORCA_WHIRLPOOLS[best.pair],
-    score: best.score,
-    reasoning: best.reasoning.join(', '),
-  };
 }
 
 /**
@@ -1672,13 +1659,14 @@ export async function generateDecisions(
       state.orcaPositions.length === 0 &&
       checkCooldown('ORCA_LP_OPEN', 24 * 3600_000)
     ) {
-      const bestPair = selectBestOrcaPair(intel);
-      const needsSol = bestPair.whirlpool.tokenA === 'SOL';
+      // Dynamic pool selection — discovers and scores 50+ Orca pools from DeFiLlama + Orca API
+      const bestPair = await selectBestOrcaPairDynamic(intel);
+      const needsSol = bestPair.tokenA === 'SOL';
       const solAvailableUsd = state.solBalance * state.solPriceUsd;
 
       // For SOL/USDC: need SOL for the A-side. For token pairs (BONK/WIF/JUP): no SOL required.
       if (needsSol && solAvailableUsd < 10) {
-        logger.debug(`[CFO:Decision] ORCA_LP_OPEN skipped — insufficient SOL ($${solAvailableUsd.toFixed(2)} available, need >$10 for SOL/USDC LP)`);
+        logger.debug(`[CFO:Decision] ORCA_LP_OPEN skipped — insufficient SOL ($${solAvailableUsd.toFixed(2)} available, need >$10 for ${bestPair.pair} LP)`);
       } else {
         // Available capital: wallet SOL (will auto-swap half to USDC) + existing USDC
         const solCapitalUsd = needsSol ? solAvailableUsd * 0.8 : 0;  // 80% of SOL (keep buffer)
@@ -1695,16 +1683,20 @@ export async function generateDecisions(
           const needsSwapForUsdc = usdcShortfall > 1;
           // SOL to swap = shortfall in USDC terms, converted to SOL
           const solToSwap = needsSwapForUsdc ? usdcShortfall / state.solPriceUsd : 0;
-          const tokenAAmount = bestPair.whirlpool.tokenA !== 'SOL'
-            ? deployUsd / 2 / (intel.analystPrices?.[bestPair.whirlpool.tokenA]?.usd ?? 1)
+          const tokenAAmount = bestPair.tokenA !== 'SOL'
+            ? deployUsd / 2 / (intel.analystPrices?.[bestPair.tokenA]?.usd ?? 1)
             : solSide;
 
           const adaptiveRange = adaptiveLpRangeWidthPct(
-            bestPair.whirlpool.tokenA,
+            bestPair.tokenA,
             intel,
             env.orcaLpRangeWidthPct,
           );
-          const baseTokenChange = Math.abs(intel.analystPrices?.[bestPair.whirlpool.tokenA]?.change24h ?? 0);
+          const baseTokenChange = Math.abs(intel.analystPrices?.[bestPair.tokenA]?.change24h ?? 0);
+
+          const estApyStr = bestPair.apyBase7d > 0
+            ? `${bestPair.apyBase7d.toFixed(0)}% 7d-avg fee APY`
+            : '~15-25% est. fee APY';
 
           decisions.push({
             type: 'ORCA_LP_OPEN',
@@ -1712,14 +1704,18 @@ export async function generateDecisions(
               `Opening Orca ${bestPair.pair} concentrated LP: $${deployUsd.toFixed(0)} total ` +
               `(range ±${adaptiveRange / 2}% — adaptive based on ${baseTokenChange.toFixed(0)}% 24h vol). ` +
               (needsSwapForUsdc ? `Auto-swap ${solToSwap.toFixed(3)} SOL → $${usdcShortfall.toFixed(0)} USDC first. ` : '') +
-              `Pair selected because: ${bestPair.reasoning}. Est. fee APY: ~15-25% while in-range.`,
+              `Pool score: ${bestPair.score}/100 — ${bestPair.reasoning}. ` +
+              (bestPair.tvlUsd > 0 ? `TVL: $${(bestPair.tvlUsd / 1e6).toFixed(1)}M. ` : '') +
+              `${estApyStr} while in-range.`,
             params: {
               pair: bestPair.pair,
-              whirlpoolAddress: bestPair.whirlpool.address,
-              tokenA: bestPair.whirlpool.tokenA,
-              tokenADecimals: bestPair.whirlpool.tokenADecimals,
+              whirlpoolAddress: bestPair.whirlpoolAddress,
+              tokenA: bestPair.tokenA,
+              tokenB: bestPair.tokenB,
+              tokenADecimals: bestPair.tokenADecimals,
+              tokenBDecimals: bestPair.tokenBDecimals,
               usdcAmount: usdcSide,
-              solAmount: bestPair.whirlpool.tokenA === 'SOL' ? solSide : 0,
+              solAmount: bestPair.tokenA === 'SOL' ? solSide : 0,
               tokenAAmount,
               rangeWidthPct: adaptiveRange,
               needsSwap: needsSwapForUsdc,
@@ -1741,6 +1737,12 @@ export async function generateDecisions(
     // I2: Rebalance out-of-range or near-edge positions
     for (const pos of state.orcaPositions) {
       if (!pos.inRange || pos.rangeUtilisationPct < env.orcaLpRebalanceTriggerPct) {
+        // Look up pool info from discovery cache for adaptive range calculation
+        const poolInfo = pos.whirlpoolAddress
+          ? await getPoolByAddress(pos.whirlpoolAddress).catch(() => null)
+          : null;
+        const tokenASymbol = poolInfo?.tokenA.symbol ?? 'SOL';
+
         decisions.push({
           type: 'ORCA_LP_REBALANCE',
           reasoning:
@@ -1750,7 +1752,7 @@ export async function generateDecisions(
             positionMint: pos.positionMint,
             whirlpoolAddress: pos.whirlpoolAddress,
             rangeWidthPct: adaptiveLpRangeWidthPct(
-              Object.values(ORCA_WHIRLPOOLS).find(w => w.address === pos.whirlpoolAddress)?.tokenA ?? 'SOL',
+              tokenASymbol,
               intel,
               env.orcaLpRangeWidthPct,
             ),
@@ -2236,7 +2238,13 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       }
 
       case 'ORCA_LP_OPEN': {
-        const { usdcAmount, solAmount, tokenAAmount, rangeWidthPct, whirlpoolAddress, tokenADecimals, needsSwap: lpNeedsSwap, solToSwap: lpSolToSwap } = decision.params;
+        const { usdcAmount, solAmount, tokenAAmount, rangeWidthPct, whirlpoolAddress, tokenADecimals, tokenBDecimals, needsSwap: lpNeedsSwap, solToSwap: lpSolToSwap } = decision.params;
+
+        // Register decimals for this pool so orcaService can read positions correctly
+        if (whirlpoolAddress && tokenADecimals != null && tokenBDecimals != null) {
+          const orcaSvc = await import('./orcaService.ts');
+          orcaSvc.registerPoolDecimals(whirlpoolAddress, tokenADecimals, tokenBDecimals);
+        }
 
         // Step 1: Auto-swap SOL → USDC if wallet doesn't have enough USDC for the B-side
         if (lpNeedsSwap && lpSolToSwap > 0) {
@@ -2252,7 +2260,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const orca = await import('./orcaService.ts');
         // Use tokenA amount if available (for non-SOL pairs), otherwise fall back to solAmount
         const amountA = tokenAAmount ?? solAmount;
-        const result = await orca.openPosition(usdcAmount, amountA, rangeWidthPct, whirlpoolAddress, tokenADecimals ?? 9);
+        const result = await orca.openPosition(usdcAmount, amountA, rangeWidthPct, whirlpoolAddress, tokenADecimals ?? 9, tokenBDecimals ?? 6);
         markDecision('ORCA_LP_OPEN');
         return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
       }
@@ -2561,7 +2569,7 @@ function _humanAction(d: Decision, state: PortfolioState): string {
     case 'KAMINO_MULTIPLY_VAULT':
       return `*Kamino Vault* — deposit ${p.depositAmount?.toFixed(2) ?? '?'} ${p.collateralToken ?? 'LST'} into "${p.vaultName ?? 'Multiply'}" (${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY, ${p.leverage?.toFixed(1) ?? '?'}x)${p.needsSwap ? ' (swap SOL first)' : ''}`;
     case 'ORCA_LP_OPEN':
-      return `*Open LP* — $${((p.usdcAmount ?? 0) * 2).toFixed(0)} in ${p.pair ?? 'SOL/USDC'} (±${(p.rangeWidthPct ?? 20) / 2}% range)`;
+      return `*Open LP* — $${((p.usdcAmount ?? 0) * 2).toFixed(0)} in ${p.pair ?? 'SOL/USDC'} (±${(p.rangeWidthPct ?? 20) / 2}% range)${p.needsSwap ? ' (auto-swap)' : ''}`;
     case 'ORCA_LP_REBALANCE':
       return `*Rebalance LP* — price moved out of range, re-centering`;
     case 'KAMINO_BORROW_LP':

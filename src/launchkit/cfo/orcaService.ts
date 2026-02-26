@@ -29,21 +29,45 @@ const SOL_USDC_WHIRLPOOL = 'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ';
 const TICK_SPACING = 64;
 
 /**
- * Known Orca Whirlpool pool → token decimal mapping.
- * TokenA is the non-USDC token. TokenB is always USDC (6 decimals).
- * Addresses match ORCA_WHIRLPOOLS in decisionEngine.ts.
+ * Dynamic pool decimal registry.
  *
- * BONK: 5 decimals
- * WIF:  6 decimals
- * JUP:  6 decimals
- * SOL:  9 decimals
+ * Previously hardcoded to 4 pools. Now populated at runtime from
+ * orcaPoolDiscovery.ts or by the decisionEngine when opening positions.
+ *
+ * Callers can register decimals via registerPoolDecimals() before
+ * opening/reading positions. Falls back to SOL/USDC (9/6) if unknown.
  */
-const KNOWN_POOL_DECIMALS: Record<string, { tokenADecimals: number; tokenBDecimals: number }> = {
+const _poolDecimalRegistry: Record<string, { tokenADecimals: number; tokenBDecimals: number }> = {
+  // Seed with SOL/USDC so it always works even before discovery runs
   'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ': { tokenADecimals: 9, tokenBDecimals: 6 }, // SOL/USDC
-  'Fy6SnHPbDxMhVj8j7BNKMiNaVVesCzK8qcFNmRKokFgT': { tokenADecimals: 5, tokenBDecimals: 6 }, // BONK/USDC
-  'ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq': { tokenADecimals: 6, tokenBDecimals: 6 }, // WIF/USDC
-  'BoG9sBfBBsGJBJbUqsFPRrmGCJF5i4kk5mMHPzSnVBa4': { tokenADecimals: 6, tokenBDecimals: 6 }, // JUP/USDC
 };
+
+/**
+ * Register token decimals for a whirlpool address.
+ * Called by decisionEngine/orcaPoolDiscovery before opening positions on dynamic pools.
+ */
+export function registerPoolDecimals(
+  whirlpoolAddress: string,
+  tokenADecimals: number,
+  tokenBDecimals: number,
+): void {
+  _poolDecimalRegistry[whirlpoolAddress] = { tokenADecimals, tokenBDecimals };
+}
+
+/**
+ * Bulk-register decimals from discovered pools.
+ * Convenience wrapper for orcaPoolDiscovery integration.
+ */
+export function registerPoolDecimalsBulk(
+  pools: Array<{ whirlpoolAddress: string; tokenA: { decimals: number }; tokenB: { decimals: number } }>,
+): void {
+  for (const p of pools) {
+    _poolDecimalRegistry[p.whirlpoolAddress] = {
+      tokenADecimals: p.tokenA.decimals,
+      tokenBDecimals: p.tokenB.decimals,
+    };
+  }
+}
 
 // ============================================================================
 // Helpers
@@ -489,9 +513,9 @@ export async function getPositions(): Promise<OrcaPosition[]> {
         const posWhirlpool = await client.getPool(data.whirlpool);
         const poolData = posWhirlpool.getData();
 
-        // Determine token decimals for this pool from our known pool table; fall back to 9/6.
+        // Determine token decimals for this pool from our dynamic registry; fall back to 9/6 (SOL/USDC).
         const poolAddress = data.whirlpool.toBase58();
-        const knownPool = KNOWN_POOL_DECIMALS[poolAddress];
+        const knownPool = _poolDecimalRegistry[poolAddress];
         const tokenADec = knownPool?.tokenADecimals ?? 9;
         const tokenBDec = knownPool?.tokenBDecimals ?? 6;
 
