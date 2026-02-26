@@ -597,10 +597,13 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     try {
       const polyMod = await import('./polymarketService.ts');
       const evmMod = await import('./evmWalletService.ts');
-      polyDeployedUsd = await polyMod.getTotalDeployed();
+      const positions = await polyMod.fetchPositions();
+      polyPositionCount = positions.length;
+      polyDeployedUsd = positions.reduce((s: number, p: any) => s + (p.currentValueUsd ?? 0), 0);
       polyUsdcBalance = await evmMod.getUSDCBalance();
-      polyPositionCount = (await polyMod.fetchPositions()).length;
-    } catch { /* 0 */ }
+    } catch (err) {
+      logger.warn('[CFO] Polymarket state fetch failed:', err);
+    }
   }
   const polyHeadroomUsd = Math.min(polyUsdcBalance, env.maxPolymarketUsd - polyDeployedUsd);
 
@@ -2589,6 +2592,15 @@ export function formatDecisionReport(
   if (state.kaminoDepositValueUsd > 1) holdings.push(`$${state.kaminoDepositValueUsd.toFixed(0)} in Kamino`);
   L.push(`    ${holdings.join(' · ')}`);
 
+  // EVM arb scanner status line (shows pools being monitored + 24h profit)
+  if (state.evmArbPoolCount > 0 || state.evmArbProfit24h > 0) {
+    const arbParts: string[] = [];
+    arbParts.push(`${state.evmArbPoolCount} pools across 4 venues`);
+    if (state.evmArbProfit24h > 0.01) arbParts.push(`+$${state.evmArbProfit24h.toFixed(2)} today`);
+    if (state.evmArbUsdcBalance > 1) arbParts.push(`$${state.evmArbUsdcBalance.toFixed(0)} USDC on Arb`);
+    L.push(`⚡ *Arb Scanner* — ${arbParts.join(' · ')}`);
+  }
+
   // Risk line — tells user if portfolio protection is adequate
   const hedgePct = (state.hedgeRatio * 100).toFixed(0);
   if (state.hedgeRatio < 0.1 && state.solExposureUsd > 20) {
@@ -2695,8 +2707,16 @@ function _humanAction(d: Decision, state: PortfolioState): string {
         return `⏸ *Borrow→LP waiting* — ${p.blockReason === 'no_collateral' ? 'needs Jito loop collateral first' : 'blocked'}. Would borrow $${p.borrowUsd?.toFixed(0) ?? '?'} → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
       }
       return `*Borrow → LP* — $${p.borrowUsd?.toFixed(0) ?? '?'} from Kamino → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
-    case 'EVM_FLASH_ARB':
-      return `*Flash arb* — atomic arb on Arbitrum`;
+    case 'EVM_FLASH_ARB': {
+      const pair = p.opportunity?.displayPair ?? p.displayPair ?? '?/?';
+      const buyDex = (p.opportunity?.buyPool?.dex ?? p.buyDex ?? '?').replace('_v3', ' V3').replace('_', ' ');
+      const sellDex = (p.opportunity?.sellPool?.dex ?? p.sellDex ?? '?').replace('_v3', ' V3').replace('_', ' ');
+      const flash = p.opportunity?.flashAmountUsd ?? p.flashAmountUsd ?? 0;
+      const net = p.opportunity?.netProfitUsd ?? p.netProfitUsd ?? 0;
+      return `*Flash arb* — ${pair} buy ${buyDex} → sell ${sellDex}` +
+        (flash > 0 ? ` · flash $${flash.toLocaleString()}` : '') +
+        (net > 0 ? ` · net $${net.toFixed(2)}` : '');
+    }
     default:
       return `*${d.type}* — ${d.reasoning.length > 60 ? d.reasoning.slice(0, 57) + '…' : d.reasoning}`;
   }

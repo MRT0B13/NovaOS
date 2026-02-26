@@ -1583,59 +1583,90 @@ export async function cancelAllOrders(): Promise<number> {
 // Position Monitoring
 // ============================================================================
 
+/** Polymarket Data API — public, no auth required, returns live positions */
+const DATA_API_BASE = 'https://data-api.polymarket.com';
+
+/**
+ * Raw shape returned by data-api.polymarket.com/positions?user=<addr>
+ */
+interface DataApiPosition {
+  proxyWallet: string;
+  asset: string;
+  conditionId: string;
+  size: number;
+  avgPrice: number;
+  initialValue: number;
+  currentValue: number;
+  cashPnl: number;
+  percentPnl: number;
+  totalBought: number;
+  realizedPnl: number;
+  curPrice: number;
+  redeemable: boolean;
+  mergeable: boolean;
+  title: string;
+  slug: string;
+  icon: string;
+  eventSlug: string;
+  outcome: string;
+  outcomeIndex: number;
+  oppositeOutcome: string;
+  oppositeAsset: string;
+  endDate: string;
+  negativeRisk: boolean;
+}
+
 /**
  * Fetch all current Polymarket positions for the connected wallet.
+ *
+ * Uses the Data API (data-api.polymarket.com) instead of the CLOB
+ * /data/positions endpoint which was deprecated and returns 404.
+ * The Data API is public (no auth needed) and returns enriched position
+ * data including title, current value, PnL, and redeemability.
  */
 export async function fetchPositions(): Promise<PolyPosition[]> {
   try {
     const { wallet } = await loadEthers();
 
-    // CLOB /data/positions requires user address as query param
-    const raw = await clobGet<Array<{
-      condition_id: string;
-      question?: string;
-      token_id: string;
-      outcome: string;
-      size: string;
-      entry_price?: string;
-      current_price?: string;
-    }>>(`/data/positions?user=${wallet.address}`, true).catch((err: Error) => {
-      // 404 = no positions or endpoint unavailable — not a real error
-      if (err.message.includes('404')) {
-        logger.debug('[Polymarket] No positions (404) — returning empty');
-        return [] as Array<any>;
-      }
-      throw err;
-    });
+    const resp = await fetch(
+      `${DATA_API_BASE}/positions?user=${wallet.address}`,
+    );
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      logger.warn(`[Polymarket] Data API /positions returned ${resp.status}: ${text.slice(0, 200)}`);
+      return [];
+    }
+
+    const raw: DataApiPosition[] = await resp.json();
 
     const positions: PolyPosition[] = [];
 
     for (const p of raw) {
       const size = Number(p.size);
-      const entryPrice = Number(p.entry_price ?? 0);
-      const currentPrice = Number(p.current_price ?? 0);
-
       if (size <= 0) continue;
 
-      const costBasisUsd = size * entryPrice;
-      const currentValueUsd = size * currentPrice;
+      const avgPrice = Number(p.avgPrice ?? 0);
+      const curPrice = Number(p.curPrice ?? 0);
+      const currentValueUsd = Number(p.currentValue ?? 0);
+      const costBasisUsd = Number(p.initialValue ?? 0);
 
       positions.push({
-        conditionId: p.condition_id,
-        question: p.question ?? p.condition_id.slice(0, 20),
-        tokenId: p.token_id,
+        conditionId: p.conditionId,
+        question: p.title ?? p.conditionId.slice(0, 20),
+        tokenId: p.asset,
         outcome: p.outcome,
         size,
-        entryPrice,
-        currentPrice,
+        entryPrice: avgPrice,
+        currentPrice: curPrice,
         costBasisUsd,
         currentValueUsd,
-        unrealizedPnlUsd: currentValueUsd - costBasisUsd,
+        unrealizedPnlUsd: Number(p.cashPnl ?? (currentValueUsd - costBasisUsd)),
         openedAt: new Date().toISOString(),
       });
     }
 
-    logger.debug(`[Polymarket] ${positions.length} active positions`);
+    logger.info(`[Polymarket] ${positions.length} active positions (${positions.filter(p => p.currentValueUsd > 0).length} live, ${positions.filter(p => p.currentValueUsd === 0).length} expired/redeemable)`);
     return positions;
   } catch (err) {
     logger.error('[Polymarket] fetchPositions error:', err);

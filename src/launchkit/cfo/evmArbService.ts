@@ -5,13 +5,14 @@
  *
  * Pool list: built from DeFiLlama yields API (public, no auth).
  *   Endpoint: https://yields.llama.fi/pools
- *   Filter: chain=Arbitrum, project in [uniswap-v3, camelot-v3, balancer-v2], tvlUsd > MIN_POOL_TVL_USD
+ *   Filter: chain=Arbitrum, project in [uniswap-v3, camelot-v3, pancakeswap-amm-v3, balancer-v2], tvlUsd > MIN_POOL_TVL_USD
  *   Refresh: every CFO_EVM_ARB_POOL_REFRESH_MS (default 4h)
  *
  * Quoting: direct on-chain staticCall to QuoterV2 per venue.
- *   - Uniswap v3 QuoterV2:  quoteExactInputSingle({ tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96 })
- *   - Camelot v3 (Algebra): quoteExactInput(path, amountIn) — path-encoded, dynamic fee
- *   - Balancer:             queryBatchSwap() — pool identified by bytes32 poolId
+ *   - Uniswap v3 QuoterV2:    quoteExactInputSingle({ tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96 })
+ *   - Camelot v3 (Algebra):   quoteExactInput(path, amountIn) — path-encoded, dynamic fee
+ *   - PancakeSwap v3 QuoterV2: quoteExactInputSingle({ ... }) — Uni V3 fork, same ABI as Uniswap
+ *   - Balancer:               queryBatchSwap() — pool identified by bytes32 poolId
  *
  * Execution: ArbFlashReceiver.sol via Aave v3 flashLoanSimple().
  *   Worst case: tx reverts → gas cost only (~$0.05 on Arbitrum).
@@ -32,15 +33,20 @@ const ARB_ADDRESSES = {
   // DEX Routers
   UNISWAP_V3_ROUTER:    '0xE592427A0AEce92De3Edee1F18E0157C05861564',
   CAMELOT_V3_ROUTER:    '0xc873fEcbd354f5A56E00E710B90EF4201db2448d',
+  PANCAKE_V3_ROUTER:    '0x32226588378236Fd0c7c4053999F88aC0e5cAc77', // PCS SmartRouter (verified: factory() → PCS factory)
   BALANCER_VAULT:       '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
 
   // Quoters (view-only — no gas cost via staticCall)
   UNISWAP_V3_QUOTER:    '0x61fFE014bA17989E743c5F6cB21bF9697530B21e', // QuoterV2
-  CAMELOT_V3_QUOTER:    '0x0524E833cCD057e4d7A296e3aaAb9f7675964Ce1', // Algebra QuoterV2
+  CAMELOT_V3_QUOTER:    '0x0524E833cCD057e4d7A296e3aaAb9f7675964Ce1', // NOTE: on-chain factory() returns SushiSwap V3 factory.
+                                                                      // Not used — Camelot quotes use local pool-level math instead
+                                                                      // (reads globalState + liquidity directly from pool contract).
+  PANCAKE_V3_QUOTER:    '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997', // PCS V3 QuoterV2 (verified: factory() → PCS factory)
 
   // DEX Factories (for resolving pool addresses from token pairs)
   UNISWAP_V3_FACTORY:   '0x1F98431c8aD98523631AE4a59f267346ea31F984',
   CAMELOT_V3_FACTORY:   '0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B',
+  PANCAKE_V3_FACTORY:   '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // verified: getPool() returns valid pools
 
   // Aave v3
   AAVE_POOL:            '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
@@ -55,11 +61,11 @@ const DEX_CAMELOT_V3 = 1;
 const DEX_BALANCER   = 2;
 type DexType = typeof DEX_UNISWAP_V3 | typeof DEX_CAMELOT_V3 | typeof DEX_BALANCER;
 
-// DeFiLlama project identifiers
-const LLAMA_PROJECTS = new Set(['uniswap-v3', 'camelot-v3', 'balancer-v2']);
+// DeFiLlama project identifiers (Balancer discovery uses Balancer V3 API instead — see fetchBalancerPools)
+const LLAMA_PROJECTS = new Set(['uniswap-v3', 'camelot-v3', 'pancakeswap-amm-v3']);
 
-// Minimum pool TVL to include in candidate list ($500k — filters out dead pools)
-const MIN_POOL_TVL_USD = 500_000;
+// Minimum pool TVL to include in candidate list ($100k — balances breadth vs noise)
+const MIN_POOL_TVL_USD = 100_000;
 
 // Flash loan sizes: scale with pool TVL. Cap at env.evmArbMaxFlashUsd.
 // Larger = more profit per spread, but more price impact.
@@ -69,7 +75,7 @@ const FLASH_AMOUNT_FRACTION = 0.05;  // use 5% of pool TVL as flash size
 // Types
 // ============================================================================
 
-export type DexId = 'uniswap_v3' | 'camelot_v3' | 'balancer';
+export type DexId = 'uniswap_v3' | 'camelot_v3' | 'pancake_v3' | 'balancer';
 
 export interface TokenMeta {
   address: string;
@@ -134,17 +140,6 @@ const UNI_QUOTER_ABI = [
   ) external returns (
     uint256 amountOut, uint160 sqrtPriceX96After,
     uint32 initializedTicksCrossed, uint256 gasEstimate
-  )`,
-];
-
-// Camelot v3 (Algebra) Quoter — path-based quoting via quoteExactInput
-// The deployed Algebra QuoterV2 on Arbitrum uses path-encoded input (same as Uniswap V3
-// path format: tokenIn(20) + fee(3) + tokenOut(20), fee bytes present but value ignored).
-const CAMELOT_QUOTER_ABI = [
-  `function quoteExactInput(
-    bytes path, uint256 amountIn
-  ) external returns (
-    uint256 amountOut, uint16[] fees
   )`,
 ];
 
@@ -243,21 +238,37 @@ export async function refreshCandidatePools(): Promise<CandidatePool[]> {
     // Filter: Arbitrum, supported DEXes, minimum TVL
     // Note: DeFiLlama `pool` field is a UUID, not an on-chain address.
     // Pool addresses are resolved via factory contracts in enrichPool().
+    // Balancer pools with >2 tokens are included but only pairwise arbs are checked.
     const raw = data.data.filter((p: any) =>
       p.chain === 'Arbitrum' &&
       LLAMA_PROJECTS.has(p.project) &&
       (p.tvlUsd ?? 0) >= MIN_POOL_TVL_USD &&
       Array.isArray(p.underlyingTokens) &&
-      p.underlyingTokens.length === 2
+      p.underlyingTokens.length >= 2
     );
 
-    // Sort by TVL descending, take top 60 (enough pairs to find arb, not so many we timeout)
-    raw.sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0));
-    const top = raw.slice(0, 60);
+    // Take top pools per venue separately — smaller venues would otherwise be
+    // squeezed out by Uniswap's higher TVL across all Arbitrum pools
+    const uniPools = raw
+      .filter((p: any) => p.project === 'uniswap-v3')
+      .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
+      .slice(0, 80);
+    const camelotPools = raw
+      .filter((p: any) => p.project === 'camelot-v3')
+      .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
+      .slice(0, 40);
+    const pcsPools = raw
+      .filter((p: any) => p.project === 'pancakeswap-amm-v3')
+      .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
+      .slice(0, 30);
+    const top = [...uniPools, ...camelotPools, ...pcsPools];
 
-    logger.info(`[ArbMonitor] DeFiLlama returned ${raw.length} pools, enriching top ${top.length}...`);
+    logger.info(
+      `[ArbMonitor] DeFiLlama: ${raw.length} CLMM pools → enriching ${top.length} ` +
+      `(${uniPools.length} Uni + ${camelotPools.length} Camelot + ${pcsPools.length} PCS)...`
+    );
 
-    // ── Enrich each pool with on-chain metadata ────────────────────────────
+    // ── Enrich each DeFiLlama pool with on-chain metadata ──────────────────
     const pools: CandidatePool[] = [];
 
     // Batch on-chain calls with Promise.allSettled to avoid one failure blocking all
@@ -271,7 +282,12 @@ export async function refreshCandidatePools(): Promise<CandidatePool[]> {
       }
     }
 
-    logger.info(`[ArbMonitor] Pool list ready: ${pools.length} pools across ${
+    // ── Balancer pools from Balancer V3 API (DeFiLlama UUIDs can't resolve) ──
+    const balancerPools = await fetchBalancerPools(provider, ethers);
+    pools.push(...balancerPools);
+
+    logger.info(`[ArbMonitor] Pool list ready: ${pools.length} pools (${
+      pools.filter(p => p.dex !== 'balancer').length} CLMM + ${balancerPools.length} Bal) across ${
       new Set(pools.map(p => p.dex)).size
     } venues`);
 
@@ -316,19 +332,23 @@ async function enrichPool(raw: any, provider: any, ethers: any): Promise<Candida
     const dexMap: Record<string, DexId> = {
       'uniswap-v3': 'uniswap_v3',
       'camelot-v3': 'camelot_v3',
+      'pancakeswap-amm-v3': 'pancake_v3',
       'balancer-v2': 'balancer',
     };
     const dex: DexId = dexMap[raw.project];
     const dexType: DexType = dex === 'uniswap_v3' ? DEX_UNISWAP_V3
       : dex === 'camelot_v3' ? DEX_CAMELOT_V3
+      : dex === 'pancake_v3' ? DEX_UNISWAP_V3  // PCS V3 is a Uni V3 fork — same router ABI
       : DEX_BALANCER;
 
     const router = dex === 'uniswap_v3' ? ARB_ADDRESSES.UNISWAP_V3_ROUTER
       : dex === 'camelot_v3' ? ARB_ADDRESSES.CAMELOT_V3_ROUTER
+      : dex === 'pancake_v3' ? ARB_ADDRESSES.PANCAKE_V3_ROUTER
       : ARB_ADDRESSES.BALANCER_VAULT;
 
     const quoter = dex === 'uniswap_v3' ? ARB_ADDRESSES.UNISWAP_V3_QUOTER
       : dex === 'camelot_v3' ? ARB_ADDRESSES.CAMELOT_V3_QUOTER
+      : dex === 'pancake_v3' ? ARB_ADDRESSES.PANCAKE_V3_QUOTER
       : ARB_ADDRESSES.BALANCER_VAULT; // Balancer queryBatchSwap is on the vault
 
     // ── Fetch token metadata on-chain ──────────────────────────────────────
@@ -345,13 +365,16 @@ async function enrichPool(raw: any, provider: any, ethers: any): Promise<Candida
     let poolId = ethers.ZeroHash as string;
     let poolAddr = '';
 
-    if (dex === 'uniswap_v3') {
+    if (dex === 'uniswap_v3' || dex === 'pancake_v3') {
       // Parse fee from poolMeta string (e.g. "0.05%" → 500)
       feeTier = parsePoolMetaFee(raw.poolMeta);
       if (feeTier === 0) return null; // can't trade without fee tier
 
-      // Resolve on-chain pool address from Uniswap v3 Factory
-      const factory = new ethers.Contract(ARB_ADDRESSES.UNISWAP_V3_FACTORY, [
+      // Resolve on-chain pool address from Factory (both Uni V3 and PCS V3 use getPool)
+      const factoryAddr = dex === 'uniswap_v3'
+        ? ARB_ADDRESSES.UNISWAP_V3_FACTORY
+        : ARB_ADDRESSES.PANCAKE_V3_FACTORY;
+      const factory = new ethers.Contract(factoryAddr, [
         'function getPool(address,address,uint24) view returns (address)',
       ], provider);
       poolAddr = (await factory.getPool(t0addr, t1addr, feeTier)).toLowerCase();
@@ -366,9 +389,8 @@ async function enrichPool(raw: any, provider: any, ethers: any): Promise<Candida
       if (!poolAddr || poolAddr === ethers.ZeroAddress) return null;
 
     } else if (dex === 'balancer') {
-      // Balancer: need pool address to fetch poolId. Resolve via Balancer subgraph or skip.
-      // For now, skip Balancer pools — only ~1 qualifies on Arbitrum and discovery
-      // requires subgraph query. TODO: integrate Balancer subgraph for pool discovery.
+      // Balancer pools are fetched directly from Balancer V3 API (see fetchBalancerPools).
+      // This branch is unreachable since 'balancer-v2' was removed from LLAMA_PROJECTS.
       return null;
     }
 
@@ -418,6 +440,112 @@ async function fetchTokenMeta(address: string, provider: any, ethers: any): Prom
 }
 
 // ============================================================================
+// Balancer Pool Discovery — Balancer V3 API (api-v3.balancer.fi)
+// ============================================================================
+
+/**
+ * Fetch Balancer V2 pools from the Balancer V3 API.
+ * DeFiLlama `pool` field is a UUID (not an on-chain address), so we use Balancer's
+ * own API which provides pool addresses, poolIds, tokens, and TVL directly.
+ *
+ * Multi-token pools generate pairwise CandidatePool entries for each token pair
+ * (e.g. a WBTC-WETH-USDC pool → 3 entries: WBTC/WETH, WBTC/USDC, WETH/USDC).
+ */
+async function fetchBalancerPools(provider: any, ethers: any): Promise<CandidatePool[]> {
+  try {
+    const query = `{
+      poolGetPools(
+        where: { chainIn: [ARBITRUM], minTvl: ${MIN_POOL_TVL_USD} }
+        orderBy: totalLiquidity
+        orderDirection: desc
+        first: 20
+      ) {
+        id
+        address
+        name
+        type
+        dynamicData { totalLiquidity }
+        poolTokens { address symbol decimals }
+      }
+    }`;
+
+    const resp = await fetch('https://api-v3.balancer.fi/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query }),
+    });
+    if (!resp.ok) throw new Error(`Balancer API: ${resp.status}`);
+
+    const data = await resp.json() as any;
+    const apiPools = data.data?.poolGetPools;
+    if (!apiPools?.length) return [];
+
+    const env = getCFOEnv();
+    const maxFlash = env.evmArbMaxFlashUsd ?? 50_000;
+    const pools: CandidatePool[] = [];
+
+    for (const p of apiPools) {
+      // Only WEIGHTED, STABLE, COMPOSABLE_STABLE are standard pool types
+      if (!['WEIGHTED', 'STABLE', 'COMPOSABLE_STABLE'].includes(p.type)) continue;
+
+      const tvlUsd = parseFloat(p.dynamicData?.totalLiquidity ?? '0');
+      if (tvlUsd < MIN_POOL_TVL_USD) continue;
+
+      const poolAddr = p.address.toLowerCase();
+      const poolId = p.id as string; // bytes32 poolId
+
+      // Filter out BPT (pool's own token which appears in COMPOSABLE_STABLE pools)
+      const tokens = (p.poolTokens ?? []).filter(
+        (t: any) => t.address.toLowerCase() !== poolAddr
+      );
+      if (tokens.length < 2) continue;
+
+      // Fetch on-chain metadata for all tokens in this pool (cached)
+      const tokenMetas = await Promise.all(
+        tokens.map((t: any) => fetchTokenMeta(t.address.toLowerCase(), provider, ethers))
+      );
+
+      // Generate pairwise CandidatePool entries for each valid token combination
+      for (let i = 0; i < tokenMetas.length; i++) {
+        for (let j = i + 1; j < tokenMetas.length; j++) {
+          const t0 = tokenMetas[i];
+          const t1 = tokenMetas[j];
+          if (!t0 || !t1) continue;
+
+          const flashAmountUsd = Math.min(tvlUsd * FLASH_AMOUNT_FRACTION, maxFlash);
+          if (flashAmountUsd < 1000) continue;
+
+          const [lo, hi] = t0.address < t1.address
+            ? [t0.address, t1.address]
+            : [t1.address, t0.address];
+
+          pools.push({
+            poolAddress: poolAddr,
+            poolId,
+            dex: 'balancer',
+            dexType: DEX_BALANCER,
+            router: ARB_ADDRESSES.BALANCER_VAULT,
+            quoter: ARB_ADDRESSES.BALANCER_VAULT,
+            token0: t0,
+            token1: t1,
+            feeTier: 0,
+            tvlUsd,
+            flashAmountUsd,
+            pairKey: `${lo}_${hi}`,
+          });
+        }
+      }
+    }
+
+    logger.info(`[ArbMonitor] Balancer API: ${apiPools.length} pools → ${pools.length} pairwise entries`);
+    return pools;
+  } catch (err) {
+    logger.warn('[ArbMonitor] Balancer API fetch failed, skipping Balancer pools:', err);
+    return [];
+  }
+}
+
+// ============================================================================
 // On-chain Quoting (staticCall — free, no gas)
 // ============================================================================
 
@@ -435,30 +563,69 @@ async function quoteUniswapV3(
       tokenIn, tokenOut, amountIn, fee: feeTier, sqrtPriceLimitX96: 0,
     });
     return result.amountOut as bigint;
-  } catch {
+  } catch (err) {
+    logger.debug(`[ArbMonitor] Uniswap quote failed ${tokenIn.slice(0,6)}→${tokenOut.slice(0,6)}: ${(err as Error).message?.slice(0, 80)}`);
     return null;
   }
 }
 
+// Algebra pool ABI for local pool-level quoting (Camelot V3)
+const ALGEBRA_POOL_ABI = [
+  'function globalState() view returns (uint160 price, int24 tick, uint16 fee, uint16 timepointIndex, uint16 communityFeeToken0, uint16 communityFeeToken1, bool unlocked)',
+  'function liquidity() view returns (uint128)',
+  'function token0() view returns (address)',
+];
+
 /**
- * Quote Camelot v3 (Algebra): quoteExactInputSingle WITHOUT fee param.
- * Fee is part of pool state; quoter returns it in the response (we ignore it for quoting).
+ * Quote Camelot v3 (Algebra): local concentrated-liquidity math.
+ *
+ * Reads pool's globalState() + liquidity() on-chain and computes output locally.
+ * This avoids needing a deployed Algebra QuoterV2 contract (which is unresolved
+ * on Arbitrum — the address 0x0524... belongs to SushiSwap, not Camelot).
+ *
+ * Math is identical to Uniswap V3 single-tick formula:
+ *   zeroToOne: sqrtPNew = sqrtP * L / (L * Q96 + amountInAfterFee * sqrtP)
+ *              amountOut = L * (sqrtP - sqrtPNew) / Q96
+ *   oneToZero: sqrtPNew = sqrtP + amountInAfterFee * Q96 / L
+ *              amountOut = L * (sqrtPNew - sqrtP) * Q96 / (sqrtPNew * sqrtP)
+ *
+ * Accurate for amounts that don't cross initialized ticks (our flash = 5% of TVL).
  */
 async function quoteCamelotV3(
-  quoterAddr: string, tokenIn: string, tokenOut: string,
+  poolAddress: string, tokenIn: string, tokenOut: string,
   amountIn: bigint, ethers: any, provider: any,
-  feeTier?: number,
 ): Promise<bigint | null> {
   try {
-    const quoter = new ethers.Contract(quoterAddr, CAMELOT_QUOTER_ABI, provider);
-    // Path-based quoting: tokenIn(20 bytes) + fee(3 bytes) + tokenOut(20 bytes)
-    // Fee bytes required by path encoding but Algebra uses dynamic fee.
-    // Use 0x0001f4 (500 = 0.05%) as default — matches most-liquid tier on Arbitrum.
-    const feeHex = (feeTier || 500).toString(16).padStart(6, '0');
-    const path = ethers.concat([tokenIn, '0x' + feeHex, tokenOut]);
-    const result = await quoter.quoteExactInput.staticCall(path, amountIn);
-    return result.amountOut as bigint;
-  } catch {
+    const pool = new ethers.Contract(poolAddress, ALGEBRA_POOL_ABI, provider);
+    const [gs, liq, t0] = await Promise.all([
+      pool.globalState(), pool.liquidity(), pool.token0(),
+    ]);
+
+    const sqrtP: bigint = gs.price;
+    const L: bigint = liq;
+    const fee: bigint = BigInt(gs.fee); // Algebra fee in 1e-6 units (e.g. 100 = 0.01%)
+    if (L === 0n || sqrtP === 0n) return null;
+
+    const Q96 = 1n << 96n;
+    const amountInAfterFee = amountIn * (1_000_000n - fee) / 1_000_000n;
+    const zeroToOne = tokenIn.toLowerCase() === t0.toLowerCase();
+
+    let amountOut: bigint;
+    if (zeroToOne) {
+      // Selling token0, buying token1
+      const num = sqrtP * L;
+      const den = L * Q96 + amountInAfterFee * sqrtP;
+      const sqrtPNew = num * Q96 / den;
+      amountOut = L * (sqrtP - sqrtPNew) / Q96;
+    } else {
+      // Selling token1, buying token0
+      const sqrtPNew = sqrtP + amountInAfterFee * Q96 / L;
+      amountOut = L * Q96 * (sqrtPNew - sqrtP) / (sqrtPNew * sqrtP);
+    }
+
+    return amountOut > 0n ? amountOut : null;
+  } catch (err) {
+    logger.debug(`[ArbMonitor] Camelot quote failed ${tokenIn.slice(0,6)}→${tokenOut.slice(0,6)}: ${(err as Error).message?.slice(0, 80)}`);
     return null;
   }
 }
@@ -496,10 +663,12 @@ async function getPoolQuote(
   pool: CandidatePool, tokenIn: string, tokenOut: string,
   amountIn: bigint, ethers: any, provider: any,
 ): Promise<bigint | null> {
-  if (pool.dex === 'uniswap_v3') {
+  if (pool.dex === 'uniswap_v3' || pool.dex === 'pancake_v3') {
+    // Both use Uniswap V3 QuoterV2 ABI (PCS V3 is a Uni V3 fork)
     return quoteUniswapV3(pool.quoter, tokenIn, tokenOut, amountIn, pool.feeTier, ethers, provider);
   } else if (pool.dex === 'camelot_v3') {
-    return quoteCamelotV3(pool.quoter, tokenIn, tokenOut, amountIn, ethers, provider);
+    // Local pool-level math — reads globalState + liquidity from pool contract directly
+    return quoteCamelotV3(pool.poolAddress, tokenIn, tokenOut, amountIn, ethers, provider);
   } else {
     return quoteBalancer(pool.poolId, tokenIn, tokenOut, amountIn, ethers, provider);
   }
@@ -537,6 +706,21 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
     const arr = byPair.get(pool.pairKey) ?? [];
     arr.push(pool);
     byPair.set(pool.pairKey, arr);
+  }
+
+  const crossVenuePairs = [...byPair.entries()].filter(([, p]) => p.length >= 2);
+  logger.info(
+    `[ArbMonitor] ${byPair.size} unique pairs, ${crossVenuePairs.length} cross-venue ` +
+    `(2+ venues). Top candidates: ${
+      crossVenuePairs.slice(0, 5).map(([, p]) =>
+        `${p[0].token0.symbol}/${p[0].token1.symbol}(${p.map(pp => pp.dex).join('+')})`
+      ).join(', ') || 'none'
+    }`
+  );
+
+  if (crossVenuePairs.length === 0) {
+    logger.warn('[ArbMonitor] No cross-venue pairs — pool fetch or Camelot quoter issue');
+    return null;
   }
 
   let best: ArbOpportunity | null = null;
@@ -687,6 +871,7 @@ export async function executeFlashArb(opp: ArbOpportunity, ethPriceUsd = 3000): 
 
   const dexTypeFor = (pool: CandidatePool): number =>
     pool.dex === 'uniswap_v3' ? DEX_UNISWAP_V3
+    : pool.dex === 'pancake_v3' ? DEX_UNISWAP_V3  // PCS V3 fork — same swap ABI as Uni V3
     : pool.dex === 'camelot_v3' ? DEX_CAMELOT_V3
     : DEX_BALANCER;
 
