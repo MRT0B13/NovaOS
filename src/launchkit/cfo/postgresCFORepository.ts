@@ -309,12 +309,13 @@ export class PostgresCFORepository {
       [id],
     );
     const costBasis = Number(unrealizedPnl.rows[0]?.cost_basis_usd ?? 0);
+    const pnl = currentValueUsd - costBasis;
     await this.pool.query(
       `UPDATE cfo_positions
        SET current_price = $2, current_value_usd = $3,
-           unrealized_pnl_usd = $3::numeric - $4::numeric, updated_at = NOW()
+           unrealized_pnl_usd = $4, updated_at = NOW()
        WHERE id = $1`,
-      [id, currentPrice, currentValueUsd, costBasis],
+      [id, currentPrice, currentValueUsd, pnl],
     );
   }
 
