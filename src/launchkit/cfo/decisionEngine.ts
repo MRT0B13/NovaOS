@@ -139,7 +139,7 @@ export interface PortfolioState {
   // Solana
   solBalance: number;             // SOL in funding wallet
   solPriceUsd: number;
-  solExposureUsd: number;         // solBalance * solPriceUsd
+  solExposureUsd: number;         // ALL SOL-correlated exposure: raw SOL + JitoSOL + other LSTs
   solanaUsdcBalance: number;       // USDC available in Solana funding wallet
   jitoSolBalance: number;
   jitoSolValueUsd: number;
@@ -595,13 +595,18 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
   }
   const polyHeadroomUsd = Math.min(polyUsdcBalance, env.maxPolymarketUsd - polyDeployedUsd);
 
-  const solExposureUsd = solBalance * solPriceUsd;
+  // SOL-correlated exposure = raw SOL + all LSTs (JitoSOL, mSOL, bSOL, etc.)
+  const rawSolUsd = solBalance * solPriceUsd;
+  const lstTotalUsd = Object.values(lstBalances).reduce((s, v) => s + v.valueUsd, 0);
+  const solExposureUsd = rawSolUsd + lstTotalUsd;
+
   const hlTotalShortUsd = hlPositions
     .filter((p) => p.coin === 'SOL' && p.side === 'SHORT')
     .reduce((s, p) => s + p.sizeUsd, 0);
 
   // Preliminary total — Kamino & Orca not yet known; patched below after gathering
-  let totalPortfolioUsd = solExposureUsd + jitoSolValueUsd + hlEquity + polyDeployedUsd + polyUsdcBalance;
+  // Note: lstTotalUsd already includes jitoSolValueUsd via lstBalances
+  let totalPortfolioUsd = solExposureUsd + hlEquity + polyDeployedUsd + polyUsdcBalance;
   const hedgeRatio = solExposureUsd > 0 ? hlTotalShortUsd / solExposureUsd : 0;
 
   // Idle SOL available for staking (above reserve)
@@ -1058,7 +1063,7 @@ export async function generateDecisions(
           const d: Decision = {
             type: 'OPEN_HEDGE',
             reasoning:
-              `SOL treasury: $${state.solExposureUsd.toFixed(0)} (${state.solBalance.toFixed(2)} SOL @ $${state.solPriceUsd.toFixed(0)}). ` +
+              `SOL exposure: $${state.solExposureUsd.toFixed(0)} (${state.solBalance.toFixed(2)} SOL + ${state.jitoSolBalance.toFixed(2)} JitoSOL + LSTs @ $${state.solPriceUsd.toFixed(0)}). ` +
               `Current hedge: $${currentHedgeUsd.toFixed(0)} (${(state.hedgeRatio * 100).toFixed(0)}%). ` +
               `Target: ${(adjustedHedgeTarget * 100).toFixed(0)}%${adjustedHedgeTarget !== config.hedgeTargetRatio ? ` (adjusted from ${(config.hedgeTargetRatio * 100).toFixed(0)}% — market: ${intel.marketCondition})` : ''}. ` +
               `Opening SHORT $${capped.toFixed(0)} SOL-PERP to protect downside.`,
@@ -2440,7 +2445,7 @@ export function formatDecisionReport(
   // Risk line — tells user if portfolio protection is adequate
   const hedgePct = (state.hedgeRatio * 100).toFixed(0);
   if (state.hedgeRatio < 0.1 && state.solExposureUsd > 20) {
-    L.push(`⚠️ *Unhedged* — ${hedgePct}% of SOL protected (SOL @ $${state.solPriceUsd.toFixed(0)})`);
+    L.push(`⚠️ *Unhedged* — ${hedgePct}% of $${state.solExposureUsd.toFixed(0)} SOL exposure protected (SOL @ $${state.solPriceUsd.toFixed(0)})`);
   } else if (state.hedgeRatio >= 0.4) {
     L.push(`🛡 ${hedgePct}% hedged · SOL @ $${state.solPriceUsd.toFixed(0)}`);
   } else {
@@ -2485,7 +2490,7 @@ function _humanAction(d: Decision, state: PortfolioState): string {
   const p = d.params ?? {};
   switch (d.type) {
     case 'OPEN_HEDGE':
-      return `*Hedge SOL* — short $${Math.abs(d.estimatedImpactUsd).toFixed(0)} SOL-PERP to protect the ${state.solBalance.toFixed(1)} SOL ($${state.solExposureUsd.toFixed(0)}) in the treasury`;
+      return `*Hedge SOL* — short $${Math.abs(d.estimatedImpactUsd).toFixed(0)} SOL-PERP to protect $${state.solExposureUsd.toFixed(0)} SOL exposure (${state.solBalance.toFixed(1)} SOL + ${state.jitoSolBalance.toFixed(1)} JitoSOL)`;
     case 'CLOSE_HEDGE':
       return `*Reduce hedge* — SOL exposure dropped, closing excess short`;
     case 'REBALANCE_HEDGE':

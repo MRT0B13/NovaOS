@@ -411,7 +411,7 @@ async function fetchKaminoApys(): Promise<KaminoMarketApy> {
 
   try {
     const resp = await fetch(
-      `https://api.kamino.finance/kamino-market/${KAMINO_MAIN_MARKET_ADDR}/reserves`,
+      `https://api.kamino.finance/kamino-market/${KAMINO_MAIN_MARKET_ADDR}/reserves/metrics`,
       { signal: AbortSignal.timeout(5000) },
     );
     if (!resp.ok) throw new Error(`Kamino API ${resp.status}`);
@@ -420,12 +420,12 @@ async function fetchKaminoApys(): Promise<KaminoMarketApy> {
     const result: KaminoMarketApy = { ...fallback };
 
     for (const reserve of data) {
-      const rawSymbol: string = (reserve.symbol ?? '');
+      const rawSymbol: string = (reserve.liquidityToken ?? '');
       const asset = SYMBOL_NORMALISE[rawSymbol.toUpperCase()] ?? rawSymbol;
       if (asset) {
         result[asset] = {
-          supplyApy: Number(reserve.supplyInterestAPY ?? reserve.supplyApy ?? fallback[asset]?.supplyApy ?? 0.06),
-          borrowApy: Number(reserve.borrowInterestAPY ?? reserve.borrowApy ?? fallback[asset]?.borrowApy ?? 0.10),
+          supplyApy: Number(reserve.supplyApy ?? fallback[asset]?.supplyApy ?? 0.06),
+          borrowApy: Number(reserve.borrowApy ?? fallback[asset]?.borrowApy ?? 0.10),
         };
       }
     }
