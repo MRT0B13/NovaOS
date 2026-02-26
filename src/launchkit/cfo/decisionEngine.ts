@@ -1289,6 +1289,8 @@ export async function generateDecisions(
   }
 
   // ── G) JitoSOL/SOL Multiply loop ─────────────────────────────────────────
+  // NOTE: If the dynamic multi-LST loop (G2) is enabled, skip this section —
+  // G2 already evaluates JitoSOL alongside all other LSTs and picks the best spread.
   // Available JitoSOL: already staked OR can stake from wallet this cycle
   const jitoSolAvailable = state.jitoSolBalance >= 0.1
     ? state.jitoSolBalance
@@ -1298,6 +1300,7 @@ export async function generateDecisions(
 
   if (
     env.kaminoEnabled && env.kaminoBorrowEnabled && env.kaminoJitoLoopEnabled &&
+    !env.kaminoLstLoopEnabled &&          // skip if dynamic LST loop covers JitoSOL
     !state.kaminoJitoLoopActive &&
     jitoSolAvailable >= 0.1 &&              // JitoSOL staked OR enough wallet SOL to stake
     state.kaminoHealthFactor > 2.0 &&
@@ -1386,7 +1389,7 @@ export async function generateDecisions(
   }
 
   // Section G skip diagnostics
-  if (env.kaminoEnabled && env.kaminoJitoLoopEnabled && !state.kaminoJitoLoopActive) {
+  if (env.kaminoEnabled && env.kaminoJitoLoopEnabled && !env.kaminoLstLoopEnabled && !state.kaminoJitoLoopActive) {
     const kaminoDiag = await import('./kaminoService.ts');
     const jitoReserveDiag = await kaminoDiag.getReserve('JitoSOL');
     const jitoStakingYieldDiag = jitoReserveDiag?.baseStakingYield ?? 0.08;
@@ -2513,7 +2516,10 @@ function _humanAction(d: Decision, state: PortfolioState): string {
       return `*Repay loan* — $${p.repayUsd?.toFixed(0) ?? '?'} USDC back to Kamino`;
     case 'KAMINO_JITO_LOOP':
       if (p.blocked) {
-        return `⏸ *Jito Loop waiting* — spread is ${p.currentSpreadPct?.toFixed(1) ?? '?'}% (need >1%). SOL borrow ${(state.kaminoSolBorrowApy * 100).toFixed(1)}% > JitoSOL yield 8%. Break-even at ${((p.breakEvenBorrowRate ?? 0) * 100).toFixed(1)}%`;
+        const jitoYieldPct = p.estimatedApy != null
+          ? ((state.kaminoJitoSupplyApy || 0.08) * 100).toFixed(1)
+          : '8.0';
+        return `⏸ *Jito Loop waiting* — spread is ${p.currentSpreadPct?.toFixed(1) ?? '?'}% (need >1%). SOL borrow ${(state.kaminoSolBorrowApy * 100).toFixed(1)}% > JitoSOL yield ${jitoYieldPct}%. Break-even at ${((p.breakEvenBorrowRate ?? 0) * 100).toFixed(1)}%`;
       }
       return `*Leverage JitoSOL* — deposit ${p.jitoSolToDeposit?.toFixed(2) ?? '?'} JitoSOL, loop to ${((p.targetLtv ?? 0.65) * 100).toFixed(0)}% LTV for ~${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY`;
     case 'KAMINO_JITO_UNWIND':
