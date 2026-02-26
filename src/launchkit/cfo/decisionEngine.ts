@@ -2083,11 +2083,18 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
     return { ...base, executed: false, success: true, pendingApproval: true };
   }
 
-  // Dry run — log but don't execute
+  // Dry run — log but don't execute.
+  // Still mark cooldown so we don't re-recommend the same action every cycle.
   if (env.dryRun) {
     logger.info(
       `[CFO:Decision] DRY RUN — ${decision.type} [${decision.tier}]: ${decision.reasoning}`,
     );
+    // Derive the same cooldown key that the execution branch would use
+    const cooldownKey =
+      (decision.type === 'OPEN_HEDGE' || decision.type === 'CLOSE_HEDGE')
+        ? `${decision.type}_${decision.params.coin ?? 'SOL'}`
+        : decision.type;
+    markDecision(cooldownKey);
     return { ...base, executed: false, success: true };
   }
 
