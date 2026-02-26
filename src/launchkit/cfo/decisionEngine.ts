@@ -786,6 +786,12 @@ function adaptiveLpRangeWidthPct(
   intel: SwarmIntel,
   baseWidthPct: number,
 ): number {
+  // Gate: if analyst prices are stale (>6h), don't tighten range — use default width
+  const STALE_MS = 6 * 3600_000;
+  if (!intel.analystPricesAt || Date.now() - intel.analystPricesAt > STALE_MS) {
+    return baseWidthPct; // stale or missing — safe default
+  }
+
   const analystPrice = intel.analystPrices?.[tokenSymbol];
   if (!analystPrice) return baseWidthPct;
 
@@ -838,6 +844,13 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
   };
 
   try {
+    // Gate: if analyst prices are stale (>6h), fall back to SOL/USDC — don't trust old intel
+    const STALE_MS = 6 * 3600_000;
+    if (intel.analystPricesAt && Date.now() - intel.analystPricesAt > STALE_MS) {
+      logger.warn('[CFO:Decision] Analyst prices stale (>6h) — falling back to SOL/USDC');
+      return fallback;
+    }
+
     // Run discovery (cached — only fetches every 2h)
     const pools = await discoverOrcaPools();
 
@@ -1827,7 +1840,7 @@ export async function generateDecisions(
             `flash $${opp.flashAmountUsd.toLocaleString()} | ` +
             `gross $${opp.expectedGrossUsd.toFixed(3)} − Aave $${opp.aaveFeeUsd.toFixed(3)} ` +
             `− gas $${opp.gasEstimateUsd.toFixed(3)} = net $${opp.netProfitUsd.toFixed(3)}`,
-          params: { opportunity: opp },
+          params: { opportunity: opp, ethPriceUsd: ethPrice },
           urgency: 'medium',
           estimatedImpactUsd: opp.netProfitUsd,
           tier: 'AUTO',
@@ -2369,8 +2382,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
       case 'EVM_FLASH_ARB': {
         const arb = await import('./evmArbService.ts');
-        const { opportunity } = decision.params;
-        const result = await arb.executeFlashArb(opportunity);
+        const { opportunity, ethPriceUsd } = decision.params;
+        const result = await arb.executeFlashArb(opportunity, ethPriceUsd ?? 3000);
         markDecision('EVM_FLASH_ARB');
         if (result.success && result.profitUsd) arb.recordProfit(result.profitUsd);
         return { ...base, executed: true, success: result.success, txId: result.txHash, error: result.error };
@@ -2701,6 +2714,14 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
     `orcaPositions:${state.orcaPositions.length} orcaValue:$${state.orcaLpValueUsd.toFixed(0)} | ` +
     `polyUSDC:$${state.polyUsdcBalance.toFixed(0)} polyHeadroom:$${state.polyHeadroomUsd.toFixed(0)}`
   );
+
+  // 1.5. Hydrate EVM arb profit from DB (survives process restarts)
+  if (env.evmArbEnabled && pool) {
+    try {
+      const arbMod = await import('./evmArbService.ts');
+      await arbMod.hydrateProfit24hFromDb(pool);
+    } catch { /* non-fatal */ }
+  }
 
   // 1.5. Consult swarm — gather intel from scout, guardian, analyst
   let intel: SwarmIntel = { riskMultiplier: 1.0, marketCondition: 'neutral' };

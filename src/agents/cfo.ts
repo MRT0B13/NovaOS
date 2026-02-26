@@ -887,7 +887,33 @@ export class CFOAgent extends BaseAgent {
 
           const action = async () => {
             const { executeDecision } = await import('../launchkit/cfo/decisionEngine.ts');
-            const overridden = { ...d, tier: 'AUTO' as const };
+            let overridden = { ...d, tier: 'AUTO' as const };
+
+            // ── Fix: refresh SOL price for LP approvals (may be minutes old) ──────
+            if (d.type === 'ORCA_LP_OPEN' && d.params) {
+              try {
+                const pythMod = await import('../launchkit/cfo/pythOracleService.ts');
+                const freshSolPrice = await pythMod.getSolPrice();
+                const p = { ...d.params };
+                const oldSolPrice = p.solToSwapForUsdc && p.usdcAmount
+                  ? (p.usdcAmount as number) / (p.solToSwapForUsdc as number || 1)
+                  : freshSolPrice;
+                const ratio = freshSolPrice / oldSolPrice;
+
+                // Recalculate SOL amounts at fresh price (USD targets stay the same)
+                if (p.solAmount) p.solAmount = (p.solAmount as number) / ratio;
+                if (p.tokenAAmount && p.tokenA === 'SOL') p.tokenAAmount = (p.tokenAAmount as number) / ratio;
+                if (p.solToSwapForUsdc) p.solToSwapForUsdc = (p.solToSwapForUsdc as number) / ratio;
+                if (p.solToSwapForTokenA) p.solToSwapForTokenA = (p.solToSwapForTokenA as number) / ratio;
+                if (p.totalSolToSwap) p.totalSolToSwap = (p.solToSwapForUsdc as number) + (p.solToSwapForTokenA as number);
+
+                overridden = { ...overridden, params: p };
+                logger.info(`[CFO] LP approval: refreshed SOL price $${oldSolPrice.toFixed(0)}→$${freshSolPrice.toFixed(0)} (ratio ${ratio.toFixed(3)})`);
+              } catch (err) {
+                logger.warn('[CFO] LP approval: Pyth price refresh failed (using original amounts):', err);
+              }
+            }
+
             const env = getCFOEnv();
             const execResult = await executeDecision(overridden, env);
             if (execResult.success && execResult.executed) {

@@ -541,6 +541,13 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
 
   let best: ArbOpportunity | null = null;
 
+  // ── Fetch live gas price for accurate cost estimation ─────────────────────
+  let gasPriceGwei = 0.1; // fallback: 0.1 gwei on Arbitrum
+  try {
+    const feeData = await provider.getFeeData();
+    if (feeData.gasPrice) gasPriceGwei = Number(feeData.gasPrice) / 1e9;
+  } catch { /* use fallback */ }
+
   for (const [pairKey, pairPools] of byPair) {
     if (pairPools.length < 2) continue; // need at least 2 venues to arb
 
@@ -607,8 +614,8 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
       const grossRaw = sellBest.amountOut - flashAmountRaw;
       const grossUsd = Number(grossRaw) / (10 ** flashAsset.decimals);
       const aaveFeeUsd = flashAmountUsd * (AAVE_FLASH_FEE_BPS / 10_000);
-      // Gas: ~800k units at 0.1 gwei on Arbitrum ≈ 0.00008 ETH
-      const gasEstimateUsd = 0.00008 * ethPriceUsd;
+      // Gas: ~800k units × live gas price (gwei) → ETH → USD
+      const gasEstimateUsd = (800_000 * gasPriceGwei * 1e-9) * ethPriceUsd;
       const netProfitUsd = grossUsd - aaveFeeUsd - gasEstimateUsd;
 
       if (netProfitUsd < minProfit) continue;
@@ -651,7 +658,7 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
 // Flash Loan Executor
 // ============================================================================
 
-export async function executeFlashArb(opp: ArbOpportunity): Promise<ArbResult> {
+export async function executeFlashArb(opp: ArbOpportunity, ethPriceUsd = 3000): Promise<ArbResult> {
   const env = getCFOEnv();
 
   if (env.dryRun) {
@@ -660,6 +667,13 @@ export async function executeFlashArb(opp: ArbOpportunity): Promise<ArbResult> {
       `${opp.buyPool.dex}→${opp.sellPool.dex} | net:$${opp.netProfitUsd.toFixed(3)}`
     );
     return { success: true, profitUsd: opp.netProfitUsd, txHash: `dry-arb-${Date.now()}` };
+  }
+
+  // ── Staleness guard: quotes drift fast, reject opportunities older than 30s ──
+  const ageMs = Date.now() - opp.detectedAt;
+  if (ageMs > 30_000) {
+    logger.warn(`[ArbMonitor] Stale opportunity — detected ${(ageMs / 1000).toFixed(0)}s ago, skipping`);
+    return { success: false, error: `Opportunity stale (${(ageMs / 1000).toFixed(0)}s old)` };
   }
 
   if (!env.evmArbReceiverAddress) {
@@ -710,8 +724,8 @@ export async function executeFlashArb(opp: ArbOpportunity): Promise<ArbResult> {
 
     // Estimate actual gas cost
     const gasUsedEth = Number(receipt.gasUsed) * Number(receipt.gasPrice ?? 0) / 1e18;
-    const actualGasCostUsd = gasUsedEth * (opp.gasEstimateUsd / 0.00008); // scale from estimate
-    const estimatedActualProfit = opp.netProfitUsd - (actualGasCostUsd - opp.gasEstimateUsd);
+    const actualGasCostUsd = gasUsedEth * ethPriceUsd;
+    const estimatedActualProfit = opp.expectedGrossUsd - opp.aaveFeeUsd - actualGasCostUsd;
 
     logger.info(
       `[ArbMonitor] ✅ Confirmed | ${opp.displayPair} | tx:${tx.hash} | ` +
@@ -744,6 +758,7 @@ export function getPoolsRefreshedAt(): number    { return _poolsRefreshedAt; }
 
 // ── 24h profit tracker (in-memory, resets on restart) ──────────────────────
 const _profitLog: Array<{ timestamp: number; profitUsd: number }> = [];
+let _profitHydrated = false;
 
 export function recordProfit(profitUsd: number): void {
   _profitLog.push({ timestamp: Date.now(), profitUsd });
@@ -754,4 +769,39 @@ export function recordProfit(profitUsd: number): void {
 export function getProfit24h(): number {
   const cutoff = Date.now() - 24 * 3600_000;
   return _profitLog.filter(p => p.timestamp >= cutoff).reduce((s, p) => s + p.profitUsd, 0);
+}
+
+/**
+ * One-shot hydration: load confirmed arb profits from the DB so in-memory
+ * tracker survives process restarts. Call once at startup or first cycle.
+ */
+export async function hydrateProfit24hFromDb(pool: any): Promise<void> {
+  if (_profitHydrated || !pool) return;
+  try {
+    const cutoff = new Date(Date.now() - 24 * 3600_000).toISOString();
+    const res = await pool.query(
+      `SELECT timestamp, metadata->>'netProfitUsd' AS profit
+       FROM cfo_transactions
+       WHERE strategy_tag = 'evm_flash_arb' AND status = 'confirmed'
+         AND timestamp >= $1
+       ORDER BY timestamp ASC`,
+      [cutoff],
+    );
+    let count = 0;
+    for (const row of res.rows) {
+      const profitUsd = parseFloat(row.profit);
+      if (!isNaN(profitUsd) && profitUsd > 0) {
+        const ts = new Date(row.timestamp).getTime();
+        // Avoid duplicates: only add if not already in the log
+        if (!_profitLog.some(p => Math.abs(p.timestamp - ts) < 5000)) {
+          _profitLog.push({ timestamp: ts, profitUsd });
+          count++;
+        }
+      }
+    }
+    _profitHydrated = true;
+    if (count > 0) logger.info(`[ArbMonitor] Hydrated ${count} arb profits from DB (24h total: $${getProfit24h().toFixed(2)})`);
+  } catch (err) {
+    logger.debug('[ArbMonitor] DB profit hydration failed (non-fatal):', err);
+  }
 }
