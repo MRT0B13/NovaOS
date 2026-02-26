@@ -2437,7 +2437,8 @@ export function formatDecisionReport(
   L.push('');
   L.push(`💰 *$${state.totalPortfolioUsd.toFixed(0)}* total`);
   const holdings: string[] = [];
-  holdings.push(`${state.solBalance.toFixed(2)} SOL ($${state.solExposureUsd.toFixed(0)})`);
+  const rawSolUsd = state.solBalance * state.solPriceUsd;
+  holdings.push(`${state.solBalance.toFixed(2)} SOL ($${rawSolUsd.toFixed(0)})`);
   if (state.jitoSolBalance > 0.01) holdings.push(`${state.jitoSolBalance.toFixed(2)} JitoSOL ($${state.jitoSolValueUsd.toFixed(0)})`);
   if (state.hlEquity > 1) holdings.push(`$${state.hlEquity.toFixed(0)} on Hyperliquid`);
   if (state.polyDeployedUsd > 1) holdings.push(`$${state.polyDeployedUsd.toFixed(0)} on Polymarket`);
