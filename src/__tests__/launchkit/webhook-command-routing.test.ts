@@ -14,7 +14,7 @@ const KNOWN_BOT_COMMANDS = new Set([
   '/scan', '/children',
   '/request_agent', '/approve_agent',
   '/reject_agent', '/my_agents', '/stop_agent',
-  '/cfo',
+  '/cfo', '/help',
 ]);
 
 /** Mirrors the token extraction in the webhook handler */
@@ -52,6 +52,7 @@ describe('Webhook command routing – KNOWN_BOT_COMMANDS gate', () => {
       '/reject_agent 123',
       '/my_agents',
       '/stop_agent 123',
+      '/help',
     ];
 
     for (const msg of intercepted) {
@@ -69,7 +70,6 @@ describe('Webhook command routing – KNOWN_BOT_COMMANDS gate', () => {
       'how do I use /health',    // not at start
       '/unknown_command',        // not in our set
       '/start',                  // Telegram default, not ours
-      '/help',                   // not registered
       'gm everyone',
       '🚀 moon soon',
     ];
@@ -104,8 +104,8 @@ describe('Webhook command routing – KNOWN_BOT_COMMANDS gate', () => {
   });
 
   describe('KNOWN_BOT_COMMANDS completeness', () => {
-    it('contains all 15 registered commands', () => {
-      expect(KNOWN_BOT_COMMANDS.size).toBe(15);
+    it('contains all 16 registered commands', () => {
+      expect(KNOWN_BOT_COMMANDS.size).toBe(16);
     });
 
     // Cross-check against the bot.command() registrations in the codebase
@@ -118,7 +118,7 @@ describe('Webhook command routing – KNOWN_BOT_COMMANDS gate', () => {
       '/scan', '/children',
       // telegramFactoryCommands.ts
       '/request_agent', '/approve_agent', '/reject_agent',
-      '/my_agents', '/stop_agent', '/cfo',
+      '/my_agents', '/stop_agent', '/cfo', '/help',
     ];
 
     for (const cmd of expectedCommands) {

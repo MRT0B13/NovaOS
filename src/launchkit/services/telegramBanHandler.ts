@@ -32,8 +32,32 @@ const KNOWN_BOT_COMMANDS = new Set([
   '/scan', '/children',
   '/request_agent', '/approve_agent',
   '/reject_agent', '/my_agents', '/stop_agent',
-  '/cfo',
+  '/cfo', '/help',
 ]);
+
+// Human-readable descriptions for /help output
+const COMMAND_DESCRIPTIONS: Record<string, string> = {
+  help:           'Show this command list',
+  // ── Moderation ──
+  ban:            'Ban a user (reply or @username)',
+  kick:           'Kick a user (reply or @username)',
+  roseban:        'Sync Rose bot ban list',
+  banned:         'Show banned users in this chat',
+  // ── System ──
+  health:         'System health dashboard',
+  errors:         'Recent error log',
+  repairs:        'Self-repair status',
+  scan:           'Scan a token contract',
+  children:       'Show child agent status',
+  // ── Agent Factory ──
+  request_agent:  'Request a new child agent',
+  approve_agent:  'Approve a pending agent request',
+  reject_agent:   'Reject a pending agent request',
+  my_agents:      'List your agents',
+  stop_agent:     'Stop a running child agent',
+  // ── CFO ──
+  cfo:            'CFO commands (status, approve, pause, resume)',
+};
 
 // ── Command dispatch registry ──────────────────────────────────────────────
 // ElizaOS registers bot.on('message') BEFORE our bot.command() handlers,
@@ -256,6 +280,45 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
       console.log('[BAN_HANDLER] ⚠️ Could not patch messageManager.handleMessage - caching may not work');
     }
     
+    // Register /help command — lists all available commands
+    bot.command('help', async (ctx) => {
+      try {
+        const lines: string[] = ['📋 *Available Commands*', ''];
+        const cats: Record<string, string[]> = {
+          '🛡 Moderation': ['ban', 'kick', 'roseban', 'banned'],
+          '🔧 System': ['health', 'errors', 'repairs', 'scan', 'children'],
+          '🤖 Agents': ['request_agent', 'approve_agent', 'reject_agent', 'my_agents', 'stop_agent'],
+          '💰 CFO': ['cfo'],
+        };
+        for (const [cat, cmds] of Object.entries(cats)) {
+          lines.push(`*${cat}*`);
+          for (const cmd of cmds) {
+            if (_commandHandlers.has(cmd)) {
+              const desc = COMMAND_DESCRIPTIONS[cmd] ?? '';
+              lines.push(`  /${cmd}${desc ? ` — ${desc}` : ''}`);
+            }
+          }
+          lines.push('');
+        }
+        // Show any extra registered commands not in the categories above
+        const categorised = new Set(Object.values(cats).flat());
+        categorised.add('help');
+        const extras = [..._commandHandlers.keys()].filter(c => !categorised.has(c));
+        if (extras.length) {
+          lines.push('*📌 Other*');
+          for (const cmd of extras) {
+            const desc = COMMAND_DESCRIPTIONS[cmd] ?? '';
+            lines.push(`  /${cmd}${desc ? ` — ${desc}` : ''}`);
+          }
+          lines.push('');
+        }
+        await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+      } catch (err) {
+        console.error('[BAN_HANDLER] /help error:', err);
+        await ctx.reply('Failed to list commands.').catch(() => {});
+      }
+    });
+
     // Register /ban command - supports both reply-to and @username
     bot.command('ban', async (ctx) => {
       try {
