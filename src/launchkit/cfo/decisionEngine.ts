@@ -1680,14 +1680,21 @@ export async function generateDecisions(
       if (needsSol && solAvailableUsd < 10) {
         logger.debug(`[CFO:Decision] ORCA_LP_OPEN skipped — insufficient SOL ($${solAvailableUsd.toFixed(2)} available, need >$10 for SOL/USDC LP)`);
       } else {
-        const deployUsd = Math.min(
-          orcaHeadroomUsd,
-          state.solanaUsdcBalance * 0.4,  // use up to 40% of Solana USDC for LP
-          needsSol ? solAvailableUsd * 2 * 0.8 : Infinity, // cap to 80% of available SOL×2 for SOL/USDC
-        );
+        // Available capital: wallet SOL (will auto-swap half to USDC) + existing USDC
+        const solCapitalUsd = needsSol ? solAvailableUsd * 0.8 : 0;  // 80% of SOL (keep buffer)
+        const usdcCapitalUsd = state.solanaUsdcBalance;
+        const totalCapitalUsd = solCapitalUsd + usdcCapitalUsd;
+
+        // How much USDC we already have vs need — swap SOL→USDC for the shortfall
+        const deployUsd = Math.min(orcaHeadroomUsd, totalCapitalUsd);
         if (deployUsd >= 20) {
           const usdcSide = deployUsd / 2;
           const solSide = deployUsd / 2 / state.solPriceUsd;
+          const usdcShortfall = Math.max(0, usdcSide - state.solanaUsdcBalance);
+          // needsSwap: true when we need to swap SOL→USDC to fund the USDC side
+          const needsSwapForUsdc = usdcShortfall > 1;
+          // SOL to swap = shortfall in USDC terms, converted to SOL
+          const solToSwap = needsSwapForUsdc ? usdcShortfall / state.solPriceUsd : 0;
           const tokenAAmount = bestPair.whirlpool.tokenA !== 'SOL'
             ? deployUsd / 2 / (intel.analystPrices?.[bestPair.whirlpool.tokenA]?.usd ?? 1)
             : solSide;
@@ -1704,6 +1711,7 @@ export async function generateDecisions(
             reasoning:
               `Opening Orca ${bestPair.pair} concentrated LP: $${deployUsd.toFixed(0)} total ` +
               `(range ±${adaptiveRange / 2}% — adaptive based on ${baseTokenChange.toFixed(0)}% 24h vol). ` +
+              (needsSwapForUsdc ? `Auto-swap ${solToSwap.toFixed(3)} SOL → $${usdcShortfall.toFixed(0)} USDC first. ` : '') +
               `Pair selected because: ${bestPair.reasoning}. Est. fee APY: ~15-25% while in-range.`,
             params: {
               pair: bestPair.pair,
@@ -1714,6 +1722,8 @@ export async function generateDecisions(
               solAmount: bestPair.whirlpool.tokenA === 'SOL' ? solSide : 0,
               tokenAAmount,
               rangeWidthPct: adaptiveRange,
+              needsSwap: needsSwapForUsdc,
+              solToSwap,
             },
             urgency: 'low',
             estimatedImpactUsd: deployUsd * 0.18,
@@ -1831,8 +1841,9 @@ export async function generateDecisions(
     const borrowLpSkip = (reason: string) =>
       logger.debug(`[CFO:Decision] Section K skip: ${reason}`);
 
-    if (!state.kaminoJitoLoopActive && state.kaminoDepositValueUsd < 10) {
-      borrowLpSkip('no Kamino collateral — deposit or start Jito loop first');
+    const anyLoopActive = state.kaminoJitoLoopActive || !!state.kaminoActiveLstLoop;
+    if (!anyLoopActive && state.kaminoDepositValueUsd < 10) {
+      borrowLpSkip('no Kamino collateral — deposit or start LST loop first');
       // Dry-run: simulate the full borrow→LP pipeline so the user can see the plan
       if (env.dryRun && state.jitoSolValueUsd > 20) {
         const simulatedCollateral = state.jitoSolValueUsd;
@@ -1852,12 +1863,12 @@ export async function generateDecisions(
         decisions.push({
           type: 'KAMINO_BORROW_LP',
           reasoning:
-            `⏸ BLOCKED — needs Kamino collateral first (Jito loop must run). ` +
+            `⏸ BLOCKED — needs Kamino collateral first (LST loop must run). ` +
             `Full pipeline: deposit ${state.jitoSolBalance.toFixed(3)} JitoSOL ($${simulatedCollateral.toFixed(0)}) → ` +
             `borrow $${borrowUsd.toFixed(0)} USDC (${(fractionToUse * 100).toFixed(0)}% of $${simulatedHeadroom.toFixed(0)} headroom) → ` +
             `SOL/USDC LP (±${adaptiveRange / 2}%). ` +
             `LP yield ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow ~${(borrowCost * 100).toFixed(0)}% = ${spreadPct.toFixed(1)}% spread. ` +
-            `Waiting for Section G (Jito loop) to activate first — currently blocked by negative spread.`,
+            `Waiting for LST loop to activate first — currently blocked by negative spread.`,
           params: {
             borrowUsd,
             rangeWidthPct: adaptiveRange,
@@ -1866,7 +1877,7 @@ export async function generateDecisions(
             spreadPct,
             blocked: true,
             blockReason: 'no_collateral',
-            prerequisite: 'KAMINO_JITO_LOOP',
+            prerequisite: 'KAMINO_LST_LOOP',
           },
           urgency: 'low',
           estimatedImpactUsd: 0,
@@ -2225,8 +2236,20 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       }
 
       case 'ORCA_LP_OPEN': {
+        const { usdcAmount, solAmount, tokenAAmount, rangeWidthPct, whirlpoolAddress, tokenADecimals, needsSwap: lpNeedsSwap, solToSwap: lpSolToSwap } = decision.params;
+
+        // Step 1: Auto-swap SOL → USDC if wallet doesn't have enough USDC for the B-side
+        if (lpNeedsSwap && lpSolToSwap > 0) {
+          const jupMod = await import('./jupiterService.ts');
+          const swapResult = await jupMod.swapSolToUsdc(lpSolToSwap, 100); // 1% slippage
+          if (!swapResult.success) {
+            return { ...base, executed: true, success: false, error: `Auto-swap SOL→USDC failed: ${swapResult.error}` };
+          }
+          logger.info(`[CFO] ORCA_LP_OPEN: swapped ${lpSolToSwap.toFixed(4)} SOL → $${(swapResult.outputAmount ?? usdcAmount).toFixed(2)} USDC`);
+        }
+
+        // Step 2: Open the LP position
         const orca = await import('./orcaService.ts');
-        const { usdcAmount, solAmount, tokenAAmount, rangeWidthPct, whirlpoolAddress, tokenADecimals } = decision.params;
         // Use tokenA amount if available (for non-SOL pairs), otherwise fall back to solAmount
         const amountA = tokenAAmount ?? solAmount;
         const result = await orca.openPosition(usdcAmount, amountA, rangeWidthPct, whirlpoolAddress, tokenADecimals ?? 9);
