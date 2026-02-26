@@ -41,6 +41,23 @@ const KNOWN_MINTS: Record<string, string> = {
   '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs': 'WHETH',
   '3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh': 'WBTC',
   cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij: 'cbBTC',
+  // Stablecoins
+  '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo': 'PYUSD',
+  CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH: 'CASH',
+  '2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH': 'USDG',
+  AvZZF1YaZDziPY2RCK4oJrRVrbN3mTD9NL24hPeaZeUj: 'SYRUPUSDC',
+  '6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG': 'USX',
+  A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6: 'USDY',
+  USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA: 'USDS',
+  Fk6X3MCChFTzF7FvNhG8KRr6YqTdABQb9ArtYASTvVwj: 'FDUSD',
+  // Memecoins & trending
+  '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr': 'POPCAT',
+  CLoUDKc4Ane7HeQcPpE3YHnznRxhMimJ4MyaUqyHFzAu: 'CLOUD',
+  '6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiMQ': 'RENDER',
+  rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof: 'RNDR',
+  HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3: 'PYTH',
+  KENJSUYLASHUMfHyy5o4Hp2FdNqZg1AsUPhfH2kYvEP: 'PENGU',
+  KMNo3nJsBXfcpJTVhZcXLW7RmTwTt4GVFE7suUBo9sS: 'KMNO',
 };
 
 // Minimum thresholds for pool inclusion
@@ -677,7 +694,12 @@ function makeMintPairKey(mintA: string, mintB: string): string {
 
 /** Resolve a human-readable symbol from a mint address */
 function resolveSymbol(mint: string, orcaSymbol: string): string {
-  return KNOWN_MINTS[mint] ?? orcaSymbol ?? mint.slice(0, 6);
+  // 1. Check our curated mint registry
+  if (KNOWN_MINTS[mint]) return KNOWN_MINTS[mint];
+  // 2. Use Orca API symbol if non-empty
+  if (orcaSymbol && orcaSymbol.trim().length > 0) return orcaSymbol;
+  // 3. Fallback to truncated mint address
+  return mint.slice(0, 8);
 }
 
 /** fetch with a timeout to prevent API hangs */
