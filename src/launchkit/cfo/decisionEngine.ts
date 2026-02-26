@@ -1269,6 +1269,43 @@ export async function generateDecisions(
           intelUsed: [],
           tier: 'APPROVAL',
         });
+      } else if (env.dryRun) {
+        // ── Dry-run simulation: show what Kamino WOULD do if rates were favourable ──
+        // This gives visibility into the full pipeline even when spread is negative.
+        const targetLtv = (env.kaminoJitoLoopTargetLtv ?? 65) / 100;
+        const leverage = 1 / (1 - targetLtv);
+        const estimatedApy = leverage * effectiveJitoApy - (leverage - 1) * state.kaminoSolBorrowApy;
+        const jitoSolToCommit = jitoSolAvailable;
+        const needsStakeFirst = state.jitoSolBalance < 0.1;
+        const breakEvenBorrowRate = effectiveJitoApy - 0.01; // rate at which spread = +1%
+
+        decisions.push({
+          type: 'KAMINO_JITO_LOOP',
+          reasoning:
+            `⏸ BLOCKED — spread is ${(loopSpread * 100).toFixed(1)}% (need >1%). ` +
+            `JitoSOL yield: ${(effectiveJitoApy * 100).toFixed(1)}%, SOL borrow: ${(state.kaminoSolBorrowApy * 100).toFixed(1)}%. ` +
+            `WOULD deposit ${jitoSolToCommit.toFixed(3)} JitoSOL ($${state.jitoSolValueUsd.toFixed(0)}) as collateral` +
+            `${needsStakeFirst ? ' (stake SOL→JitoSOL first)' : ''}, ` +
+            `loop to ${(targetLtv * 100).toFixed(0)}% LTV (~${leverage.toFixed(1)}x). ` +
+            `At current rates the loop APY would be ${(estimatedApy * 100).toFixed(1)}% (negative — losing money). ` +
+            `Break-even: SOL borrow needs to drop below ${(breakEvenBorrowRate * 100).toFixed(1)}%.`,
+          params: {
+            jitoSolToDeposit: jitoSolToCommit,
+            needsStakeFirst,
+            targetLtv,
+            maxLoops: env.kaminoJitoLoopMaxLoops ?? 3,
+            solPriceUsd: state.solPriceUsd,
+            estimatedApy,
+            blocked: true,
+            blockReason: 'negative_spread',
+            currentSpreadPct: loopSpread * 100,
+            breakEvenBorrowRate,
+          },
+          urgency: 'low',
+          estimatedImpactUsd: 0,
+          intelUsed: [],
+          tier: 'NOTIFY',
+        });
       }
     }
   }
@@ -1522,6 +1559,47 @@ export async function generateDecisions(
 
     if (!state.kaminoJitoLoopActive && state.kaminoDepositValueUsd < 10) {
       borrowLpSkip('no Kamino collateral — deposit or start Jito loop first');
+      // Dry-run: simulate the full borrow→LP pipeline so the user can see the plan
+      if (env.dryRun && state.jitoSolValueUsd > 20) {
+        const simulatedCollateral = state.jitoSolValueUsd;
+        const maxBorrowLtv = (env.kaminoBorrowLpMaxLtvPct) / 100;
+        const simulatedHeadroom = simulatedCollateral * maxBorrowLtv;
+        const fractionToUse = (env.kaminoBorrowLpCapacityPct ?? 20) / 100;
+        const borrowUsd = Math.min(
+          simulatedHeadroom * fractionToUse,
+          env.kaminoBorrowLpMaxUsd ?? 200,
+          env.orcaLpMaxUsd,
+        );
+        const estimatedLpFeeApy = 0.15;
+        const borrowCost = state.kaminoBorrowApy > 0 ? state.kaminoBorrowApy : 0.08;
+        const spreadPct = (estimatedLpFeeApy - borrowCost) * 100;
+        const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct);
+
+        decisions.push({
+          type: 'KAMINO_BORROW_LP',
+          reasoning:
+            `⏸ BLOCKED — needs Kamino collateral first (Jito loop must run). ` +
+            `Full pipeline: deposit ${state.jitoSolBalance.toFixed(3)} JitoSOL ($${simulatedCollateral.toFixed(0)}) → ` +
+            `borrow $${borrowUsd.toFixed(0)} USDC (${(fractionToUse * 100).toFixed(0)}% of $${simulatedHeadroom.toFixed(0)} headroom) → ` +
+            `SOL/USDC LP (±${adaptiveRange / 2}%). ` +
+            `LP yield ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow ~${(borrowCost * 100).toFixed(0)}% = ${spreadPct.toFixed(1)}% spread. ` +
+            `Waiting for Section G (Jito loop) to activate first — currently blocked by negative spread.`,
+          params: {
+            borrowUsd,
+            rangeWidthPct: adaptiveRange,
+            estimatedLpApy: estimatedLpFeeApy,
+            borrowApy: borrowCost,
+            spreadPct,
+            blocked: true,
+            blockReason: 'no_collateral',
+            prerequisite: 'KAMINO_JITO_LOOP',
+          },
+          urgency: 'low',
+          estimatedImpactUsd: 0,
+          intelUsed: [],
+          tier: 'NOTIFY',
+        });
+      }
     } else if (state.kaminoHealthFactor < 2.0) {
       borrowLpSkip(`health factor ${state.kaminoHealthFactor.toFixed(2)} < 2.0 — too risky to borrow more`);
     } else if (state.kaminoLtv >= (env.kaminoBorrowLpMaxLtvPct / 100) * 0.90) {
@@ -2108,6 +2186,9 @@ function _humanAction(d: Decision, state: PortfolioState): string {
     case 'KAMINO_REPAY':
       return `*Repay loan* — $${p.repayUsd?.toFixed(0) ?? '?'} USDC back to Kamino`;
     case 'KAMINO_JITO_LOOP':
+      if (p.blocked) {
+        return `⏸ *Jito Loop waiting* — spread is ${p.currentSpreadPct?.toFixed(1) ?? '?'}% (need >1%). SOL borrow ${(state.kaminoSolBorrowApy * 100).toFixed(1)}% > JitoSOL yield 8%. Break-even at ${((p.breakEvenBorrowRate ?? 0) * 100).toFixed(1)}%`;
+      }
       return `*Leverage JitoSOL* — deposit ${p.jitoSolToDeposit?.toFixed(2) ?? '?'} JitoSOL, loop to ${((p.targetLtv ?? 0.65) * 100).toFixed(0)}% LTV for ~${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY`;
     case 'KAMINO_JITO_UNWIND':
       return `*Unwind JitoSOL loop* — closing leveraged position`;
@@ -2116,6 +2197,9 @@ function _humanAction(d: Decision, state: PortfolioState): string {
     case 'ORCA_LP_REBALANCE':
       return `*Rebalance LP* — price moved out of range, re-centering`;
     case 'KAMINO_BORROW_LP':
+      if (p.blocked) {
+        return `⏸ *Borrow→LP waiting* — ${p.blockReason === 'no_collateral' ? 'needs Jito loop collateral first' : 'blocked'}. Would borrow $${p.borrowUsd?.toFixed(0) ?? '?'} → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
+      }
       return `*Borrow → LP* — $${p.borrowUsd?.toFixed(0) ?? '?'} from Kamino → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
     case 'EVM_FLASH_ARB':
       return `*Flash arb* — atomic arb on Arbitrum`;
