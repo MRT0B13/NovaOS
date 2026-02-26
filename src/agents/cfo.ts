@@ -786,7 +786,10 @@ export class CFOAgent extends BaseAgent {
         if (!dbPos) continue;
         const meta = dbPos.metadata as { tokenId?: string };
         const freshPos = freshPositions.find((p: any) => p.tokenId === meta.tokenId);
-        if (!freshPos || freshPos.currentPrice <= 0.01) continue;
+        // Skip truly worthless positions (< $0.05 remaining value)
+        // Note: currentPrice is per-share probability (0-1), NOT USD — a curPrice of 0.001
+        // still represents real money if size is large. Use currentValueUsd instead.
+        if (!freshPos || freshPos.currentValueUsd < 0.05) continue;
 
         const exitOrder = await polyMod.exitPosition(freshPos, 1.0);
         if (exitOrder.status === 'LIVE' || exitOrder.status === 'MATCHED') {
