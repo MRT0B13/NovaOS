@@ -58,7 +58,7 @@ class PostgresSecretsStore implements SecretsStoreWithClose {
   constructor(private pool: Pool) {}
 
   static async create(databaseUrl: string): Promise<PostgresSecretsStore> {
-    const pool = new Pool({ connectionString: databaseUrl });
+    const pool = new Pool({ connectionString: databaseUrl, max: 2, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 10_000 });
     await ensurePgTable(pool);
     return new PostgresSecretsStore(pool);
   }

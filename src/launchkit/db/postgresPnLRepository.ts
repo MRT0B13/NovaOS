@@ -12,7 +12,12 @@ import type { TradeRecord, TokenPosition, SolFlowRecord, PnLSummary } from '../s
 
 function buildPool(databaseUrl: string): Pool {
   const sslNeeded = databaseUrl.includes('sslmode=require') || process.env.PGSSLMODE === 'require';
-  const config: PoolConfig = { connectionString: databaseUrl };
+  const config: PoolConfig = {
+    connectionString: databaseUrl,
+    max: 3,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000,
+  };
   if (sslNeeded) {
     config.ssl = { rejectUnauthorized: false } as any;
   }

@@ -141,7 +141,8 @@ export async function initLaunchKit(
         // Prevent hung queries from stalling the supervisor poll loop
         statement_timeout: 15_000,        // kill queries after 15s
         connectionTimeoutMillis: 10_000,  // fail fast if no connection in 10s
-        max: 10,
+        max: 5,
+        idleTimeoutMillis: 30_000,        // release idle connections after 30s
       });
       _swarmHandle = await initSwarm(pool, {
         // Callbacks are wired later when xPublisher/novaChannel are available
