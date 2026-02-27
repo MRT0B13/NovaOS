@@ -1203,7 +1203,8 @@ export async function startLaunchKitServer(options: LaunchKitServerOptions = {})
     if (pathname.startsWith('/x402/') && req.method === 'GET') {
       try {
         const { handleX402Request } = await import('../cfo/x402Service.ts');
-        const result = await handleX402Request(pathname, url.searchParams, pool);
+        const paymentHeader = req.headers['x-payment'] as string | undefined;
+        const result = await handleX402Request(pathname, url.searchParams, pool, paymentHeader);
         sendJson(res, result.status, result.body);
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'x402 request failed';

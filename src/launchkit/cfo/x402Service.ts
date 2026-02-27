@@ -17,6 +17,9 @@
  *  GET /x402/signal/:query    — KOL signal for a token  ($0.001 USDC)
  *  GET /x402/trend            — Top 10 narrative trends ($0.10 USDC)
  *  GET /x402/portfolio        — Nova portfolio snapshot ($0.05 USDC)
+ *  GET /x402/scout            — Latest scout digest     ($0.05 USDC)
+ *  GET /x402/narrative        — Recent narrative shifts  ($0.03 USDC)
+ *  GET /x402/lp               — Live LP positions        ($0.05 USDC)
  *
  * Revenue flows into the CFO treasury wallet for reinvestment.
  *
@@ -400,12 +403,76 @@ export function registerX402Routes(router: Router): void {
     },
   );
 
+  // ── Scout digest — latest batched intel summary ──────────────────
+  router.get(
+    '/scout',
+    requirePayment('scout', env.x402PriceScoutDigest),
+    async (req: Request, res: Response) => {
+      try {
+        const fs = await import('fs');
+        const path = await import('path');
+        let scoutData: any = null;
+        try {
+          const raw = fs.readFileSync(path.resolve('./data/system_metrics.json'), 'utf-8');
+          const metrics = JSON.parse(raw);
+          scoutData = metrics?.scoutDigest ?? metrics?.lastScoutDigest ?? null;
+        } catch { /* file may not exist */ }
+        if (!scoutData) {
+          res.status(404).json({ error: 'No scout digest available yet' });
+          return;
+        }
+        res.json({ scoutDigest: scoutData, generatedAt: new Date().toISOString() });
+      } catch (err) {
+        res.status(500).json({ error: (err as Error).message });
+      }
+    },
+  );
+
+  // ── Narrative shifts — recent narrative shift alerts ──────────────
+  router.get(
+    '/narrative',
+    requirePayment('narrative', env.x402PriceNarrativeShift),
+    async (req: Request, res: Response) => {
+      try {
+        const fs = await import('fs');
+        const path = await import('path');
+        let trendData: any = null;
+        try {
+          const raw = fs.readFileSync(path.resolve('./data/trend_pool.json'), 'utf-8');
+          trendData = JSON.parse(raw);
+        } catch { /* file may not exist */ }
+        const narratives = trendData?.narrativeShifts ?? trendData?.trends?.filter((t: any) => t.type === 'narrative_shift') ?? [];
+        res.json({ narrativeShifts: narratives.slice(0, 10), generatedAt: new Date().toISOString() });
+      } catch (err) {
+        res.status(500).json({ error: (err as Error).message });
+      }
+    },
+  );
+
+  // ── LP positions — current Orca / DeFi LP positions ──────────────
+  router.get(
+    '/lp',
+    requirePayment('lp', env.x402PriceLpPositions),
+    async (req: Request, res: Response) => {
+      try {
+        const { getPnLSummary } = await import('../services/pnlTracker.ts');
+        const summary = await getPnLSummary();
+        const lpPositions = (summary as any)?.positions?.filter((p: any) =>
+          p.strategy === 'orca_lp' || p.strategy === 'kamino' || p.type === 'LP'
+        ) ?? [];
+        res.json({ lpPositions, generatedAt: new Date().toISOString() });
+      } catch (err) {
+        res.status(500).json({ error: (err as Error).message });
+      }
+    },
+  );
+
   // ── Revenue stats (free — for transparency / marketing) ────────────
   router.get('/stats', (req: Request, res: Response) => {
     res.json(getRevenue());
   });
 
-  logger.info('[x402] Routes registered: /rugcheck/:mint, /signal, /trend, /portfolio, /stats');
+  logger.info('[x402] Routes registered: /rugcheck/:mint, /signal, /trend, /portfolio, /scout, /narrative, /lp, /stats');
 }
 
 // ============================================================================
@@ -489,12 +556,15 @@ export async function x402Fetch(url: string, maxPriceUsdc = 0.10): Promise<unkno
 
 /**
  * Handle an x402 request from the raw HTTP server.
+ * Enforces payment: returns 402 with payment instructions if no X-Payment header,
+ * verifies on-chain payment if header is provided, then serves data.
  * Returns { status, body } for the server to send.
  */
 export async function handleX402Request(
   pathname: string,
   searchParams: URLSearchParams,
   _pool: any,
+  paymentHeader?: string,
 ): Promise<{ status: number; body: any }> {
   const env = getCFOEnv();
 
@@ -502,14 +572,63 @@ export async function handleX402Request(
     return { status: 404, body: { error: 'x402 service is disabled' } };
   }
 
+  // Derive pay-to wallet address
+  const solEnv = getEnv();
+  const payToAddress = (() => {
+    try {
+      if (!solEnv.AGENT_FUNDING_WALLET_SECRET) return null;
+      const { Keypair } = require('@solana/web3.js');
+      const bs58 = require('bs58');
+      return Keypair.fromSecretKey(bs58.decode(solEnv.AGENT_FUNDING_WALLET_SECRET)).publicKey.toBase58();
+    } catch { return null; }
+  })();
+
+  /** Gate a paid endpoint — returns null if payment is valid, or a 402 response */
+  async function gatePayment(
+    endpoint: string,
+    priceUsdc: number,
+  ): Promise<{ status: number; body: any } | null> {
+    // /x402/revenue is always free
+    if (endpoint === 'revenue') return null;
+
+    const resource = `${env.x402BaseUrl}${pathname}`;
+    const requirement = buildPaymentRequirement(
+      resource,
+      `Nova AI data: ${endpoint}`,
+      priceUsdc,
+      payToAddress ?? '11111111111111111111111111111111',
+    );
+
+    if (!paymentHeader) {
+      return {
+        status: 402,
+        body: { x402Version: 1, error: 'Payment required', accepts: [requirement] },
+      };
+    }
+
+    const { valid, error } = await verifyPayment(paymentHeader, requirement);
+    if (!valid) {
+      return {
+        status: 402,
+        body: { x402Version: 1, error: error ?? 'Invalid payment', accepts: [requirement] },
+      };
+    }
+
+    // Payment verified — track revenue
+    trackRevenue(endpoint, priceUsdc);
+    logger.info(`[x402] Payment verified for ${endpoint}: $${priceUsdc} USDC`);
+    return null; // proceed to serve data
+  }
+
   // Route: /x402/rugcheck/:mint
   const rugcheckMatch = pathname.match(/^\/x402\/rugcheck\/([A-Za-z0-9]+)$/);
   if (rugcheckMatch) {
+    const gate = await gatePayment('rugcheck', env.x402PriceRugcheck);
+    if (gate) return gate;
     try {
       const { scanToken } = await import('../services/rugcheck.ts');
       const report = await scanToken(rugcheckMatch[1]);
       if (!report) return { status: 404, body: { error: 'Token not found or scan failed' } };
-      trackRevenue('rugcheck', env.x402PriceRugcheck);
       return { status: 200, body: { mint: rugcheckMatch[1], report, generatedAt: new Date().toISOString() } };
     } catch (err) {
       return { status: 500, body: { error: (err as Error).message } };
@@ -518,11 +637,12 @@ export async function handleX402Request(
 
   // Route: /x402/signal
   if (pathname === '/x402/signal') {
+    const gate = await gatePayment('signal', env.x402PriceSignal);
+    if (gate) return gate;
     try {
       const { getReplyIntel } = await import('../services/novaResearch.ts');
       const query = searchParams.get('q') ?? 'latest crypto signal';
       const intel = await getReplyIntel(query);
-      trackRevenue('signal', env.x402PriceSignal);
       return { status: 200, body: { query, intel, generatedAt: new Date().toISOString() } };
     } catch (err) {
       return { status: 500, body: { error: (err as Error).message } };
@@ -531,6 +651,8 @@ export async function handleX402Request(
 
   // Route: /x402/trend
   if (pathname === '/x402/trend') {
+    const gate = await gatePayment('trend', env.x402PriceTrend);
+    if (gate) return gate;
     try {
       const fs = await import('fs');
       const path = await import('path');
@@ -539,7 +661,6 @@ export async function handleX402Request(
         const raw = fs.readFileSync(path.resolve('./data/trend_pool.json'), 'utf-8');
         trends = JSON.parse(raw);
       } catch { /* file may not exist */ }
-      trackRevenue('trend', env.x402PriceTrend);
       return { status: 200, body: { trends: trends?.trends?.slice(0, 10) ?? [], generatedAt: new Date().toISOString() } };
     } catch (err) {
       return { status: 500, body: { error: (err as Error).message } };
@@ -549,6 +670,61 @@ export async function handleX402Request(
   // Route: /x402/revenue — public stats (no payment required)
   if (pathname === '/x402/revenue') {
     return { status: 200, body: { data: getRevenue() } };
+  }
+
+  // Route: /x402/scout — latest scout digest
+  if (pathname === '/x402/scout') {
+    const gate = await gatePayment('scout', env.x402PriceScoutDigest);
+    if (gate) return gate;
+    try {
+      const fs = await import('fs');
+      const path = await import('path');
+      let scoutData: any = null;
+      try {
+        const raw = fs.readFileSync(path.resolve('./data/system_metrics.json'), 'utf-8');
+        const metrics = JSON.parse(raw);
+        scoutData = metrics?.scoutDigest ?? metrics?.lastScoutDigest ?? null;
+      } catch { /* file may not exist */ }
+      if (!scoutData) return { status: 404, body: { error: 'No scout digest available yet' } };
+      return { status: 200, body: { scoutDigest: scoutData, generatedAt: new Date().toISOString() } };
+    } catch (err) {
+      return { status: 500, body: { error: (err as Error).message } };
+    }
+  }
+
+  // Route: /x402/narrative — recent narrative shifts
+  if (pathname === '/x402/narrative') {
+    const gate = await gatePayment('narrative', env.x402PriceNarrativeShift);
+    if (gate) return gate;
+    try {
+      const fs = await import('fs');
+      const path = await import('path');
+      let trendData: any = null;
+      try {
+        const raw = fs.readFileSync(path.resolve('./data/trend_pool.json'), 'utf-8');
+        trendData = JSON.parse(raw);
+      } catch { /* file may not exist */ }
+      const narratives = trendData?.narrativeShifts ?? trendData?.trends?.filter((t: any) => t.type === 'narrative_shift') ?? [];
+      return { status: 200, body: { narrativeShifts: narratives.slice(0, 10), generatedAt: new Date().toISOString() } };
+    } catch (err) {
+      return { status: 500, body: { error: (err as Error).message } };
+    }
+  }
+
+  // Route: /x402/lp — live LP positions
+  if (pathname === '/x402/lp') {
+    const gate = await gatePayment('lp', env.x402PriceLpPositions);
+    if (gate) return gate;
+    try {
+      const { getPnLSummary } = await import('../services/pnlTracker.ts');
+      const summary = await getPnLSummary();
+      const lpPositions = (summary as any)?.positions?.filter((p: any) =>
+        p.strategy === 'orca_lp' || p.strategy === 'kamino' || p.type === 'LP'
+      ) ?? [];
+      return { status: 200, body: { lpPositions, generatedAt: new Date().toISOString() } };
+    } catch (err) {
+      return { status: 500, body: { error: (err as Error).message } };
+    }
   }
 
   return { status: 404, body: { error: 'Unknown x402 endpoint' } };

@@ -100,8 +100,9 @@ export interface CFOEnv {
   // ── x402 Micropayments ────────────────────────────────────────────
   x402PriceRugcheck: number;                      // USDC per rug-check report
   x402PriceSignal: number;                        // USDC per KOL signal
-  x402PriceTrend: number;                         // USDC per trend report
-  x402BaseUrl: string;                            // Nova's public API base URL
+  x402PriceTrend: number;                         // USDC per trend report  x402PriceScoutDigest: number;                   // USDC per scout digest
+  x402PriceNarrativeShift: number;                // USDC per narrative shift report
+  x402PriceLpPositions: number;                   // USDC per LP positions snapshot  x402BaseUrl: string;                            // Nova's public API base URL
 
   // ── Helius ────────────────────────────────────────────────────────
   heliusApiKey: string | undefined;
@@ -217,6 +218,9 @@ export function getCFOEnv(bust = false): CFOEnv {
     x402PriceRugcheck: Number(process.env.CFO_X402_PRICE_RUGCHECK ?? 0.02),
     x402PriceSignal: Number(process.env.CFO_X402_PRICE_SIGNAL ?? 0.001),
     x402PriceTrend: Number(process.env.CFO_X402_PRICE_TREND ?? 0.10),
+    x402PriceScoutDigest: Number(process.env.CFO_X402_PRICE_SCOUT_DIGEST ?? 0.05),
+    x402PriceNarrativeShift: Number(process.env.CFO_X402_PRICE_NARRATIVE_SHIFT ?? 0.03),
+    x402PriceLpPositions: Number(process.env.CFO_X402_PRICE_LP_POSITIONS ?? 0.05),
     x402BaseUrl: process.env.CFO_X402_BASE_URL ?? 'http://localhost:8787',
 
     heliusApiKey: process.env.CFO_HELIUS_API_KEY,
