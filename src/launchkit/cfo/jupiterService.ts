@@ -121,9 +121,12 @@ export async function getQuote(
 ): Promise<SwapQuote | null> {
   try {
     const rawAmount = toRaw(inputAmount, inputMint);
+    const wallet = loadWallet();
+    const taker = wallet.publicKey.toBase58();
     const url =
       `${JUPITER_ULTRA_BASE}/order?inputMint=${inputMint}` +
-      `&outputMint=${outputMint}&amount=${rawAmount}&slippageBps=${slippageBps}`;
+      `&outputMint=${outputMint}&amount=${rawAmount}&slippageBps=${slippageBps}` +
+      `&taker=${taker}`;
 
     const resp = await fetch(url);
     if (!resp.ok) {
@@ -186,16 +189,32 @@ export async function executeSwap(
     const rpcUrl = getRpcUrl();
     const connection = new Connection(rpcUrl, 'confirmed');
 
-    // Build the transaction via Jupiter /swap endpoint
+    // Ultra API: the /order response contains a pre-built transaction + requestId
+    const orderData = quote.quoteResponse as any;
+    const orderTx = orderData.transaction as string | undefined;
+    const requestId = orderData.requestId as string | undefined;
+
+    if (!orderTx || !requestId) {
+      const apiError = orderData.error || orderData.errorMessage || '';
+      throw new Error(
+        `Jupiter Ultra /order did not return a signable transaction` +
+        (apiError ? `: ${apiError}` : ` (keys: ${Object.keys(orderData).join(', ')})`),
+      );
+    }
+
+    // Deserialize the order transaction, sign with our wallet
+    const txBuf = Buffer.from(orderTx, 'base64');
+    const tx = VersionedTransaction.deserialize(txBuf);
+    tx.sign([wallet]);
+
+    // Submit the signed transaction + requestId to /execute
+    const signedTxBase64 = Buffer.from(tx.serialize()).toString('base64');
     const swapResp = await fetch(`${JUPITER_ULTRA_BASE}/execute`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        quoteResponse: quote.quoteResponse,
-        userPublicKey: wallet.publicKey.toBase58(),
-        wrapAndUnwrapSol: true,
-        dynamicComputeUnitLimit: true,
-        dynamicSlippage: { maxBps: quote.slippageBps * 2 },
+        signedTransaction: signedTxBase64,
+        requestId,
       }),
     });
 
@@ -204,20 +223,14 @@ export async function executeSwap(
       throw new Error(`Jupiter /execute (${swapResp.status}): ${text}`);
     }
 
-    const swapData = await swapResp.json() as { swapTransaction: string };
-    if (!swapData.swapTransaction) throw new Error('No swapTransaction in response');
+    const execResult = await swapResp.json() as any;
 
-    // Deserialize and sign
-    const txBuf = Buffer.from(swapData.swapTransaction, 'base64');
-    const tx = VersionedTransaction.deserialize(txBuf);
-    tx.sign([wallet]);
-
-    // Send
-    const signature = await connection.sendRawTransaction(tx.serialize(), {
-      skipPreflight: false,
-      preflightCommitment: 'confirmed',
-      maxRetries: 3,
-    });
+    // Ultra API returns { status, signature, ... }
+    const signature: string =
+      execResult.signature ?? execResult.txid ?? execResult.txSignature ?? '';
+    if (!signature) {
+      throw new Error(`Jupiter /execute returned no signature: ${JSON.stringify(execResult)}`);
+    }
 
     // Poll for confirmation (avoid WebSocket)
     const confirmed = await pollConfirmation(connection, signature, 60_000);
