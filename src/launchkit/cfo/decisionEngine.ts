@@ -1455,7 +1455,7 @@ export async function generateDecisions(
     state.kaminoHealthFactor > 2.0 &&
     intel.marketCondition !== 'danger'
   ) {
-    if (checkCooldown('KAMINO_JITO_LOOP', 24 * 3600_000)) {
+    if (checkCooldown('KAMINO_JITO_LOOP', 2 * 3600_000)) {
       // JitoSOL value = staking rewards (~7% base + 1-2% MEV tips).
       // The Kamino supply APY (kaminoJitoSupplyApy) only reflects the lending pool rate
       // (people paying to borrow JitoSOL), NOT the staking yield the token accrues.
@@ -1564,7 +1564,7 @@ export async function generateDecisions(
     !state.kaminoActiveLstLoop &&     // no LST loop already active
     state.kaminoHealthFactor > 2.0 &&
     intel.marketCondition !== 'danger' &&
-    checkCooldown('KAMINO_LST_LOOP', 24 * 3600_000)
+    checkCooldown('KAMINO_LST_LOOP', 2 * 3600_000)
   ) {
     try {
       const kamino = await import('./kaminoService.ts');
@@ -1819,7 +1819,7 @@ export async function generateDecisions(
     if (
       orcaHeadroomUsd >= 20 &&
       state.orcaPositions.length === 0 &&
-      checkCooldown('ORCA_LP_OPEN', 24 * 3600_000)
+      checkCooldown('ORCA_LP_OPEN', 2 * 3600_000)
     ) {
       // Dynamic pool selection — discovers and scores 50+ Orca pools from DeFiLlama + Orca API
       const bestPair = await selectBestOrcaPairDynamic(intel);
@@ -2202,14 +2202,14 @@ export async function generateDecisions(
       const loopLabel = env.kaminoLstLoopEnabled ? 'LSTloop' : 'JitoLoop';
       if (state.kaminoJitoLoopActive || state.kaminoActiveLstLoop)
         diag.push(`${loopLabel}:active`);
-      else if (!checkCooldown(loopKey, 24 * 3600_000)) diag.push(`${loopLabel}:cooldown`);
+      else if (!checkCooldown(loopKey, 2 * 3600_000)) diag.push(`${loopLabel}:cooldown`);
       else diag.push(`${loopLabel}:spread?`);
     }
 
     // I: Orca LP
     if (env.orcaLpEnabled) {
       if (state.orcaPositions.length > 0) diag.push(`OrcaLP:active(${state.orcaPositions.length})`);
-      else if (!checkCooldown('ORCA_LP_OPEN', 24 * 3600_000)) diag.push('OrcaLP:cooldown');
+      else if (!checkCooldown('ORCA_LP_OPEN', 2 * 3600_000)) diag.push('OrcaLP:cooldown');
       else diag.push('OrcaLP:conditions?');
     }
 
@@ -2271,7 +2271,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           exposureUsd,
           leverage: decision.params.leverage,
         });
-        markDecision(`OPEN_HEDGE_${coin}`);
+        if (result.success) markDecision(`OPEN_HEDGE_${coin}`);
         return {
           ...base,
           executed: true,
@@ -2296,7 +2296,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const reduceUsd = Math.min(decision.params.reduceUsd, coinShort.sizeUsd);
         const reduceSizeCoin = reduceUsd / coinShort.markPrice;
         const result = await hl.closePosition(coin, reduceSizeCoin, true); // buy back to reduce short
-        markDecision(`CLOSE_HEDGE_${coin}`);
+        if (result.success) markDecision(`CLOSE_HEDGE_${coin}`);
         return {
           ...base,
           executed: true,
@@ -2319,7 +2319,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const sizeInCoin = pos.sizeUsd / pos.markPrice;
         const isBuy = pos.side === 'SHORT'; // buy to close short, sell to close long
         const result = await hl.closePosition(pos.coin, sizeInCoin, isBuy);
-        markDecision('CLOSE_LOSING');
+        if (result.success) markDecision('CLOSE_LOSING');
         return {
           ...base,
           executed: true,
@@ -2332,7 +2332,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       case 'AUTO_STAKE': {
         const jito = await import('./jitoStakingService.ts');
         const result = await jito.stakeSol(decision.params.amount);
-        markDecision('AUTO_STAKE');
+        if (result.success) markDecision('AUTO_STAKE');
         return {
           ...base,
           executed: true,
@@ -2345,7 +2345,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       case 'UNSTAKE_JITO': {
         const jito = await import('./jitoStakingService.ts');
         const result = await jito.instantUnstake(decision.params.amount);
-        markDecision('UNSTAKE_JITO');
+        if (result.success) markDecision('UNSTAKE_JITO');
         return {
           ...base,
           executed: true,
@@ -2409,8 +2409,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           return { ...base, executed: false, error: 'Polymarket token not found in market' };
         }
         const order = await polyMod.placeBuyOrder(market, token, decision.params.sizeUsd);
-        markDecision('POLY_BET');
         const polyBetSuccess = order.status === 'LIVE' || order.status === 'MATCHED';
+        if (polyBetSuccess) markDecision('POLY_BET');
         return {
           ...base,
           executed: true,
@@ -2428,8 +2428,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           return { ...base, executed: false, error: 'Polymarket position not found for exit' };
         }
         const exitOrder = await polyMod.exitPosition(pos, 1.0);
-        markDecision('POLY_EXIT');
         const polyExitSuccess = exitOrder.status === 'LIVE' || exitOrder.status === 'MATCHED';
+        if (polyExitSuccess) markDecision('POLY_EXIT');
         return {
           ...base,
           executed: true,
@@ -2469,7 +2469,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           logger.info(`[CFO:KAMINO_BORROW_DEPLOY] $${borrowUsd} USDC borrowed and ready for Polymarket deployment`);
         }
 
-        markDecision('KAMINO_BORROW_DEPLOY');
+        if (deploySuccess) markDecision('KAMINO_BORROW_DEPLOY');
         return {
           ...base,
           executed: true,
@@ -2483,7 +2483,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const kamino = await import('./kaminoService.ts');
         const { repayUsd } = decision.params;
         const result = await kamino.repay('USDC', repayUsd);
-        markDecision('KAMINO_REPAY');
+        if (result.success) markDecision('KAMINO_REPAY');
         return {
           ...base,
           executed: true,
@@ -2546,7 +2546,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         // Step 3: Open the LP position
         const orca = await import('./orcaService.ts');
         const result = await orca.openPosition(usdcAmount, tokenAInputAmount, rangeWidthPct, whirlpoolAddress, tokenADecimals ?? 9, tokenBDecimals ?? 6, poolTickSpacing);
-        markDecision('ORCA_LP_OPEN');
+        if (result.success) markDecision('ORCA_LP_OPEN');
         return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
       }
 
@@ -2554,7 +2554,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const orca = await import('./orcaService.ts');
         const { positionMint, whirlpoolAddress, rangeWidthPct } = decision.params;
         const result = await orca.rebalancePosition(positionMint, rangeWidthPct, whirlpoolAddress);
-        markDecision('ORCA_LP_OPEN'); // reuses OPEN cooldown
+        if (result.success) markDecision('ORCA_LP_OPEN'); // reuses OPEN cooldown
         return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
       }
 
@@ -2604,7 +2604,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const arb = await import('./evmArbService.ts');
         const { opportunity, ethPriceUsd } = decision.params;
         const result = await arb.executeFlashArb(opportunity, ethPriceUsd ?? 3000);
-        markDecision('EVM_FLASH_ARB');
+        if (result.success) markDecision('EVM_FLASH_ARB');
         if (result.success && result.profitUsd) arb.recordProfit(result.profitUsd);
         return { ...base, executed: true, success: result.success, txId: result.txHash, error: result.error };
       }
@@ -2633,7 +2633,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
         // Step 2: Execute the multiply loop
         const loopResult = await kamino.loopJitoSol(targetLtv, maxLoops, solPriceUsd);
-        markDecision('KAMINO_JITO_LOOP');
+        if (loopResult.success) markDecision('KAMINO_JITO_LOOP');
         return {
           ...base,
           executed: true,
@@ -2646,7 +2646,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       case 'KAMINO_JITO_UNWIND': {
         const kamino = await import('./kaminoService.ts');
         const unwindResult = await kamino.unwindJitoSolLoop();
-        markDecision('KAMINO_JITO_UNWIND');
+        if (unwindResult.success) markDecision('KAMINO_JITO_UNWIND');
         return {
           ...base,
           executed: true,
@@ -2675,7 +2675,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         }
 
         const loopResult = await kamino.loopLst(lstAsset, targetLtv, maxLoops, solPriceUsd);
-        markDecision('KAMINO_LST_LOOP');
+        if (loopResult.success) markDecision('KAMINO_LST_LOOP');
         return {
           ...base,
           executed: true,
@@ -2689,7 +2689,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const kamino = await import('./kaminoService.ts');
         const lstAsset = (decision.params.lst ?? 'JitoSOL') as import('./kaminoService.ts').LstAsset;
         const unwindResult = await kamino.unwindLstLoop(lstAsset);
-        markDecision('KAMINO_LST_UNWIND');
+        if (unwindResult.success) markDecision('KAMINO_LST_UNWIND');
         return {
           ...base,
           executed: true,
