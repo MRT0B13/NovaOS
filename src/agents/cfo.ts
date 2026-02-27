@@ -860,12 +860,13 @@ export class CFOAgent extends BaseAgent {
 
         // ── Dust cleanup: position worth < $1 or not found on-chain ──
         // For redeemable (resolved) markets: redeem on-chain instead of trying to sell
-        // For live markets: attempt sell on CLOB, then close in DB regardless
+        // For live markets: attempt sell on CLOB; if sell fails, mark for redemption
         if (!freshPos || freshPos.currentValueUsd < 1.00) {
           const dustValue = freshPos?.currentValueUsd ?? 0;
           const dustPnl = dustValue - dbPos.costBasisUsd;
 
           let redeemTxHash: string | undefined;
+          let dustSellSucceeded = false;
           if (freshPos && freshPos.size > 0 && !env.dryRun) {
             if (freshPos.redeemable) {
               // Resolved market: redeem on-chain (burns tokens, returns USDC if winning)
@@ -873,6 +874,7 @@ export class CFOAgent extends BaseAgent {
                 const result = await polyMod.redeemPosition(freshPos);
                 if (result.success) {
                   redeemTxHash = result.txHash;
+                  dustSellSucceeded = true;
                   logger.info(`[CFO] Redeemed resolved position: "${dbPos.description.slice(0, 60)}" tx: ${result.txHash}`);
                 } else {
                   logger.warn(`[CFO] Redeem failed: "${dbPos.description.slice(0, 60)}" — ${result.error}`);
@@ -883,28 +885,53 @@ export class CFOAgent extends BaseAgent {
             } else {
               // Live market with near-zero value: attempt sell on CLOB
               try {
-                await polyMod.exitPosition(freshPos, 1.0);
-                logger.info(`[CFO] Dust sell attempted: "${dbPos.description.slice(0, 60)}" ($${dustValue.toFixed(2)})`);
+                const sellResult = await polyMod.exitPosition(freshPos, 1.0);
+                if (sellResult.status !== 'ERROR') {
+                  dustSellSucceeded = true;
+                  logger.info(`[CFO] Dust sell attempted: "${dbPos.description.slice(0, 60)}" ($${dustValue.toFixed(2)})`);
+                }
               } catch (err) {
-                logger.debug(`[CFO] Dust sell failed (expected for expired): ${(err as Error).message}`);
+                logger.debug(`[CFO] Dust sell failed (expected for small positions): ${(err as Error).message}`);
               }
             }
+          } else {
+            // No on-chain position or dry-run — safe to close
+            dustSellSucceeded = true;
           }
 
-          // Close in DB regardless — position is worthless
-          await this.positionManager.closePosition(
-            action.positionId, freshPos?.currentPrice ?? 0, 'dust-cleanup', dustValue,
-          );
-          logger.info(
-            `[CFO] Dust cleanup: closed "${dbPos.description.slice(0, 60)}" ` +
-            `(value: $${dustValue.toFixed(2)}, PnL: $${dustPnl.toFixed(2)})`,
-          );
-          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
-          const txLine = redeemTxHash ? `\nTX: https://polygonscan.com/tx/${redeemTxHash}` : '';
-          await notifyAdminForce(
-            `🧹 ${freshPos?.redeemable ? 'Redeemed' : 'Dust cleanup'}: ${dbPos.description.slice(0, 60)}\n` +
-            `Value: $${dustValue.toFixed(2)} | PnL: $${dustPnl.toFixed(2)}${txLine}`,
-          );
+          if (dustSellSucceeded || !freshPos) {
+            // Tokens cleared on-chain (or never existed) — safe to close in DB
+            await this.positionManager.closePosition(
+              action.positionId, freshPos?.currentPrice ?? 0, 'dust-cleanup', dustValue,
+            );
+            logger.info(
+              `[CFO] Dust cleanup: closed "${dbPos.description.slice(0, 60)}" ` +
+              `(value: $${dustValue.toFixed(2)}, PnL: $${dustPnl.toFixed(2)})`,
+            );
+            const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+            const txLine = redeemTxHash ? `\nTX: https://polygonscan.com/tx/${redeemTxHash}` : '';
+            await notifyAdminForce(
+              `🧹 ${freshPos?.redeemable ? 'Redeemed' : 'Dust cleanup'}: ${dbPos.description.slice(0, 60)}\n` +
+              `Value: $${dustValue.toFixed(2)} | PnL: $${dustPnl.toFixed(2)}${txLine}`,
+            );
+          } else {
+            // CLOB sell failed — tokens still on-chain, don't close in DB
+            // Mark as awaiting redemption so we stop retrying
+            await this.repo?.updatePositionMetadata(action.positionId, {
+              sellFailedAt: Date.now(),
+              sellFailedError: 'CLOB sell failed for dust position',
+              awaitingRedemption: true,
+            });
+            logger.info(
+              `[CFO] Dust sell failed — marked for redemption: "${dbPos.description.slice(0, 60)}" ` +
+              `($${dustValue.toFixed(2)})`,
+            );
+            const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+            await notifyAdminForce(
+              `⏳ Dust sell failed — awaiting resolution: ${dbPos.description.slice(0, 60)}\n` +
+              `Value: $${dustValue.toFixed(2)} | Will auto-redeem when market resolves.`,
+            );
+          }
           continue;
         }
 
@@ -2018,21 +2045,30 @@ export class CFOAgent extends BaseAgent {
       if (redeemable.length > 0) {
         logger.info(`[CFO] Found ${redeemable.length} redeemable position(s) on startup — redeeming on-chain`);
         let redeemed = 0;
+        let skippedAlready = 0;
         const redeemDetails: string[] = [];
         for (const pos of redeemable) {
           try {
             const result = await polyMod.redeemPosition(pos);
             if (result.success) {
-              redeemed++;
               const label = (pos as any).question?.slice(0, 50) ?? 'unknown';
-              logger.info(`[CFO] Startup redeem: "${label}" tx: ${result.txHash}`);
-              redeemDetails.push(
-                `  • ${label}\n    TX: https://polygonscan.com/tx/${result.txHash}`,
-              );
+              if (result.txHash === 'already-redeemed') {
+                skippedAlready++;
+                logger.info(`[CFO] Already redeemed on-chain, skipping: "${label}"`);
+              } else {
+                redeemed++;
+                logger.info(`[CFO] Startup redeem: "${label}" tx: ${result.txHash}`);
+                redeemDetails.push(
+                  `  • ${label}\n    TX: https://polygonscan.com/tx/${result.txHash}`,
+                );
+              }
             }
           } catch (err) {
             logger.debug(`[CFO] Startup redeem failed: ${(err as Error).message}`);
           }
+        }
+        if (skippedAlready > 0) {
+          logger.info(`[CFO] Skipped ${skippedAlready} position(s) already redeemed on-chain`);
         }
         if (redeemed > 0) {
           const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
