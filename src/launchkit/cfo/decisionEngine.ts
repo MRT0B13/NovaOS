@@ -1375,6 +1375,15 @@ export async function generateDecisions(
   }
 
   // ── F) Simple collateral loop — borrow USDC, deploy for spread ───────────
+  // Fetch alt market APY upfront (used for both decision and diagnostics)
+  let altMarketUsdcApy = state.kaminoUsdcSupplyApy; // fallback to main market
+  if (env.kaminoEnabled && env.kaminoBorrowEnabled) {
+    try {
+      const kamino = await import('./kaminoService.ts');
+      altMarketUsdcApy = await kamino.fetchAltMarketUsdcApy();
+    } catch { /* use fallback */ }
+  }
+
   if (
     env.kaminoEnabled && env.kaminoBorrowEnabled &&
     !state.kaminoJitoLoopActive &&           // don't double up — one active strategy at a time
@@ -1384,9 +1393,10 @@ export async function generateDecisions(
   ) {
     if (checkCooldown('KAMINO_BORROW_DEPLOY', 6 * 3600_000)) {
       const borrowCost = state.kaminoBorrowApy;
+
       const estimatedDeployYield = intel.scoutBullish && env.polymarketEnabled && state.polyHeadroomUsd > 5
-        ? Math.max(state.kaminoUsdcSupplyApy, 0.18) // Polymarket expected ~18% if bullish
-        : state.kaminoUsdcSupplyApy;
+        ? Math.max(altMarketUsdcApy, 0.18) // Polymarket expected ~18% if bullish
+        : altMarketUsdcApy;
 
       const spreadPct = (estimatedDeployYield - borrowCost) * 100;
       if (spreadPct >= (env.kaminoBorrowMinSpreadPct ?? 3)) {
@@ -1425,7 +1435,7 @@ export async function generateDecisions(
       logger.debug(`[CFO:Decision] Section F skip: healthFactor=${state.kaminoHealthFactor.toFixed(2)} (need >1.8)`);
     } else {
       const borrowCostDiag = state.kaminoBorrowApy;
-      const deployYieldDiag = state.kaminoUsdcSupplyApy;
+      const deployYieldDiag = altMarketUsdcApy ?? state.kaminoUsdcSupplyApy;
       const spreadDiag = (deployYieldDiag - borrowCostDiag) * 100;
       if (spreadDiag < (env.kaminoBorrowMinSpreadPct ?? 3)) {
         logger.debug(
@@ -2457,8 +2467,9 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         let deployTxId: string | undefined;
 
         if (deployTarget === 'kamino_supply') {
-          // Re-deposit the borrowed USDC back into Kamino USDC supply (recursive yield — valid strategy)
-          const depositResult = await kamino.deposit('USDC', borrowUsd * 0.995); // small buffer for fees
+          // Supply USDC into Kamino Altcoin Market (separate obligation from Main Market
+          // where we borrowed — avoids same-asset supply+borrow conflict)
+          const depositResult = await kamino.depositToAltMarket('USDC', borrowUsd * 0.995); // small buffer for fees
           deploySuccess = depositResult.success;
           deployTxId = depositResult.txSignature;
         } else if (deployTarget === 'polymarket') {
@@ -2469,13 +2480,25 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           logger.info(`[CFO:KAMINO_BORROW_DEPLOY] $${borrowUsd} USDC borrowed and ready for Polymarket deployment`);
         }
 
-        if (deploySuccess) markDecision('KAMINO_BORROW_DEPLOY');
+        if (deploySuccess) {
+          markDecision('KAMINO_BORROW_DEPLOY');
+        } else {
+          // Deploy failed — auto-repay borrowed USDC so it doesn't sit idle in wallet
+          logger.warn(`[CFO:KAMINO_BORROW_DEPLOY] Deploy to ${deployTarget} failed — auto-repaying $${borrowUsd} USDC`);
+          const repayResult = await kamino.repay('USDC', borrowUsd * 0.995).catch((err: any) => {
+            logger.error(`[CFO:KAMINO_BORROW_DEPLOY] Auto-repay also failed: ${err}`);
+            return { success: false } as { success: boolean };
+          });
+          if (repayResult.success) {
+            logger.info(`[CFO:KAMINO_BORROW_DEPLOY] Auto-repay succeeded — borrowed USDC returned to Kamino`);
+          }
+        }
         return {
           ...base,
           executed: true,
           success: deploySuccess,
           txId: deployTxId,
-          error: deploySuccess ? undefined : 'Borrow succeeded but deploy failed — USDC is in wallet, repay manually if needed',
+          error: deploySuccess ? undefined : 'Borrow succeeded but deploy failed — auto-repay attempted',
         };
       }
 

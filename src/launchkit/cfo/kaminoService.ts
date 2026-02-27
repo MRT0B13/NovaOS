@@ -41,6 +41,10 @@ import { getCFOEnv } from './cfoEnv.ts';
 
 const KAMINO_MAIN_MARKET_ADDR: any = '7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF';
 
+// Altcoin Market — separate market for cross-market supply (avoids same-obligation conflict)
+// Used by KAMINO_BORROW_DEPLOY: borrow USDC from Main Market → supply into Altcoin Market
+const KAMINO_ALT_MARKET_ADDR: any = 'ByYiZxp8QrdN9qbdtaAiePN8AAr3qvTPppNJDpf5DVJ5';
+
 // ── Token mints (verified mainnet) ──────────────────────────────────────────
 const JITOSOL_MINT = 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn';
 const MSOL_MINT    = 'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So';
@@ -453,6 +457,216 @@ async function fetchKaminoApys(): Promise<KaminoMarketApy> {
     return result;
   } catch {
     return fallback;
+  }
+}
+
+// ============================================================================
+// Alt Market APY + Deposit (cross-market supply for borrow-deploy strategy)
+// ============================================================================
+
+/**
+ * Fetch USDC supply APY from the Altcoin Market.
+ * Used by the decision engine to calculate the real spread for kamino_supply deploy.
+ */
+export async function fetchAltMarketUsdcApy(): Promise<number> {
+  try {
+    const resp = await fetch(
+      `https://api.kamino.finance/kamino-market/${KAMINO_ALT_MARKET_ADDR}/reserves/metrics`,
+      { signal: AbortSignal.timeout(15_000) },
+    );
+    if (!resp.ok) throw new Error(`Kamino Alt Market API ${resp.status}`);
+    const data = await resp.json() as any[];
+    for (const reserve of data) {
+      const rawSymbol: string = (reserve.liquidityToken ?? '').toUpperCase();
+      if (rawSymbol === 'USDC') {
+        return Number(reserve.supplyApy ?? 0.06);
+      }
+    }
+    return 0.06; // fallback
+  } catch {
+    return 0.06; // fallback
+  }
+}
+
+/**
+ * Deposit USDC into the Kamino Altcoin Market (separate from Main Market).
+ * This avoids the same-obligation conflict: you can't supply and borrow USDC
+ * in the same market/obligation. By depositing into the Alt Market we create
+ * a separate obligation that only has a supply position.
+ */
+export async function depositToAltMarket(asset: KaminoAsset, amount: number): Promise<KaminoDepositResult> {
+  const env = getCFOEnv();
+
+  if (env.dryRun) {
+    const apy = await fetchAltMarketUsdcApy();
+    logger.info(`[Kamino:AltMarket] DRY RUN — would deposit ${amount} ${asset} at ${(apy * 100).toFixed(1)}% APY`);
+    return { success: true, asset, amountDeposited: amount, kTokensReceived: amount, txSignature: `dry-alt-${Date.now()}` };
+  }
+
+  if (amount <= 0) return { success: false, asset, amountDeposited: 0, kTokensReceived: 0, error: 'Amount must be positive' };
+
+  try {
+    const klend = await loadKlend();
+    const wallet = loadWallet();
+    const connection = getConnection();
+    const rpc = getRpcV2();
+
+    // Load the Altcoin Market (NOT the Main Market)
+    const market = await klend.KaminoMarket.load(
+      rpc,
+      KAMINO_ALT_MARKET_ADDR,
+      400,
+    );
+    if (!market) throw new Error('Failed to load Kamino Altcoin Market');
+
+    // Find USDC reserve in the alt market — need to look up by mint since
+    // the reserve address will be different from the Main Market
+    const reserveInfo = await getReserve(asset);
+    if (!reserveInfo) throw new Error(`Unknown asset: ${asset}`);
+    const mintAddr = reserveInfo.mint;
+
+    // Find the reserve in the alt market by matching the liquidity mint
+    const allReserves = market.reserves;
+    let altReserve: any = null;
+    for (const [, r] of allReserves) {
+      const liquidityMint = r.getLiquidityMint?.()?.toString?.() ?? '';
+      if (liquidityMint === mintAddr) {
+        altReserve = r;
+        break;
+      }
+    }
+    if (!altReserve) throw new Error(`${asset} reserve not found in Altcoin Market`);
+
+    const walletAddr = { address: wallet.publicKey.toBase58() } as any;
+    const baseAmount = Math.floor(amount * 10 ** reserveInfo.decimals).toString();
+    const kaminoAction = await klend.KaminoAction.buildDepositTxns(
+      market,
+      baseAmount,
+      altReserve.getLiquidityMint(),
+      walletAddr,
+      new klend.VanillaObligation(klend.PROGRAM_ID),
+      0 as any,
+      undefined,
+      undefined,
+      undefined,
+      klend.PROGRAM_ID as any,
+    );
+
+    const tx = new Transaction();
+    for (const ix of kaminoAction.computeBudgetIxs ?? []) tx.add(ixV2toV1(ix));
+    for (const ix of [
+      ...kaminoAction.setupIxs,
+      ...kaminoAction.lendingIxs,
+      ...kaminoAction.cleanupIxs,
+    ]) {
+      tx.add(ixV2toV1(ix));
+    }
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = wallet.publicKey;
+
+    tx.sign(wallet);
+    const signature = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    logger.info(`[Kamino:AltMarket] Tx sent: ${signature}, polling for confirmation...`);
+    await pollConfirmation(connection, signature, lastValidBlockHeight);
+
+    logger.info(`[Kamino:AltMarket] Deposited ${amount} ${asset} into Altcoin Market: ${signature}`);
+    return {
+      success: true,
+      txSignature: signature,
+      asset,
+      amountDeposited: amount,
+      kTokensReceived: amount,
+    };
+  } catch (err) {
+    const error = (err as Error).message;
+    logger.error('[Kamino:AltMarket] deposit error:', err);
+    return { success: false, asset, amountDeposited: 0, kTokensReceived: 0, error };
+  }
+}
+
+/**
+ * Withdraw from the Kamino Altcoin Market (to unwind cross-market supply).
+ */
+export async function withdrawFromAltMarket(asset: KaminoAsset, amount: number): Promise<KaminoWithdrawResult> {
+  const env = getCFOEnv();
+
+  if (env.dryRun) {
+    logger.info(`[Kamino:AltMarket] DRY RUN — would withdraw ${amount} ${asset}`);
+    return { success: true, asset, amountWithdrawn: amount, txSignature: `dry-alt-w-${Date.now()}` };
+  }
+
+  try {
+    const klend = await loadKlend();
+    const wallet = loadWallet();
+    const connection = getConnection();
+    const rpc = getRpcV2();
+
+    const market = await klend.KaminoMarket.load(rpc, KAMINO_ALT_MARKET_ADDR, 400);
+    if (!market) throw new Error('Failed to load Kamino Altcoin Market');
+
+    const reserveInfo = await getReserve(asset);
+    if (!reserveInfo) throw new Error(`Unknown asset: ${asset}`);
+    const mintAddr = reserveInfo.mint;
+
+    // Find the reserve in the alt market by matching the liquidity mint
+    let altReserve: any = null;
+    for (const [, r] of market.reserves) {
+      const liquidityMint = r.getLiquidityMint?.()?.toString?.() ?? '';
+      if (liquidityMint === mintAddr) {
+        altReserve = r;
+        break;
+      }
+    }
+    if (!altReserve) throw new Error(`${asset} reserve not found in Altcoin Market`);
+
+    const walletAddr = { address: wallet.publicKey.toBase58() } as any;
+    const baseAmount = Math.floor(amount * 10 ** reserveInfo.decimals).toString();
+    const kaminoAction = await klend.KaminoAction.buildWithdrawTxns(
+      market,
+      baseAmount,
+      altReserve.getLiquidityMint(),
+      walletAddr,
+      new klend.VanillaObligation(klend.PROGRAM_ID),
+      0 as any,
+      undefined,
+      undefined,
+      undefined,
+      klend.PROGRAM_ID as any,
+    );
+
+    const tx = new Transaction();
+    for (const ix of kaminoAction.computeBudgetIxs ?? []) tx.add(ixV2toV1(ix));
+    for (const ix of [
+      ...kaminoAction.setupIxs,
+      ...kaminoAction.lendingIxs,
+      ...kaminoAction.cleanupIxs,
+    ]) {
+      tx.add(ixV2toV1(ix));
+    }
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = wallet.publicKey;
+
+    tx.sign(wallet);
+    const signature = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    logger.info(`[Kamino:AltMarket] Withdraw tx sent: ${signature}`);
+    await pollConfirmation(connection, signature, lastValidBlockHeight);
+
+    logger.info(`[Kamino:AltMarket] Withdrew ${amount} ${asset}: ${signature}`);
+    return { success: true, asset, amountWithdrawn: amount, txSignature: signature };
+  } catch (err) {
+    const error = (err as Error).message;
+    logger.error('[Kamino:AltMarket] withdraw error:', err);
+    return { success: false, asset, amountWithdrawn: 0, error };
   }
 }
 
