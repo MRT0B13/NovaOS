@@ -1917,6 +1917,13 @@ export async function redeemPosition(position: PolyPosition): Promise<{
         amounts.push(bal);
       }
 
+      // Skip if all balances are already 0 (already redeemed)
+      const totalBalance = amounts.reduce((s, a) => s + a, 0n);
+      if (totalBalance === 0n) {
+        logger.info(`[Polymarket] Neg-risk already redeemed (0 balance on-chain): "${position.question}" — skipping`);
+        return { success: true, txHash: 'already-redeemed' };
+      }
+
       logger.info(
         `[Polymarket] Redeeming neg-risk: "${position.question}" ` +
         `(conditionId=${adapterConditionId.slice(0, 18)}…, slots=${slotCount}, ` +
@@ -1932,11 +1939,23 @@ export async function redeemPosition(position: PolyPosition): Promise<{
       // Regular: call ConditionalTokens.redeemPositions(collateral, parentCollectionId, conditionId, indexSets)
       const ct = new eth.Contract(CONDITIONAL_TOKENS, [
         'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] calldata indexSets)',
+        'function balanceOf(address account, uint256 id) view returns (uint256)',
+        'function getPositionId(address collateralToken, bytes32 collectionId) pure returns (uint256)',
+        'function getCollectionId(bytes32 parentCollectionId, bytes32 conditionId, uint256 indexSet) view returns (bytes32)',
       ], connectedWallet);
+
+      // Check on-chain balance before sending TX — skip if already redeemed
+      const collectionId = await ct.getCollectionId(eth.ZeroHash, position.conditionId, indexSet);
+      const positionId = await ct.getPositionId(USDC_POLYGON, collectionId);
+      const onChainBal = await ct.balanceOf(wallet.address, positionId);
+      if (onChainBal === 0n) {
+        logger.info(`[Polymarket] Already redeemed (0 balance on-chain): "${position.question}" — skipping`);
+        return { success: true, txHash: 'already-redeemed' };
+      }
 
       logger.info(
         `[Polymarket] Redeeming: "${position.question}" ` +
-        `(conditionId=${position.conditionId.slice(0, 18)}…, indexSet=${indexSet})`,
+        `(conditionId=${position.conditionId.slice(0, 18)}…, indexSet=${indexSet}, balance=${onChainBal.toString()})`,
       );
       tx = await ct.redeemPositions(
         USDC_POLYGON,
