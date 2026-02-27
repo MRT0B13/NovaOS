@@ -850,7 +850,12 @@ export class CFOAgent extends BaseAgent {
         }
         const dbPos = await this.repo?.getPosition(action.positionId);
         if (!dbPos) continue;
-        const meta = dbPos.metadata as { tokenId?: string };
+        const meta = dbPos.metadata as { tokenId?: string; awaitingRedemption?: boolean };
+        // Skip positions already marked as awaiting redemption (CLOB sell failed previously)
+        if (meta.awaitingRedemption) {
+          logger.debug(`[CFO] Skipping ${action.action} for ${action.positionId} — awaiting market resolution/redemption`);
+          continue;
+        }
         const freshPos = freshPositions.find((p: any) => p.tokenId === meta.tokenId);
 
         // ── Dust cleanup: position worth < $1 or not found on-chain ──
@@ -954,18 +959,25 @@ export class CFOAgent extends BaseAgent {
             `"${dbPos.description.slice(0, 60)}" — will check next cycle`,
           );
         } else if (exitOrder.status === 'ERROR' && freshPos.currentValueUsd < 5) {
-          // CLOB sell failed for a small position — close as dust instead of retrying forever
-          await this.positionManager.closePosition(
-            action.positionId, freshPos.currentPrice, 'sell-failed-dust', freshPos.currentValueUsd,
-          );
+          // CLOB sell failed for a small position — DON'T close in DB because the
+          // tokens are still in the wallet on-chain. Closing in DB would cause
+          // reconcilePolymarketGhosts() to reopen it, creating an infinite loop.
+          // Instead, mark it so we don't retry sell every cycle — let it sit until
+          // the market resolves, then startup redemption will handle it.
+          await this.repo?.updatePositionMetadata(action.positionId, {
+            sellFailedAt: Date.now(),
+            sellFailedError: exitOrder.errorMessage ?? 'unknown',
+            awaitingRedemption: true,
+          });
           const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
           await notifyAdminForce(
-            `🧹 Sell failed (dust close): ${dbPos.description.slice(0, 60)}\n` +
+            `⏳ Sell failed — awaiting market resolution: ${dbPos.description.slice(0, 60)}\n` +
             `Value: $${freshPos.currentValueUsd.toFixed(2)} | PnL: $${pnl.toFixed(2)}\n` +
-            `Error: ${exitOrder.errorMessage ?? 'unknown'}`,
+            `Error: ${exitOrder.errorMessage ?? 'unknown'}\n` +
+            `Will auto-redeem when market resolves.`,
           );
           logger.info(
-            `[CFO] CLOB sell failed for small position — closing as dust: "${dbPos.description.slice(0, 60)}" ` +
+            `[CFO] CLOB sell failed for small position — marked for redemption: "${dbPos.description.slice(0, 60)}" ` +
             `($${freshPos.currentValueUsd.toFixed(2)})`,
           );
         }
