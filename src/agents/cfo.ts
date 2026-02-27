@@ -860,12 +860,14 @@ export class CFOAgent extends BaseAgent {
           const dustValue = freshPos?.currentValueUsd ?? 0;
           const dustPnl = dustValue - dbPos.costBasisUsd;
 
+          let redeemTxHash: string | undefined;
           if (freshPos && freshPos.size > 0 && !env.dryRun) {
             if (freshPos.redeemable) {
               // Resolved market: redeem on-chain (burns tokens, returns USDC if winning)
               try {
                 const result = await polyMod.redeemPosition(freshPos);
                 if (result.success) {
+                  redeemTxHash = result.txHash;
                   logger.info(`[CFO] Redeemed resolved position: "${dbPos.description.slice(0, 60)}" tx: ${result.txHash}`);
                 } else {
                   logger.warn(`[CFO] Redeem failed: "${dbPos.description.slice(0, 60)}" — ${result.error}`);
@@ -893,9 +895,10 @@ export class CFOAgent extends BaseAgent {
             `(value: $${dustValue.toFixed(2)}, PnL: $${dustPnl.toFixed(2)})`,
           );
           const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          const txLine = redeemTxHash ? `\nTX: https://polygonscan.com/tx/${redeemTxHash}` : '';
           await notifyAdminForce(
             `🧹 ${freshPos?.redeemable ? 'Redeemed' : 'Dust cleanup'}: ${dbPos.description.slice(0, 60)}\n` +
-            `Value: $${dustValue.toFixed(2)} | PnL: $${dustPnl.toFixed(2)}`,
+            `Value: $${dustValue.toFixed(2)} | PnL: $${dustPnl.toFixed(2)}${txLine}`,
           );
           continue;
         }
@@ -1988,12 +1991,17 @@ export class CFOAgent extends BaseAgent {
       if (redeemable.length > 0) {
         logger.info(`[CFO] Found ${redeemable.length} redeemable position(s) on startup — redeeming on-chain`);
         let redeemed = 0;
+        const redeemDetails: string[] = [];
         for (const pos of redeemable) {
           try {
             const result = await polyMod.redeemPosition(pos);
             if (result.success) {
               redeemed++;
-              logger.info(`[CFO] Startup redeem: "${(pos as any).question?.slice(0, 50)}" tx: ${result.txHash}`);
+              const label = (pos as any).question?.slice(0, 50) ?? 'unknown';
+              logger.info(`[CFO] Startup redeem: "${label}" tx: ${result.txHash}`);
+              redeemDetails.push(
+                `  • ${label}\n    TX: https://polygonscan.com/tx/${result.txHash}`,
+              );
             }
           } catch (err) {
             logger.debug(`[CFO] Startup redeem failed: ${(err as Error).message}`);
@@ -2001,7 +2009,9 @@ export class CFOAgent extends BaseAgent {
         }
         if (redeemed > 0) {
           const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
-          await notifyAdminForce(`♻️ Redeemed ${redeemed}/${redeemable.length} resolved Polymarket position(s) on startup`);
+          await notifyAdminForce(
+            `♻️ Redeemed ${redeemed}/${redeemable.length} resolved Polymarket position(s) on startup\n${redeemDetails.join('\n')}`,
+          );
         }
       }
 

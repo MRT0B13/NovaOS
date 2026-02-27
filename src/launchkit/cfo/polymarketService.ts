@@ -1874,16 +1874,60 @@ export async function redeemPosition(position: PolyPosition): Promise<{
     let tx: any;
 
     if (position.negativeRisk) {
-      // Neg-risk: call NegRiskAdapter.redeemPositions(conditionId, indexSets)
-      const adapter = new eth.Contract(NEG_RISK_ADAPTER, [
-        'function redeemPositions(bytes32 conditionId, uint256[] calldata indexSets)',
+      // Neg-risk markets: the NegRiskAdapter.redeemPositions(conditionId, amounts)
+      // takes an AMOUNTS array — one entry per outcome slot (always 2 for neg-risk).
+      // We pass our token balance at our outcomeIndex, and 0 for the other slot.
+      //
+      // The conditionId from the Data API IS the correct on-chain condition
+      // (adapter creates it via getConditionId(adapter, questionId, 2)).
+      // We need the question_id to look up the correct conditionId.
+      let questionId: string;
+      try {
+        const mktResp = await clobGet<{ question_id?: string }>(`/markets/${position.conditionId}`);
+        questionId = mktResp?.question_id ?? position.conditionId;
+      } catch {
+        questionId = position.conditionId;
+      }
+
+      // Get the on-chain conditionId that the adapter registered
+      const ctView = new eth.Contract(CONDITIONAL_TOKENS, [
+        'function getConditionId(address oracle, bytes32 questionId, uint256 outcomeSlotCount) pure returns (bytes32)',
+        'function getOutcomeSlotCount(bytes32 conditionId) view returns (uint256)',
+        'function balanceOf(address account, uint256 id) view returns (uint256)',
+        'function getPositionId(address collateralToken, bytes32 collectionId) pure returns (uint256)',
+        'function getCollectionId(bytes32 parentCollectionId, bytes32 conditionId, uint256 indexSet) view returns (bytes32)',
       ], connectedWallet);
+
+      const adapterConditionId = await ctView.getConditionId(NEG_RISK_ADAPTER, questionId, 2);
+      const slotCount = Number(await ctView.getOutcomeSlotCount(adapterConditionId));
+
+      if (slotCount === 0) {
+        logger.warn(`[Polymarket] Neg-risk market not resolved on-chain yet: "${position.question}" — skipping`);
+        return { success: false, error: 'Market not resolved on-chain yet' };
+      }
+
+      // Build amounts array: our token balance at our index, 0 elsewhere
+      // Query actual on-chain balance to be precise
+      const amounts: bigint[] = [];
+      for (let i = 0; i < slotCount; i++) {
+        const iSet = 1 << i;
+        const collectionId = await ctView.getCollectionId(eth.ZeroHash, adapterConditionId, iSet);
+        const positionId = await ctView.getPositionId(NEG_RISK_ADAPTER, collectionId);
+        const bal = await ctView.balanceOf(wallet.address, positionId);
+        amounts.push(bal);
+      }
 
       logger.info(
         `[Polymarket] Redeeming neg-risk: "${position.question}" ` +
-        `(conditionId=${position.conditionId.slice(0, 18)}…, indexSet=${indexSet})`,
+        `(conditionId=${adapterConditionId.slice(0, 18)}…, slots=${slotCount}, ` +
+        `amounts=[${amounts.map(a => a.toString()).join(',')}])`,
       );
-      tx = await adapter.redeemPositions(position.conditionId, [indexSet]);
+
+      const adapter = new eth.Contract(NEG_RISK_ADAPTER, [
+        'function redeemPositions(bytes32 conditionId, uint256[] calldata amounts)',
+      ], connectedWallet);
+
+      tx = await adapter.redeemPositions(adapterConditionId, amounts);
     } else {
       // Regular: call ConditionalTokens.redeemPositions(collateral, parentCollectionId, conditionId, indexSets)
       const ct = new eth.Contract(CONDITIONAL_TOKENS, [
