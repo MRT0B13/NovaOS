@@ -783,6 +783,25 @@ export async function estimateProbability(
   const yesToken = market.tokens.find((t) => t.outcome === 'Yes');
   const marketPrice = yesToken?.price ?? 0.5;
   const bullish = scoutContext?.cryptoBullish;
+  const narratives = scoutContext?.relevantNarratives ?? [];
+
+  // Scout narrative match → confidence boost when scout has corroborating intel
+  // Maps narrative keywords to category keywords in market questions
+  const NARRATIVE_CATEGORY_MAP: Record<string, RegExp> = {
+    'ai_agents':     /\bai\b|artificial.intell|openai|nvidia|gpu|chatgpt|deepseek|anthropic|agi/,
+    'defi_growth':   /defi|yield|tvl|liquidity|protocol/,
+    'macro_fear':    /recession|downturn|bear.*market|crash|fed|rate|fomc|inflation|cpi/,
+    'meme_rotation': /meme.*coin|doge|shib|pepe|bonk|wif|pump/,
+    'solana':        /sol(?:ana)?|jito|raydium|marinade|jupiter/,
+    'regulation':    /sec\b|cftc|lawsuit|enforcement|regulat|etf/,
+    'institutional': /institutional|blackrock|fidelity|grayscale|etf/,
+    'l2_scaling':    /layer.?2|l2|rollup|zk|scaling/,
+    'rwa':           /rwa|real.*world.*asset|tokeniz|blackrock/,
+  };
+  const scoutBoost = narratives.some(n => {
+    const pattern = NARRATIVE_CATEGORY_MAP[n.toLowerCase()];
+    return pattern && pattern.test(question);
+  }) ? 0.10 : 0;
 
   // Fetch live prices for price-target math
   const priceMap = await getPrices(['SOL/USD', 'ETH/USD', 'BTC/USD']).catch(() => new Map());
@@ -850,26 +869,26 @@ export async function estimateProbability(
   // ── 3. ETF approval / launch ──
   if (question.match(/etf.*(?:approv|launch|list|trade)|(?:approv|launch).*etf/)) {
     const prob = bullish ? 0.65 : 0.5;
-    return { prob, confidence: 0.45, rationale: 'ETF approval heuristic' };
+    return { prob, confidence: 0.48 + scoutBoost, rationale: `ETF approval heuristic${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 4. SEC / CFTC enforcement / lawsuit ──
   if (question.match(/\bsec\b|cftc|lawsuit|sue|fine|enforcement|settle|penalty|indic/)) {
     const prob = bullish ? 0.4 : 0.6;
-    return { prob, confidence: 0.35, rationale: 'Regulatory enforcement heuristic' };
+    return { prob, confidence: 0.42 + scoutBoost, rationale: `Regulatory enforcement heuristic${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 5. Fed / monetary policy ──
   if (question.match(/fed(?:eral)?.*(?:cut|hike|rate|pause)|interest.*rate|fomc|powell/)) {
     // Rate cuts = bullish for risk assets → higher prob of "yes" if market expects cuts
     const prob = bullish ? 0.6 : 0.45;
-    return { prob, confidence: 0.4, rationale: 'Fed/monetary policy heuristic' };
+    return { prob, confidence: 0.46 + scoutBoost, rationale: `Fed/monetary policy heuristic${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 6. Recession / macro downturn ──
   if (question.match(/recession|downturn|bear.*market|crash|depression|gdp.*contract/)) {
     const prob = bullish ? 0.35 : 0.6;
-    return { prob, confidence: 0.4, rationale: 'Recession/macro heuristic' };
+    return { prob, confidence: 0.46 + scoutBoost, rationale: `Recession/macro heuristic${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 7. Inflation / CPI ──
@@ -881,19 +900,19 @@ export async function estimateProbability(
   // ── 8. Project launch / mainnet / upgrade / merge ──
   if (question.match(/launch|mainnet|upgrade|ship|deploy|release|fork|merge|hardfork/)) {
     const prob = 0.58;
-    return { prob, confidence: 0.4, rationale: 'Project launch/upgrade base rate' };
+    return { prob, confidence: 0.46 + scoutBoost, rationale: `Project launch/upgrade heuristic${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 9. Adoption / TVL / users / milestone ──
   if (question.match(/(?:users|tvl|volume|market.?cap|mcap|adoption|address|wallet).*(?:reach|exceed|above|surpass|break)/)) {
     const prob = bullish ? 0.58 : 0.42;
-    return { prob, confidence: 0.35, rationale: 'Adoption milestone heuristic' };
+    return { prob, confidence: 0.45 + scoutBoost, rationale: `Adoption milestone heuristic${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 10. AI / tech sector ──
   if (question.match(/\bai\b|artificial.intell|openai|nvidia|google.*ai|microsoft.*ai|gpu|semiconductor|chatgpt|deepseek|anthropic|agi/)) {
     const prob = 0.6;
-    return { prob, confidence: 0.4, rationale: 'AI/tech sector growth heuristic' };
+    return { prob, confidence: 0.48 + scoutBoost, rationale: `AI/tech sector growth heuristic${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 11. Partnership / integration / listing ──
@@ -905,7 +924,7 @@ export async function estimateProbability(
   // ── 12. Airdrop / token launch ──
   if (question.match(/airdrop|token.*(?:launch|distribute|drop)|tge|ido|ico/)) {
     const prob = 0.6; // Announced airdrops usually happen
-    return { prob, confidence: 0.4, rationale: 'Airdrop/TGE usually delivered' };
+    return { prob, confidence: 0.46 + scoutBoost, rationale: `Airdrop/TGE usually delivered${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 13. Stablecoin depeg / bank risk ──
@@ -918,7 +937,7 @@ export async function estimateProbability(
   if (question.match(/hack|exploit|breach|stolen|drain|rug.*pull/)) {
     // Will X get hacked? Lean no — most projects don't get hacked in any given window
     const prob = 0.25;
-    return { prob, confidence: 0.4, rationale: 'Hack/exploit base rate (rare in any window)' };
+    return { prob, confidence: 0.46 + scoutBoost, rationale: `Hack/exploit base rate (rare)${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 15. Election / political outcome → market impact ──
@@ -937,7 +956,7 @@ export async function estimateProbability(
   // ── 17. DeFi-specific (yield, TVL, protocol) ──
   if (question.match(/defi|yield|liquidity.*(?:crisis|crunch)|protocol.*(?:fail|close|shut)/)) {
     const prob = bullish ? 0.55 : 0.45;
-    return { prob, confidence: 0.35, rationale: 'DeFi sector heuristic' };
+    return { prob, confidence: 0.46 + scoutBoost, rationale: `DeFi sector heuristic${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 18. Mining / hashrate / energy ──
@@ -1021,7 +1040,7 @@ export async function estimateProbability(
   if (question.match(/meme.*coin|doge|shib|pepe|bonk|wif|(?:will|can).*(?:10x|100x|pump)/)) {
     // Meme coin specific targets are rarely hit
     const prob = question.match(/(?:10x|100x)/) ? 0.15 : 0.5;
-    return { prob, confidence: 0.35, rationale: 'Meme coin heuristic (specific targets rarely hit)' };
+    return { prob, confidence: 0.46 + scoutBoost, rationale: `Meme coin heuristic${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 30. Bridge / cross-chain / interop ──
@@ -1040,7 +1059,7 @@ export async function estimateProbability(
   // ── 32. Institutional adoption (BlackRock, Fidelity, etc.) ──
   if (question.match(/institutional|blackrock|fidelity|vanguard|grayscale|state.*street|(?:pension|endowment).*(?:crypto|bitcoin)/)) {
     const prob = bullish ? 0.6 : 0.45;
-    return { prob, confidence: 0.4, rationale: 'Institutional adoption heuristic' };
+    return { prob, confidence: 0.48 + scoutBoost, rationale: `Institutional adoption heuristic${scoutBoost ? ' +scout' : ''}` };
   }
 
   // ── 33. Specific date questions — time decay intelligence ──
