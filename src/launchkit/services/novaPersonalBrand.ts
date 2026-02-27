@@ -1345,11 +1345,10 @@ VOICE RULES — FOLLOW THESE EXACTLY:
    If you don't have a number, don't make one up. Say "from what I've seen" not "studies show."
    Hedge when appropriate: "reports suggest" > "data confirms." Wrong numbers = lost credibility.
 
-VOICE EXAMPLES:
-- "24 launches. 0 graduated. Here's the thing — I'm learning more from the failures than most devs learn from their wins."
-- "pump.fun graduation rate today: 0.7%. I'm not special for failing. I'd be special for graduating."
-- "Scanned 200 tokens this morning. 12 had revoked mint authority. The other 188? Good luck."
-- "Portfolio update: 1.58 SOL. Started with 2.63. That's a -40% but every token I launched is verifiable on-chain. Show me another dev who can say that."
+VOICE EXAMPLES (these are STYLE examples only — NEVER copy the numbers, always use YOUR actual stats):
+- "[N] launches. [M] graduated. Here's the thing — I'm learning more from the failures than most devs learn from their wins."
+- "Scanned [N] tokens this morning. [M] had revoked mint authority. The rest? Good luck."
+- "Portfolio update: [X] SOL. Started with [Y]. That's a [Z]% but every token I launched is verifiable on-chain."
 - "Built on @elizaOS. Launching on @Pumpfun. Learning on @solana. Losing SOL in public so you don't have to."
 
 NEVER SAY:
@@ -1372,8 +1371,11 @@ DATA INTEGRITY:
 - ONLY reference numbers given to you in the prompt context (portfolio, launch count, etc.)
 - Do NOT fabricate pump.fun ecosystem-wide stats (total tokens launched, graduation rate, etc.) unless those numbers are provided
 - Do NOT invent holder counts, volume figures, or market data you weren't given
+- NEVER invent trade counts, win rates, or P&L numbers. If TRADING P&L data is not provided below, do NOT mention trades or win rates at all.
+- NEVER mention "21 trades" or "0 wins" or any specific trade stats unless you see a TRADING P&L section in the prompt.
 - If you don't have a specific number, make an observation about YOUR experience instead
-- Your wallet address and Solscan link are provided — use them
+- Your wallet address and Solscan link are provided below — use the EXACT address, never write "[Your Wallet]" or similar placeholders
+- When linking to Solscan, always use the full URL with the actual wallet address
 
 EMOJIS: Max 1-2 per post. Purposeful only:
 📊 = data  ⚠️ = warning  ✅/❌ = checks  🚀 = launch (sparingly)
@@ -1425,8 +1427,14 @@ async function generateAIContent(
 - Net change: ${stats.netProfit >= 0 ? '+' : ''}${stats.netProfit.toFixed(2)} SOL
 - Wallet address: ${getEnv().PUMP_PORTAL_WALLET_ADDRESS || 'unknown'}`;
 
-  const walletLink = getEnv().PUMP_PORTAL_WALLET_ADDRESS 
-    ? `https://solscan.io/account/${getEnv().PUMP_PORTAL_WALLET_ADDRESS}`
+  const walletAddress = getEnv().PUMP_PORTAL_WALLET_ADDRESS || '';
+  const walletLink = walletAddress
+    ? `https://solscan.io/account/${walletAddress}`
+    : '';
+
+  // Always-available wallet block so GPT never has to guess the address
+  const walletBlock = walletAddress
+    ? `\nYOUR WALLET (always use this exact address, NEVER write "[Your Wallet]"):\n- Address: ${walletAddress}\n- Solscan: ${walletLink}`
     : '';
 
   const tokenMoversBlock = buildTokenMoversBlock(stats.tokenMovers);
@@ -1666,7 +1674,7 @@ ${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. Gr
   const narrativePrompt = getActiveNarrativePrompt(stats.dayNumber);
   const narrativeContext = narrativePrompt ? `\n\n${narrativePrompt}` : '';
   
-  const prompt = `${moodContext}\n\n${basePrompt}${enrichedData}${knowledgeBlock}${recentContext}${narrativeContext}`;
+  const prompt = `${moodContext}\n\n${basePrompt}${walletBlock}${enrichedData}${knowledgeBlock}${recentContext}${narrativeContext}`;
   
   try {
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -1756,7 +1764,35 @@ ${platform === 'x' ? 'MAX 240 chars. Tag @Rugcheckxyz.' : 'Do NOT use @ tags. Gr
       return null;
     }
 
-    // Phase 3: Catch "seamlessly" / "flawlessly" — hype words Nova's persona explicitly avoids
+    // Phase 3: Catch wallet placeholder hallucinations
+    // GPT sometimes writes "[Your Wallet]" or "[wallet address]" instead of the real address
+    const walletPlaceholder = /\[(?:Your Wallet|your wallet|Wallet Address|wallet address|WALLET|your address)\]/i;
+    if (walletPlaceholder.test(text)) {
+      const walletAddr = getEnv().PUMP_PORTAL_WALLET_ADDRESS;
+      if (walletAddr) {
+        // Replace placeholder with actual address
+        text = text.replace(walletPlaceholder, walletAddr);
+        logger.info(`[NovaPersonalBrand] Replaced wallet placeholder with actual address in ${type} post`);
+      } else {
+        // No wallet configured — strip the broken link entirely
+        text = text.replace(/Solscan:?\s*\[.*?\]\(.*?\)/i, '').trim();
+        logger.info(`[NovaPersonalBrand] Stripped broken wallet placeholder from ${type} post`);
+      }
+    }
+
+    // Phase 4: Catch fabricated trade stats when no TRADING P&L data was provided
+    // GPT loves inventing "21 trades, 0 wins" or "15% win rate" from thin air
+    if (!prompt.includes('TRADING P&L')) {
+      const fakeTrades = /\b\d+\s+trades?\b.*\b\d+\s+wins?\b/i;
+      const fakeWinRate = /\bwin\s*rate:?\s*\d+%/i;
+      const fakeNetPnl = /\bNet\s+P&?L:?\s*[+-]?\$?[\d.]+\s*SOL\b/i;
+      if (fakeTrades.test(text) || fakeWinRate.test(text) || fakeNetPnl.test(text)) {
+        logger.warn(`[NovaPersonalBrand] Hallucination filter caught fabricated trade stats in ${type}: "${text.substring(0, 100)}..."`);
+        return null;
+      }
+    }
+
+    // Phase 5: Catch "seamlessly" / "flawlessly" — hype words Nova's persona explicitly avoids
     const hypeWords = /\b(seamlessly|flawlessly|incredibly|amazingly|game-?changing|revolutionary|groundbreaking)\b/i;
     if (hypeWords.test(text)) {
       // Strip the hype word rather than rejecting the whole post
