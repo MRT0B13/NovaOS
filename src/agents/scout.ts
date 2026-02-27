@@ -448,6 +448,10 @@ export class ScoutAgent extends BaseAgent {
       this.lastDigestAt = now;
       this.intelBuffer = [];
       this.scanCount = 0;
+      // Reset dedup hashes so next 2h window can re-evaluate topics
+      // (Tavily cache returns same answers for 6h; without clearing,
+      //  seenHashes blocks all results after first digest window)
+      this.seenHashes.clear();
     } catch (err) {
       logger.error('[scout] Digest failed:', err);
     }
