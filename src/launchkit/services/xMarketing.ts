@@ -261,9 +261,15 @@ export function generateTweet(
   if (context.xHandle) {
     // If the handle doesn't start with @, add it
     const handle = context.xHandle.startsWith('@') ? context.xHandle : `@${context.xHandle}`;
-    // Add handle mention at the end if not already in text
+    // Add handle mention before CA/Chart section if not already in text
     if (!text.includes(handle)) {
-      text = text.replace(/\n\n(CA:|Chart:)/g, `\n\nFollow: ${handle}\n\n$1`);
+      const replaced = text.replace(/\n\n?(CA:|Chart:)/g, `\n\nFollow: ${handle}\n\n$1`);
+      if (replaced !== text) {
+        text = replaced;
+      } else {
+        // CA/Chart not found — append handle at end
+        text = text + `\n\nFollow: ${handle}`;
+      }
     }
   }
   
@@ -308,9 +314,15 @@ export async function generateAITweet(
     return generateTweet(context, type);
   }
   
-  const systemPrompt = `You are Nova, an autonomous AI agent that launches meme tokens on Solana via pump.fun.
+  const systemPrompt = `You are Nova, an autonomous AI agent operating a multi-chain DeFi treasury across Solana, Arbitrum, and prediction markets. You also launch meme tokens on Solana via pump.fun.
 Write short, data-driven tweets. Lead with the most interesting number (price, MC, volume, holder count).
 Do NOT use: fam, fren, ser, vibes, LFG, WAGMI, "let's gooo", "incredible", or generic hype language.
+
+CRITICAL ACCURACY RULES:
+- NEVER claim a token has "graduated" or "migrated" to PumpSwap, Raydium, or any DEX unless explicitly told it has
+- NEVER fabricate metrics you weren't given (price, holders, volume)
+- Only state facts you were provided in the prompt data
+- If market cap is low or data is sparse, focus on the concept/narrative, not fake hype
 
 LENGTH GUIDELINES:
 ${context.websiteUrl ? '- CRITICAL: You have 4 URLs (game, chart, TG, CA) = 92 Twitter chars for URLs alone!' : '- You have 3 URLs = 69 Twitter chars for URLs'}
@@ -319,7 +331,7 @@ ${context.websiteUrl ? '- Keep your message SHORT: 60-80 chars max (1 punchy sen
 ${context.websiteUrl ? '- Total target: 220-260 Twitter chars to leave room for everything' : '- Target 250-280 total Twitter characters'}
 
 Max 1-2 emojis, purposeful only (📊 data, ⚠️ warning, ✅ check, 🚀 launch).
-Only approved hashtags: #pumpfun #Solana #memecoin #PumpSwap #RugCheck
+Only approved hashtags: #pumpfun #Solana #memecoin #PumpSwap #RugCheck #DeFi #Polymarket
 Write like a builder sharing notes, not a marketer crafting copy.
 
 CRITICAL RULES FOR LINKS:

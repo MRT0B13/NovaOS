@@ -378,15 +378,15 @@ export async function initLaunchKit(
           },
           onPostToChannel: async (content: string) => {
             try {
-              const { sendToCommunity } = await import('./services/novaChannel.ts');
-              const result = await sendToCommunity(content);
-              if (result.success) {
-                logger.info(`[swarm] Supervisor → Community: ${content.slice(0, 80)}...`);
+              const { sendToChannel } = await import('./services/novaChannel.ts');
+              const result = await sendToChannel(content);
+              if (result) {
+                logger.info(`[swarm] Supervisor → Channel: ${content.slice(0, 80)}...`);
               } else {
-                logger.debug(`[swarm] Supervisor → Community skipped (novaChannel disabled or no group configured)`);
+                logger.debug(`[swarm] Supervisor → Channel skipped (novaChannel disabled or no channel configured)`);
               }
             } catch (err) {
-              logger.warn('[swarm] Supervisor → Community post failed:', err);
+              logger.warn('[swarm] Supervisor → Channel post failed:', err);
             }
           },
           onPostToFarcaster: farcasterPost,

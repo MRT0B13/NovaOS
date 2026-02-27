@@ -83,9 +83,9 @@ function sanitizeForTelegram(text: string): string {
 }
 
 /**
- * Send a message to Nova's channel
+ * Send a message to Nova's channel (broadcast channel, not community group)
  */
-async function sendToChannel(
+export async function sendToChannel(
   text: string,
   options: { parseMode?: 'HTML' | 'Markdown'; disablePreview?: boolean } = {}
 ): Promise<boolean> {

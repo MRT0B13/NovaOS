@@ -976,7 +976,7 @@ export class CFOAgent extends BaseAgent {
         // Append approval buttons to the report
         let msg = report;
         if (approvalIds.size > 0) {
-          msg += '\n\n🔐 *Approve:*';
+          msg += '\n\n🔐 <b>Approve:</b>';
           for (const [id, a] of this.pendingApprovals) {
             const shortDesc = a.description.split(':')[0]; // e.g. "OPEN_HEDGE"
             msg += `\n  /cfo approve ${id}  ← ${shortDesc} ($${a.amountUsd.toFixed(0)})`;

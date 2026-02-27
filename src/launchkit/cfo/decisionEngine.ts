@@ -2679,7 +2679,7 @@ export function formatDecisionReport(
   const L: string[] = [];
 
   // ── Header ──
-  L.push(`🧠 *CFO Report*${dryRun ? '  _(dry run)_' : ''}`);
+  L.push(`🧠 <b>CFO Report</b>`);
 
   // ── Market Summary — single human-readable sentence ──
   if (intel) {
@@ -2697,7 +2697,7 @@ export function formatDecisionReport(
 
   // ── Portfolio — wallet balances ──
   L.push('');
-  L.push(`💰 *$${state.totalPortfolioUsd.toFixed(0)}* total`);
+  L.push(`💰 <b>$${state.totalPortfolioUsd.toFixed(0)}</b> total`);
   const holdings: string[] = [];
   const rawSolUsd = state.solBalance * state.solPriceUsd;
   holdings.push(`${state.solBalance.toFixed(2)} SOL ($${rawSolUsd.toFixed(0)})`);
@@ -2714,13 +2714,13 @@ export function formatDecisionReport(
     arbParts.push(`${state.evmArbPoolCount} pools across 4 venues`);
     if (state.evmArbProfit24h > 0.01) arbParts.push(`+$${state.evmArbProfit24h.toFixed(2)} today`);
     if (state.evmArbUsdcBalance > 1) arbParts.push(`$${state.evmArbUsdcBalance.toFixed(0)} USDC on Arb`);
-    L.push(`⚡ *Arb Scanner* — ${arbParts.join(' · ')}`);
+    L.push(`⚡ <b>Arb Scanner</b> — ${arbParts.join(' · ')}`);
   }
 
   // Risk line — tells user if portfolio protection is adequate
   const hedgePct = (state.hedgeRatio * 100).toFixed(0);
   if (state.hedgeRatio < 0.1 && state.solExposureUsd > 20) {
-    L.push(`⚠️ *Unhedged* — ${hedgePct}% of $${state.solExposureUsd.toFixed(0)} SOL exposure protected (SOL @ $${state.solPriceUsd.toFixed(0)})`);
+    L.push(`⚠️ <b>Unhedged</b> — ${hedgePct}% of $${state.solExposureUsd.toFixed(0)} SOL exposure protected (SOL @ $${state.solPriceUsd.toFixed(0)})`);
   } else if (state.hedgeRatio >= 0.4) {
     L.push(`🛡 ${hedgePct}% hedged · SOL @ $${state.solPriceUsd.toFixed(0)}`);
   } else {
@@ -2746,7 +2746,7 @@ export function formatDecisionReport(
       const amt = Math.abs(d.estimatedImpactUsd);
       const amtStr = amt >= 1 ? ` · $${amt.toFixed(0)}` : '';
 
-      L.push(`${icon} ${what}${amtStr} — _${tag}_`);
+      L.push(`${icon} ${what}${amtStr} — ${tag}`);
 
       // Error detail (only on failure)
       if (r.error && !r.success) L.push(`    ⚠️ ${r.error}`);
@@ -2766,75 +2766,75 @@ function _humanAction(d: Decision, state: PortfolioState): string {
   switch (d.type) {
     case 'OPEN_HEDGE': {
       const coin = p.coin ?? 'SOL';
-      return `*Hedge ${coin}* — short $${Math.abs(d.estimatedImpactUsd).toFixed(0)} ${coin}-PERP to protect $${(state.treasuryExposures?.find(e => e.symbol === coin)?.valueUsd ?? state.solExposureUsd).toFixed(0)} ${coin} exposure`;
+      return `<b>Hedge ${coin}</b> — short $${Math.abs(d.estimatedImpactUsd).toFixed(0)} ${coin}-PERP to protect $${(state.treasuryExposures?.find(e => e.symbol === coin)?.valueUsd ?? state.solExposureUsd).toFixed(0)} ${coin} exposure`;
     }
     case 'CLOSE_HEDGE': {
       const coin = p.coin ?? 'SOL';
-      return `*Reduce ${coin} hedge* — ${coin} exposure changed, closing excess short`;
+      return `<b>Reduce ${coin} hedge</b> — ${coin} exposure changed, closing excess short`;
     }
     case 'REBALANCE_HEDGE': {
       const coin = p.coin ?? 'SOL';
-      return `*Rebalance ${coin} hedge* — adjusting short size to match current ${coin}`;
+      return `<b>Rebalance ${coin} hedge</b> — adjusting short size to match current ${coin}`;
     }
     case 'CLOSE_LOSING':
-      return `*Close losing position* — cutting loss before it gets worse`;
+      return `<b>Close losing position</b> — cutting loss before it gets worse`;
     case 'AUTO_STAKE':
-      return `*Stake ${p.amount?.toFixed(2) ?? '?'} SOL* → JitoSOL for ~7% APY`;
+      return `<b>Stake ${p.amount?.toFixed(2) ?? '?'} SOL</b> → JitoSOL for ~7% APY`;
     case 'UNSTAKE_JITO':
-      return `*Unstake ${p.amount?.toFixed(2) ?? '?'} JitoSOL* → SOL (need runway)`;
+      return `<b>Unstake ${p.amount?.toFixed(2) ?? '?'} JitoSOL</b> → SOL (need runway)`;
     case 'POLY_BET': {
       const q = (p.marketQuestion ?? '').slice(0, 50);
-      return `*Prediction bet* — ${q || 'placing bet'}`;
+      return `<b>Prediction bet</b> — ${q || 'placing bet'}`;
     }
     case 'POLY_EXIT':
-      return `*Close prediction* — exiting position`;
+      return `<b>Close prediction</b> — exiting position`;
     case 'KAMINO_BORROW_DEPLOY':
-      return `*Borrow & deploy* — $${p.borrowUsd?.toFixed(0) ?? '?'} USDC from Kamino → yield (${p.spreadPct?.toFixed(1) ?? '?'}% spread)`;
+      return `<b>Borrow &amp; deploy</b> — $${p.borrowUsd?.toFixed(0) ?? '?'} USDC from Kamino → yield (${p.spreadPct?.toFixed(1) ?? '?'}% spread)`;
     case 'KAMINO_REPAY':
-      return `*Repay loan* — $${p.repayUsd?.toFixed(0) ?? '?'} USDC back to Kamino`;
+      return `<b>Repay loan</b> — $${p.repayUsd?.toFixed(0) ?? '?'} USDC back to Kamino`;
     case 'KAMINO_JITO_LOOP':
       if (p.blocked) {
         const jitoYieldPct = p.estimatedApy != null
           ? ((state.kaminoJitoSupplyApy || 0.08) * 100).toFixed(1)
           : '8.0';
-        return `⏸ *Jito Loop waiting* — spread is ${p.currentSpreadPct?.toFixed(1) ?? '?'}% (need >1%). SOL borrow ${(state.kaminoSolBorrowApy * 100).toFixed(1)}% > JitoSOL yield ${jitoYieldPct}%. Break-even at ${((p.breakEvenBorrowRate ?? 0) * 100).toFixed(1)}%`;
+        return `⏸ <b>Jito Loop waiting</b> — spread is ${p.currentSpreadPct?.toFixed(1) ?? '?'}% (need >1%). SOL borrow ${(state.kaminoSolBorrowApy * 100).toFixed(1)}% > JitoSOL yield ${jitoYieldPct}%. Break-even at ${((p.breakEvenBorrowRate ?? 0) * 100).toFixed(1)}%`;
       }
-      return `*Leverage JitoSOL* — deposit ${p.jitoSolToDeposit?.toFixed(2) ?? '?'} JitoSOL, loop to ${((p.targetLtv ?? 0.65) * 100).toFixed(0)}% LTV for ~${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY`;
+      return `<b>Leverage JitoSOL</b> — deposit ${p.jitoSolToDeposit?.toFixed(2) ?? '?'} JitoSOL, loop to ${((p.targetLtv ?? 0.65) * 100).toFixed(0)}% LTV for ~${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY`;
     case 'KAMINO_JITO_UNWIND':
-      return `*Unwind JitoSOL loop* — closing leveraged position`;
+      return `<b>Unwind JitoSOL loop</b> — closing leveraged position`;
     case 'KAMINO_LST_LOOP': {
       if (p.blocked) {
         const spreads = (p.allCandidates ?? []).map((c: any) => `${c.lst} ${(c.spread * 100).toFixed(1)}%`).join(', ');
-        return `⏸ *LST Loop waiting* — best spread is ${p.currentSpreadPct?.toFixed(1) ?? '?'}% (${p.lst ?? '?'}, need >1%). All: ${spreads}`;
+        return `⏸ <b>LST Loop waiting</b> — best spread is ${p.currentSpreadPct?.toFixed(1) ?? '?'}% (${p.lst ?? '?'}, need >1%). All: ${spreads}`;
       }
       const runners = (p.allCandidates ?? []).filter((c: any) => c.lst !== p.lst).map((c: any) => `${c.lst} ${(c.spread * 100).toFixed(1)}%`).join(', ');
-      return `*Leverage ${p.lst ?? '?'}* — deposit ${p.lstAmount?.toFixed(2) ?? '?'} ${p.lst ?? 'LST'}, loop to ${((p.targetLtv ?? 0.65) * 100).toFixed(0)}% LTV for ~${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY${runners ? ` (vs ${runners})` : ''}`;
+      return `<b>Leverage ${p.lst ?? '?'}</b> — deposit ${p.lstAmount?.toFixed(2) ?? '?'} ${p.lst ?? 'LST'}, loop to ${((p.targetLtv ?? 0.65) * 100).toFixed(0)}% LTV for ~${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY${runners ? ` (vs ${runners})` : ''}`;
     }
     case 'KAMINO_LST_UNWIND':
-      return `*Unwind ${p.lst ?? 'LST'} loop* — closing leveraged ${p.lst ?? 'LST'}/SOL position`;
+      return `<b>Unwind ${p.lst ?? 'LST'} loop</b> — closing leveraged ${p.lst ?? 'LST'}/SOL position`;
     case 'KAMINO_MULTIPLY_VAULT':
-      return `*Kamino Vault* — deposit ${p.depositAmount?.toFixed(2) ?? '?'} ${p.collateralToken ?? 'LST'} into "${p.vaultName ?? 'Multiply'}" (${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY, ${p.leverage?.toFixed(1) ?? '?'}x)${p.needsSwap ? ' (swap SOL first)' : ''}`;
+      return `<b>Kamino Vault</b> — deposit ${p.depositAmount?.toFixed(2) ?? '?'} ${p.collateralToken ?? 'LST'} into "${p.vaultName ?? 'Multiply'}" (${((p.estimatedApy ?? 0) * 100).toFixed(1)}% APY, ${p.leverage?.toFixed(1) ?? '?'}x)${p.needsSwap ? ' (swap SOL first)' : ''}`;
     case 'ORCA_LP_OPEN':
-      return `*Open LP* — $${((p.usdcAmount ?? 0) * 2).toFixed(0)} in ${p.pair ?? 'SOL/USDC'} (±${(p.rangeWidthPct ?? 20) / 2}% range)${p.needsSwap ? ' (auto-swap)' : ''}`;
+      return `<b>Open LP</b> — $${((p.usdcAmount ?? 0) * 2).toFixed(0)} in ${p.pair ?? 'SOL/USDC'} (±${(p.rangeWidthPct ?? 20) / 2}% range)${p.needsSwap ? ' (auto-swap)' : ''}`;
     case 'ORCA_LP_REBALANCE':
-      return `*Rebalance LP* — price moved out of range, re-centering`;
+      return `<b>Rebalance LP</b> — price moved out of range, re-centering`;
     case 'KAMINO_BORROW_LP':
       if (p.blocked) {
-        return `⏸ *Borrow→LP waiting* — ${p.blockReason === 'no_collateral' ? 'needs Jito loop collateral first' : 'blocked'}. Would borrow $${p.borrowUsd?.toFixed(0) ?? '?'} → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
+        return `⏸ <b>Borrow→LP waiting</b> — ${p.blockReason === 'no_collateral' ? 'needs Jito loop collateral first' : 'blocked'}. Would borrow $${p.borrowUsd?.toFixed(0) ?? '?'} → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
       }
-      return `*Borrow → LP* — $${p.borrowUsd?.toFixed(0) ?? '?'} from Kamino → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
+      return `<b>Borrow → LP</b> — $${p.borrowUsd?.toFixed(0) ?? '?'} from Kamino → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
     case 'EVM_FLASH_ARB': {
       const pair = p.opportunity?.displayPair ?? p.displayPair ?? '?/?';
       const buyDex = (p.opportunity?.buyPool?.dex ?? p.buyDex ?? '?').replace('_v3', ' V3').replace('_', ' ');
       const sellDex = (p.opportunity?.sellPool?.dex ?? p.sellDex ?? '?').replace('_v3', ' V3').replace('_', ' ');
       const flash = p.opportunity?.flashAmountUsd ?? p.flashAmountUsd ?? 0;
       const net = p.opportunity?.netProfitUsd ?? p.netProfitUsd ?? 0;
-      return `*Flash arb* — ${pair} buy ${buyDex} → sell ${sellDex}` +
+      return `<b>Flash arb</b> — ${pair} buy ${buyDex} → sell ${sellDex}` +
         (flash > 0 ? ` · flash $${flash.toLocaleString()}` : '') +
         (net > 0 ? ` · net $${net.toFixed(2)}` : '');
     }
     default:
-      return `*${d.type}* — ${d.reasoning.length > 60 ? d.reasoning.slice(0, 57) + '…' : d.reasoning}`;
+      return `<b>${d.type}</b> — ${d.reasoning.length > 60 ? d.reasoning.slice(0, 57) + '…' : d.reasoning}`;
   }
 }
 
