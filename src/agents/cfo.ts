@@ -115,6 +115,15 @@ export class CFOAgent extends BaseAgent {
   private cycleCount = 0;
   private startedAt = Date.now();
 
+  /** Pending sell orders that were placed but not yet filled (LIVE on the book) */
+  private pendingSellOrders = new Map<string, {
+    orderId: string;
+    positionId: string;
+    costBasisUsd: number;
+    description: string;
+    placedAt: number;
+  }>();
+
   constructor(pool: Pool) {
     super({ agentId: 'nova-cfo', agentType: 'cfo' as any, pool });
   }
@@ -778,18 +787,94 @@ export class CFOAgent extends BaseAgent {
     try {
       const polyMod = await poly();
       const freshPositions = await polyMod.fetchPositions();
+
+      // ── Check pending sell orders from previous cycles ──
+      if (this.pendingSellOrders.size > 0) {
+        for (const [orderId, pending] of this.pendingSellOrders) {
+          try {
+            const orderStatus = await polyMod.getOrderStatus(orderId);
+            if (!orderStatus) {
+              // Order not found — maybe expired or API error. Cancel after 30 min.
+              if (Date.now() - pending.placedAt > 30 * 60_000) {
+                logger.warn(`[CFO] Pending sell ${orderId} not found after 30min — removing tracker`);
+                this.pendingSellOrders.delete(orderId);
+              }
+              continue;
+            }
+
+            if (orderStatus.status === 'MATCHED') {
+              // Order filled! Now close the position
+              const dbPos = await this.repo?.getPosition(pending.positionId);
+              const receivedUsd = dbPos ? (dbPos.currentValueUsd ?? 0) : 0;
+              const pnl = receivedUsd - pending.costBasisUsd;
+              await this.positionManager?.closePosition(
+                pending.positionId, 0,
+                orderStatus.transactionHashes?.[0] ?? orderId, receivedUsd,
+              );
+              const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+              await notifyAdminForce(
+                `🏦 CFO Sell filled: ${pending.description.slice(0, 60)}\n` +
+                `P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`,
+              );
+              logger.info(`[CFO] Pending sell ${orderId} MATCHED — position ${pending.positionId} closed`);
+              this.pendingSellOrders.delete(orderId);
+            } else if (orderStatus.status === 'CANCELLED' || orderStatus.status === 'EXPIRED') {
+              logger.warn(`[CFO] Pending sell ${orderId} ${orderStatus.status} — will retry next cycle`);
+              this.pendingSellOrders.delete(orderId);
+            }
+            // LIVE — still on the book, check again next cycle
+          } catch (err) {
+            logger.debug(`[CFO] Error checking pending sell ${orderId}:`, err);
+          }
+        }
+      }
+
       const actions = await this.positionManager.updatePolymarketPrices(freshPositions);
 
       for (const action of actions) {
         if (action.action !== 'STOP_LOSS' && action.action !== 'EXPIRE') continue;
+        // Skip if there's already a pending sell order for this position
+        const hasPending = [...this.pendingSellOrders.values()].some(p => p.positionId === action.positionId);
+        if (hasPending) {
+          logger.debug(`[CFO] Skipping ${action.action} for ${action.positionId} — sell order already pending`);
+          continue;
+        }
         const dbPos = await this.repo?.getPosition(action.positionId);
         if (!dbPos) continue;
         const meta = dbPos.metadata as { tokenId?: string };
         const freshPos = freshPositions.find((p: any) => p.tokenId === meta.tokenId);
-        // Skip truly worthless positions (< $0.05 remaining value)
-        // Note: currentPrice is per-share probability (0-1), NOT USD — a curPrice of 0.001
-        // still represents real money if size is large. Use currentValueUsd instead.
-        if (!freshPos || freshPos.currentValueUsd < 0.05) continue;
+
+        // ── Dust cleanup: position worth < $0.05 or not found on-chain ──
+        // Attempt sell on Polymarket first, then close in DB regardless
+        if (!freshPos || freshPos.currentValueUsd < 0.05) {
+          const dustValue = freshPos?.currentValueUsd ?? 0;
+          const dustPnl = dustValue - dbPos.costBasisUsd;
+
+          // Try to sell on Polymarket even if near-zero — clears the shares
+          if (freshPos && freshPos.size > 0 && !env.dryRun) {
+            try {
+              await polyMod.exitPosition(freshPos, 1.0);
+              logger.info(`[CFO] Dust sell attempted: "${dbPos.description.slice(0, 60)}" ($${dustValue.toFixed(2)})`);
+            } catch (err) {
+              logger.debug(`[CFO] Dust sell failed (expected for expired): ${(err as Error).message}`);
+            }
+          }
+
+          // Close in DB regardless — position is worthless
+          await this.positionManager.closePosition(
+            action.positionId, freshPos?.currentPrice ?? 0, 'dust-cleanup', dustValue,
+          );
+          logger.info(
+            `[CFO] Dust cleanup: closed "${dbPos.description.slice(0, 60)}" ` +
+            `(value: $${dustValue.toFixed(2)}, PnL: $${dustPnl.toFixed(2)})`,
+          );
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(
+            `🧹 Dust cleanup: ${dbPos.description.slice(0, 60)}\n` +
+            `Value: $${dustValue.toFixed(2)} | PnL: $${dustPnl.toFixed(2)}`,
+          );
+          continue;
+        }
 
         const pnl = freshPos.currentValueUsd - dbPos.costBasisUsd;
 
@@ -806,7 +891,8 @@ export class CFOAgent extends BaseAgent {
         }
 
         const exitOrder = await polyMod.exitPosition(freshPos, 1.0);
-        if (exitOrder.status === 'LIVE' || exitOrder.status === 'MATCHED') {
+        if (exitOrder.status === 'MATCHED') {
+          // Order was immediately filled — close the position
           await this.positionManager.closePosition(
             action.positionId, freshPos.currentPrice,
             exitOrder.transactionHash ?? exitOrder.orderId, freshPos.currentValueUsd,
@@ -821,6 +907,19 @@ export class CFOAgent extends BaseAgent {
             pnlUsd: pnl, reason: action.reason,
             message: `${action.action}: ${dbPos.description.slice(0, 60)} — PnL $${pnl.toFixed(2)}`,
           });
+        } else if (exitOrder.status === 'LIVE') {
+          // Order is on the book but not yet filled — track it for later confirmation
+          this.pendingSellOrders.set(exitOrder.orderId, {
+            orderId: exitOrder.orderId,
+            positionId: action.positionId,
+            costBasisUsd: dbPos.costBasisUsd,
+            description: dbPos.description,
+            placedAt: Date.now(),
+          });
+          logger.info(
+            `[CFO] Sell order LIVE (not yet filled): ${exitOrder.orderId} — ` +
+            `"${dbPos.description.slice(0, 60)}" — will check next cycle`,
+          );
         }
       }
     } catch (err) { logger.error('[CFO] monitorPositions error:', err); }
