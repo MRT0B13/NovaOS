@@ -150,6 +150,9 @@ export class CFOAgent extends BaseAgent {
         // Reconcile CFO exposure with Guardian based on currently open positions
         // This ensures correct state after restarts (positions opened before this feature)
         setTimeout(() => this.reconcileCFOExposure(), 15_000); // slight delay for guardian to be ready
+
+        // Reconcile Polymarket ghost positions — reopen DB entries where shares still exist on-chain
+        setTimeout(() => this.reconcilePolymarketGhosts(), 20_000);
       } catch (err) { logger.warn('[CFO] DB init failed:', err); }
     }
 
@@ -1932,6 +1935,29 @@ export class CFOAgent extends BaseAgent {
     }
     if (mints.length > 0) {
       logger.info(`[CFO] Deregistered exposure with Guardian: ${mints.map(m => m.ticker).join(', ')}`);
+    }
+  }
+
+  /**
+   * On startup, check for Polymarket positions marked CLOSED in DB but still
+   * holding shares on-chain. Reopens them so the position monitor can properly
+   * handle stop-loss, dust cleanup, and expiry.
+   */
+  private async reconcilePolymarketGhosts(): Promise<void> {
+    if (!this.positionManager) return;
+    const env = getCFOEnv();
+    if (!env.polymarketEnabled) return;
+
+    try {
+      const polyMod = await poly();
+      const freshPositions = await polyMod.fetchPositions();
+      const reopened = await this.positionManager.reconcilePolymarketPositions(freshPositions);
+      if (reopened > 0) {
+        const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+        await notifyAdminForce(`🔄 Reconciled ${reopened} ghost Polymarket position(s) — reopened in DB for proper cleanup`);
+      }
+    } catch (err) {
+      logger.warn('[CFO] Polymarket reconciliation error:', err);
     }
   }
 

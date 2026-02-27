@@ -391,6 +391,43 @@ export class PositionManager {
     );
   }
 
+  // ── Reconciliation ────────────────────────────────────────────────
+
+  /**
+   * Reconcile DB positions with on-chain Polymarket state.
+   * Reopens positions that are CLOSED in DB but still have shares on Polymarket.
+   * This handles the case where a sell order was placed (LIVE) but the position
+   * was prematurely marked as closed before the order actually filled.
+   */
+  async reconcilePolymarketPositions(freshPositions: PolyPosition[]): Promise<number> {
+    const recentlyClosed = await this.repo.getRecentlyClosedPositions('polymarket', 48);
+    let reopened = 0;
+
+    for (const dbPos of recentlyClosed) {
+      const meta = dbPos.metadata as { tokenId?: string };
+      if (!meta.tokenId) continue;
+
+      // Check if shares still exist on Polymarket
+      const fresh = freshPositions.find((p) => p.tokenId === meta.tokenId);
+      if (fresh && fresh.size > 0 && fresh.currentValueUsd > 0) {
+        // Shares still exist — reopen in DB
+        await this.repo.reopenPosition(dbPos.id);
+        // Update with current price
+        await this.repo.updatePositionPrice(dbPos.id, fresh.currentPrice, fresh.currentValueUsd);
+        logger.info(
+          `[PositionManager] Reconciled: reopened "${dbPos.description.slice(0, 60)}" ` +
+          `(still has ${fresh.size} shares worth $${fresh.currentValueUsd.toFixed(2)})`,
+        );
+        reopened++;
+      }
+    }
+
+    if (reopened > 0) {
+      logger.info(`[PositionManager] Reconciliation: reopened ${reopened} ghost position(s)`);
+    }
+    return reopened;
+  }
+
   // ── Portfolio Snapshot ────────────────────────────────────────────
 
   /**

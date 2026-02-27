@@ -281,6 +281,27 @@ export class PostgresCFORepository {
     return res.rows.map((r) => this.rowToPosition(r));
   }
 
+  async reopenPosition(id: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE cfo_positions
+       SET status = 'OPEN', exit_tx_hash = NULL, realized_pnl_usd = 0,
+           closed_at = NULL, updated_at = NOW()
+       WHERE id = $1 AND status = 'CLOSED'`,
+      [id],
+    );
+  }
+
+  async getRecentlyClosedPositions(strategy: PositionStrategy, withinHours = 24): Promise<CFOPosition[]> {
+    const res = await this.pool.query(
+      `SELECT * FROM cfo_positions
+       WHERE status = 'CLOSED' AND strategy = $1
+         AND closed_at > NOW() - INTERVAL '1 hour' * $2
+       ORDER BY closed_at DESC`,
+      [strategy, withinHours],
+    );
+    return res.rows.map((r) => this.rowToPosition(r));
+  }
+
   async closePosition(id: string, exitTxHash: string, realizedPnlUsd: number, exitPrice?: number): Promise<void> {
     if (exitPrice !== undefined && exitPrice > 0) {
       await this.pool.query(

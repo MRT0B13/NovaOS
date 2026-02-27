@@ -1539,6 +1539,30 @@ export async function placeBuyOrder(
 }
 
 /**
+ * Check order status.
+ * Returns 'MATCHED' (filled), 'LIVE' (on book), 'CANCELLED', 'EXPIRED', or null if not found.
+ */
+export async function getOrderStatus(orderId: string): Promise<{
+  status: 'MATCHED' | 'LIVE' | 'CANCELLED' | 'EXPIRED' | 'UNKNOWN';
+  filledSize?: number;
+  transactionHashes?: string[];
+} | null> {
+  try {
+    const data = await clobGet<any>(`/data/order/${orderId}`, true);
+    if (!data) return null;
+    const status = (data.status ?? '').toUpperCase();
+    return {
+      status: ['MATCHED', 'LIVE', 'CANCELLED', 'EXPIRED'].includes(status) ? status : 'UNKNOWN',
+      filledSize: data.size_matched ? parseFloat(data.size_matched) : undefined,
+      transactionHashes: data.transactions_hashes ?? data.transactionsHashes ?? [],
+    };
+  } catch (err) {
+    logger.warn(`[Polymarket] getOrderStatus(${orderId}) failed: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+/**
  * Cancel an open order by order ID.
  */
 export async function cancelOrder(orderId: string): Promise<boolean> {
