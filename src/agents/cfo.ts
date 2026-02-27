@@ -791,18 +791,36 @@ export class CFOAgent extends BaseAgent {
         // still represents real money if size is large. Use currentValueUsd instead.
         if (!freshPos || freshPos.currentValueUsd < 0.05) continue;
 
+        const pnl = freshPos.currentValueUsd - dbPos.costBasisUsd;
+
+        // In dry-run, log what would happen but do NOT close the DB position
+        if (env.dryRun) {
+          await polyMod.exitPosition(freshPos, 1.0); // logs the dry-run message
+          logger.info(`[CFO] DRY RUN — would ${action.action} ${dbPos.description.slice(0, 60)} | PnL: $${pnl.toFixed(2)}`);
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(
+            `🏦 CFO ${action.action} (dry run): ${dbPos.description.slice(0, 60)}\n` +
+            `P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Value: $${freshPos.currentValueUsd.toFixed(2)}`,
+          );
+          continue;
+        }
+
         const exitOrder = await polyMod.exitPosition(freshPos, 1.0);
         if (exitOrder.status === 'LIVE' || exitOrder.status === 'MATCHED') {
-          const pnl = freshPos.currentValueUsd - dbPos.costBasisUsd;
           await this.positionManager.closePosition(
             action.positionId, freshPos.currentPrice,
             exitOrder.transactionHash ?? exitOrder.orderId, freshPos.currentValueUsd,
           );
-          if (Math.abs(pnl) > 5) {
-            const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
-            await notifyAdminForce(`🏦 CFO ${action.action}: ${dbPos.description.slice(0, 60)}\nP&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
-          }
-          await this.reportToSupervisor('alert', action.urgency as any, { event: 'cfo_position_closed', action: action.action, pnlUsd: pnl, reason: action.reason });
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(
+            `🏦 CFO ${action.action}: ${dbPos.description.slice(0, 60)}\n` +
+            `P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Received: $${freshPos.currentValueUsd.toFixed(2)}`,
+          );
+          await this.reportToSupervisor('alert', action.urgency as any, {
+            event: 'cfo_position_closed', action: action.action,
+            pnlUsd: pnl, reason: action.reason,
+            message: `${action.action}: ${dbPos.description.slice(0, 60)} — PnL $${pnl.toFixed(2)}`,
+          });
         }
       }
     } catch (err) { logger.error('[CFO] monitorPositions error:', err); }

@@ -577,9 +577,12 @@ export class Supervisor extends BaseAgent {
 
     // ── CFO Alerts (admin-only — never post financial alerts to community) ──
     this.handlers.set('nova-cfo:alert', async (msg) => {
-      const { source, message } = msg.payload;
+      const { action, pnlUsd, reason, message } = msg.payload;
       if (msg.priority === 'critical') {
-        const content = `🏦 CFO Alert: ${message || JSON.stringify(msg.payload).slice(0, 200)}`;
+        // Format a human-readable alert instead of dumping raw JSON
+        const content = message
+          ? `🏦 CFO Alert: ${message}`
+          : `🏦 CFO ${action ?? 'Alert'}: ${reason ?? ''}${pnlUsd !== undefined ? ` (PnL: $${Number(pnlUsd).toFixed(2)})` : ''}`;
         if (this.callbacks.onPostToAdmin) await this.callbacks.onPostToAdmin(content);
         logger.warn(`[supervisor] CFO critical alert: ${content}`);
       }
