@@ -853,10 +853,10 @@ export class CFOAgent extends BaseAgent {
         const meta = dbPos.metadata as { tokenId?: string };
         const freshPos = freshPositions.find((p: any) => p.tokenId === meta.tokenId);
 
-        // ── Dust cleanup: position worth < $0.05 or not found on-chain ──
+        // ── Dust cleanup: position worth < $1 or not found on-chain ──
         // For redeemable (resolved) markets: redeem on-chain instead of trying to sell
         // For live markets: attempt sell on CLOB, then close in DB regardless
-        if (!freshPos || freshPos.currentValueUsd < 0.05) {
+        if (!freshPos || freshPos.currentValueUsd < 1.00) {
           const dustValue = freshPos?.currentValueUsd ?? 0;
           const dustPnl = dustValue - dbPos.costBasisUsd;
 
@@ -952,6 +952,21 @@ export class CFOAgent extends BaseAgent {
           logger.info(
             `[CFO] Sell order LIVE (not yet filled): ${exitOrder.orderId} — ` +
             `"${dbPos.description.slice(0, 60)}" — will check next cycle`,
+          );
+        } else if (exitOrder.status === 'ERROR' && freshPos.currentValueUsd < 5) {
+          // CLOB sell failed for a small position — close as dust instead of retrying forever
+          await this.positionManager.closePosition(
+            action.positionId, freshPos.currentPrice, 'sell-failed-dust', freshPos.currentValueUsd,
+          );
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(
+            `🧹 Sell failed (dust close): ${dbPos.description.slice(0, 60)}\n` +
+            `Value: $${freshPos.currentValueUsd.toFixed(2)} | PnL: $${pnl.toFixed(2)}\n` +
+            `Error: ${exitOrder.errorMessage ?? 'unknown'}`,
+          );
+          logger.info(
+            `[CFO] CLOB sell failed for small position — closing as dust: "${dbPos.description.slice(0, 60)}" ` +
+            `($${freshPos.currentValueUsd.toFixed(2)})`,
           );
         }
       }
