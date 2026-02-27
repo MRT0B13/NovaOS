@@ -374,7 +374,6 @@ export class ScoutAgent extends BaseAgent {
       const now = Date.now();
       const periodMs = this.lastDigestAt ? now - this.lastDigestAt : this.digestIntervalMs;
       const periodH = Math.round(periodMs / 3600_000) || 1;
-      this.lastDigestAt = now;
 
       const totalItems = this.intelBuffer.length;
       const crossItems = this.intelBuffer.filter(i => i.crossConfirmed);
@@ -445,7 +444,8 @@ export class ScoutAgent extends BaseAgent {
         `synthesis: ${synthesis ? 'GPT' : 'fallback'} | ${periodH}h window`
       );
 
-      // Clear buffer for next digest window
+      // Mark digest as completed + clear buffer for next digest window
+      this.lastDigestAt = now;
       this.intelBuffer = [];
       this.scanCount = 0;
     } catch (err) {

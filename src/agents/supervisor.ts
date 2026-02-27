@@ -821,7 +821,6 @@ export class Supervisor extends BaseAgent {
       const periodHours = this.lastBriefingAt
         ? Math.round((now - this.lastBriefingAt) / 3600000)
         : 4;
-      this.lastBriefingAt = now;
 
       // ── Gather data ──
       await this.checkAgentStatuses();
@@ -975,7 +974,8 @@ export class Supervisor extends BaseAgent {
       // Log
       logger.info(`[supervisor] 🐝 Briefings sent: admin (detailed + hive) | ${activeAgents.length} agents, ${this.messagesProcessed} msgs`);
 
-      // Reset
+      // Mark briefing as completed + reset
+      this.lastBriefingAt = now;
       this.messagesProcessed = 0;
     } catch (err) {
       logger.warn('[supervisor] Briefing failed:', err);

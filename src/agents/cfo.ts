@@ -251,14 +251,13 @@ export class CFOAgent extends BaseAgent {
     const env = getCFOEnv();
     if (!env.polymarketEnabled) return;
 
-    this.cycleCount++;
-    this.lastOpportunityScanAt = Date.now();
-    await this.persistState();
-
     // Decision engine handles Polymarket bets now (with tier gating + scout intel)
     const config = getDecisionConfig();
     if (config.enabled) {
       await this.runAutonomousDecisionCycle();
+      this.cycleCount++;
+      this.lastOpportunityScanAt = Date.now();
+      await this.persistState();
       return;
     }
 
@@ -288,6 +287,9 @@ export class CFOAgent extends BaseAgent {
         await this.reportToSupervisor('report', 'medium', { event: 'cfo_positions_opened', count: newPositions, strategy: 'polymarket' });
       }
 
+      this.cycleCount++;
+      this.lastOpportunityScanAt = Date.now();
+      await this.persistState();
       await this.updateStatus('idle');
     } catch (err) {
       logger.error('[CFO] runOpportunityScan error:', err);
