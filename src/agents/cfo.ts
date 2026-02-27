@@ -153,6 +153,9 @@ export class CFOAgent extends BaseAgent {
 
         // Reconcile Polymarket ghost positions — reopen DB entries where shares still exist on-chain
         setTimeout(() => this.reconcilePolymarketGhosts(), 20_000);
+
+        // Reload pending sell orders from DB metadata (survive restarts)
+        setTimeout(() => this.reloadPendingSellOrders(), 5_000);
       } catch (err) { logger.warn('[CFO] DB init failed:', err); }
     }
 
@@ -801,6 +804,7 @@ export class CFOAgent extends BaseAgent {
               if (Date.now() - pending.placedAt > 30 * 60_000) {
                 logger.warn(`[CFO] Pending sell ${orderId} not found after 30min — removing tracker`);
                 this.pendingSellOrders.delete(orderId);
+                await this.repo?.updatePositionMetadata(pending.positionId, { pendingSellOrderId: null, pendingSellPlacedAt: null });
               }
               continue;
             }
@@ -821,9 +825,11 @@ export class CFOAgent extends BaseAgent {
               );
               logger.info(`[CFO] Pending sell ${orderId} MATCHED — position ${pending.positionId} closed`);
               this.pendingSellOrders.delete(orderId);
+              // metadata cleared by closePosition
             } else if (orderStatus.status === 'CANCELLED' || orderStatus.status === 'EXPIRED') {
               logger.warn(`[CFO] Pending sell ${orderId} ${orderStatus.status} — will retry next cycle`);
               this.pendingSellOrders.delete(orderId);
+              await this.repo?.updatePositionMetadata(pending.positionId, { pendingSellOrderId: null, pendingSellPlacedAt: null });
             }
             // LIVE — still on the book, check again next cycle
           } catch (err) {
@@ -912,12 +918,18 @@ export class CFOAgent extends BaseAgent {
           });
         } else if (exitOrder.status === 'LIVE') {
           // Order is on the book but not yet filled — track it for later confirmation
+          const placedAt = Date.now();
           this.pendingSellOrders.set(exitOrder.orderId, {
             orderId: exitOrder.orderId,
             positionId: action.positionId,
             costBasisUsd: dbPos.costBasisUsd,
             description: dbPos.description,
-            placedAt: Date.now(),
+            placedAt,
+          });
+          // Persist to DB metadata so it survives restarts
+          await this.repo?.updatePositionMetadata(action.positionId, {
+            pendingSellOrderId: exitOrder.orderId,
+            pendingSellPlacedAt: placedAt,
           });
           logger.info(
             `[CFO] Sell order LIVE (not yet filled): ${exitOrder.orderId} — ` +
@@ -1959,6 +1971,34 @@ export class CFOAgent extends BaseAgent {
       }
     } catch (err) {
       logger.warn('[CFO] Polymarket reconciliation error:', err);
+    }
+  }
+
+  /**
+   * Reload pending sell orders from position metadata on startup.
+   * This survives Railway restarts — the in-memory Map is repopulated from DB.
+   */
+  private async reloadPendingSellOrders(): Promise<void> {
+    if (!this.repo) return;
+    try {
+      const positions = await this.repo.getPositionsWithPendingSellOrders();
+      for (const pos of positions) {
+        const meta = pos.metadata as { pendingSellOrderId?: string; pendingSellPlacedAt?: number };
+        if (meta.pendingSellOrderId) {
+          this.pendingSellOrders.set(meta.pendingSellOrderId, {
+            orderId: meta.pendingSellOrderId,
+            positionId: pos.id,
+            costBasisUsd: pos.costBasisUsd,
+            description: pos.description,
+            placedAt: meta.pendingSellPlacedAt ?? Date.now(),
+          });
+        }
+      }
+      if (positions.length > 0) {
+        logger.info(`[CFO] Reloaded ${positions.length} pending sell order(s) from DB`);
+      }
+    } catch (err) {
+      logger.warn('[CFO] Error reloading pending sell orders:', err);
     }
   }
 

@@ -26,7 +26,7 @@ import Decimal from 'decimal.js';
 
 // SOL/USDC Whirlpool (0.3% fee tier) — highest liquidity, most fee revenue
 const SOL_USDC_WHIRLPOOL = 'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ';
-const TICK_SPACING = 64;
+const DEFAULT_TICK_SPACING = 64;
 
 /**
  * Dynamic pool decimal registry.
@@ -203,6 +203,7 @@ export async function openPosition(
   whirlpoolAddress?: string,
   tokenADecimals = 9,
   tokenBDecimals = 6,
+  tickSpacing?: number,
 ): Promise<OrcaOpenResult> {
   const env = getCFOEnv();
   const halfRange = (rangeWidthPct ?? env.orcaLpRangeWidthPct ?? 20) / 2 / 100;
@@ -239,13 +240,17 @@ export async function openPosition(
     // Calculate tick range centred on current price — PriceMath needs Decimal
     const lowerPriceDec = currentPriceDec.mul(1 - halfRange);
     const upperPriceDec = currentPriceDec.mul(1 + halfRange);
+    // Use pool-specific tick spacing (from discovery) or read from on-chain data, fall back to 64
+    const effectiveTickSpacing = tickSpacing ?? whirlpoolData.tickSpacing ?? DEFAULT_TICK_SPACING;
+    logger.info(`[Orca] Using tickSpacing=${effectiveTickSpacing} for pool ${poolAddress.slice(0, 8)}`);
+
     const lowerTick = TickUtil.getInitializableTickIndex(
       PriceMath.priceToTickIndex(lowerPriceDec, tokenADecimals, tokenBDecimals),
-      TICK_SPACING,
+      effectiveTickSpacing,
     );
     const upperTick = TickUtil.getInitializableTickIndex(
       PriceMath.priceToTickIndex(upperPriceDec, tokenADecimals, tokenBDecimals),
-      TICK_SPACING,
+      effectiveTickSpacing,
     );
 
     // Build liquidity quote — pick the token with the larger USD value as input

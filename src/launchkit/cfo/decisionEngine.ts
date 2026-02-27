@@ -926,6 +926,7 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
     tokenBMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
     tokenADecimals: 9,
     tokenBDecimals: 6,
+    tickSpacing: 64,
     score: 50,
     reasoning: 'Fallback SOL/USDC — pool discovery unavailable',
     apyBase7d: 0,
@@ -992,6 +993,7 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
       tokenBMint: p.tokenB.mint,
       tokenADecimals: p.tokenA.decimals,
       tokenBDecimals: p.tokenB.decimals,
+      tickSpacing: p.tickSpacing,
       score: pick.effective,
       reasoning: `${p.reasoning.slice(0, 6).join(', ')}${pick.recency > 0 ? ' (diversity rotation)' : ''} (${ranked.length} pools evaluated)`,
       apyBase7d: p.apyBase7d,
@@ -1821,13 +1823,16 @@ export async function generateDecisions(
     ) {
       // Dynamic pool selection — discovers and scores 50+ Orca pools from DeFiLlama + Orca API
       const bestPair = await selectBestOrcaPairDynamic(intel);
-      const solAvailableUsd = state.solBalance * state.solPriceUsd;
+      // Reserve SOL for gas + token launches — never touch this for LP
+      const reserveSol = Math.max(config.stakeReserveSol, 0.3);
+      const solForLp = Math.max(0, state.solBalance - reserveSol);
+      const solAvailableUsd = solForLp * state.solPriceUsd;
 
       if (solAvailableUsd < 10) {
-        logger.debug(`[CFO:Decision] ORCA_LP_OPEN skipped — insufficient SOL ($${solAvailableUsd.toFixed(2)} available, need >$10 for ${bestPair.pair} LP)`);
+        logger.debug(`[CFO:Decision] ORCA_LP_OPEN skipped — insufficient SOL after reserve ($${solAvailableUsd.toFixed(2)} available, ${reserveSol} SOL reserved for launches)`);
       } else {
-        // Available capital: wallet SOL (base capital, can be swapped to either side) + existing USDC
-        const solCapitalUsd = solAvailableUsd * 0.8; // keep 20% SOL buffer
+        // Available capital: wallet SOL minus reserve (can be swapped to either side) + existing USDC
+        const solCapitalUsd = solAvailableUsd * 0.8; // keep 20% buffer on top of reserve
         const usdcCapitalUsd = state.solanaUsdcBalance;
         const totalCapitalUsd = solCapitalUsd + usdcCapitalUsd;
 
@@ -1888,6 +1893,7 @@ export async function generateDecisions(
               tokenBMint: bestPair.tokenBMint,
               tokenADecimals: bestPair.tokenADecimals,
               tokenBDecimals: bestPair.tokenBDecimals,
+              tickSpacing: bestPair.tickSpacing,
               usdcAmount: usdcSide,
               solAmount: solSide,
               tokenAAmount,
@@ -2498,6 +2504,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           whirlpoolAddress,
           tokenADecimals,
           tokenBDecimals,
+          tickSpacing: poolTickSpacing,
           needsSwapForUsdc: lpNeedsSwapForUsdc,
           needsSwapForTokenA: lpNeedsSwapForTokenA,
           solToSwapForUsdc: lpSolToSwapForUsdc,
@@ -2538,7 +2545,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
         // Step 3: Open the LP position
         const orca = await import('./orcaService.ts');
-        const result = await orca.openPosition(usdcAmount, tokenAInputAmount, rangeWidthPct, whirlpoolAddress, tokenADecimals ?? 9, tokenBDecimals ?? 6);
+        const result = await orca.openPosition(usdcAmount, tokenAInputAmount, rangeWidthPct, whirlpoolAddress, tokenADecimals ?? 9, tokenBDecimals ?? 6, poolTickSpacing);
         markDecision('ORCA_LP_OPEN');
         return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
       }

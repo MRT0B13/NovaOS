@@ -345,6 +345,30 @@ export class PostgresCFORepository {
     );
   }
 
+  /**
+   * Merge a key/value into the position's metadata JSONB.
+   * Uses jsonb_set to avoid overwriting existing fields.
+   */
+  async updatePositionMetadata(id: string, patch: Record<string, unknown>): Promise<void> {
+    await this.pool.query(
+      `UPDATE cfo_positions SET metadata = metadata || $2::jsonb, updated_at = NOW() WHERE id = $1`,
+      [id, JSON.stringify(patch)],
+    );
+  }
+
+  /**
+   * Get all OPEN polymarket positions that have a pendingSellOrderId in metadata.
+   * Used to reload pending sell orders after a restart.
+   */
+  async getPositionsWithPendingSellOrders(): Promise<CFOPosition[]> {
+    const res = await this.pool.query(
+      `SELECT * FROM cfo_positions
+       WHERE status = 'OPEN' AND strategy = 'polymarket'
+         AND metadata->>'pendingSellOrderId' IS NOT NULL`,
+    );
+    return res.rows.map((r: any) => this.rowToPosition(r));
+  }
+
   async getTotalUnrealizedPnl(): Promise<number> {
     const res = await this.pool.query(
       `SELECT COALESCE(SUM(unrealized_pnl_usd), 0) AS total FROM cfo_positions WHERE status = 'OPEN'`,
