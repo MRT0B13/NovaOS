@@ -1053,6 +1053,7 @@ export class CFOAgent extends BaseAgent {
               logger.info(`[CFO] Approved decision ${d.type} executed successfully (tx: ${execResult.txId ?? 'n/a'})`);
               // Persist the approved+executed decision
               await this.persistDecisionResults([execResult]);
+
               const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
               await notifyAdminForce(`✅ ${d.type} executed.\ntx: ${execResult.txId ?? 'dry-run'}`);
             } else {

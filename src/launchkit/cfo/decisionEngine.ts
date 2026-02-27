@@ -340,6 +340,30 @@ function markDecision(type: string): void {
   lastDecisionAt[type] = Date.now();
 }
 
+/**
+ * Track recently selected LP pairs for diversity rotation.
+ * Key = whirlpoolAddress, value = timestamp when last selected.
+ * Any pair selected within RECENCY_WINDOW gets a score penalty so
+ * the agent naturally rotates through different pools each cycle.
+ */
+const RECENCY_WINDOW_MS = 72 * 3600_000; // 72 hours
+const RECENCY_PENALTY  = 25;             // points deducted for recently-selected pairs
+
+const _lpPairLastSelected: Record<string, number> = {};
+
+/** Record that a pair was selected this cycle */
+export function markLpPairSelected(whirlpoolAddress: string): void {
+  _lpPairLastSelected[whirlpoolAddress] = Date.now();
+}
+
+/** Get recency penalty — RECENCY_PENALTY if selected within the window, 0 otherwise */
+export function getLpRecencyPenalty(whirlpoolAddress: string): number {
+  const lastSelected = _lpPairLastSelected[whirlpoolAddress];
+  if (!lastSelected) return 0;
+  if (Date.now() - lastSelected > RECENCY_WINDOW_MS) return 0;
+  return RECENCY_PENALTY;
+}
+
 /** Export cooldown state so CFO can persist it across restarts */
 export function getCooldownState(): Record<string, number> {
   return { ...lastDecisionAt };
@@ -935,7 +959,30 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
       return fallback;
     }
 
-    const p = selection.pool;
+    // ── Diversity rotation: apply recency penalty to all pools, pick best effective score ──
+    const ranked = pools
+      .filter(p => p.score >= 20)
+      .map(p => {
+        const recency = getLpRecencyPenalty(p.whirlpoolAddress);
+        return { pool: p, recency, effective: p.score - recency };
+      })
+      .sort((a, b) => b.effective - a.effective);
+
+    // Use the top-ranked pool after recency adjustment (falls back to selectBestPool winner if no recency applies)
+    const pick = ranked[0] ?? { pool: selection.pool, recency: 0, effective: selection.score };
+
+    if (pick.recency > 0) {
+      logger.info(
+        `[CFO:Decision] Diversity rotation: ${selection.pool.pair} (score ${selection.score}) penalized -${RECENCY_PENALTY} (recently used). ` +
+        `Picked ${pick.pool.pair} (base ${pick.pool.score}, effective ${pick.effective})`,
+      );
+    } else if (pick.pool.whirlpoolAddress !== selection.pool.whirlpoolAddress) {
+      logger.info(`[CFO:Decision] Pool ${pick.pool.pair} chosen over ${selection.pool.pair} after recency adjustment`);
+    }
+
+    markLpPairSelected(pick.pool.whirlpoolAddress);
+
+    const p = pick.pool;
     return {
       pair: p.pair,
       whirlpoolAddress: p.whirlpoolAddress,
@@ -945,8 +992,8 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
       tokenBMint: p.tokenB.mint,
       tokenADecimals: p.tokenA.decimals,
       tokenBDecimals: p.tokenB.decimals,
-      score: selection.score,
-      reasoning: `${selection.reasoning} (${selection.alternativesConsidered} pools evaluated)`,
+      score: pick.effective,
+      reasoning: `${p.reasoning.slice(0, 6).join(', ')}${pick.recency > 0 ? ' (diversity rotation)' : ''} (${ranked.length} pools evaluated)`,
       apyBase7d: p.apyBase7d,
       tvlUsd: p.tvlUsd,
     };
