@@ -168,6 +168,9 @@ export interface PolyPosition {
   unrealizedPnlUsd: number;
   openedAt: string;
   minimumTickSize?: string; // e.g. '0.001' — from CLOB /markets response
+  redeemable?: boolean;     // market resolved — can redeem on-chain for USDC
+  negativeRisk?: boolean;   // neg-risk market (multi-outcome, uses NegRiskAdapter)
+  outcomeIndex?: number;    // 0 = YES, 1 = NO (for indexSet calculation)
 }
 
 export interface CLOBCredentials {
@@ -1687,10 +1690,15 @@ export async function fetchPositions(): Promise<PolyPosition[]> {
         currentValueUsd,
         unrealizedPnlUsd: Number(p.cashPnl ?? (currentValueUsd - costBasisUsd)),
         openedAt: new Date().toISOString(),
+        redeemable: p.redeemable ?? false,
+        negativeRisk: p.negativeRisk ?? false,
+        outcomeIndex: p.outcomeIndex ?? 0,
       });
     }
 
-    logger.info(`[Polymarket] ${positions.length} active positions (${positions.filter(p => p.currentValueUsd > 0).length} live, ${positions.filter(p => p.currentValueUsd === 0).length} expired/redeemable)`);
+    const redeemableCount = positions.filter(p => p.redeemable).length;
+    const liveCount = positions.length - redeemableCount;
+    logger.info(`[Polymarket] ${positions.length} active positions (${liveCount} live, ${redeemableCount} redeemable)`);
     return positions;
   } catch (err) {
     logger.error('[Polymarket] fetchPositions error:', err);
@@ -1819,6 +1827,89 @@ export async function exitPosition(
   }
 
   return result;
+}
+
+// ============================================================================
+// On-chain Redemption for Resolved Markets
+// ============================================================================
+
+/**
+ * Redeem outcome tokens from a resolved Polymarket market on-chain.
+ *
+ * When a market resolves, CLOB sell orders will never fill (no buyers for
+ * resolved outcome tokens). Instead, we must call the ConditionalTokens
+ * contract to burn the tokens and receive USDC collateral:
+ *   - Winning outcomes: receive USDC proportional to shares held
+ *   - Losing outcomes: tokens are burned, 0 USDC returned (clears position)
+ *
+ * For neg-risk markets, uses the NegRiskAdapter which wraps the CTF call.
+ * For regular markets, calls ConditionalTokens.redeemPositions directly.
+ *
+ * Gas cost: ~0.001-0.01 MATIC on Polygon (negligible).
+ */
+export async function redeemPosition(position: PolyPosition): Promise<{
+  success: boolean;
+  txHash?: string;
+  error?: string;
+}> {
+  const env = getCFOEnv();
+
+  if (env.dryRun) {
+    logger.info(
+      `[Polymarket] DRY RUN — would REDEEM "${position.question}" ` +
+      `(negRisk=${position.negativeRisk}, outcomeIndex=${position.outcomeIndex})`,
+    );
+    return { success: true, txHash: `dry-redeem-${Date.now()}` };
+  }
+
+  try {
+    const { wallet, ethers: eth } = await loadEthers();
+    const provider = new eth.JsonRpcProvider(env.polygonRpcUrl);
+    const connectedWallet = wallet.connect(provider);
+
+    // indexSet for our outcome: bit position = outcomeIndex
+    const outcomeIndex = position.outcomeIndex ?? 0;
+    const indexSet = 1 << outcomeIndex;
+
+    let tx: any;
+
+    if (position.negativeRisk) {
+      // Neg-risk: call NegRiskAdapter.redeemPositions(conditionId, indexSets)
+      const adapter = new eth.Contract(NEG_RISK_ADAPTER, [
+        'function redeemPositions(bytes32 conditionId, uint256[] calldata indexSets)',
+      ], connectedWallet);
+
+      logger.info(
+        `[Polymarket] Redeeming neg-risk: "${position.question}" ` +
+        `(conditionId=${position.conditionId.slice(0, 18)}…, indexSet=${indexSet})`,
+      );
+      tx = await adapter.redeemPositions(position.conditionId, [indexSet]);
+    } else {
+      // Regular: call ConditionalTokens.redeemPositions(collateral, parentCollectionId, conditionId, indexSets)
+      const ct = new eth.Contract(CONDITIONAL_TOKENS, [
+        'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] calldata indexSets)',
+      ], connectedWallet);
+
+      logger.info(
+        `[Polymarket] Redeeming: "${position.question}" ` +
+        `(conditionId=${position.conditionId.slice(0, 18)}…, indexSet=${indexSet})`,
+      );
+      tx = await ct.redeemPositions(
+        USDC_POLYGON,
+        eth.ZeroHash,        // parentCollectionId = 0x0 for top-level conditions
+        position.conditionId,
+        [indexSet],
+      );
+    }
+
+    const receipt = await tx.wait(1);
+    logger.info(`[Polymarket] Redeemed "${position.question}" ✓ tx: ${receipt.hash}`);
+    return { success: true, txHash: receipt.hash };
+  } catch (err) {
+    const errMsg = (err as Error).message;
+    logger.error(`[Polymarket] Redeem failed for "${position.question}": ${errMsg}`);
+    return { success: false, error: errMsg };
+  }
 }
 
 // ============================================================================

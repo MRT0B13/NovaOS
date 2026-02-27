@@ -854,18 +854,33 @@ export class CFOAgent extends BaseAgent {
         const freshPos = freshPositions.find((p: any) => p.tokenId === meta.tokenId);
 
         // ── Dust cleanup: position worth < $0.05 or not found on-chain ──
-        // Attempt sell on Polymarket first, then close in DB regardless
+        // For redeemable (resolved) markets: redeem on-chain instead of trying to sell
+        // For live markets: attempt sell on CLOB, then close in DB regardless
         if (!freshPos || freshPos.currentValueUsd < 0.05) {
           const dustValue = freshPos?.currentValueUsd ?? 0;
           const dustPnl = dustValue - dbPos.costBasisUsd;
 
-          // Try to sell on Polymarket even if near-zero — clears the shares
           if (freshPos && freshPos.size > 0 && !env.dryRun) {
-            try {
-              await polyMod.exitPosition(freshPos, 1.0);
-              logger.info(`[CFO] Dust sell attempted: "${dbPos.description.slice(0, 60)}" ($${dustValue.toFixed(2)})`);
-            } catch (err) {
-              logger.debug(`[CFO] Dust sell failed (expected for expired): ${(err as Error).message}`);
+            if (freshPos.redeemable) {
+              // Resolved market: redeem on-chain (burns tokens, returns USDC if winning)
+              try {
+                const result = await polyMod.redeemPosition(freshPos);
+                if (result.success) {
+                  logger.info(`[CFO] Redeemed resolved position: "${dbPos.description.slice(0, 60)}" tx: ${result.txHash}`);
+                } else {
+                  logger.warn(`[CFO] Redeem failed: "${dbPos.description.slice(0, 60)}" — ${result.error}`);
+                }
+              } catch (err) {
+                logger.debug(`[CFO] Redeem error: ${(err as Error).message}`);
+              }
+            } else {
+              // Live market with near-zero value: attempt sell on CLOB
+              try {
+                await polyMod.exitPosition(freshPos, 1.0);
+                logger.info(`[CFO] Dust sell attempted: "${dbPos.description.slice(0, 60)}" ($${dustValue.toFixed(2)})`);
+              } catch (err) {
+                logger.debug(`[CFO] Dust sell failed (expected for expired): ${(err as Error).message}`);
+              }
             }
           }
 
@@ -879,7 +894,7 @@ export class CFOAgent extends BaseAgent {
           );
           const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
           await notifyAdminForce(
-            `🧹 Dust cleanup: ${dbPos.description.slice(0, 60)}\n` +
+            `🧹 ${freshPos?.redeemable ? 'Redeemed' : 'Dust cleanup'}: ${dbPos.description.slice(0, 60)}\n` +
             `Value: $${dustValue.toFixed(2)} | PnL: $${dustPnl.toFixed(2)}`,
           );
           continue;
@@ -1955,6 +1970,9 @@ export class CFOAgent extends BaseAgent {
    * On startup, check for Polymarket positions marked CLOSED in DB but still
    * holding shares on-chain. Reopens them so the position monitor can properly
    * handle stop-loss, dust cleanup, and expiry.
+   *
+   * Also redeems any resolved (redeemable) positions on-chain to clear ghost
+   * shares that would otherwise cycle: reopen → dust sell (fails) → close → reopen.
    */
   private async reconcilePolymarketGhosts(): Promise<void> {
     if (!this.positionManager) return;
@@ -1964,7 +1982,32 @@ export class CFOAgent extends BaseAgent {
     try {
       const polyMod = await poly();
       const freshPositions = await polyMod.fetchPositions();
-      const reopened = await this.positionManager.reconcilePolymarketPositions(freshPositions);
+
+      // First, redeem any resolved positions on-chain to clear ghost shares
+      const redeemable = freshPositions.filter((p: any) => p.redeemable && p.size > 0);
+      if (redeemable.length > 0) {
+        logger.info(`[CFO] Found ${redeemable.length} redeemable position(s) on startup — redeeming on-chain`);
+        let redeemed = 0;
+        for (const pos of redeemable) {
+          try {
+            const result = await polyMod.redeemPosition(pos);
+            if (result.success) {
+              redeemed++;
+              logger.info(`[CFO] Startup redeem: "${(pos as any).question?.slice(0, 50)}" tx: ${result.txHash}`);
+            }
+          } catch (err) {
+            logger.debug(`[CFO] Startup redeem failed: ${(err as Error).message}`);
+          }
+        }
+        if (redeemed > 0) {
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(`♻️ Redeemed ${redeemed}/${redeemable.length} resolved Polymarket position(s) on startup`);
+        }
+      }
+
+      // Then reconcile non-redeemable ghost positions (reopen in DB for proper monitoring)
+      const nonRedeemable = freshPositions.filter((p: any) => !p.redeemable);
+      const reopened = await this.positionManager.reconcilePolymarketPositions(nonRedeemable);
       if (reopened > 0) {
         const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
         await notifyAdminForce(`🔄 Reconciled ${reopened} ghost Polymarket position(s) — reopened in DB for proper cleanup`);
