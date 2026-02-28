@@ -125,6 +125,7 @@ async function quoteViaUniswap(
     });
 
     const amountOutRaw = result[0] ?? result.amountOut;
+    const sqrtPriceX96After = result[1] ?? BigInt(0);
     const gasEstimate = Number(result[3] ?? result.gasEstimate ?? 200_000);
 
     // Get output token decimals
@@ -132,9 +133,30 @@ async function quoteViaUniswap(
     const outDecimals = await outToken.decimals().catch(() => 18);
     const amountOut = Number(ethers.formatUnits(amountOutRaw, outDecimals));
 
-    const priceImpactPct = amountInHuman > 0 && amountOut > 0
-      ? Math.abs(1 - amountOut / amountInHuman) * 100
-      : 0;
+    // Compute price impact from sqrtPriceX96 shift (works for cross-asset swaps)
+    // Read current sqrtPriceX96 from pool for comparison
+    let priceImpactPct = 0;
+    try {
+      const poolFactoryAddr = '0x1F98431c8aD98523631AE4a59f267346ea31F984';
+      const factoryAbi = ['function getPool(address,address,uint24) view returns (address)'];
+      const factory = new ethers.Contract(poolFactoryAddr, factoryAbi, provider);
+      const poolAddr = await factory.getPool(tokenInAddr, tokenOutAddr, feeTier);
+      if (poolAddr && poolAddr !== ethers.ZeroAddress) {
+        const poolAbi = ['function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, uint8, bool)'];
+        const pool = new ethers.Contract(poolAddr, poolAbi, provider);
+        const slot0 = await pool.slot0();
+        const sqrtPriceBefore = Number(slot0[0]);
+        const sqrtPriceAfter = Number(sqrtPriceX96After);
+        if (sqrtPriceBefore > 0 && sqrtPriceAfter > 0) {
+          // Price impact = |1 - (priceAfter / priceBefore)| × 100
+          // price ∝ sqrtPrice², so ratio = (sqrtAfter/sqrtBefore)²
+          const ratio = (sqrtPriceAfter / sqrtPriceBefore) ** 2;
+          priceImpactPct = Math.abs(1 - ratio) * 100;
+        }
+      }
+    } catch {
+      // Non-fatal — impact stays 0 (no guard will fire)
+    }
 
     return {
       tokenIn: tokenInAddr,

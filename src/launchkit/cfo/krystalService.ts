@@ -284,21 +284,21 @@ export async function discoverKrystalPools(forceRefresh = false): Promise<Scored
   logger.info(`[KrystalDiscovery] Refreshing pool list across ${targetChains.length} chains (${PAGES_PER_CHAIN} pages each)…`);
 
   try {
-    // Build fetch tasks: each chain × each page
-    const fetchTasks: Array<{ chainId: number; page: number }> = [];
+    // Build fetch tasks: each chain × each page (offset-based — Krystal ignores 'page')
+    const fetchTasks: Array<{ chainId: number; offset: number }> = [];
     for (const chainId of targetChains) {
-      for (let page = 1; page <= PAGES_PER_CHAIN; page++) {
-        fetchTasks.push({ chainId, page });
+      for (let p = 0; p < PAGES_PER_CHAIN; p++) {
+        fetchTasks.push({ chainId, offset: p * PER_PAGE });
       }
     }
 
     const perChainResults = await Promise.allSettled(
-      fetchTasks.map(({ chainId, page }) =>
+      fetchTasks.map(({ chainId, offset }) =>
         krystalFetch('/v1/pools', {
           sortBy: '0',
           limit: String(PER_PAGE),
           chainId: String(chainId),
-          page: String(page),
+          offset: String(offset),
         }),
       ),
     );
@@ -813,19 +813,29 @@ export async function openEvmLpPosition(
             const isToken1Usdc = pool.token1.address.toLowerCase() === usdcAddr.toLowerCase();
 
             if (!isToken0Usdc && halfUsdc > 0.5) {
-              // Swap half USDC → token0
-              const swapResult = await swap.executeEvmSwap(
-                chainNumericId, usdcAddr, pool.token0.address, halfUsdc, pool.feeTier,
-              );
-              if (swapResult.success) logger.info(`[Krystal] Swapped $${halfUsdc.toFixed(2)} USDC → ${pool.token0.symbol}`);
+              // Quote first — guard against excessive price impact
+              const quote0 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token0.address, halfUsdc, pool.feeTier);
+              if (quote0 && quote0.priceImpactPct > 3) {
+                logger.warn(`[Krystal] Swap USDC→${pool.token0.symbol} price impact ${quote0.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+              } else {
+                const swapResult = await swap.executeEvmSwap(
+                  chainNumericId, usdcAddr, pool.token0.address, halfUsdc, pool.feeTier,
+                );
+                if (swapResult.success) logger.info(`[Krystal] Swapped $${halfUsdc.toFixed(2)} USDC → ${pool.token0.symbol}`);
+              }
             }
 
             if (!isToken1Usdc && halfUsdc > 0.5) {
-              // Swap half USDC → token1
-              const swapResult = await swap.executeEvmSwap(
-                chainNumericId, usdcAddr, pool.token1.address, halfUsdc, pool.feeTier,
-              );
-              if (swapResult.success) logger.info(`[Krystal] Swapped $${halfUsdc.toFixed(2)} USDC → ${pool.token1.symbol}`);
+              // Quote first — guard against excessive price impact
+              const quote1 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token1.address, halfUsdc, pool.feeTier);
+              if (quote1 && quote1.priceImpactPct > 3) {
+                logger.warn(`[Krystal] Swap USDC→${pool.token1.symbol} price impact ${quote1.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+              } else {
+                const swapResult = await swap.executeEvmSwap(
+                  chainNumericId, usdcAddr, pool.token1.address, halfUsdc, pool.feeTier,
+                );
+                if (swapResult.success) logger.info(`[Krystal] Swapped $${halfUsdc.toFixed(2)} USDC → ${pool.token1.symbol}`);
+              }
             }
           }
         }
@@ -936,9 +946,15 @@ export async function openEvmLpPosition(
       logger.info(`[Krystal] Approved ${pool.token1.symbol} for NFPM`);
     }
 
-    // 8. Slippage: 2%
-    const amount0Min = (amount0Desired * BigInt(98)) / BigInt(100);
-    const amount1Min = (amount1Desired * BigInt(98)) / BigInt(100);
+    // 8. Slippage: For V3 concentrated LP mints, set mins to 0.
+    //    The NFPM deposits tokens in the ratio dictated by the tick range
+    //    and current price — not our requested ratio. Excess tokens stay
+    //    in the wallet. Setting min > 0 causes "Price slippage check" reverts
+    //    whenever the pool's required ratio differs from our even split.
+    //    Protection comes from: (a) capping desired amounts, (b) the deadline,
+    //    (c) choosing the tick range ourselves.
+    const amount0Min = BigInt(0);
+    const amount1Min = BigInt(0);
 
     // 9. Mint LP position
     const deadline = Math.floor(Date.now() / 1000) + 600; // 10 minutes
@@ -1065,6 +1081,9 @@ export async function closeEvmLpPosition(params: {
   posId: string;
   chainId: string;
   chainNumericId: number;
+  /** Token info for USD value estimation (optional — improves rebalance sizing) */
+  token0?: { address: string; symbol: string; decimals: number };
+  token1?: { address: string; symbol: string; decimals: number };
 }): Promise<EvmLpCloseResult> {
   const env = getCFOEnv();
   const { posId, chainNumericId } = params;
@@ -1146,9 +1165,37 @@ export async function closeEvmLpPosition(params: {
       logger.warn(`[Krystal] Burn failed (non-fatal): ${(burnErr as Error).message}`);
     }
 
-    // Estimate USD value — rough approximation
-    // In production, use price oracle. For now, use a placeholder.
-    const valueRecoveredUsd = 0; // Will be enriched by caller using price data
+    // Estimate USD value from recovered token amounts
+    let valueRecoveredUsd = 0;
+    try {
+      const stableSymbols = ['USDC', 'USDT', 'DAI', 'BUSD', 'USDCE', 'USDC.E', 'USDT0'];
+      const t0 = params.token0;
+      const t1 = params.token1;
+      if (t0 && t1) {
+        const dec0 = t0.decimals ?? 18;
+        const dec1 = t1.decimals ?? 18;
+        const human0 = Number(amount0Recovered) / (10 ** dec0);
+        const human1 = Number(amount1Recovered) / (10 ** dec1);
+        const is0Stable = stableSymbols.includes(t0.symbol.toUpperCase());
+        const is1Stable = stableSymbols.includes(t1.symbol.toUpperCase());
+
+        if (is0Stable && is1Stable) {
+          valueRecoveredUsd = human0 + human1;
+        } else if (is0Stable) {
+          // token0 is $1 → token1 value ≈ human0 equivalent (symmetric LP)
+          valueRecoveredUsd = human0 * 2; // approximate: LP is ~50/50
+        } else if (is1Stable) {
+          valueRecoveredUsd = human1 * 2;
+        } else {
+          // Neither is stable — use native price heuristic
+          const nPrice = await getNativeTokenPrice(chainNumericId);
+          valueRecoveredUsd = (human0 + human1) * nPrice; // rough
+        }
+      }
+      if (valueRecoveredUsd > 0) {
+        logger.info(`[Krystal] Estimated value recovered: $${valueRecoveredUsd.toFixed(2)}`);
+      }
+    } catch { /* non-fatal — fallback to 0 */ }
 
     return {
       success: true,
@@ -1221,21 +1268,38 @@ export async function claimEvmLpFees(params: {
 // ============================================================================
 
 /**
- * Get a rough native token price for gas cost estimation.
- * Falls back to hardcoded estimates if no oracle available.
+ * Module-level price cache — set by `setAnalystPrices()` from decision engine.
+ * Maps symbol → USD price. Populated each cycle from swarm intel.
+ */
+const _analystPrices: Record<string, number> = {};
+
+/** Update native token prices from analyst/oracle data. Call once per decision cycle. */
+export function setAnalystPrices(prices: Record<string, number>): void {
+  Object.assign(_analystPrices, prices);
+}
+
+/** Chain → native token symbol mapping for price lookups */
+const CHAIN_NATIVE_SYMBOL: Record<number, string> = {
+  1: 'ETH', 42161: 'ETH', 10: 'ETH', 8453: 'ETH', 324: 'ETH', 534352: 'ETH', 59144: 'ETH',
+  137: 'MATIC', 56: 'BNB', 43114: 'AVAX', 250: 'FTM',
+};
+
+/**
+ * Get native token price for gas cost estimation.
+ * Uses analyst prices when available, falls back to hardcoded estimates.
  */
 async function getNativeTokenPrice(chainId: number): Promise<number> {
-  // Try to read from analyst prices via env or cached source
-  // For now, use conservative estimates per chain
+  // 1. Try analyst prices (updated each decision cycle)
+  const symbol = CHAIN_NATIVE_SYMBOL[chainId];
+  if (symbol && _analystPrices[symbol] > 0) return _analystPrices[symbol];
+  // Also try common aliases
+  if (symbol === 'ETH' && _analystPrices['WETH'] > 0) return _analystPrices['WETH'];
+  if (symbol === 'MATIC' && _analystPrices['POL'] > 0) return _analystPrices['POL'];
+
+  // 2. Fallback to conservative hardcoded estimates
   const estimates: Record<number, number> = {
-    1: 2500,      // ETH mainnet
-    42161: 2500,  // Arbitrum (ETH)
-    10: 2500,     // Optimism (ETH)
-    8453: 2500,   // Base (ETH)
-    137: 0.5,     // Polygon (MATIC)
-    56: 300,      // BSC (BNB)
-    43114: 25,    // Avalanche (AVAX)
-    250: 0.3,     // Fantom (FTM)
+    1: 2500, 42161: 2500, 10: 2500, 8453: 2500, 324: 2500, 534352: 2500, 59144: 2500,
+    137: 0.5, 56: 300, 43114: 25, 250: 0.3,
   };
   return estimates[chainId] ?? 2500;
 }
@@ -1325,6 +1389,9 @@ export async function rebalanceEvmLpPosition(params: {
   chainNumericId: number;
   rangeWidthTicks: number;
   closeOnly?: boolean;
+  /** Token info for USD value estimation (improves rebalance deploy sizing) */
+  token0?: { address: string; symbol: string; decimals: number };
+  token1?: { address: string; symbol: string; decimals: number };
 }): Promise<{
   closeResult: EvmLpCloseResult;
   openResult?: EvmLpOpenResult;
@@ -1332,8 +1399,12 @@ export async function rebalanceEvmLpPosition(params: {
   const { posId, chainId, chainNumericId, rangeWidthTicks, closeOnly } = params;
   const env = getCFOEnv();
 
-  // Step 1: Close existing position
-  const closeResult = await closeEvmLpPosition({ posId, chainId, chainNumericId });
+  // Step 1: Close existing position (pass token info for USD estimation)
+  const closeResult = await closeEvmLpPosition({
+    posId, chainId, chainNumericId,
+    token0: params.token0,
+    token1: params.token1,
+  });
   if (!closeResult.success) {
     return { closeResult };
   }
@@ -1356,7 +1427,10 @@ export async function rebalanceEvmLpPosition(params: {
   }
 
   const best = eligible[0]; // already sorted by score
-  const deployUsd = closeResult.valueRecoveredUsd || env.krystalLpMaxUsd * 0.5;
+  // Use recovered value if computed, otherwise fallback to 50% of max (conservative)
+  const deployUsd = closeResult.valueRecoveredUsd > 1
+    ? closeResult.valueRecoveredUsd
+    : env.krystalLpMaxUsd * 0.5;
 
   const openResult = await openEvmLpPosition(
     {

@@ -260,6 +260,10 @@ export interface PortfolioState {
     chainNumericId: number;
     token0Symbol: string;
     token1Symbol: string;
+    token0Address: string;
+    token1Address: string;
+    token0Decimals: number;
+    token1Decimals: number;
     valueUsd: number;
     inRange: boolean;
     rangeUtilisationPct: number;
@@ -861,6 +865,10 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
           chainNumericId: p.chainNumericId,
           token0Symbol: p.token0.symbol,
           token1Symbol: p.token1.symbol,
+          token0Address: p.token0.address,
+          token1Address: p.token1.address,
+          token0Decimals: p.token0.decimals,
+          token1Decimals: p.token1.decimals,
           valueUsd: p.valueUsd,
           inRange: p.inRange,
           rangeUtilisationPct: p.rangeUtilisationPct,
@@ -2130,6 +2138,10 @@ export async function generateDecisions(
             chainName: pos.chainName,
             token0Symbol: pos.token0Symbol,
             token1Symbol: pos.token1Symbol,
+            token0Address: pos.token0Address,
+            token1Address: pos.token1Address,
+            token0Decimals: pos.token0Decimals,
+            token1Decimals: pos.token1Decimals,
             closeOnly: false,
             rangeWidthTicks: adaptiveLpRangeWidthTicks(
               pos.token0Symbol,
@@ -3051,6 +3063,14 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           ? `${decision.params.chainName}@${chainNumericId}`
           : String(chainNumericId);
 
+        // Look up token info from params for USD value estimation
+        const token0 = decision.params.token0Address
+          ? { address: decision.params.token0Address, symbol: decision.params.token0Symbol ?? '?', decimals: decision.params.token0Decimals ?? 18 }
+          : undefined;
+        const token1 = decision.params.token1Address
+          ? { address: decision.params.token1Address, symbol: decision.params.token1Symbol ?? '?', decimals: decision.params.token1Decimals ?? 18 }
+          : undefined;
+
         // Use standalone rebalance function
         const { closeResult, openResult } = await krystal.rebalanceEvmLpPosition({
           posId,
@@ -3058,6 +3078,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           chainNumericId,
           rangeWidthTicks,
           closeOnly,
+          token0,
+          token1,
         });
 
         if (!closeResult.success) {
@@ -3423,6 +3445,12 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
         if (sym && gt.priceUsd > 0) priceMap[sym] = gt.priceUsd;
       }
     }
+
+    // Push analyst prices to krystalService for native token pricing (gas estimates, LP value)
+    try {
+      const krystal = await import('./krystalService.ts');
+      krystal.setAnalystPrices(priceMap);
+    } catch { /* non-fatal */ }
 
     // Build enriched treasury exposures
     // SOL LSTs (JitoSOL, mSOL, bSOL, etc.) are folded into the underlying SOL entry
