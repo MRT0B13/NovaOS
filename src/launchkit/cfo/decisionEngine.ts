@@ -2216,10 +2216,10 @@ export async function generateDecisions(
         // Apply learned APR floor adjustment (raised if past LP positions underperformed)
         const learnedMinApr = env.krystalLpMinApr7d + (learned.lpMinAprAdjustment * learned.confidenceLevel);
 
-        // Build set of chains where we actually have USDC (>= $10)
+        // Build set of chains where we actually have deployable value (USDC + native >= $10)
         const fundedChainIds = new Set(
           state.evmChainBalances
-            .filter(b => b.usdcBalance >= 10)
+            .filter(b => (b.usdcBalance + b.nativeValueUsd) >= 10)
             .map(b => b.chainId),
         );
 
@@ -2249,10 +2249,10 @@ export async function generateDecisions(
           if (best.apr7d <= bestSolanaApr + 5) {
             krystalSkip(`best EVM APR ${best.apr7d.toFixed(1)}% doesn't beat Solana ${bestSolanaApr.toFixed(1)}% + 5%`);
           } else {
-          // Cap deploy to USDC actually available on the target chain (not global total)
+          // Cap deploy to available value on the target chain (USDC + native token value)
           const targetChainBal = state.evmChainBalances.find(b => b.chainId === best.chainNumericId);
-          const targetChainUsdc = targetChainBal?.usdcBalance ?? 0;
-          const deployUsd = Math.min(evmLpHeadroomUsd, env.krystalLpMaxUsd, evmUsdcCap, targetChainUsdc * 0.9);
+          const targetChainValue = (targetChainBal?.usdcBalance ?? 0) + (targetChainBal?.nativeValueUsd ?? 0);
+          const deployUsd = Math.min(evmLpHeadroomUsd, env.krystalLpMaxUsd, evmUsdcCap, targetChainValue * 0.9);
           const rangeWidthTicks = adaptiveLpRangeWidthTicks(
             best.token0.symbol,
             intel,

@@ -745,8 +745,7 @@ export async function openEvmLpPosition(
     ]);
 
     // ── Bridge + Swap Funding Flow ──────────────────────────────────
-    // If both token balances are zero/insufficient and bridge funding is requested,
-    // bridge USDC from source chain → target chain, then swap into pool tokens.
+    // Phase 1: Bridge — only if BOTH balances are zero and bridge funding is available
     if (bal0 === BigInt(0) && bal1 === BigInt(0) && bridgeFunding) {
       logger.info(`[Krystal] No token balances on chain ${chainNumericId} — attempting bridge funding from chain ${bridgeFunding.sourceChainId}`);
       try {
@@ -797,60 +796,107 @@ export async function openEvmLpPosition(
       } catch (err) {
         logger.warn('[Krystal] Bridge funding failed (non-fatal):', err);
       }
+    }
 
-      // After bridge, swap USDC into pool tokens if needed
-      try {
-        const swap = await import('./evmSwapService.ts');
-        const bridge = await import('./wormholeService.ts');
-        const usdcAddr = bridge.resolveTokenAddress(chainNumericId, 'USDC');
+    // Phase 2: Swap USDC into pool tokens if we have USDC but are missing one side
+    // This runs ALWAYS (not just after bridge) — handles cases where wallet has USDC
+    // on the target chain already, or where one pool token is USDC and we need the other.
+    try {
+      const swap = await import('./evmSwapService.ts');
+      const bridge = await import('./wormholeService.ts');
+      const usdcAddr = bridge.resolveTokenAddress(chainNumericId, 'USDC');
 
-        if (usdcAddr) {
-          const usdcBal = await bridge.getEvmTokenBalance(chainNumericId, usdcAddr, wallet.address);
+      if (usdcAddr) {
+        const usdcBal = await bridge.getEvmTokenBalance(chainNumericId, usdcAddr, wallet.address);
+        const isToken0Usdc = pool.token0.address.toLowerCase() === usdcAddr.toLowerCase();
+        const isToken1Usdc = pool.token1.address.toLowerCase() === usdcAddr.toLowerCase();
 
-          if (usdcBal > 0) {
-            const halfUsdc = usdcBal / 2;
+        // Determine if swaps are needed: we have USDC but are missing a pool token
+        const needSwap0 = !isToken0Usdc && bal0 === BigInt(0) && usdcBal > 0.5;
+        const needSwap1 = !isToken1Usdc && bal1 === BigInt(0) && usdcBal > 0.5;
 
-            // Check if either pool token is USDC — if so, only swap one side
-            const isToken0Usdc = pool.token0.address.toLowerCase() === usdcAddr.toLowerCase();
-            const isToken1Usdc = pool.token1.address.toLowerCase() === usdcAddr.toLowerCase();
+        if ((needSwap0 || needSwap1) && usdcBal > 0) {
+          // If one pool token IS USDC, swap the other half only; else split 50/50
+          const swapPortion = (isToken0Usdc || isToken1Usdc) ? usdcBal / 2 : usdcBal / 2;
+          logger.info(`[Krystal] Auto-swap: USDC bal=$${usdcBal.toFixed(2)} → swapping for missing pool tokens`);
 
-            if (!isToken0Usdc && halfUsdc > 0.5) {
-              // Quote first — guard against excessive price impact
-              const quote0 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token0.address, halfUsdc, pool.feeTier);
-              if (quote0 && quote0.priceImpactPct > 3) {
-                logger.warn(`[Krystal] Swap USDC→${pool.token0.symbol} price impact ${quote0.priceImpactPct.toFixed(1)}% > 3% — skipping`);
-              } else {
-                const swapResult = await swap.executeEvmSwap(
-                  chainNumericId, usdcAddr, pool.token0.address, halfUsdc, pool.feeTier,
-                );
-                if (swapResult.success) logger.info(`[Krystal] Swapped $${halfUsdc.toFixed(2)} USDC → ${pool.token0.symbol}`);
-              }
+          if (needSwap0 && swapPortion > 0.5) {
+            const quote0 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token0.address, swapPortion, pool.feeTier);
+            if (quote0 && quote0.priceImpactPct > 3) {
+              logger.warn(`[Krystal] Swap USDC→${pool.token0.symbol} price impact ${quote0.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+            } else {
+              const swapResult = await swap.executeEvmSwap(
+                chainNumericId, usdcAddr, pool.token0.address, swapPortion, pool.feeTier,
+              );
+              if (swapResult.success) logger.info(`[Krystal] Swapped $${swapPortion.toFixed(2)} USDC → ${pool.token0.symbol}`);
             }
+          }
 
-            if (!isToken1Usdc && halfUsdc > 0.5) {
-              // Quote first — guard against excessive price impact
-              const quote1 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token1.address, halfUsdc, pool.feeTier);
-              if (quote1 && quote1.priceImpactPct > 3) {
-                logger.warn(`[Krystal] Swap USDC→${pool.token1.symbol} price impact ${quote1.priceImpactPct.toFixed(1)}% > 3% — skipping`);
-              } else {
-                const swapResult = await swap.executeEvmSwap(
-                  chainNumericId, usdcAddr, pool.token1.address, halfUsdc, pool.feeTier,
-                );
-                if (swapResult.success) logger.info(`[Krystal] Swapped $${halfUsdc.toFixed(2)} USDC → ${pool.token1.symbol}`);
-              }
+          if (needSwap1 && swapPortion > 0.5) {
+            const quote1 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token1.address, swapPortion, pool.feeTier);
+            if (quote1 && quote1.priceImpactPct > 3) {
+              logger.warn(`[Krystal] Swap USDC→${pool.token1.symbol} price impact ${quote1.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+            } else {
+              const swapResult = await swap.executeEvmSwap(
+                chainNumericId, usdcAddr, pool.token1.address, swapPortion, pool.feeTier,
+              );
+              if (swapResult.success) logger.info(`[Krystal] Swapped $${swapPortion.toFixed(2)} USDC → ${pool.token1.symbol}`);
             }
           }
         }
-      } catch (err) {
-        logger.warn('[Krystal] Pre-position swap failed (non-fatal):', err);
       }
-
-      // Re-check balances after bridge + swap
-      [bal0, bal1] = await Promise.all([
-        token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
-        token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
-      ]);
+    } catch (err) {
+      logger.warn('[Krystal] Pre-position swap failed (non-fatal):', err);
     }
+
+    // Phase 3: Wrap native token if we have native balance but no WETH/WMATIC
+    // Handles cases where wallet has ETH/MATIC but the pool needs WETH/WMATIC
+    try {
+      const WRAPPED_NATIVE: Record<number, { symbol: string; address: string }> = {
+        1:     { symbol: 'WETH',   address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' },
+        10:    { symbol: 'WETH',   address: '0x4200000000000000000000000000000000000006' },
+        137:   { symbol: 'WMATIC', address: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270' },
+        8453:  { symbol: 'WETH',   address: '0x4200000000000000000000000000000000000006' },
+        42161: { symbol: 'WETH',   address: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1' },
+        43114: { symbol: 'WAVAX',  address: '0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7' },
+      };
+
+      const wrapped = WRAPPED_NATIVE[chainNumericId];
+      if (wrapped) {
+        const t0IsWrapped = pool.token0.address.toLowerCase() === wrapped.address.toLowerCase();
+        const t1IsWrapped = pool.token1.address.toLowerCase() === wrapped.address.toLowerCase();
+
+        if ((t0IsWrapped && bal0 === BigInt(0)) || (t1IsWrapped && bal1 === BigInt(0))) {
+          const nativeBal = await provider.getBalance(wallet.address);
+          // Keep 0.005 native for gas, wrap the rest (up to deployUsd/2 worth)
+          const gasReserve = ethers.parseEther('0.005');
+          if (nativeBal > gasReserve) {
+            const nativePrice = await getNativeTokenPrice(chainNumericId);
+            const halfDeployWei = ethers.parseEther(String(Math.min(
+              Number(ethers.formatEther(nativeBal - gasReserve)),
+              (deployUsd / 2) / nativePrice,
+            )));
+
+            if (halfDeployWei > BigInt(0)) {
+              const WETH_ABI = ['function deposit() payable'];
+              const wethContract = new ethers.Contract(wrapped.address, WETH_ABI, wallet);
+              const wrapTx = await wethContract.deposit({ value: halfDeployWei });
+              await wrapTx.wait();
+              const wrappedAmt = Number(ethers.formatEther(halfDeployWei));
+              logger.info(`[Krystal] Wrapped ${wrappedAmt.toFixed(4)} native → ${wrapped.symbol} ($${(wrappedAmt * nativePrice).toFixed(2)})`);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn('[Krystal] Native token wrap failed (non-fatal):', err);
+    }
+
+    // Re-check balances after bridge + swap + wrap
+    [bal0, bal1] = await Promise.all([
+      token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+    ]);
 
     // 4. Calculate desired amounts — cap at deployUsd equivalent
     //    Use sqrtPriceX96 to derive token0 price in token1 terms, then limit each side.
