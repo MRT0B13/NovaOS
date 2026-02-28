@@ -3209,81 +3209,93 @@ export function formatDecisionReport(
   // ── Header ──
   L.push(`🧠 <b>CFO Report</b>`);
 
-  // ── Market Summary — single human-readable sentence ──
+  // ── Market ──
   if (intel) {
     const mood = intel.marketCondition ?? 'neutral';
     const moodIcon = mood === 'bullish' ? '🟢' : mood === 'bearish' ? '🔴' : mood === 'danger' ? '🚨' : '⚪';
-    const alerts: string[] = [];
-    if (intel.guardianCritical) alerts.push('security alert active');
-    else if (intel.guardianAlerts?.length) alerts.push(`${intel.guardianAlerts.length} watch alert${intel.guardianAlerts.length > 1 ? 's' : ''}`);
-    if (intel.analystVolumeSpike) alerts.push('volume spike');
+
+    // Alerts detail
+    const alertParts: string[] = [];
+    if (intel.guardianCritical) alertParts.push('🚨 Security alert active');
+    if (intel.guardianAlerts?.length) {
+      for (const a of intel.guardianAlerts.slice(0, 2)) {
+        alertParts.push(`⚠️ ${typeof a === 'string' ? a : (a as any).summary ?? (a as any).message ?? 'watch alert'}`);
+      }
+    }
+    if (intel.analystVolumeSpike) alertParts.push('📊 Volume spike detected');
+
     const moverStr = intel.analystMovers?.length
-      ? ` · Top mover: ${intel.analystMovers[0].symbol} ${intel.analystMovers[0].change24hPct > 0 ? '+' : ''}${intel.analystMovers[0].change24hPct.toFixed(0)}%`
+      ? `\n   Top mover: ${intel.analystMovers[0].symbol} ${intel.analystMovers[0].change24hPct > 0 ? '+' : ''}${intel.analystMovers[0].change24hPct.toFixed(0)}%`
       : '';
-    L.push(`${moodIcon} Market ${mood}${alerts.length ? ` — ${alerts.join(', ')}` : ''}${moverStr}`);
+
+    L.push(`${moodIcon} <b>Market:</b> ${mood}${moverStr}`);
+    if (alertParts.length) L.push(alertParts.map(a => `   ${a}`).join('\n'));
   }
 
-  // ── Portfolio — wallet balances ──
+  // ── Holdings ──
   L.push('');
-  L.push(`💰 <b>$${state.totalPortfolioUsd.toFixed(0)}</b> total`);
-  const holdings: string[] = [];
-  const rawSolUsd = state.solBalance * state.solPriceUsd;
-  holdings.push(`${state.solBalance.toFixed(2)} SOL ($${rawSolUsd.toFixed(0)})`);
-  if (state.jitoSolBalance > 0.01) holdings.push(`${state.jitoSolBalance.toFixed(2)} JitoSOL ($${state.jitoSolValueUsd.toFixed(0)})`);
-  if (state.hlEquity > 1) holdings.push(`$${state.hlEquity.toFixed(0)} on Hyperliquid`);
-  if (state.polyDeployedUsd > 1) holdings.push(`$${state.polyDeployedUsd.toFixed(0)} on Polymarket`);
-  if (state.orcaLpValueUsd > 1) holdings.push(`$${state.orcaLpValueUsd.toFixed(0)} in Orca LP`);
-  if (state.evmLpTotalValueUsd > 1) {
-    const feeStr = state.evmLpTotalFeesUsd > 0.01 ? ` (+$${state.evmLpTotalFeesUsd.toFixed(2)} fees)` : '';
-    holdings.push(`$${state.evmLpTotalValueUsd.toFixed(0)} in EVM LP${feeStr}`);
-  }
-  if (state.kaminoDepositValueUsd > 1) holdings.push(`$${state.kaminoDepositValueUsd.toFixed(0)} in Kamino`);
-  L.push(`    ${holdings.join(' · ')}`);
+  L.push(`━━━ <b>Holdings — $${state.totalPortfolioUsd.toFixed(0)}</b> ━━━`);
 
-  // Per-position EVM LP breakdown (when positions exist)
+  const rawSolUsd = state.solBalance * state.solPriceUsd;
+  L.push(`   Wallet: ${state.solBalance.toFixed(2)} SOL ($${rawSolUsd.toFixed(0)})`);
+  if (state.jitoSolBalance > 0.01) L.push(`   Staked: ${state.jitoSolBalance.toFixed(2)} JitoSOL ($${state.jitoSolValueUsd.toFixed(0)})`);
+  if (state.hlEquity > 1) L.push(`   Hyperliquid: $${state.hlEquity.toFixed(0)}`);
+  if (state.polyDeployedUsd > 1) L.push(`   Polymarket: $${state.polyDeployedUsd.toFixed(0)}`);
+  if (state.kaminoDepositValueUsd > 1) L.push(`   Kamino: $${state.kaminoDepositValueUsd.toFixed(0)}`);
+  if (state.orcaLpValueUsd > 1) L.push(`   Orca LP: $${state.orcaLpValueUsd.toFixed(0)}`);
+
+  // EVM LP positions
   if (state.evmLpPositions.length > 0) {
-    const chainNames: Record<number, string> = { 1: 'ETH', 10: 'OP', 56: 'BSC', 137: 'Polygon', 8453: 'Base', 42161: 'Arb', 43114: 'Avax', 324: 'zkSync', 534352: 'Scroll', 59144: 'Linea' };
+    const chainNames: Record<number, string> = { 1: 'Ethereum', 10: 'Optimism', 56: 'BSC', 137: 'Polygon', 8453: 'Base', 42161: 'Arbitrum', 43114: 'Avalanche', 324: 'zkSync', 534352: 'Scroll', 59144: 'Linea' };
     for (const pos of state.evmLpPositions) {
       const chain = chainNames[pos.chainNumericId] ?? `Chain ${pos.chainNumericId}`;
       const range = pos.inRange ? '🟢' : '🔴';
-      const fee = pos.feesOwedUsd > 0.01 ? ` · $${pos.feesOwedUsd.toFixed(2)} fees` : '';
-      L.push(`    ${range} ${pos.token0Symbol}/${pos.token1Symbol} on ${chain} — $${pos.valueUsd.toFixed(0)}${fee}`);
+      const fee = pos.feesOwedUsd > 0.01 ? ` (+$${pos.feesOwedUsd.toFixed(2)} fees)` : '';
+      L.push(`   ${range} LP: ${pos.token0Symbol}/${pos.token1Symbol} on ${chain} — $${pos.valueUsd.toFixed(0)}${fee}`);
     }
+  } else if (state.evmLpTotalValueUsd > 1) {
+    const feeStr = state.evmLpTotalFeesUsd > 0.01 ? ` (+$${state.evmLpTotalFeesUsd.toFixed(2)} fees)` : '';
+    L.push(`   EVM LP: $${state.evmLpTotalValueUsd.toFixed(0)}${feeStr}`);
   }
 
-  // EVM chain balances summary (when we have USDC staged on EVM chains)
+  // EVM chain balances (USDC staged on chains)
   if (state.evmTotalUsdcAllChains > 1 && state.evmChainBalances.length > 0) {
     const chains = state.evmChainBalances
       .filter(b => b.usdcBalance > 0.5)
-      .map(b => `$${b.usdcBalance.toFixed(0)} on ${b.chainName}`);
-    if (chains.length > 0) L.push(`    💵 EVM staging: ${chains.join(' · ')}`);
+      .map(b => `$${b.usdcBalance.toFixed(0)} ${b.chainName}`);
+    if (chains.length > 0) L.push(`   EVM USDC: ${chains.join(', ')}`);
   }
 
-  // EVM arb scanner status line (shows pools being monitored + 24h profit)
+  // ── Strategies ──
+  // Arb scanner
   if (state.evmArbPoolCount > 0 || state.evmArbProfit24h > 0) {
+    L.push('');
     const arbParts: string[] = [];
-    arbParts.push(`${state.evmArbPoolCount} pools across 4 venues`);
+    arbParts.push(`scanning ${state.evmArbPoolCount} pools`);
     if (state.evmArbProfit24h > 0.01) arbParts.push(`+$${state.evmArbProfit24h.toFixed(2)} today`);
-    if (state.evmArbUsdcBalance > 1) arbParts.push(`$${state.evmArbUsdcBalance.toFixed(0)} USDC on Arb`);
-    L.push(`⚡ <b>Arb Scanner</b> — ${arbParts.join(' · ')}`);
+    if (state.evmArbUsdcBalance > 1) arbParts.push(`$${state.evmArbUsdcBalance.toFixed(0)} USDC deployed`);
+    L.push(`⚡ <b>Arb Scanner:</b> ${arbParts.join(' · ')}`);
   }
 
-  // Risk line — tells user if portfolio protection is adequate
+  // ── Risk ──
+  L.push('');
   const hedgePct = (state.hedgeRatio * 100).toFixed(0);
-  if (state.hedgeRatio < 0.1 && state.solExposureUsd > 20) {
-    L.push(`⚠️ <b>Unhedged</b> — ${hedgePct}% of $${state.solExposureUsd.toFixed(0)} SOL exposure protected (SOL @ $${state.solPriceUsd.toFixed(0)})`);
+  if (state.hedgeRatio > 1.05) {
+    L.push(`🛡 <b>Risk:</b> ${hedgePct}% hedged (over-hedged) · SOL @ $${state.solPriceUsd.toFixed(0)}`);
   } else if (state.hedgeRatio >= 0.4) {
-    L.push(`🛡 ${hedgePct}% hedged · SOL @ $${state.solPriceUsd.toFixed(0)}`);
+    L.push(`🛡 <b>Risk:</b> ${hedgePct}% hedged · SOL @ $${state.solPriceUsd.toFixed(0)}`);
+  } else if (state.hedgeRatio < 0.1 && state.solExposureUsd > 20) {
+    L.push(`⚠️ <b>Risk: Unhedged!</b> Only ${hedgePct}% of $${state.solExposureUsd.toFixed(0)} SOL exposure is protected · SOL @ $${state.solPriceUsd.toFixed(0)}`);
   } else {
-    L.push(`🔸 ${hedgePct}% hedged · SOL @ $${state.solPriceUsd.toFixed(0)}`);
+    L.push(`🔸 <b>Risk:</b> ${hedgePct}% hedged · SOL @ $${state.solPriceUsd.toFixed(0)}`);
   }
 
-  // ── Actions — what the CFO is doing / recommending ──
+  // ── Actions ──
+  L.push('');
   if (results.length === 0) {
-    L.push('');
-    L.push(`✅ All good — nothing to do right now.`);
+    L.push(`✅ <b>Actions:</b> Nothing to do — all good.`);
   } else {
-    L.push('');
+    L.push(`━━━ <b>Actions</b> ━━━`);
     for (const r of results) {
       const d = r.decision;
       const icon = r.pendingApproval ? '⏳' : r.success ? (r.executed ? '✅' : '📋') : '❌';
@@ -3299,13 +3311,12 @@ export function formatDecisionReport(
 
       L.push(`${icon} ${what}${amtStr} — ${tag}`);
 
-      // Error detail (only on failure)
-      if (r.error && !r.success) L.push(`    ⚠️ ${r.error}`);
-      if (r.txId) L.push(`    🔗 ${r.txId}`);
+      if (r.error && !r.success) L.push(`      ⚠️ ${r.error}`);
+      if (r.txId) L.push(`      🔗 ${r.txId}`);
     }
   }
 
-  // ── Learning summary ──
+  // ── Learning ──
   const learnedParams = getAdaptiveParams();
   if (learnedParams.lastComputed > 0) {
     L.push('');

@@ -1035,80 +1035,102 @@ export function applyAdaptive(
  * Format a human-readable learning summary for admin reports.
  */
 export function formatLearningSummary(params: AdaptiveParams): string {
-  if (params.lastComputed === 0) return '🧠 Learning: No data yet (need 5+ closed trades)';
+  if (params.lastComputed === 0) return '🧠 <b>Learning:</b> No data yet — need 5+ closed trades to start adapting.';
 
   const totalSamples = Object.values(params.sampleSizes).reduce((s, n) => s + n, 0);
-  const top3 = Object.entries(params.strategyScores)
-    .sort(([, a], [, b]) => b - a)
-    .slice(0, 3)
-    .map(([name, score]) => `${name}(${score.toFixed(0)})`)
-    .join(', ');
+  const L: string[] = [];
 
-  // Per-strategy confidence
-  const stratConfidence = Object.entries(params.sampleSizes)
-    .filter(([, n]) => n > 0)
-    .map(([name, n]) => {
-      const level = n >= 20 ? 'high' : n >= MIN_TRADES_FOR_CONFIDENCE ? 'med' : 'low';
-      return `${name}:${level}(${n})`;
-    })
-    .join(', ');
+  // Header with overall confidence
+  const confPct = (params.confidenceLevel * 100).toFixed(0);
+  const confLabel = params.confidenceLevel >= 0.7 ? 'high' : params.confidenceLevel >= 0.4 ? 'moderate' : 'low';
+  L.push(`━━━ <b>Learning</b> ━━━`);
+  L.push(`   ${totalSamples} trades analysed · ${confLabel} confidence (${confPct}%) · ${params.regimeSignal} regime`);
 
-  const adjustments: string[] = [];
+  // Portfolio performance
+  const sharpeLabel = params.portfolioSharpe >= 1.5 ? '(excellent)' : params.portfolioSharpe >= 1.0 ? '(good)' : params.portfolioSharpe >= 0.5 ? '(fair)' : params.portfolioSharpe >= 0 ? '(poor)' : '(losing)';
+  const ddLabel = params.portfolioMaxDrawdownPct <= 0.1 ? '' : params.portfolioMaxDrawdownPct <= 0.25 ? '' : params.portfolioMaxDrawdownPct <= 0.4 ? ' ⚠️' : ' 🔴';
+  L.push(`   Performance: Sharpe ${params.portfolioSharpe.toFixed(2)} ${sharpeLabel} · max drawdown ${(params.portfolioMaxDrawdownPct * 100).toFixed(0)}%${ddLabel}`);
+
+  // Best/worst strategies with names expanded
+  const stratNameMap: Record<string, string> = {
+    hyperliquid: 'Hyperliquid', kamino: 'Kamino', jito: 'Jito Staking',
+    orca_lp: 'Orca LP', krystal_lp: 'EVM LP', evm_flash_arb: 'Arb Scanner',
+    polymarket: 'Polymarket',
+  };
+  const sorted = Object.entries(params.strategyScores)
+    .filter(([name]) => (params.sampleSizes[name] ?? 0) > 0)
+    .sort(([, a], [, b]) => b - a);
+
+  if (sorted.length > 0) {
+    const best = sorted[0];
+    const bestName = stratNameMap[best[0]] ?? best[0];
+    const bestTrades = params.sampleSizes[best[0]] ?? 0;
+    L.push(`   Best strategy: ${bestName} (score ${best[1].toFixed(0)}/100, ${bestTrades} trades)`);
+    if (sorted.length > 1) {
+      const worst = sorted[sorted.length - 1];
+      const worstName = stratNameMap[worst[0]] ?? worst[0];
+      const worstTrades = params.sampleSizes[worst[0]] ?? 0;
+      if (worst[1] < 30) {
+        L.push(`   Worst strategy: ${worstName} (score ${worst[1].toFixed(0)}/100, ${worstTrades} trades)`);
+      }
+    }
+  }
+
+  // Active adjustments — explained in plain English
+  const adj: string[] = [];
   if (Math.abs(params.kellyMultiplier - 1) > 0.05) {
-    adjustments.push(`Kelly ${params.kellyMultiplier > 1 ? '↑' : '↓'}${(params.kellyMultiplier * 100).toFixed(0)}%`);
+    const dir = params.kellyMultiplier > 1 ? 'Increased' : 'Reduced';
+    adj.push(`${dir} bet sizing to ${(params.kellyMultiplier * 100).toFixed(0)}%`);
   }
   if (Math.abs(params.hlStopLossMultiplier - 1) > 0.05) {
-    adjustments.push(`HLstop ${params.hlStopLossMultiplier > 1 ? 'wider' : 'tighter'}`);
+    adj.push(`Stop losses ${params.hlStopLossMultiplier > 1 ? 'widened' : 'tightened'}`);
   }
   if (Math.abs(params.hlHedgeTargetMultiplier - 1) > 0.05) {
-    adjustments.push(`Hedge ${params.hlHedgeTargetMultiplier > 1 ? '↑' : '↓'}${(params.hlHedgeTargetMultiplier * 100).toFixed(0)}%`);
+    adj.push(`Hedge target ${params.hlHedgeTargetMultiplier > 1 ? 'increased' : 'decreased'}`);
   }
   if (Math.abs(params.lpRangeWidthMultiplier - 1) > 0.05) {
-    adjustments.push(`LP range ${params.lpRangeWidthMultiplier > 1 ? 'wider' : 'tighter'}`);
+    adj.push(`LP ranges ${params.lpRangeWidthMultiplier > 1 ? 'widened' : 'tightened'}`);
   }
   if (params.lpMinAprAdjustment > 0) {
-    adjustments.push(`APR floor +${params.lpMinAprAdjustment.toFixed(0)}%`);
+    adj.push(`Min APR raised by ${params.lpMinAprAdjustment.toFixed(0)}%`);
   }
   if (Math.abs(params.evmArbMinProfitMultiplier - 1) > 0.05) {
-    adjustments.push(`ArbMin ${params.evmArbMinProfitMultiplier > 1 ? '↑' : '↓'}${(params.evmArbMinProfitMultiplier * 100).toFixed(0)}%`);
+    adj.push(`Arb min profit ${params.evmArbMinProfitMultiplier > 1 ? 'raised' : 'lowered'}`);
   }
   if (params.globalRiskMultiplier < 0.9) {
-    adjustments.push(`🛡️ RISK-OFF ×${params.globalRiskMultiplier.toFixed(2)}`);
+    adj.push(`🛡️ Risk-off mode (×${params.globalRiskMultiplier.toFixed(2)})`);
   } else if (params.globalRiskMultiplier > 1.1) {
-    adjustments.push(`🚀 RISK-ON ×${params.globalRiskMultiplier.toFixed(2)}`);
+    adj.push(`🚀 Risk-on mode (×${params.globalRiskMultiplier.toFixed(2)})`);
   }
   if (params.feeDragPct > 1) {
-    adjustments.push(`💸 Fees ${params.feeDragPct.toFixed(1)}%`);
+    adj.push(`Fees eating ${params.feeDragPct.toFixed(1)}% of returns`);
   }
 
-  const lines = [
-    `🧠 Learning: ${totalSamples} trades | confidence ${(params.confidenceLevel * 100).toFixed(0)}% | regime: ${params.regimeSignal}`,
-    `   Portfolio: Sharpe=${params.portfolioSharpe.toFixed(2)} | MaxDD=${(params.portfolioMaxDrawdownPct * 100).toFixed(1)}%`,
-    `   Top strategies: ${top3 || 'n/a'}`,
-    `   Data quality: ${stratConfidence || 'no data'}`,
-    adjustments.length > 0
-      ? `   Adjustments: ${adjustments.join(', ')}`
-      : '   No adjustments yet (building data)',
-  ];
+  if (adj.length > 0) {
+    L.push(`   Adjustments: ${adj.join(' · ')}`);
+  }
 
-  // Add capital allocation weights if meaningful
+  // Capital allocation — only if not equal
   const weightEntries = Object.entries(params.capitalWeights)
     .filter(([, w]) => w > 0.05)
     .sort(([, a], [, b]) => b - a);
-  if (weightEntries.length > 0) {
-    lines.push(`   Capital weights: ${weightEntries.map(([n, w]) => `${n}=${(w * 100).toFixed(0)}%`).join(', ')}`);
+  const allEqual = weightEntries.length > 0 && weightEntries.every(([, w]) => Math.abs(w - weightEntries[0][1]) < 0.02);
+  if (weightEntries.length > 0 && !allEqual) {
+    L.push(`   Capital split: ${weightEntries.map(([n, w]) => `${stratNameMap[n] ?? n} ${(w * 100).toFixed(0)}%`).join(', ')}`);
+  } else if (weightEntries.length > 0) {
+    L.push(`   Capital split: equal across ${weightEntries.length} strategies (not enough data to optimise)`);
   }
 
-  // Alerts
+  // Alerts — with clearer language
   if (params.alerts.length > 0) {
-    lines.push(`   🚨 Alerts: ${params.alerts.length}`);
+    L.push('');
     for (const alert of params.alerts.slice(0, 3)) {
-      lines.push(`      ${alert}`);
+      L.push(`   ⚠️ ${alert}`);
     }
     if (params.alerts.length > 3) {
-      lines.push(`      ... +${params.alerts.length - 3} more`);
+      L.push(`   ... +${params.alerts.length - 3} more`);
     }
   }
 
-  return lines.join('\n');
+  return L.join('\n');
 }
