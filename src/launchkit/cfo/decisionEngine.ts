@@ -89,6 +89,11 @@ export type DecisionType =
   | 'ORCA_LP_REBALANCE'      // close out-of-range position and reopen centred on new price
   | 'KAMINO_BORROW_LP'       // borrow from Kamino → swap → open Orca LP, fees repay loan
   | 'EVM_FLASH_ARB'          // Arbitrum: atomic flash loan arb via Aave v3 + DEX spread
+  | 'KRYSTAL_LP_OPEN'        // open EVM concentrated LP via Krystal-discovered pool
+  | 'KRYSTAL_LP_REBALANCE'   // close + reopen out-of-range EVM LP (closeOnly=true → just close)
+  | 'KRYSTAL_LP_CLAIM_FEES'  // collect accumulated fees from EVM LP positions
+  | 'EVM_BRIDGE'             // bridge tokens between EVM chains (via LI.FI)
+  | 'EVM_SWAP'               // same-chain token swap on EVM (via Uniswap V3 / LI.FI)
   | 'SKIP';            // no action taken (for logging)
 
 /** Approval tier determines whether CFO executes immediately or waits for admin */
@@ -154,6 +159,10 @@ export interface SwarmIntel {
   analystTrending?: string[];         // CoinGecko trending tickers
   analystPricesAt?: number;
   analystArbitrumVolume24h?: number;  // Arbitrum DEX 24h volume USD (DeFiLlama via Analyst)
+
+  // From Analyst — Krystal EVM LP opportunities
+  analystEvmLpOpportunities?: any[];  // top Krystal pools from analyst
+  analystEvmLpAt?: number;
 
   // Composite score (computed)
   riskMultiplier: number;             // 0.5 (bullish) to 2.0 (danger) — scales hedge aggressiveness
@@ -243,6 +252,34 @@ export interface PortfolioState {
   evmArbProfit24h: number;        // confirmed flash arb profit last 24h (in-memory)
   evmArbPoolCount: number;        // number of candidate pools currently tracked
   evmArbUsdcBalance: number;      // native USDC on Arbitrum (in EVM wallet)
+
+  // Krystal EVM LP state
+  evmLpPositions: Array<{
+    posId: string;
+    chainName: string;
+    chainNumericId: number;
+    token0Symbol: string;
+    token1Symbol: string;
+    valueUsd: number;
+    inRange: boolean;
+    rangeUtilisationPct: number;
+    feesOwedUsd: number;
+    openedAt: number;
+  }>;
+  evmLpTotalValueUsd: number;     // total value in EVM LP positions
+  evmLpTotalFeesUsd: number;      // total uncollected fees across positions
+
+  // Multi-chain EVM balances (scanned from configured chains)
+  evmChainBalances: Array<{
+    chainId: number;
+    chainName: string;
+    usdcBalance: number;
+    nativeBalance: number;
+    nativeSymbol: string;
+    nativeValueUsd: number;
+  }>;
+  evmTotalUsdcAllChains: number;   // sum of USDC across all EVM chains
+  evmTotalNativeAllChains: number; // sum of native token USD value across all chains
 }
 
 // ============================================================================
@@ -525,6 +562,11 @@ export async function gatherSwarmIntel(pool: any): Promise<SwarmIntel> {
           intel.analystTrending = payload.trending ?? [];
           intel.analystPricesAt = ts;
           intel.analystArbitrumVolume24h = payload.arbitrumVolume24h;
+          // Krystal EVM LP opportunities (from analyst fetchKrystalLpIntel)
+          if (payload.evmLpOpportunities) {
+            intel.analystEvmLpOpportunities = payload.evmLpOpportunities;
+            intel.analystEvmLpAt = ts;
+          }
         }
       }
     }
@@ -800,8 +842,52 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     } catch { /* 0 */ }
   }
 
-  // Patch totalPortfolioUsd with Kamino + Orca values gathered above
-  totalPortfolioUsd += kaminoNetValueUsd + orcaLpValueUsd;
+  // ── Krystal EVM LP state ─────────────────────────────────────────────────
+  let evmLpPositions: PortfolioState['evmLpPositions'] = [];
+  let evmLpTotalValueUsd = 0, evmLpTotalFeesUsd = 0;
+  if (env.krystalLpEnabled) {
+    try {
+      const krystal = await import('./krystalService.ts');
+      const walletAddr = env.evmPrivateKey
+        ? (await import('ethers' as string)).computeAddress(env.evmPrivateKey)
+        : undefined;
+      if (walletAddr) {
+        // Pass DB records for openedAt enrichment (hydrated from kv_store by CFO agent)
+        const dbRecords = (globalThis as any).__cfo_evm_lp_records as import('./krystalService.ts').EvmLpRecord[] | undefined;
+        const positions = await krystal.fetchKrystalPositions(walletAddr, dbRecords);
+        evmLpPositions = positions.map(p => ({
+          posId: p.posId,
+          chainName: p.chainName,
+          chainNumericId: p.chainNumericId,
+          token0Symbol: p.token0.symbol,
+          token1Symbol: p.token1.symbol,
+          valueUsd: p.valueUsd,
+          inRange: p.inRange,
+          rangeUtilisationPct: p.rangeUtilisationPct,
+          feesOwedUsd: p.feesOwedUsd,
+          openedAt: p.openedAt,
+        }));
+        evmLpTotalValueUsd = evmLpPositions.reduce((s, p) => s + p.valueUsd, 0);
+        evmLpTotalFeesUsd = evmLpPositions.reduce((s, p) => s + p.feesOwedUsd, 0);
+      }
+    } catch { /* 0 */ }
+  }
+
+  // ── Multi-chain EVM balance scan ──────────────────────────────────────────
+  let evmChainBalances: PortfolioState['evmChainBalances'] = [];
+  let evmTotalUsdcAllChains = 0, evmTotalNativeAllChains = 0;
+  if (env.krystalLpEnabled || env.lifiEnabled) {
+    try {
+      const krystal = await import('./krystalService.ts');
+      const balances = await krystal.getMultiChainEvmBalances();
+      evmChainBalances = balances;
+      evmTotalUsdcAllChains = balances.reduce((s, b) => s + b.usdcBalance, 0);
+      evmTotalNativeAllChains = balances.reduce((s, b) => s + b.nativeValueUsd, 0);
+    } catch { /* 0 */ }
+  }
+
+  // Patch totalPortfolioUsd with Kamino + Orca + EVM LP values gathered above
+  totalPortfolioUsd += kaminoNetValueUsd + orcaLpValueUsd + evmLpTotalValueUsd;
 
   return {
     solBalance,
@@ -845,6 +931,12 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     evmArbProfit24h,
     evmArbPoolCount,
     evmArbUsdcBalance,
+    evmLpPositions,
+    evmLpTotalValueUsd,
+    evmLpTotalFeesUsd,
+    evmChainBalances,
+    evmTotalUsdcAllChains,
+    evmTotalNativeAllChains,
     treasuryExposures,
   };
 }
@@ -891,6 +983,33 @@ function adaptiveLpRangeWidthPct(
   if (absChange > 5)  return baseWidthPct;                       // normal: use configured width
   if (absChange > 2)  return Math.max(baseWidthPct * 0.75, 10); // calm: tighten to ±7.5%
   return Math.max(baseWidthPct * 0.5, 8);                        // very calm: ±5-6% for max fees
+}
+
+/**
+ * Compute adaptive LP range width in ticks for EVM concentrated LP.
+ * Mirrors adaptiveLpRangeWidthPct() but returns tick-based width (e.g. 400 = ±200 ticks).
+ * Wider in volatile conditions, narrower when calm.
+ */
+function adaptiveLpRangeWidthTicks(
+  tokenSymbol: string,
+  intel: SwarmIntel,
+  baseWidthTicks: number,
+): number {
+  const STALE_MS = 6 * 3600_000;
+  if (!intel.analystPricesAt || Date.now() - intel.analystPricesAt > STALE_MS) {
+    return baseWidthTicks;
+  }
+
+  const analystPrice = intel.analystPrices?.[tokenSymbol];
+  if (!analystPrice) return baseWidthTicks;
+
+  const absChange = Math.abs(analystPrice.change24h ?? 0);
+
+  if (absChange > 15) return Math.min(baseWidthTicks * 2.0, 2000); // very volatile
+  if (absChange > 10) return Math.min(baseWidthTicks * 1.5, 1200);  // volatile
+  if (absChange > 5)  return baseWidthTicks;                        // normal
+  if (absChange > 2)  return Math.max(baseWidthTicks * 0.75, 200); // calm
+  return Math.max(baseWidthTicks * 0.5, 150);                        // very calm
 }
 
 /**
@@ -1960,6 +2079,171 @@ export async function generateDecisions(
     }
   }
 
+  // ── I-bis) Krystal EVM Concentrated LP ────────────────────────────────────
+  //
+  // Mirrors Section I (Orca LP) but on EVM chains, powered by Krystal Cloud API
+  // for pool discovery and Uniswap V3 NonfungiblePositionManager for execution.
+  //
+  if (env.krystalLpEnabled && intel.marketCondition !== 'danger') {
+    const krystalSkip = (reason: string) =>
+      logger.debug(`[CFO:Decision] Section I-bis skip: ${reason}`);
+
+    // I-bis.0: Claim accumulated fees from existing positions
+    for (const pos of state.evmLpPositions) {
+      if (pos.feesOwedUsd >= 2 && checkCooldown(`KRYSTAL_LP_CLAIM_${pos.posId}`, 4 * 3600_000)) {
+        decisions.push({
+          type: 'KRYSTAL_LP_CLAIM_FEES',
+          reasoning:
+            `Collecting $${pos.feesOwedUsd.toFixed(2)} unclaimed fees from ` +
+            `${pos.token0Symbol}/${pos.token1Symbol} LP on ${pos.chainName}.`,
+          params: {
+            posId: pos.posId,
+            chainNumericId: pos.chainNumericId,
+            chainName: pos.chainName,
+            token0Symbol: pos.token0Symbol,
+            token1Symbol: pos.token1Symbol,
+            feesOwedUsd: pos.feesOwedUsd,
+          },
+          urgency: 'low',
+          estimatedImpactUsd: pos.feesOwedUsd,
+          intelUsed: [],
+          tier: 'AUTO',
+        });
+      }
+    }
+
+    // I-bis.1: Rebalance out-of-range or near-edge EVM LP positions
+    for (const pos of state.evmLpPositions) {
+      if (
+        (!pos.inRange || pos.rangeUtilisationPct < env.krystalLpRebalanceTriggerPct) &&
+        checkCooldown(`KRYSTAL_LP_REBALANCE_${pos.posId}`, 6 * 3600_000) // 6h per-position cooldown
+      ) {
+        decisions.push({
+          type: 'KRYSTAL_LP_REBALANCE',
+          reasoning:
+            `EVM LP ${pos.posId.slice(0, 8)} (${pos.token0Symbol}/${pos.token1Symbol}, ${pos.chainName}) ` +
+            `${pos.inRange ? 'near range edge' : 'OUT OF RANGE'} ` +
+            `(utilisation: ${pos.rangeUtilisationPct.toFixed(0)}%). Closing and reopening centred.`,
+          params: {
+            posId: pos.posId,
+            chainNumericId: pos.chainNumericId,
+            chainName: pos.chainName,
+            token0Symbol: pos.token0Symbol,
+            token1Symbol: pos.token1Symbol,
+            closeOnly: false,
+            rangeWidthTicks: adaptiveLpRangeWidthTicks(
+              pos.token0Symbol,
+              intel,
+              env.krystalLpRangeWidthTicks,
+            ),
+          },
+          urgency: pos.inRange ? 'low' : 'medium',
+          estimatedImpactUsd: pos.valueUsd * 0.02, // rebalance cost ~2%
+          intelUsed: [],
+          tier: 'NOTIFY',
+        });
+      }
+    }
+
+    // I-bis.2: Open new EVM LP position if we have headroom
+    const evmLpHeadroomUsd = Math.max(0, env.krystalLpMaxUsd - state.evmLpTotalValueUsd);
+    // Cap deploy to 80% of available EVM USDC across all chains
+    const evmUsdcCap = state.evmTotalUsdcAllChains * 0.8;
+    if (
+      evmLpHeadroomUsd >= 20 &&
+      state.evmTotalUsdcAllChains >= 20 &&
+      state.evmLpPositions.length < env.krystalLpMaxPositions &&
+      intel.marketCondition !== 'bearish' &&
+      checkCooldown('KRYSTAL_LP_OPEN', 12 * 3600_000)
+    ) {
+      try {
+        const krystal = await import('./krystalService.ts');
+        const pools = await krystal.discoverKrystalPools();
+
+        // Filter to pools meeting env thresholds AND with configured RPC
+        const eligible = pools.filter(p =>
+          p.tvlUsd >= env.krystalLpMinTvlUsd &&
+          p.apr7d >= env.krystalLpMinApr7d &&
+          (env.evmRpcUrls[p.chainNumericId] || p.chainNumericId === 42161),
+        );
+
+        // Check: not already in the same pool
+        const existingPoolAddrs = new Set(state.evmLpPositions.map(p => {
+          // We track by token symbols + chain — find matching pool addresses
+          return `${p.chainNumericId}_${p.token0Symbol}_${p.token1Symbol}`;
+        }));
+        const deduped = eligible.filter(p => {
+          const key = `${p.chainNumericId}_${p.token0.symbol}_${p.token1.symbol}`;
+          const keyRev = `${p.chainNumericId}_${p.token1.symbol}_${p.token0.symbol}`;
+          return !existingPoolAddrs.has(key) && !existingPoolAddrs.has(keyRev);
+        });
+
+        if (deduped.length > 0) {
+          const best = deduped[0]; // already sorted by score
+
+          // Check: EVM APR must beat best Solana LP APR by 5%
+          const bestSolanaApr = state.orcaLpFeeApy ?? 0;
+          if (best.apr7d <= bestSolanaApr + 5) {
+            krystalSkip(`best EVM APR ${best.apr7d.toFixed(1)}% doesn't beat Solana ${bestSolanaApr.toFixed(1)}% + 5%`);
+          } else {
+          const deployUsd = Math.min(evmLpHeadroomUsd, env.krystalLpMaxUsd, evmUsdcCap);
+          const rangeWidthTicks = adaptiveLpRangeWidthTicks(
+            best.token0.symbol,
+            intel,
+            env.krystalLpRangeWidthTicks,
+          );
+
+          decisions.push({
+            type: 'KRYSTAL_LP_OPEN',
+            reasoning:
+              `Opening EVM LP: ${best.token0.symbol}/${best.token1.symbol} on ${best.chainName} ` +
+              `($${deployUsd.toFixed(0)}). Pool score: ${best.score.toFixed(0)}/100 — ` +
+              `APR7d ${best.apr7d.toFixed(1)}%, TVL $${(best.tvlUsd / 1e6).toFixed(1)}M. ` +
+              `${best.reasoning.join(', ')}.`,
+            params: {
+              pool: {
+                chainId: best.chainId,
+                chainNumericId: best.chainNumericId,
+                poolAddress: best.poolAddress,
+                token0: best.token0,
+                token1: best.token1,
+                protocol: best.protocol,
+                feeTier: best.feeTier,
+              },
+              deployUsd,
+              rangeWidthTicks,
+              chainName: best.chainName,
+              pair: `${best.token0.symbol}/${best.token1.symbol}`,
+              // Bridge funding: pick the chain with the most USDC (if not same chain)
+              bridgeFunding: (() => {
+                const bestBal = state.evmChainBalances
+                  .filter(b => b.chainId !== best.chainNumericId && b.usdcBalance >= deployUsd * 0.5)
+                  .sort((a, b) => b.usdcBalance - a.usdcBalance)[0];
+                if (bestBal && env.evmPrivateKey) {
+                  // Wallet address will be computed by the executor from env.evmPrivateKey
+                  return { sourceChainId: bestBal.chainId, walletAddress: '' };
+                }
+                return undefined;
+              })(),
+            },
+            urgency: 'low',
+            estimatedImpactUsd: deployUsd * (best.apr7d / 100 / 52), // weekly yield estimate
+            intelUsed: [
+              intel.analystEvmLpAt ? 'analyst' : '',
+              intel.guardianReceivedAt ? 'guardian' : '',
+            ].filter(Boolean),
+            tier: classifyTier('KRYSTAL_LP_OPEN', 'low', deployUsd, config, intel.marketCondition),
+          });
+          }
+        } else {
+          krystalSkip(`no eligible pools (${pools.length} total, 0 pass TVL/APR/RPC/dedup filters)`);
+        }
+      } catch (err) {
+        logger.debug('[CFO:Decision] Krystal pool discovery failed:', err);
+      }
+    }
+  }
+
   // Sort by urgency: critical > high > medium > low
   const urgencyOrder: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
   decisions.sort((a, b) => urgencyOrder[a.urgency] - urgencyOrder[b.urgency]);
@@ -2734,6 +3018,83 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         };
       }
 
+      case 'KRYSTAL_LP_OPEN': {
+        const krystal = await import('./krystalService.ts');
+        const { pool, deployUsd, rangeWidthTicks, bridgeFunding } = decision.params;
+
+        // Compute wallet address for bridge funding if needed
+        let resolvedBridgeFunding = bridgeFunding;
+        if (bridgeFunding && !bridgeFunding.walletAddress && env.evmPrivateKey) {
+          const ethers = await import('ethers' as string);
+          resolvedBridgeFunding = {
+            ...bridgeFunding,
+            walletAddress: ethers.computeAddress(env.evmPrivateKey),
+          };
+        }
+
+        const result = await krystal.openEvmLpPosition(pool, deployUsd, rangeWidthTicks, resolvedBridgeFunding);
+        if (result.success) markDecision('KRYSTAL_LP_OPEN');
+        return {
+          ...base,
+          executed: true,
+          success: result.success,
+          txId: result.tokenId ?? result.txHash,  // tokenId for NFPM ops; txHash stored separately below
+          txHash: result.txHash,                   // actual on-chain tx hash for records
+          error: result.error,
+        } as DecisionResult & { txHash?: string };
+      }
+
+      case 'KRYSTAL_LP_REBALANCE': {
+        const krystal = await import('./krystalService.ts');
+        const { posId, chainNumericId, closeOnly, rangeWidthTicks } = decision.params;
+        const chainId = decision.params.chainName
+          ? `${decision.params.chainName}@${chainNumericId}`
+          : String(chainNumericId);
+
+        // Use standalone rebalance function
+        const { closeResult, openResult } = await krystal.rebalanceEvmLpPosition({
+          posId,
+          chainId,
+          chainNumericId,
+          rangeWidthTicks,
+          closeOnly,
+        });
+
+        if (!closeResult.success) {
+          return { ...base, executed: true, success: false, error: `Close failed: ${closeResult.error}` };
+        }
+        logger.info(`[CFO] KRYSTAL_LP_REBALANCE: closed posId=${posId} | tx=${closeResult.txHash}`);
+
+        if (openResult?.success) {
+          markDecision('KRYSTAL_LP_OPEN');
+          return {
+            ...base,
+            executed: true,
+            success: true,
+            txId: openResult.tokenId ?? openResult.txHash,
+            txHash: openResult.txHash,
+          } as DecisionResult & { txHash?: string };
+        }
+
+        markDecision('KRYSTAL_LP_REBALANCE');
+        return { ...base, executed: true, success: true, txId: closeResult.txHash };
+      }
+
+      case 'KRYSTAL_LP_CLAIM_FEES': {
+        const krystal = await import('./krystalService.ts');
+        const { posId, chainNumericId, chainName } = decision.params;
+        const chainId = `${chainName}@${chainNumericId}`;
+        const result = await krystal.claimEvmLpFees({ posId, chainId, chainNumericId });
+        if (result.success) markDecision(`KRYSTAL_LP_CLAIM_${posId}`);
+        return {
+          ...base,
+          executed: true,
+          success: result.success,
+          txId: result.txHash,
+          error: result.error,
+        };
+      }
+
       default:
         return { ...base, executed: false, error: `Unknown decision type: ${decision.type}` };
     }
@@ -2782,8 +3143,31 @@ export function formatDecisionReport(
   if (state.hlEquity > 1) holdings.push(`$${state.hlEquity.toFixed(0)} on Hyperliquid`);
   if (state.polyDeployedUsd > 1) holdings.push(`$${state.polyDeployedUsd.toFixed(0)} on Polymarket`);
   if (state.orcaLpValueUsd > 1) holdings.push(`$${state.orcaLpValueUsd.toFixed(0)} in Orca LP`);
+  if (state.evmLpTotalValueUsd > 1) {
+    const feeStr = state.evmLpTotalFeesUsd > 0.01 ? ` (+$${state.evmLpTotalFeesUsd.toFixed(2)} fees)` : '';
+    holdings.push(`$${state.evmLpTotalValueUsd.toFixed(0)} in EVM LP${feeStr}`);
+  }
   if (state.kaminoDepositValueUsd > 1) holdings.push(`$${state.kaminoDepositValueUsd.toFixed(0)} in Kamino`);
   L.push(`    ${holdings.join(' · ')}`);
+
+  // Per-position EVM LP breakdown (when positions exist)
+  if (state.evmLpPositions.length > 0) {
+    const chainNames: Record<number, string> = { 1: 'ETH', 10: 'OP', 56: 'BSC', 137: 'Polygon', 8453: 'Base', 42161: 'Arb', 43114: 'Avax', 324: 'zkSync', 534352: 'Scroll', 59144: 'Linea' };
+    for (const pos of state.evmLpPositions) {
+      const chain = chainNames[pos.chainNumericId] ?? `Chain ${pos.chainNumericId}`;
+      const range = pos.inRange ? '🟢' : '🔴';
+      const fee = pos.feesOwedUsd > 0.01 ? ` · $${pos.feesOwedUsd.toFixed(2)} fees` : '';
+      L.push(`    ${range} ${pos.token0Symbol}/${pos.token1Symbol} on ${chain} — $${pos.valueUsd.toFixed(0)}${fee}`);
+    }
+  }
+
+  // EVM chain balances summary (when we have USDC staged on EVM chains)
+  if (state.evmTotalUsdcAllChains > 1 && state.evmChainBalances.length > 0) {
+    const chains = state.evmChainBalances
+      .filter(b => b.usdcBalance > 0.5)
+      .map(b => `$${b.usdcBalance.toFixed(0)} on ${b.chainName}`);
+    if (chains.length > 0) L.push(`    💵 EVM staging: ${chains.join(' · ')}`);
+  }
 
   // EVM arb scanner status line (shows pools being monitored + 24h profit)
   if (state.evmArbPoolCount > 0 || state.evmArbProfit24h > 0) {
@@ -2910,6 +3294,14 @@ function _humanAction(d: Decision, state: PortfolioState): string {
         (flash > 0 ? ` · flash $${flash.toLocaleString()}` : '') +
         (net > 0 ? ` · net $${net.toFixed(2)}` : '');
     }
+    case 'KRYSTAL_LP_OPEN':
+      return `<b>Open EVM LP</b> — $${p.deployUsd?.toFixed(0) ?? '?'} in ${p.pair ?? '?/?'} on ${p.chainName ?? 'EVM'} (${p.rangeWidthTicks ?? 400} tick range)`;
+    case 'KRYSTAL_LP_REBALANCE':
+      return p.closeOnly
+        ? `<b>Close EVM LP</b> — ${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'} on ${p.chainName ?? 'EVM'}`
+        : `<b>Rebalance EVM LP</b> — ${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'} on ${p.chainName ?? 'EVM'}, re-centering`;
+    case 'KRYSTAL_LP_CLAIM_FEES':
+      return `<b>Claim EVM LP fees</b> — $${p.feesOwedUsd?.toFixed(2) ?? '?'} from ${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'} on ${p.chainName ?? 'EVM'}`;
     default:
       return `<b>${d.type}</b> — ${d.reasoning.length > 60 ? d.reasoning.slice(0, 57) + '…' : d.reasoning}`;
   }

@@ -322,6 +322,9 @@ export class AnalystAgent extends BaseAgent {
   private dynamicCoinGeckoIds: Map<string, string> = new Map();     // id → symbol (discovered dynamically)
   private dynamicDexMints: string[] = [];                            // Solana mints from swarm (guardian/scout)
 
+  // ── Krystal EVM LP Intel ──
+  private analystKrystalApiKey: string | undefined;
+
   constructor(pool: Pool, opts?: { snapshotIntervalMs?: number; pulseIntervalMs?: number; priceCheckIntervalMs?: number }) {
     super({
       agentId: 'nova-analyst',
@@ -331,6 +334,7 @@ export class AnalystAgent extends BaseAgent {
     this.snapshotIntervalMs = opts?.snapshotIntervalMs ?? 4 * 60 * 60 * 1000; // 4 hours
     this.pulseIntervalMs = opts?.pulseIntervalMs ?? 60 * 60 * 1000;           // 1 hour
     this.priceCheckIntervalMs = opts?.priceCheckIntervalMs ?? 15 * 60 * 1000;  // 15 min
+    this.analystKrystalApiKey = process.env.CFO_KRYSTAL_API_KEY ?? process.env.KRYSTAL_API_KEY;
   }
 
   protected async onStart(): Promise<void> {
@@ -683,6 +687,9 @@ export class AnalystAgent extends BaseAgent {
       const trendingSymbols = Array.from(this.dynamicCoinGeckoIds.values()).slice(0, 10);
       movers.sort((a, b) => b.change24hPct - a.change24hPct);
 
+      // Fetch Krystal EVM LP opportunities (graceful no-op if API key not set)
+      const evmLpOpportunities = await this.fetchKrystalLpIntel();
+
       await this.sendMessage('nova-cfo', 'intel', 'low', {
         source: 'token_intel',
         prices,
@@ -690,12 +697,45 @@ export class AnalystAgent extends BaseAgent {
         trending: trendingSymbols,
         tokenCount: allPrices.length,
         arbitrumVolume24h: this.lastVolumes?.chainVolume?.['Arbitrum'] ?? 0,
+        evmLpOpportunities,
         at: Date.now(),
       });
 
       logger.debug(`[analyst] Sent token intel to CFO: ${allPrices.length} prices, ${movers.length} movers`);
     } catch (err) {
       logger.debug('[analyst] broadcastTokenIntel failed (non-fatal):', err);
+    }
+  }
+
+  /**
+   * Fetch top EVM LP pool opportunities from Krystal Cloud API.
+   * Uses krystalService.discoverKrystalPools() for scoring + token registration.
+   * Graceful no-op if API key not configured.
+   */
+  private async fetchKrystalLpIntel(): Promise<any[] | undefined> {
+    if (!this.analystKrystalApiKey) return undefined;
+    try {
+      const krystal = await import('../launchkit/cfo/krystalService.ts');
+      const pools = await krystal.discoverKrystalPools();
+      if (!pools || pools.length === 0) return undefined;
+
+      // Return top 15 as summary for CFO consumption
+      return pools.slice(0, 15).map(p => ({
+        chainId: p.chainId,
+        poolAddress: p.poolAddress,
+        protocol: typeof p.protocol === 'string' ? p.protocol : p.protocol?.name ?? 'unknown',
+        token0: p.token0?.symbol ?? '?',
+        token1: p.token1?.symbol ?? '?',
+        feeTier: p.feeTier,
+        tvl: p.tvl,
+        apr7d: String(p.apr7d),
+        apr24h: String(p.apr24h),
+        score: p.score,
+        chainName: p.chainName,
+      }));
+    } catch (err) {
+      logger.debug('[analyst] fetchKrystalLpIntel failed (non-fatal):', err);
+      return undefined;
     }
   }
 

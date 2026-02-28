@@ -38,6 +38,7 @@ let _bridge:  any = null; const bridge  = async () => _bridge  ??= await import(
 let _x402:    any = null; const x402    = async () => _x402    ??= await import('../launchkit/cfo/x402Service.ts');
 let _pyth:    any = null; const pyth    = async () => _pyth    ??= await import('../launchkit/cfo/pythOracleService.ts');
 let _helius:  any = null; const helius  = async () => _helius  ??= await import('../launchkit/cfo/heliusService.ts');
+let _krystal: any = null; const krystalSvc = async () => _krystal ??= await import('../launchkit/cfo/krystalService.ts');
 
 interface ScoutIntel { cryptoBullish?: boolean; btcEstimate?: number; narratives?: string[]; receivedAt: number; }
 
@@ -156,6 +157,12 @@ export class CFOAgent extends BaseAgent {
 
         // Reload pending sell orders from DB metadata (survive restarts)
         setTimeout(() => this.reloadPendingSellOrders(), 5_000);
+
+        // Hydrate EVM LP positions from DB and share via globalThis for decisionEngine
+        this.hydrateEvmLpPositionsFromDb().then(records => {
+          (globalThis as any).__cfo_evm_lp_records = records;
+          if (records.length > 0) logger.info(`[CFO] Hydrated ${records.length} EVM LP position(s) from DB`);
+        }).catch(() => { /* non-fatal */ });
       } catch (err) { logger.warn('[CFO] DB init failed:', err); }
     }
 
@@ -755,6 +762,89 @@ export class CFOAgent extends BaseAgent {
               metadata: { pair: p.displayPair, buyDex: p.buyPool?.dex, sellDex: p.sellPool?.dex, netProfitUsd: arbResult.profitUsd, reasoning: d.reasoning },
             });
             logger.info(`[CFO] Persisted EVM_FLASH_ARB: ${p.displayPair} profit=$${(arbResult.profitUsd ?? 0).toFixed(3)} tx=${arbResult.txHash?.slice(0, 10)}`);
+            break;
+          }
+
+          // ── Krystal EVM LP Open ──────────────────────────────
+          case 'KRYSTAL_LP_OPEN': {
+            const pool = p.pool ?? {};
+            const resultAny = r as any;
+            await this.repo.insertTransaction({
+              id: `tx-krystal-lp-open-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: p.chainName ?? 'evm', strategyTag: 'krystal_lp', txType: 'liquidity_add' as TransactionType,
+              tokenIn: pool.token0?.symbol ?? '?', amountIn: p.deployUsd ?? 0,
+              tokenOut: `${pool.token0?.symbol ?? '?'}/${pool.token1?.symbol ?? '?'}-LP`, amountOut: p.deployUsd ?? 0,
+              feeUsd: 0, txHash: resultAny.txHash ?? r.txId, walletAddress: '', status: 'confirmed',
+              metadata: {
+                pair: p.pair, chainName: p.chainName, chainNumericId: pool.chainNumericId,
+                poolAddress: pool.poolAddress, feeTier: pool.feeTier,
+                rangeWidthTicks: p.rangeWidthTicks, reasoning: d.reasoning,
+              },
+            });
+            // Persist EVM LP record to kv_store
+            await this.persistEvmLpPosition({
+              posId: r.txId ?? `unknown-${Date.now()}`,
+              chainId: pool.chainId ?? '',
+              chainNumericId: pool.chainNumericId ?? 0,
+              chainName: p.chainName ?? 'evm',
+              protocol: typeof pool.protocol === 'string' ? pool.protocol : pool.protocol?.name ?? 'uniswapv3',
+              poolAddress: pool.poolAddress ?? '',
+              token0Symbol: pool.token0?.symbol ?? '?',
+              token1Symbol: pool.token1?.symbol ?? '?',
+              entryUsd: p.deployUsd ?? 0,
+              openedAt: Date.now(),
+            });
+            logger.info(`[CFO] Persisted KRYSTAL_LP_OPEN: ${p.pair} on ${p.chainName} $${(p.deployUsd ?? 0).toFixed(0)}`);
+            break;
+          }
+
+          // ── Krystal EVM LP Rebalance ─────────────────────────
+          case 'KRYSTAL_LP_REBALANCE': {
+            const resultAny = r as any;
+            await this.repo.insertTransaction({
+              id: `tx-krystal-lp-rebalance-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: p.chainName ?? 'evm', strategyTag: 'krystal_lp', txType: 'liquidity_rebalance' as TransactionType,
+              tokenIn: `${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'}-LP`, amountIn: 0,
+              tokenOut: `${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'}-LP`, amountOut: 0,
+              feeUsd: 0, txHash: resultAny.txHash ?? r.txId, walletAddress: '', status: 'confirmed',
+              metadata: {
+                posId: p.posId, chainName: p.chainName, closeOnly: p.closeOnly,
+                rangeWidthTicks: p.rangeWidthTicks, reasoning: d.reasoning,
+              },
+            });
+            // Always remove old position record
+            await this.removeEvmLpPosition(p.posId);
+            // If not closeOnly, the executor reopened a new position — persist it
+            if (!p.closeOnly && r.txId) {
+              const pool = p.pool ?? {};
+              await this.persistEvmLpPosition({
+                posId: r.txId,
+                chainId: pool.chainId ?? `${p.chainName}@${p.chainNumericId}`,
+                chainNumericId: p.chainNumericId ?? 0,
+                chainName: p.chainName ?? 'evm',
+                protocol: typeof pool.protocol === 'string' ? pool.protocol : pool.protocol?.name ?? 'uniswapv3',
+                poolAddress: pool.poolAddress ?? '',
+                token0Symbol: p.token0Symbol ?? '?',
+                token1Symbol: p.token1Symbol ?? '?',
+                entryUsd: p.deployUsd ?? 0,
+                openedAt: Date.now(),
+              });
+            }
+            logger.info(`[CFO] Persisted KRYSTAL_LP_REBALANCE: posId=${p.posId} closeOnly=${p.closeOnly}`);
+            break;
+          }
+
+          // ── Krystal EVM LP Fee Claim ─────────────────────────
+          case 'KRYSTAL_LP_CLAIM_FEES': {
+            await this.repo.insertTransaction({
+              id: `tx-krystal-lp-claim-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: p.chainName ?? 'evm', strategyTag: 'krystal_lp', txType: 'fee_claim' as TransactionType,
+              tokenIn: 'fees', amountIn: 0,
+              tokenOut: `${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'}-fees`, amountOut: p.feesOwedUsd ?? 0,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { posId: p.posId, chainName: p.chainName, feesOwedUsd: p.feesOwedUsd, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted KRYSTAL_LP_CLAIM_FEES: posId=${p.posId} fees=$${(p.feesOwedUsd ?? 0).toFixed(2)}`);
             break;
           }
 
@@ -2273,6 +2363,65 @@ export class CFOAgent extends BaseAgent {
           `🔄 *CFO restarted* — ${restoredCount} pending approval(s) restored:\n${lines.join('\n')}`,
         );
       } catch { /* non-fatal */ }
+    }
+  }
+
+  // ── EVM LP Position Persistence (Krystal) ──────────────────────
+
+  /**
+   * Persist an EVM LP position record to kv_store for cross-restart tracking.
+   * Key: `cfo_evm_lp_<posId>_<chainNumericId>`
+   */
+  private async persistEvmLpPosition(record: import('../launchkit/cfo/krystalService.ts').EvmLpRecord): Promise<void> {
+    try {
+      const key = `cfo_evm_lp_${record.posId}_${record.chainNumericId}`;
+      await this.pool.query(
+        `INSERT INTO kv_store (key, data) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET data = $2`,
+        [key, JSON.stringify(record)],
+      );
+      // Keep in-memory globalThis cache in sync
+      const existing = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('../launchkit/cfo/krystalService.ts').EvmLpRecord[];
+      existing.push(record);
+      (globalThis as any).__cfo_evm_lp_records = existing;
+      logger.debug(`[CFO] Persisted EVM LP position: ${key}`);
+    } catch (err) {
+      logger.warn('[CFO] persistEvmLpPosition failed:', err);
+    }
+  }
+
+  /**
+   * Remove an EVM LP position record from kv_store (after close).
+   */
+  private async removeEvmLpPosition(posId: string): Promise<void> {
+    try {
+      await this.pool.query(
+        `DELETE FROM kv_store WHERE key LIKE $1`,
+        [`cfo_evm_lp_${posId}_%`],
+      );
+      // Keep in-memory globalThis cache in sync
+      const existing = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('../launchkit/cfo/krystalService.ts').EvmLpRecord[];
+      (globalThis as any).__cfo_evm_lp_records = existing.filter(r => r.posId !== posId);
+      logger.debug(`[CFO] Removed EVM LP position: ${posId}`);
+    } catch (err) {
+      logger.warn('[CFO] removeEvmLpPosition failed:', err);
+    }
+  }
+
+  /**
+   * Hydrate all saved EVM LP positions from kv_store.
+   * Used by krystalService.fetchKrystalPositions() for openedAt timestamps.
+   */
+  private async hydrateEvmLpPositionsFromDb(): Promise<import('../launchkit/cfo/krystalService.ts').EvmLpRecord[]> {
+    try {
+      const result = await this.pool.query(
+        `SELECT data FROM kv_store WHERE key LIKE 'cfo_evm_lp_%'`,
+      );
+      return result.rows.map((r: any) => {
+        const data = typeof r.data === 'string' ? JSON.parse(r.data) : r.data;
+        return data as import('../launchkit/cfo/krystalService.ts').EvmLpRecord;
+      });
+    } catch {
+      return [];
     }
   }
 

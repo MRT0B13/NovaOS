@@ -75,6 +75,17 @@ export interface CFOEnv {
   orcaLpMaxUsd: number;                           // max USD deployed into Orca LP (default 500)
   orcaLpRebalanceTriggerPct: number;              // rebalance when price within X% of range edge (default 5%)
 
+  // ── Krystal EVM Concentrated LP ──────────────────────────────────
+  krystalLpEnabled: boolean;                      // enable Krystal EVM LP (default false)
+  krystalApiKey: string | undefined;              // Krystal Cloud API key
+  krystalLpMaxUsd: number;                        // max USD per position (default 200)
+  krystalLpMinTvlUsd: number;                     // min pool TVL filter (default 500000)
+  krystalLpMinApr7d: number;                      // min 7d APR filter (default 15)
+  krystalLpMaxPositions: number;                  // max concurrent EVM LP positions (default 3)
+  krystalLpRangeWidthTicks: number;               // range width in ticks (default 400)
+  krystalLpRebalanceTriggerPct: number;           // rebalance when utilisation drops below X% (default 10)
+  evmRpcUrls: Record<number, string>;             // chainId → RPC URL mapping
+
   // ── Kamino-funded LP (borrow → LP → fees repay loan) ─────────────
   kaminoBorrowLpEnabled: boolean;                 // enable borrow-for-LP strategy (default false)
   kaminoBorrowLpMaxUsd: number;                   // max USD borrowed for LP (default 200 — conservative)
@@ -119,6 +130,29 @@ export interface CFOEnv {
 
 function isValidEvmKey(key: string | undefined): boolean {
   return !!key && key.startsWith('0x') && key.length === 66;
+}
+
+/** Parse CFO_EVM_RPC_URLS JSON env var into Record<number, string>.
+ *  Also merges legacy CFO_POLYGON_RPC_URL and CFO_ARBITRUM_RPC_URL as fallbacks. */
+function parseEvmRpcUrls(): Record<number, string> {
+  const result: Record<number, string> = {};
+  const raw = process.env.CFO_EVM_RPC_URLS;
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof v === 'string') result[Number(k)] = v;
+      }
+    } catch { /* ignore malformed JSON */ }
+  }
+  // Merge legacy polygon/arbitrum RPC URLs (lower priority than explicit map)
+  if (!result[137] && process.env.CFO_POLYGON_RPC_URL) {
+    result[137] = process.env.CFO_POLYGON_RPC_URL;
+  }
+  if (!result[42161] && process.env.CFO_ARBITRUM_RPC_URL) {
+    result[42161] = process.env.CFO_ARBITRUM_RPC_URL;
+  }
+  return result;
 }
 
 // ── Factory ───────────────────────────────────────────────────────
@@ -196,6 +230,16 @@ export function getCFOEnv(bust = false): CFOEnv {
     orcaLpRangeWidthPct: Number(process.env.CFO_ORCA_LP_RANGE_WIDTH_PCT ?? 20),
     orcaLpMaxUsd: Number(process.env.CFO_ORCA_LP_MAX_USD ?? 500),
     orcaLpRebalanceTriggerPct: Number(process.env.CFO_ORCA_LP_REBALANCE_TRIGGER_PCT ?? 5),
+
+    krystalLpEnabled: process.env.CFO_KRYSTAL_LP_ENABLE === 'true',
+    krystalApiKey: process.env.CFO_KRYSTAL_API_KEY,
+    krystalLpMaxUsd: Number(process.env.CFO_KRYSTAL_LP_MAX_USD ?? 200),
+    krystalLpMinTvlUsd: Number(process.env.CFO_KRYSTAL_LP_MIN_TVL_USD ?? 500_000),
+    krystalLpMinApr7d: Number(process.env.CFO_KRYSTAL_LP_MIN_APR_7D ?? 15),
+    krystalLpMaxPositions: Number(process.env.CFO_KRYSTAL_LP_MAX_POSITIONS ?? 3),
+    krystalLpRangeWidthTicks: Number(process.env.CFO_KRYSTAL_LP_RANGE_WIDTH_TICKS ?? 400),
+    krystalLpRebalanceTriggerPct: Number(process.env.CFO_KRYSTAL_LP_REBALANCE_TRIGGER_PCT ?? 10),
+    evmRpcUrls: parseEvmRpcUrls(),
 
     kaminoBorrowLpEnabled: process.env.CFO_KAMINO_BORROW_LP_ENABLE === 'true',
     kaminoBorrowLpMaxUsd: Number(process.env.CFO_KAMINO_BORROW_LP_MAX_USD ?? 200),

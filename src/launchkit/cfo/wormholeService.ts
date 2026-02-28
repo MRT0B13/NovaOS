@@ -28,29 +28,113 @@ import { getCFOEnv } from './cfoEnv.ts';
 
 const LIFI_API_BASE = 'https://li.quest/v1';
 
-// Chain IDs
-const CHAIN_IDS: Record<string, number> = {
-  solana:   1151111081099710,  // LI.FI Solana chain ID
-  polygon:  137,
-  arbitrum: 42161,
-  base:     8453,
-  ethereum: 1,
+// ============================================================================
+// Well-Known Chain IDs (all EVM + Solana LI.FI chain ID)
+// ============================================================================
+
+export const WELL_KNOWN_CHAIN_IDS: Record<string, number> = {
+  ethereum:  1,
+  optimism:  10,
+  bsc:       56,
+  polygon:   137,
+  base:      8453,
+  arbitrum:  42161,
+  avalanche: 43114,
+  zksync:    324,
+  linea:     59144,
+  scroll:    534352,
+  mantle:    5000,
+  blast:     81457,
+  solana:    1151111081099710,  // LI.FI Solana chain ID
 };
 
-// Well-known token addresses per chain (used for routing)
+/** Reverse lookup: numeric → name */
+const CHAIN_ID_TO_NAME: Record<number, string> = Object.fromEntries(
+  Object.entries(WELL_KNOWN_CHAIN_IDS).map(([name, id]) => [id, name]),
+);
+
+export function chainIdToName(numericId: number): string {
+  return CHAIN_ID_TO_NAME[numericId] ?? `chain-${numericId}`;
+}
+
+export function chainNameToId(name: string): number | undefined {
+  return WELL_KNOWN_CHAIN_IDS[name.toLowerCase()];
+}
+
+// ============================================================================
+// Well-Known USDC addresses per chain
+// ============================================================================
+
+export const WELL_KNOWN_USDC: Record<number, string> = {
+  1:     '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',  // Ethereum
+  10:    '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',  // Optimism (native USDC)
+  56:    '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',  // BSC
+  137:   '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',  // Polygon (native USDC)
+  8453:  '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',  // Base
+  42161: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',  // Arbitrum (native USDC)
+  43114: '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E',  // Avalanche
+  324:   '0x1d17CBcF0D6D143135aE902365D2E5e2A16538D4',  // zkSync Era
+  59144: '0x176211869cA2b568f2A7D4EE941E073a821EE1ff',  // Linea (USDC.e)
+  534352:'0x06eFdBFf2a14a7c8E15944D1F4A48F9F95F663A4',  // Scroll
+  5000:  '0x09Bc4E0D10E52d8DA1060E04bfe1860bCe6f8A37',  // Mantle
+};
+
+// ============================================================================
+// Dynamic Token Registry
+// ============================================================================
+// Populated at runtime from pool discovery, bridge operations, etc.
+// Key: `${chainId}_${SYMBOL}` → token address
+
+const _tokenRegistry = new Map<string, string>();
+
+// Seed the registry with well-known USDC addresses
+for (const [chainId, addr] of Object.entries(WELL_KNOWN_USDC)) {
+  _tokenRegistry.set(`${chainId}_USDC`, addr);
+}
+// Seed legacy bridged USDC variants
+_tokenRegistry.set('137_USDC.e', '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174');  // Polygon USDC.e
+_tokenRegistry.set('42161_USDC.e', '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8'); // Arbitrum USDC.e
+
+/**
+ * Register a token address for a chain + symbol pair.
+ * Called from pool discovery to build up the dynamic registry.
+ */
+export function registerTokenAddress(chainId: number, symbol: string, address: string): void {
+  const key = `${chainId}_${symbol.toUpperCase()}`;
+  if (!_tokenRegistry.has(key)) {
+    _tokenRegistry.set(key, address);
+  }
+}
+
+/**
+ * Resolve a token address from the dynamic registry.
+ * Falls back to WELL_KNOWN_USDC for USDC, returns undefined if not found.
+ */
+export function resolveTokenAddress(chainId: number, symbol: string): string | undefined {
+  return _tokenRegistry.get(`${chainId}_${symbol.toUpperCase()}`);
+}
+
+// ============================================================================
+// Legacy aliases (backward compat)
+// ============================================================================
+
+const CHAIN_IDS = WELL_KNOWN_CHAIN_IDS;
+
 const TOKEN_ADDRESSES: Record<string, Record<string, string>> = {
   polygon: {
-    USDC: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
+    USDC: WELL_KNOWN_USDC[137]!,
+    'USDC.e': '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
     MATIC: '0x0000000000000000000000000000000000001010',
   },
   arbitrum: {
-    USDC: '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8',  // USDC.e
-    USDC_NATIVE: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
-    ETH:  '0x0000000000000000000000000000000000000000',
+    USDC: WELL_KNOWN_USDC[42161]!,
+    USDC_NATIVE: WELL_KNOWN_USDC[42161]!,
+    'USDC.e': '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8',
+    ETH: '0x0000000000000000000000000000000000000000',
   },
   solana: {
     USDC: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-    SOL:  'So11111111111111111111111111111111111111112',
+    SOL: 'So11111111111111111111111111111111111111112',
   },
 };
 
@@ -198,11 +282,20 @@ async function executeLifiEvmRoute(quote: BridgeQuote, fromPrivateKey: string): 
     const lifi = await import('@lifi/sdk');
     const ethers = await import('ethers');
 
-    const provider = new ethers.JsonRpcProvider(
-      quote.fromChain === 'polygon'
+    // Use dynamic provider from krystalService (covers all configured chains)
+    const fromChainId = WELL_KNOWN_CHAIN_IDS[quote.fromChain] ?? 137;
+    let rpcUrl: string;
+    try {
+      const { getEvmProvider } = await import('./krystalService.ts');
+      const p = await getEvmProvider(fromChainId);
+      rpcUrl = (p as any)._getConnection?.()?.url ?? getCFOEnv().polygonRpcUrl;
+    } catch {
+      // fallback to legacy RPC
+      rpcUrl = quote.fromChain === 'polygon'
         ? getCFOEnv().polygonRpcUrl
-        : getCFOEnv().arbitrumRpcUrl,
-    );
+        : getCFOEnv().arbitrumRpcUrl;
+    }
+    const provider = new ethers.JsonRpcProvider(rpcUrl);
     const signer = new ethers.Wallet(fromPrivateKey, provider);
 
     lifi.createConfig({ integrator: 'nova-cfo' });
@@ -451,8 +544,8 @@ export async function bridgePolygonToSolana(
  */
 export async function checkBridgeStatus(txHash: string, fromChain: string): Promise<'PENDING' | 'DONE' | 'FAILED'> {
   try {
-    const fromChainId = CHAIN_IDS[fromChain];
-    if (!fromChainId) return 'PENDING';
+    const fromChainId = CHAIN_IDS[fromChain] ?? Number(fromChain);
+    if (!fromChainId || isNaN(fromChainId)) return 'PENDING';
 
     const resp = await fetch(
       `${LIFI_API_BASE}/status?txHash=${txHash}&fromChain=${fromChainId}`,
@@ -468,5 +561,187 @@ export async function checkBridgeStatus(txHash: string, fromChain: string): Prom
     return 'PENDING';
   } catch {
     return 'PENDING';
+  }
+}
+
+// ============================================================================
+// Generic EVM → EVM bridge (LI.FI)
+// ============================================================================
+
+/**
+ * Bridge a token from one EVM chain to another via LI.FI.
+ * Uses the dynamic token registry + WELL_KNOWN_CHAIN_IDS.
+ *
+ * @param fromChainId  Numeric chain ID (e.g. 137)
+ * @param toChainId    Numeric chain ID (e.g. 42161)
+ * @param tokenSymbol  Token to bridge (e.g. 'USDC')
+ * @param amountHuman  Human-readable amount (e.g. 50.0)
+ * @param fromAddress  Sender wallet address
+ * @param toAddress    Receiver wallet address (can be same wallet)
+ *
+ * Skips if bridge fee > 3% of amount.
+ */
+export async function bridgeEvmToEvm(
+  fromChainId: number,
+  toChainId: number,
+  tokenSymbol: string,
+  amountHuman: number,
+  fromAddress: string,
+  toAddress: string,
+): Promise<BridgeResult> {
+  const env = getCFOEnv();
+  const fromName = chainIdToName(fromChainId);
+  const toName = chainIdToName(toChainId);
+
+  const fail = (error: string): BridgeResult => ({
+    success: false, fromChain: fromName, toChain: toName,
+    fromAmount: amountHuman, toAmountExpected: 0,
+    bridge: 'none', status: 'FAILED', error,
+  });
+
+  // Enforce max bridge cap
+  if (env.maxBridgeUsd > 0 && amountHuman > env.maxBridgeUsd) {
+    return fail(`Amount $${amountHuman} exceeds max bridge cap $${env.maxBridgeUsd}`);
+  }
+
+  // Resolve token addresses from registry
+  const fromTokenAddr = resolveTokenAddress(fromChainId, tokenSymbol);
+  const toTokenAddr = resolveTokenAddress(toChainId, tokenSymbol);
+  if (!fromTokenAddr || !toTokenAddr) {
+    return fail(`Cannot resolve ${tokenSymbol} address on chain ${fromChainId} or ${toChainId}`);
+  }
+
+  // Get quote via LI.FI
+  const decimals = tokenSymbol.toUpperCase().includes('USDC') ? 6 : 18;
+  const fromAmountRaw = Math.floor(amountHuman * 10 ** decimals).toString();
+
+  try {
+    const params = new URLSearchParams({
+      fromChain: fromChainId.toString(),
+      toChain: toChainId.toString(),
+      fromToken: fromTokenAddr,
+      toToken: toTokenAddr,
+      fromAmount: fromAmountRaw,
+      fromAddress,
+      toAddress,
+      slippage: '0.005',
+    });
+
+    const resp = await fetch(`${LIFI_API_BASE}/quote?${params}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      return fail(`LI.FI quote failed (${resp.status}): ${body.slice(0, 200)}`);
+    }
+
+    const data = await resp.json() as any;
+    const toAmount = Number(data.estimate?.toAmount ?? 0) / 10 ** decimals;
+    const gasCostUsd = Number(data.estimate?.gasCosts?.[0]?.amountUSD ?? 0);
+    const feeCostUsd = Number(data.estimate?.feeCosts?.[0]?.amountUSD ?? 0);
+    const totalFee = gasCostUsd + feeCostUsd;
+
+    // Fee gate: skip if fee > 3% of amount
+    if (amountHuman > 0 && totalFee > amountHuman * 0.03) {
+      return fail(`Bridge fee $${totalFee.toFixed(2)} exceeds 3% of $${amountHuman}`);
+    }
+
+    const quote: BridgeQuote = {
+      id: data.id ?? `lifi-${Date.now()}`,
+      fromChain: fromName,
+      toChain: toName,
+      fromToken: tokenSymbol,
+      toToken: tokenSymbol,
+      fromAmount: amountHuman,
+      toAmount,
+      bridgeFeeUsd: totalFee,
+      estimatedTimeSeconds: Number(data.estimate?.executionDuration ?? 120),
+      bridge: data.tool ?? 'unknown',
+      tool: data.tool ?? 'unknown',
+      rawRoute: data,
+    };
+
+    logger.info(
+      `[Bridge] EVM→EVM best route: ${quote.bridge} — $${amountHuman} ${tokenSymbol} ` +
+      `${fromName}→${toName} (fee: $${totalFee.toFixed(3)}, ~${quote.estimatedTimeSeconds}s)`,
+    );
+
+    if (!env.evmPrivateKey) {
+      return fail('CFO_EVM_PRIVATE_KEY not configured');
+    }
+
+    return executeLifiEvmRoute(quote, env.evmPrivateKey);
+  } catch (err) {
+    return fail((err as Error).message);
+  }
+}
+
+/**
+ * Poll bridge status until DONE/FAILED, up to maxWaitMs (default 5min).
+ * Polls every 15s.
+ */
+export async function awaitBridgeCompletion(
+  txHash: string,
+  fromChain: string,
+  maxWaitMs = 5 * 60_000,
+): Promise<'DONE' | 'FAILED' | 'TIMEOUT'> {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const status = await checkBridgeStatus(txHash, fromChain);
+    if (status === 'DONE') return 'DONE';
+    if (status === 'FAILED') return 'FAILED';
+    await new Promise(r => setTimeout(r, 15_000));
+  }
+  return 'TIMEOUT';
+}
+
+// ============================================================================
+// Generic EVM balance helpers
+// ============================================================================
+
+/**
+ * Get ERC-20 token balance for a wallet on any EVM chain.
+ * Returns human-readable amount (decimal-adjusted).
+ */
+export async function getEvmTokenBalance(
+  chainId: number,
+  tokenAddress: string,
+  walletAddress: string,
+): Promise<number> {
+  try {
+    const { getEvmProvider } = await import('./krystalService.ts');
+    const ethers = await import('ethers' as string);
+    const provider = await getEvmProvider(chainId);
+    const erc20 = new ethers.Contract(tokenAddress, [
+      'function balanceOf(address) view returns (uint256)',
+      'function decimals() view returns (uint8)',
+    ], provider);
+    const [balance, decimals] = await Promise.all([
+      erc20.balanceOf(walletAddress),
+      erc20.decimals().catch(() => 18),
+    ]);
+    return Number(ethers.formatUnits(balance, decimals));
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Get native token (ETH/MATIC/AVAX/etc.) balance on any EVM chain.
+ * Returns human-readable amount in native units.
+ */
+export async function getEvmNativeBalance(
+  chainId: number,
+  walletAddress: string,
+): Promise<number> {
+  try {
+    const { getEvmProvider } = await import('./krystalService.ts');
+    const ethers = await import('ethers' as string);
+    const provider = await getEvmProvider(chainId);
+    const balance = await provider.getBalance(walletAddress);
+    return Number(ethers.formatEther(balance));
+  } catch {
+    return 0;
   }
 }
