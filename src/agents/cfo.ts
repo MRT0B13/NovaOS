@@ -910,12 +910,15 @@ export class CFOAgent extends BaseAgent {
                 pending.positionId, 0,
                 orderStatus.transactionHashes?.[0] ?? orderId, receivedUsd,
               );
-              const txHash = orderStatus.transactionHashes?.[0] ?? orderId;
+              const onChainHash = orderStatus.transactionHashes?.[0];
               const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+              const txLine = onChainHash
+                ? `Tx: https://polygonscan.com/tx/${onChainHash}`
+                : `CLOB Order: ${orderId.slice(0, 16)}…`;
               await notifyAdminForce(
                 `🏦 CFO Sell filled: ${pending.description.slice(0, 60)}\n` +
                 `P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n` +
-                `Tx: ${txHash}`,
+                txLine,
               );
               logger.info(`[CFO] Pending sell ${orderId} MATCHED — position ${pending.positionId} closed`);
               this.pendingSellOrders.delete(orderId);
@@ -1050,12 +1053,15 @@ export class CFOAgent extends BaseAgent {
             action.positionId, freshPos.currentPrice,
             exitOrder.transactionHash ?? exitOrder.orderId, freshPos.currentValueUsd,
           );
-          const closeTxHash = exitOrder.transactionHash ?? exitOrder.orderId;
+          const onChainHash = exitOrder.transactionHash;
           const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          const txLine = onChainHash
+            ? `Tx: https://polygonscan.com/tx/${onChainHash}`
+            : `CLOB Order: ${exitOrder.orderId.slice(0, 16)}…`;
           await notifyAdminForce(
             `🏦 CFO ${action.action}: ${dbPos.description.slice(0, 60)}\n` +
             `P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Received: $${freshPos.currentValueUsd.toFixed(2)}\n` +
-            `Tx: ${closeTxHash}`,
+            txLine,
           );
           await this.reportToSupervisor('alert', action.urgency as any, {
             event: 'cfo_position_closed', action: action.action,
