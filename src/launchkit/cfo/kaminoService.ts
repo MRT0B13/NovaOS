@@ -1112,9 +1112,40 @@ export async function borrow(
       klend.PROGRAM_ID as any,
     );
 
+    // ── Elevation group guard ─────────────────────────────────────────────
+    // The SDK auto-inserts a RequestElevationGroup instruction when it detects
+    // correlated collateral/borrow pairs (e.g. JitoSOL deposit + SOL borrow).
+    // But if the obligation ALREADY has borrows in the default group (e.g. USDC),
+    // the elevation group change will revert with InconsistentElevationGroup (6068).
+    // Fix: detect existing non-matching borrows and strip the RequestElevationGroup ix.
+    const hasOtherBorrows = pos.borrows.some(b => b.asset !== asset && b.amount > 0);
+    const klendProgramId = klend.PROGRAM_ID?.toString?.() ?? 'KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD';
+
+    const filterElevationGroup = (ixs: any[]): any[] => {
+      if (!hasOtherBorrows) return ixs; // no conflict — keep elevation group request
+      return ixs.filter((ix: any) => {
+        // Anchor discriminator for RequestElevationGroup: first 8 bytes of sha256("global:request_elevation_group")
+        // We match by checking the instruction data prefix or the instruction name in logs.
+        // Safer approach: filter any KLend ix where data starts with the RequestElevationGroup discriminator.
+        const programId = ix.programId?.toString?.() ?? ix.programAddress?.toString?.() ?? '';
+        if (!programId.includes('KLend')) return true; // not a klend ix, keep it
+        const data: Buffer | Uint8Array | undefined = ix.data ?? ix.instruction?.data;
+        if (!data || data.length < 8) return true;
+        // RequestElevationGroup Anchor discriminator: SHA256("global:request_elevation_group")[0..8]
+        // = [36, 119, 251, 129, 34, 240, 7, 147]
+        const disc = [36, 119, 251, 129, 34, 240, 7, 147];
+        const matches = disc.every((b, i) => (data[i] ?? -1) === b);
+        if (matches) {
+          logger.info(`[Kamino] Stripping RequestElevationGroup ix — obligation has existing ${pos.borrows.map(b => b.asset).join('+')} borrows`);
+        }
+        return !matches;
+      });
+    };
+
     const tx = new Transaction();
     for (const ix of kaminoAction.computeBudgetIxs ?? []) tx.add(ixV2toV1(ix));
-    for (const ix of [...kaminoAction.setupIxs, ...kaminoAction.lendingIxs, ...kaminoAction.cleanupIxs]) {
+    const allIxs = [...kaminoAction.setupIxs, ...kaminoAction.lendingIxs, ...kaminoAction.cleanupIxs];
+    for (const ix of filterElevationGroup(allIxs)) {
       tx.add(ixV2toV1(ix));
     }
 
