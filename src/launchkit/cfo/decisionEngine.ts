@@ -2215,10 +2215,19 @@ export async function generateDecisions(
         // Filter to pools meeting env thresholds AND with configured RPC
         // Apply learned APR floor adjustment (raised if past LP positions underperformed)
         const learnedMinApr = env.krystalLpMinApr7d + (learned.lpMinAprAdjustment * learned.confidenceLevel);
+
+        // Build set of chains where we actually have USDC (>= $10)
+        const fundedChainIds = new Set(
+          state.evmChainBalances
+            .filter(b => b.usdcBalance >= 10)
+            .map(b => b.chainId),
+        );
+
         const eligible = pools.filter(p =>
           p.tvlUsd >= env.krystalLpMinTvlUsd &&
           p.apr7d >= learnedMinApr &&
-          (env.evmRpcUrls[p.chainNumericId] || p.chainNumericId === 42161),
+          (env.evmRpcUrls[p.chainNumericId] || p.chainNumericId === 42161) &&
+          fundedChainIds.has(p.chainNumericId), // only deploy on chains where we have balance
         );
 
         // Check: not already in the same pool
@@ -2240,7 +2249,10 @@ export async function generateDecisions(
           if (best.apr7d <= bestSolanaApr + 5) {
             krystalSkip(`best EVM APR ${best.apr7d.toFixed(1)}% doesn't beat Solana ${bestSolanaApr.toFixed(1)}% + 5%`);
           } else {
-          const deployUsd = Math.min(evmLpHeadroomUsd, env.krystalLpMaxUsd, evmUsdcCap);
+          // Cap deploy to USDC actually available on the target chain (not global total)
+          const targetChainBal = state.evmChainBalances.find(b => b.chainId === best.chainNumericId);
+          const targetChainUsdc = targetChainBal?.usdcBalance ?? 0;
+          const deployUsd = Math.min(evmLpHeadroomUsd, env.krystalLpMaxUsd, evmUsdcCap, targetChainUsdc * 0.9);
           const rangeWidthTicks = adaptiveLpRangeWidthTicks(
             best.token0.symbol,
             intel,

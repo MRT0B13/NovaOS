@@ -104,13 +104,48 @@ async function loadHL() {
 }
 
 // ============================================================================
+// Retry helper (exponential backoff for 429s)
+// ============================================================================
+
+async function withRetry<T>(fn: () => Promise<T>, label: string, maxAttempts = 3): Promise<T> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      const is429 = err?.message?.includes('429') ||
+                    err?.status === 429 ||
+                    String(err).includes('Too Many Requests');
+      if (is429 && attempt < maxAttempts) {
+        const delayMs = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s
+        logger.debug(`[Hyperliquid] ${label} 429 — retry ${attempt}/${maxAttempts} in ${delayMs}ms`);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error(`[Hyperliquid] ${label} unreachable`);
+}
+
+// ============================================================================
+// Cache for rarely-changing data
+// ============================================================================
+
+let _listedCoinsCache: string[] = [];
+let _listedCoinsCacheTs = 0;
+const LISTED_COINS_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+// ============================================================================
 // Account info
 // ============================================================================
 
 export async function getAccountSummary(): Promise<HLAccountSummary> {
   try {
     const { info, wallet } = await loadHL();
-    const state = await info.clearinghouseState({ user: wallet.address });
+    const state = await withRetry(
+      () => info.clearinghouseState({ user: wallet.address }),
+      'getAccountSummary',
+    );
 
     const equity = Number(state.marginSummary.accountValue ?? 0);
     const availableMargin = Number(state.withdrawable ?? 0);
@@ -155,16 +190,24 @@ export async function getAccountSummary(): Promise<HLAccountSummary> {
 // Hedge treasury exposure (generic — any HL-listed coin)
 // ============================================================================
 
-/** Returns all coins currently listed as perps on Hyperliquid, from meta().universe */
+/** Returns all coins currently listed as perps on Hyperliquid, from meta().universe.
+ *  Cached for 10 minutes (coin listings rarely change) + retry on 429. */
 export async function getHLListedCoins(): Promise<string[]> {
+  // Return cached if fresh
+  if (_listedCoinsCache.length > 0 && Date.now() - _listedCoinsCacheTs < LISTED_COINS_TTL_MS) {
+    return _listedCoinsCache;
+  }
   try {
     const { info } = await loadHL();
-    const meta = await info.meta();
+    const meta = await withRetry(() => info.meta(), 'getHLListedCoins');
     const universe = (meta as any).universe ?? [];
-    return universe.map((u: any) => u.name as string);
+    _listedCoinsCache = universe.map((u: any) => u.name as string);
+    _listedCoinsCacheTs = Date.now();
+    return _listedCoinsCache;
   } catch (err) {
     logger.warn('[Hyperliquid] getHLListedCoins error:', err);
-    return [];
+    // Return stale cache if available, otherwise empty
+    return _listedCoinsCache.length > 0 ? _listedCoinsCache : [];
   }
 }
 
@@ -195,13 +238,13 @@ export async function hedgeTreasury(params: HedgeParams): Promise<HLOrderResult>
   try {
     const { exchange, info, wallet } = await loadHL();
 
-    const mids = await info.allMids();
+    const mids = await withRetry(() => info.allMids(), 'hedgeTreasury:allMids');
     const coinPrice = Number(mids[coin] ?? 0);
     if (coinPrice <= 0) {
       return { success: false, error: `${coin} not found in HL allMids — not listed or delisted` };
     }
 
-    const meta = await info.meta();
+    const meta = await withRetry(() => info.meta(), 'hedgeTreasury:meta');
     const universe = (meta as any).universe ?? [];
     const assetIdx = universe.findIndex((u: any) => u.name === coin);
     if (assetIdx < 0) {
@@ -283,12 +326,12 @@ export async function closePosition(coin: string, sizeInCoin: number, isBuy: boo
 
   try {
     const { exchange, info } = await loadHL();
-    const mids = await info.allMids();
+    const mids = await withRetry(() => info.allMids(), 'closePosition:allMids');
     const markPrice = Number(mids[coin] ?? 0);
     if (!markPrice) return { success: false, error: `No mark price for ${coin}` };
 
     // Resolve asset info
-    const meta = await info.meta();
+    const meta = await withRetry(() => info.meta(), 'closePosition:meta');
     const universe = (meta as any).universe ?? [];
     const assetIdx = universe.findIndex((u: any) => u.name === coin);
     if (assetIdx < 0) return { success: false, error: `Unknown asset ${coin}` };
