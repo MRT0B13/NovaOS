@@ -111,7 +111,7 @@ async function quoteViaUniswap(
 
     // Get input token decimals
     const inToken = new ethers.Contract(tokenInAddr, ERC20_ABI, provider);
-    const inDecimals = await inToken.decimals().catch(() => 18);
+    const inDecimals = Number(await inToken.decimals().catch(() => 18));
     const amountInRaw = ethers.parseUnits(amountInHuman.toString(), inDecimals);
 
     // Call QuoterV2 (staticCall — doesn't consume gas)
@@ -130,7 +130,7 @@ async function quoteViaUniswap(
 
     // Get output token decimals
     const outToken = new ethers.Contract(tokenOutAddr, ERC20_ABI, provider);
-    const outDecimals = await outToken.decimals().catch(() => 18);
+    const outDecimals = Number(await outToken.decimals().catch(() => 18));
     const amountOut = Number(ethers.formatUnits(amountOutRaw, outDecimals));
 
     // Compute price impact from sqrtPriceX96 shift (works for cross-asset swaps)
@@ -186,7 +186,7 @@ async function quoteViaLifi(
     const provider = await getEvmProvider(chainId);
 
     const inToken = new ethers.Contract(tokenInAddr, ERC20_ABI, provider);
-    const inDecimals = await inToken.decimals().catch(() => 18);
+    const inDecimals = Number(await inToken.decimals().catch(() => 18));
     const amountInRaw = ethers.parseUnits(amountInHuman.toString(), inDecimals).toString();
 
     // LI.FI supports same-chain swaps via /quote with fromChain === toChain
@@ -214,7 +214,7 @@ async function quoteViaLifi(
 
     const data = await resp.json() as any;
     const outToken = new ethers.Contract(tokenOutAddr, ERC20_ABI, provider);
-    const outDecimals = await outToken.decimals().catch(() => 18);
+    const outDecimals = Number(await outToken.decimals().catch(() => 18));
     const amountOut = Number(data.estimate?.toAmount ?? 0) / 10 ** outDecimals;
 
     return {
@@ -293,8 +293,8 @@ async function executeViaUniswap(
     const inToken = new ethers.Contract(tokenInAddr, ERC20_ABI, wallet);
     const outToken = new ethers.Contract(tokenOutAddr, ERC20_ABI, provider);
     const [inDecimals, outDecimals] = await Promise.all([
-      inToken.decimals().catch(() => 18),
-      outToken.decimals().catch(() => 18),
+      inToken.decimals().then(Number).catch(() => 18),
+      outToken.decimals().then(Number).catch(() => 18),
     ]);
 
     const amountInRaw = ethers.parseUnits(amountInHuman.toString(), inDecimals);
@@ -356,7 +356,7 @@ async function executeViaLifiSwap(
     const wallet = new ethers.Wallet(env.evmPrivateKey, provider);
 
     const inToken = new ethers.Contract(tokenInAddr, ERC20_ABI, provider);
-    const inDecimals = await inToken.decimals().catch(() => 18);
+    const inDecimals = Number(await inToken.decimals().catch(() => 18));
     const amountInRaw = ethers.parseUnits(amountInHuman.toString(), inDecimals).toString();
 
     // Get LI.FI quote (same-chain swap)
@@ -393,7 +393,7 @@ async function executeViaLifiSwap(
     const txHash = lastStep?.execution?.process?.at(-1)?.txHash;
 
     const outToken = new ethers.Contract(tokenOutAddr, ERC20_ABI, provider);
-    const outDecimals = await outToken.decimals().catch(() => 18);
+    const outDecimals = Number(await outToken.decimals().catch(() => 18));
     const amountOut = Number(data.estimate?.toAmount ?? 0) / 10 ** outDecimals;
 
     return { success: true, txHash, amountIn: amountInHuman, amountOut, route: 'lifi' };

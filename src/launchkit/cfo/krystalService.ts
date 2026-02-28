@@ -24,7 +24,24 @@ import { getCFOEnv } from './cfoEnv.ts';
 
 const KRYSTAL_BASE_URL = 'https://cloud-api.krystal.app';
 
-// NonfungiblePositionManager — Uniswap V3 canonical (same on all chains)
+// NonfungiblePositionManager — per-chain mapping
+// Canonical Uniswap V3 NFPM works on ETH, Optimism, Polygon, Arbitrum.
+// Base uses the v1.3.0 deployment at a different address.
+// BSC, Avalanche, zkSync, Scroll, Linea do NOT have Uniswap V3 NFPM.
+const NFPM_BY_CHAIN: Record<number, string> = {
+  1:     '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Ethereum
+  10:    '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Optimism
+  137:   '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Polygon
+  8453:  '0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1', // Base (v1.3.0)
+  42161: '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Arbitrum
+};
+
+/** Get the NonfungiblePositionManager address for a given chain. Returns undefined for unsupported chains. */
+function getNfpmAddress(chainId: number): string | undefined {
+  return NFPM_BY_CHAIN[chainId];
+}
+
+// Backward compat — default for chains where canonical works
 const NFPM_ADDRESS = '0xC36442b4a4522E871399CD717aBDD847Ab11FE88';
 
 const NFPM_ABI = [
@@ -589,7 +606,9 @@ export async function fetchKrystalPositions(
         try {
           const ethers = await loadEthers();
           const provider = await getEvmProvider(numericId);
-          const nfpm = new ethers.Contract(NFPM_ADDRESS, NFPM_ABI, provider);
+          const nfpmAddr = getNfpmAddress(numericId);
+          if (!nfpmAddr) continue; // no NFPM on this chain — skip on-chain reads
+          const nfpm = new ethers.Contract(nfpmAddr, NFPM_ABI, provider);
           const posData = await nfpm.positions(posId);
           tickLower = Number(posData.tickLower ?? posData[5] ?? 0);
           tickUpper = Number(posData.tickUpper ?? posData[6] ?? 0);
@@ -799,9 +818,12 @@ export async function openEvmLpPosition(
         const isToken0Usdc = pool.token0.address.toLowerCase() === usdcAddr.toLowerCase();
         const isToken1Usdc = pool.token1.address.toLowerCase() === usdcAddr.toLowerCase();
 
-        // Determine if swaps are needed: we have USDC but are missing a pool token
-        const needSwap0 = !isToken0Usdc && bal0 === BigInt(0) && usdcBal > 0.5;
-        const needSwap1 = !isToken1Usdc && bal1 === BigInt(0) && usdcBal > 0.5;
+        // Determine if swaps are needed: we have USDC but are missing (or have negligible) a pool token
+        // Use a dust threshold: if token balance < 0.01% of max possible on-chain (by raw amount), treat as "missing"
+        const dustThreshold0 = BigInt(Math.max(1, Math.floor(0.001 * (10 ** (pool.token0.decimals ?? 18))))); // ~0.001 units
+        const dustThreshold1 = BigInt(Math.max(1, Math.floor(0.001 * (10 ** (pool.token1.decimals ?? 18))))); // ~0.001 units
+        const needSwap0 = !isToken0Usdc && bal0 < dustThreshold0 && usdcBal > 0.5;
+        const needSwap1 = !isToken1Usdc && bal1 < dustThreshold1 && usdcBal > 0.5;
 
         if ((needSwap0 || needSwap1) && usdcBal > 0) {
           // If one pool token IS USDC, swap the other half only; else split 50/50
@@ -812,11 +834,14 @@ export async function openEvmLpPosition(
             const quote0 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token0.address, swapPortion, pool.feeTier);
             if (quote0 && quote0.priceImpactPct > 3) {
               logger.warn(`[Krystal] Swap USDC→${pool.token0.symbol} price impact ${quote0.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+            } else if (!quote0) {
+              logger.warn(`[Krystal] Swap USDC→${pool.token0.symbol}: no quote available`);
             } else {
               const swapResult = await swap.executeEvmSwap(
                 chainNumericId, usdcAddr, pool.token0.address, swapPortion, pool.feeTier,
               );
               if (swapResult.success) logger.info(`[Krystal] Swapped $${swapPortion.toFixed(2)} USDC → ${pool.token0.symbol}`);
+              else logger.warn(`[Krystal] Swap USDC→${pool.token0.symbol} failed: ${swapResult.error}`);
             }
           }
 
@@ -824,11 +849,14 @@ export async function openEvmLpPosition(
             const quote1 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token1.address, swapPortion, pool.feeTier);
             if (quote1 && quote1.priceImpactPct > 3) {
               logger.warn(`[Krystal] Swap USDC→${pool.token1.symbol} price impact ${quote1.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+            } else if (!quote1) {
+              logger.warn(`[Krystal] Swap USDC→${pool.token1.symbol}: no quote available`);
             } else {
               const swapResult = await swap.executeEvmSwap(
                 chainNumericId, usdcAddr, pool.token1.address, swapPortion, pool.feeTier,
               );
               if (swapResult.success) logger.info(`[Krystal] Swapped $${swapPortion.toFixed(2)} USDC → ${pool.token1.symbol}`);
+              else logger.warn(`[Krystal] Swap USDC→${pool.token1.symbol} failed: ${swapResult.error}`);
             }
           }
         }
@@ -928,24 +956,32 @@ export async function openEvmLpPosition(
 
     logger.info(`[Krystal] Deploy cap: $${deployUsd} → token0 max=${ethers.formatUnits(maxToken0, dec0)} (have ${ethers.formatUnits(bal0, dec0)}), token1 max=${ethers.formatUnits(maxToken1, dec1)} (have ${ethers.formatUnits(bal1, dec1)})`);
 
-    // 5. Self-zap: if we only have one pool token, swap half into the other
+    // 5. Self-zap: if we only have one pool token (or negligible amount of the other),
+    //    swap half into the missing token.
     //    Replicates Krystal/V3Utils `swapAndMint` logic without needing their
     //    contract addresses or 0x API calldata. For our position sizes the
     //    2-tx approach (swap → mint) is functionally identical to an atomic zap.
-    if (amount0Desired > BigInt(0) && amount1Desired === BigInt(0)) {
+    //    Treat < 5% of target as "negligible" (handles dust balances)
+    const amt0Ratio = maxToken0 > BigInt(0) ? Number(amount0Desired * BigInt(100) / maxToken0) : 0;
+    const amt1Ratio = maxToken1 > BigInt(0) ? Number(amount1Desired * BigInt(100) / maxToken1) : 0;
+    const NEGLIGIBLE_PCT = 5; // treat < 5% of target as "missing"
+
+    if (amt0Ratio > NEGLIGIBLE_PCT && amt1Ratio < NEGLIGIBLE_PCT) {
       // Have token0 only → swap half into token1
-      logger.info(`[Krystal] Zap: only have ${pool.token0.symbol} — swapping half into ${pool.token1.symbol}`);
+      logger.info(`[Krystal] Zap: have ${pool.token0.symbol} (${amt0Ratio}% of target) but ${pool.token1.symbol} negligible (${amt1Ratio}%) — swapping half into ${pool.token1.symbol}`);
       try {
         const swap = await import('./evmSwapService.ts');
         const halfAmt0 = amount0Desired / BigInt(2);
-        const halfUsdVal = Number(ethers.formatUnits(halfAmt0, dec0)) * usdPerToken0;
+        const halfHumanAmt = Number(ethers.formatUnits(halfAmt0, dec0)); // human token amount (NOT USD)
+        const halfUsdVal = halfHumanAmt * usdPerToken0; // for logging only
         if (halfUsdVal > 0.5) {
-          const quote = await swap.quoteEvmSwap(chainNumericId, pool.token0.address, pool.token1.address, halfUsdVal, pool.feeTier);
+          const quote = await swap.quoteEvmSwap(chainNumericId, pool.token0.address, pool.token1.address, halfHumanAmt, pool.feeTier);
           if (quote && quote.priceImpactPct > 3) {
             logger.warn(`[Krystal] Zap swap impact ${quote.priceImpactPct.toFixed(1)}% > 3% — skipping zap`);
           } else {
-            const res = await swap.executeEvmSwap(chainNumericId, pool.token0.address, pool.token1.address, halfUsdVal, pool.feeTier);
-            if (res.success) logger.info(`[Krystal] Zap: $${halfUsdVal.toFixed(2)} ${pool.token0.symbol} → ${pool.token1.symbol}`);
+            const res = await swap.executeEvmSwap(chainNumericId, pool.token0.address, pool.token1.address, halfHumanAmt, pool.feeTier);
+            if (res.success) logger.info(`[Krystal] Zap: ${halfHumanAmt.toFixed(6)} ${pool.token0.symbol} (~$${halfUsdVal.toFixed(2)}) → ${pool.token1.symbol}`);
+            else logger.warn(`[Krystal] Zap swap failed: ${res.error}`);
           }
         }
       } catch (err) { logger.warn('[Krystal] Zap swap failed (non-fatal):', err); }
@@ -959,20 +995,22 @@ export async function openEvmLpPosition(
       amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
       logger.info(`[Krystal] Post-zap: ${pool.token0.symbol}=${ethers.formatUnits(amount0Desired, dec0)}, ${pool.token1.symbol}=${ethers.formatUnits(amount1Desired, dec1)}`);
 
-    } else if (amount1Desired > BigInt(0) && amount0Desired === BigInt(0)) {
+    } else if (amt1Ratio > NEGLIGIBLE_PCT && amt0Ratio < NEGLIGIBLE_PCT) {
       // Have token1 only → swap half into token0
-      logger.info(`[Krystal] Zap: only have ${pool.token1.symbol} — swapping half into ${pool.token0.symbol}`);
+      logger.info(`[Krystal] Zap: have ${pool.token1.symbol} (${amt1Ratio}% of target) but ${pool.token0.symbol} negligible (${amt0Ratio}%) — swapping half into ${pool.token0.symbol}`);
       try {
         const swap = await import('./evmSwapService.ts');
         const halfAmt1 = amount1Desired / BigInt(2);
-        const halfUsdVal = Number(ethers.formatUnits(halfAmt1, dec1)) * usdPerToken1;
+        const halfHumanAmt = Number(ethers.formatUnits(halfAmt1, dec1)); // human token amount (NOT USD)
+        const halfUsdVal = halfHumanAmt * usdPerToken1; // for logging only
         if (halfUsdVal > 0.5) {
-          const quote = await swap.quoteEvmSwap(chainNumericId, pool.token1.address, pool.token0.address, halfUsdVal, pool.feeTier);
+          const quote = await swap.quoteEvmSwap(chainNumericId, pool.token1.address, pool.token0.address, halfHumanAmt, pool.feeTier);
           if (quote && quote.priceImpactPct > 3) {
             logger.warn(`[Krystal] Zap swap impact ${quote.priceImpactPct.toFixed(1)}% > 3% — skipping zap`);
           } else {
-            const res = await swap.executeEvmSwap(chainNumericId, pool.token1.address, pool.token0.address, halfUsdVal, pool.feeTier);
-            if (res.success) logger.info(`[Krystal] Zap: $${halfUsdVal.toFixed(2)} ${pool.token1.symbol} → ${pool.token0.symbol}`);
+            const res = await swap.executeEvmSwap(chainNumericId, pool.token1.address, pool.token0.address, halfHumanAmt, pool.feeTier);
+            if (res.success) logger.info(`[Krystal] Zap: ${halfHumanAmt.toFixed(6)} ${pool.token1.symbol} (~$${halfUsdVal.toFixed(2)}) → ${pool.token0.symbol}`);
+            else logger.warn(`[Krystal] Zap swap failed: ${res.error}`);
           }
         }
       } catch (err) { logger.warn('[Krystal] Zap swap failed (non-fatal):', err); }
@@ -992,8 +1030,26 @@ export async function openEvmLpPosition(
       return { success: false, error: 'No token0 or token1 balance on target chain (even after zap attempt)' };
     }
 
+    // Re-check ratios after zap
+    const post0Ratio = maxToken0 > BigInt(0) ? Number(amount0Desired * BigInt(100) / maxToken0) : 0;
+    const post1Ratio = maxToken1 > BigInt(0) ? Number(amount1Desired * BigInt(100) / maxToken1) : 0;
+
+    // If only one side has tokens and the tick range spans the current price,
+    // the NFPM mint will revert (can't create in-range liquidity with one token).
+    // Abort early with a clear error rather than burning gas on a revert.
+    if (post0Ratio < NEGLIGIBLE_PCT || post1Ratio < NEGLIGIBLE_PCT) {
+      const oneSide = post0Ratio >= NEGLIGIBLE_PCT ? pool.token0.symbol : pool.token1.symbol;
+      const missing = post0Ratio < NEGLIGIBLE_PCT ? pool.token0.symbol : pool.token1.symbol;
+      logger.warn(`[Krystal] One-sided: have ${oneSide} (${Math.max(post0Ratio, post1Ratio)}%) but ${missing} negligible (${Math.min(post0Ratio, post1Ratio)}%). Tick range is in-range — both tokens required. Aborting.`);
+      return { success: false, error: `Zap swap failed to acquire ${missing} — cannot mint in-range LP with only ${oneSide}` };
+    }
+
     // 6. Gas estimate check — skip if gas > 5% of deployUsd
-    const nfpmContract = new ethers.Contract(NFPM_ADDRESS, NFPM_ABI, wallet);
+    const nfpmAddr = getNfpmAddress(chainNumericId);
+    if (!nfpmAddr) {
+      return { success: false, error: `No Uniswap V3 NFPM deployed on chainId ${chainNumericId}` };
+    }
+    const nfpmContract = new ethers.Contract(nfpmAddr, NFPM_ABI, wallet);
     const feeData = await provider.getFeeData();
     const gasPrice = feeData.gasPrice ?? BigInt(0);
     const estimatedGas = BigInt(500_000); // conservative estimate for mint
@@ -1011,17 +1067,17 @@ export async function openEvmLpPosition(
     const token1Signer = new ethers.Contract(pool.token1.address, ERC20_ABI, wallet);
 
     const [allowance0, allowance1] = await Promise.all([
-      token0Signer.allowance(wallet.address, NFPM_ADDRESS),
-      token1Signer.allowance(wallet.address, NFPM_ADDRESS),
+      token0Signer.allowance(wallet.address, nfpmAddr),
+      token1Signer.allowance(wallet.address, nfpmAddr),
     ]);
 
     if (allowance0 < amount0Desired) {
-      const approveTx = await token0Signer.approve(NFPM_ADDRESS, ethers.MaxUint256);
+      const approveTx = await token0Signer.approve(nfpmAddr, ethers.MaxUint256);
       await approveTx.wait();
       logger.info(`[Krystal] Approved ${pool.token0.symbol} for NFPM`);
     }
     if (allowance1 < amount1Desired) {
-      const approveTx = await token1Signer.approve(NFPM_ADDRESS, ethers.MaxUint256);
+      const approveTx = await token1Signer.approve(nfpmAddr, ethers.MaxUint256);
       await approveTx.wait();
       logger.info(`[Krystal] Approved ${pool.token1.symbol} for NFPM`);
     }
@@ -1060,7 +1116,7 @@ export async function openEvmLpPosition(
     const tx = await nfpmContract.mint(mintParams);
     const receipt = await tx.wait();
 
-    // Parse tokenId from Transfer event (ERC721)
+    // Parse tokenId from Transfer event (ERC721) or IncreaseLiquidity
     let tokenId: string | undefined;
     for (const log of receipt.logs) {
       try {
@@ -1072,8 +1128,24 @@ export async function openEvmLpPosition(
       } catch { /* skip non-NFPM logs */ }
     }
 
+    // Fallback: extract tokenId from raw ERC721 Transfer topics
+    // Transfer(address indexed from, address indexed to, uint256 indexed tokenId)
+    // topic[0] = keccak256("Transfer(address,address,uint256)")
+    // topic[3] = tokenId (4 topics = ERC721, 3 topics = ERC20)
     if (!tokenId) {
-      // Fallback: try to extract from receipt logs
+      const transferSig = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+      for (const log of receipt.logs) {
+        const topics = log.topics as string[];
+        if (topics.length === 4 && topics[0] === transferSig) {
+          // topic[3] is the tokenId as a 32-byte hex — parse to BigInt then string
+          tokenId = BigInt(topics[3]).toString();
+          if (tokenId && tokenId !== '0') break;
+        }
+      }
+    }
+
+    if (!tokenId) {
+      logger.warn(`[Krystal] Could not parse tokenId from mint receipt — ${receipt.logs.length} logs. Hash: ${receipt.hash}`);
       tokenId = `unknown-${receipt.hash.slice(0, 12)}`;
     }
 
@@ -1118,7 +1190,8 @@ export async function closeEvmLpPosition(params: {
   try {
     const ethers = await loadEthers();
     const wallet = await getEvmWallet(chainNumericId);
-    const nfpm = new ethers.Contract(NFPM_ADDRESS, NFPM_ABI, wallet);
+    const nfpmAddr = getNfpmAddress(chainNumericId) ?? NFPM_ADDRESS;
+    const nfpm = new ethers.Contract(nfpmAddr, NFPM_ABI, wallet);
 
     // 1. Read position data
     const posData = await nfpm.positions(posId);
@@ -1130,6 +1203,11 @@ export async function closeEvmLpPosition(params: {
     }
 
     // 2. Decrease liquidity (withdraw all)
+    //    We manage nonces manually because ethers v6 caches nonces aggressively
+    //    and Arbitrum's sequencer confirms txs faster than the cache updates.
+    const provider = await getEvmProvider(chainNumericId);
+    let nextNonce = await provider.getTransactionCount(wallet.address, 'latest');
+
     if (liquidity > BigInt(0)) {
       const deadline = Math.floor(Date.now() / 1000) + 600;
       const decreaseTx = await nfpm.decreaseLiquidity({
@@ -1138,8 +1216,9 @@ export async function closeEvmLpPosition(params: {
         amount0Min: BigInt(0),
         amount1Min: BigInt(0),
         deadline,
-      });
+      }, { nonce: nextNonce });
       await decreaseTx.wait();
+      nextNonce++;
       logger.info(`[Krystal] decreaseLiquidity done for ${posId}`);
     }
 
@@ -1149,8 +1228,9 @@ export async function closeEvmLpPosition(params: {
       recipient: wallet.address,
       amount0Max: MaxUint128,
       amount1Max: MaxUint128,
-    });
+    }, { nonce: nextNonce });
     const collectReceipt = await collectTx.wait();
+    nextNonce++;
 
     // Parse collected amounts from Collect event
     let amount0Recovered = BigInt(0);
@@ -1169,7 +1249,7 @@ export async function closeEvmLpPosition(params: {
 
     // 4. Burn the NFT
     try {
-      const burnTx = await nfpm.burn(posId);
+      const burnTx = await nfpm.burn(posId, { nonce: nextNonce });
       await burnTx.wait();
       logger.info(`[Krystal] Burned NFT ${posId}`);
     } catch (burnErr) {
@@ -1244,7 +1324,8 @@ export async function claimEvmLpFees(params: {
   try {
     const ethers = await loadEthers();
     const wallet = await getEvmWallet(chainNumericId);
-    const nfpm = new ethers.Contract(NFPM_ADDRESS, NFPM_ABI, wallet);
+    const nfpmAddr = getNfpmAddress(chainNumericId) ?? NFPM_ADDRESS;
+    const nfpm = new ethers.Contract(nfpmAddr, NFPM_ABI, wallet);
 
     const tx = await nfpm.collect({
       tokenId: posId,
