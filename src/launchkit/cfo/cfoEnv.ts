@@ -147,9 +147,9 @@ const ALCHEMY_CHAINS: Record<string, number> = {
 
 /** Free public RPCs for chains Alchemy doesn't support */
 const PUBLIC_FALLBACK_RPCS: Record<number, string> = {
-  56:    'https://bsc-dataseed1.binance.org',   // BSC
-  43114: 'https://api.avax.network/ext/bc/C/rpc', // Avalanche
-  250:   'https://rpc.ftm.tools',                // Fantom
+  56:    'https://bsc-dataseed1.binance.org',                // BSC
+  43114: 'https://avalanche-c-chain-rpc.publicnode.com',     // Avalanche
+  250:   'https://rpc.ankr.com/fantom',                      // Fantom
 };
 
 /** Build EVM RPC URL map. Priority (highest first):

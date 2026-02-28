@@ -219,7 +219,9 @@ export async function getEvmProvider(numericChainId: number): Promise<any> {
   if (!url) throw new Error(`[Krystal] No RPC URL configured for chainId ${numericChainId}`);
 
   const ethers = await loadEthers();
-  const provider = new ethers.JsonRpcProvider(url);
+  // Use staticNetwork to skip auto-detect (avoids infinite retry on dead RPCs)
+  const staticNetwork = ethers.Network.from(numericChainId);
+  const provider = new ethers.JsonRpcProvider(url, staticNetwork, { staticNetwork: true });
   _providerCache.set(numericChainId, provider);
   return provider;
 }
