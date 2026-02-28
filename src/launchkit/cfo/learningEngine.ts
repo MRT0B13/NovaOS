@@ -78,25 +78,47 @@ export interface PolymarketCalibration {
 export interface AdaptiveParams {
   // Global
   confidenceLevel: number;      // 0–1, how much we trust learned params (based on sample size)
+  globalRiskMultiplier: number; // <1 = risk-off (multiple strategies deteriorating), 1 = normal
 
   // Polymarket
   kellyMultiplier: number;      // multiply env kellyFraction by this (e.g. 0.8 = more conservative)
   minEdgeOverride: number;      // absolute override for minEdge based on calibration
   polyBetSizeMultiplier: number; // scale bet sizing
+  polyCooldownMultiplier: number; // >1 = slower betting (poor calibration), <1 = faster
 
   // Hyperliquid
   hlStopLossMultiplier: number; // tighter/wider stop loss (< 1 = tighter)
   hlLeverageBias: number;       // -1 to +1 adjustment on max leverage
+  hlHedgeTargetMultiplier: number; // scale hedge target ratio based on hedge performance
+  hlRebalanceThresholdMultiplier: number; // wider if frequent rebalance = churn losses
 
   // LP (Orca + Krystal)
   lpRangeWidthMultiplier: number;  // wider/narrower ranges based on rebalance frequency
   lpMinAprAdjustment: number;      // increase min APR floor if LP positions underperform
+  lpRebalanceTriggerMultiplier: number; // tighter if OOR rate high, looser if profitable
 
   // Kamino
   kaminoLtvMultiplier: number;     // tighten/loosen LTV target
+  kaminoSpreadFloorMultiplier: number; // raise spread floor if actual yield < projected
+
+  // EVM Arb
+  evmArbMinProfitMultiplier: number; // raise if slippage consistently eats profit
+
+  // Operational
+  feeDragPct: number;           // total fees / total volume — awareness of cost drag
+  executionFailRates: Record<string, number>; // strategy → tx failure rate (0-1)
 
   // Strategy allocation preference (higher = more capital)
   strategyScores: Record<string, number>;  // strategy → relative performance score
+  capitalWeights: Record<string, number>;  // strategy → allocation weight (0-1, sums to 1)
+
+  // Portfolio-level
+  portfolioSharpe: number;       // daily portfolio Sharpe ratio
+  portfolioMaxDrawdownPct: number; // max drawdown from peak (0-1)
+  regimeSignal: 'risk-on' | 'neutral' | 'risk-off'; // multi-strategy regime detection
+
+  // Alerts
+  alerts: string[];              // drift alerts, degradation warnings
 
   // Metadata
   sampleSizes: Record<string, number>;
@@ -343,6 +365,229 @@ async function computePolyCalibration(pool: any): Promise<PolymarketCalibration>
 }
 
 // ============================================================================
+// Fee-drag & Execution Quality
+// ============================================================================
+
+interface FeeStats {
+  totalFeesUsd: number;
+  totalVolumeUsd: number;
+  feeDragPct: number;             // fees / volume
+  perStrategy: Record<string, { fees: number; volume: number; failRate: number }>;
+}
+
+async function computeFeeAndExecStats(pool: any): Promise<FeeStats> {
+  const empty: FeeStats = { totalFeesUsd: 0, totalVolumeUsd: 0, feeDragPct: 0, perStrategy: {} };
+  try {
+    // Fee drag from transactions
+    const feeRes = await pool.query(
+      `SELECT strategy_tag,
+              SUM(COALESCE(fee_usd, 0)) AS total_fees,
+              SUM(COALESCE(amount_in, 0)) AS total_volume,
+              COUNT(*) AS total_txns,
+              SUM(CASE WHEN status = 'failed' OR error_message IS NOT NULL THEN 1 ELSE 0 END) AS failed_txns
+       FROM cfo_transactions
+       WHERE timestamp > NOW() - INTERVAL '${LOOKBACK_DAYS} days'
+       GROUP BY strategy_tag`,
+    );
+
+    let totalFees = 0;
+    let totalVol = 0;
+    const perStrategy: Record<string, { fees: number; volume: number; failRate: number }> = {};
+
+    for (const row of feeRes.rows) {
+      const strat = String(row.strategy_tag);
+      const fees = Number(row.total_fees || 0);
+      const vol = Number(row.total_volume || 0);
+      const total = Number(row.total_txns || 1);
+      const failed = Number(row.failed_txns || 0);
+
+      totalFees += fees;
+      totalVol += vol;
+      perStrategy[strat] = { fees, volume: vol, failRate: total > 0 ? failed / total : 0 };
+    }
+
+    return {
+      totalFeesUsd: totalFees,
+      totalVolumeUsd: totalVol,
+      feeDragPct: totalVol > 0 ? (totalFees / totalVol) * 100 : 0,
+      perStrategy,
+    };
+  } catch (err) {
+    logger.debug('[Learning] Fee/exec stats error:', err);
+    return empty;
+  }
+}
+
+// ============================================================================
+// Portfolio-level Intelligence
+// ============================================================================
+
+interface PortfolioLearning {
+  sharpe: number;
+  maxDrawdownPct: number;
+  regimeSignal: 'risk-on' | 'neutral' | 'risk-off';
+}
+
+async function computePortfolioStats(
+  pool: any,
+  strategyStats: Record<string, StrategyStats>,
+): Promise<PortfolioLearning> {
+  const neutral: PortfolioLearning = { sharpe: 0, maxDrawdownPct: 0, regimeSignal: 'neutral' };
+
+  try {
+    // Daily portfolio returns from snapshots
+    const snapRes = await pool.query(
+      `SELECT date, total_portfolio_usd, realized_pnl_24h
+       FROM cfo_daily_snapshots
+       WHERE date > NOW() - INTERVAL '${LOOKBACK_DAYS} days'
+       ORDER BY date ASC`,
+    );
+
+    const snaps = snapRes.rows;
+    if (snaps.length < 3) return neutral;
+
+    // Compute daily returns
+    const dailyReturns: number[] = [];
+    let peak = 0;
+    let maxDrawdown = 0;
+
+    for (let i = 1; i < snaps.length; i++) {
+      const prev = Number(snaps[i - 1].total_portfolio_usd) || 1;
+      const curr = Number(snaps[i].total_portfolio_usd) || 1;
+      const ret = (curr - prev) / Math.max(1, prev);
+      dailyReturns.push(ret);
+
+      // Track drawdown from peak
+      if (curr > peak) peak = curr;
+      const dd = peak > 0 ? (peak - curr) / peak : 0;
+      if (dd > maxDrawdown) maxDrawdown = dd;
+    }
+
+    // Portfolio Sharpe (daily, not annualized)
+    const mean = dailyReturns.reduce((s, r) => s + r, 0) / dailyReturns.length;
+    const variance = dailyReturns.reduce((s, r) => s + (r - mean) ** 2, 0) / Math.max(1, dailyReturns.length - 1);
+    const stdev = Math.sqrt(variance);
+    const sharpe = stdev > 0 ? mean / stdev : 0;
+
+    // Regime detection: if 3+ strategies show deteriorating recent performance, risk-off
+    let deteriorating = 0;
+    let improving = 0;
+    for (const st of Object.values(strategyStats)) {
+      if (st.totalTrades < 3) continue;
+      if (st.recentWinRate < st.winRate - 0.1 && st.recentAvgPnlUsd < st.avgPnlUsd) {
+        deteriorating++;
+      } else if (st.recentWinRate > st.winRate + 0.1 && st.recentAvgPnlUsd > st.avgPnlUsd) {
+        improving++;
+      }
+    }
+
+    let regimeSignal: 'risk-on' | 'neutral' | 'risk-off' = 'neutral';
+    if (deteriorating >= 3 || (maxDrawdown > 0.15 && sharpe < 0)) {
+      regimeSignal = 'risk-off';
+    } else if (improving >= 2 && sharpe > 0.3) {
+      regimeSignal = 'risk-on';
+    }
+
+    return { sharpe, maxDrawdownPct: maxDrawdown, regimeSignal };
+  } catch (err) {
+    logger.debug('[Learning] Portfolio stats error:', err);
+    return neutral;
+  }
+}
+
+// ============================================================================
+// Capital Allocation from Strategy Scores
+// ============================================================================
+
+function computeCapitalWeights(scores: Record<string, number>): Record<string, number> {
+  const entries = Object.entries(scores).filter(([, s]) => s > 0);
+  if (entries.length === 0) return {};
+
+  const totalScore = entries.reduce((s, [, score]) => s + score, 0);
+  if (totalScore === 0) return {};
+
+  const weights: Record<string, number> = {};
+  for (const [name, score] of entries) {
+    weights[name] = score / totalScore;
+  }
+  return weights;
+}
+
+// ============================================================================
+// Parameter Drift Detection & Alerts
+// ============================================================================
+
+function detectDriftAlerts(
+  current: AdaptiveParams,
+  prior: AdaptiveParams | null,
+  strategyStats: Record<string, StrategyStats>,
+  feeStats: FeeStats,
+): string[] {
+  const alerts: string[] = [];
+
+  if (prior && prior.lastComputed > 0) {
+    // Check for large parameter swings (>30% change in any multiplier)
+    const drifts: Array<[string, number, number]> = [
+      ['Kelly', current.kellyMultiplier, prior.kellyMultiplier],
+      ['HL Stop', current.hlStopLossMultiplier, prior.hlStopLossMultiplier],
+      ['LP Range', current.lpRangeWidthMultiplier, prior.lpRangeWidthMultiplier],
+      ['Bet Size', current.polyBetSizeMultiplier, prior.polyBetSizeMultiplier],
+      ['Hedge Target', current.hlHedgeTargetMultiplier, prior.hlHedgeTargetMultiplier],
+    ];
+
+    for (const [name, curr, prev] of drifts) {
+      if (prev === 0) continue;
+      const changePct = Math.abs((curr - prev) / prev) * 100;
+      if (changePct > 30) {
+        const dir = curr > prev ? '↑' : '↓';
+        alerts.push(`${dir} ${name} shifted ${changePct.toFixed(0)}% (${prev.toFixed(2)} → ${curr.toFixed(2)})`);
+      }
+    }
+  }
+
+  // Strategy degradation alerts
+  for (const [name, st] of Object.entries(strategyStats)) {
+    if (st.totalTrades < MIN_TRADES_FOR_CONFIDENCE) continue;
+
+    const score = current.strategyScores[name] ?? 50;
+    if (score < 25) {
+      alerts.push(
+        `⚠️ ${name} degraded: score=${score.toFixed(0)}, ` +
+        `WR=${(st.winRate * 100).toFixed(0)}%, Sharpe=${st.sharpeApprox.toFixed(2)}, ` +
+        `avgPnL=$${st.avgPnlUsd.toFixed(2)} — consider pausing`,
+      );
+    }
+
+    // Recent regime shift warning
+    if (st.recentWinRate < st.winRate - 0.2) {
+      alerts.push(
+        `📉 ${name} regime shift: recent WR ${(st.recentWinRate * 100).toFixed(0)}% vs ` +
+        `overall ${(st.winRate * 100).toFixed(0)}% — deteriorating`,
+      );
+    }
+  }
+
+  // High fee drag warning
+  if (feeStats.feeDragPct > 2) {
+    alerts.push(
+      `💸 High fee drag: ${feeStats.feeDragPct.toFixed(1)}% of volume lost to fees ` +
+      `($${feeStats.totalFeesUsd.toFixed(2)} on $${feeStats.totalVolumeUsd.toFixed(0)} volume)`,
+    );
+  }
+
+  // High execution failure rate per strategy
+  for (const [strat, info] of Object.entries(feeStats.perStrategy)) {
+    if (info.failRate > 0.2) {
+      alerts.push(
+        `🔴 ${strat} execution failures: ${(info.failRate * 100).toFixed(0)}% of transactions failing`,
+      );
+    }
+  }
+
+  return alerts;
+}
+
+// ============================================================================
 // Adaptive Parameter Computation
 // ============================================================================
 
@@ -351,6 +596,8 @@ function computeAdaptiveParams(
   lpStats: Record<string, LPStats>,
   polyCal: PolymarketCalibration,
   prior: AdaptiveParams | null,
+  feeStats: FeeStats,
+  portfolio: PortfolioLearning,
 ): AdaptiveParams {
 
   const blend = (newVal: number, priorVal: number | undefined): number => {
@@ -362,6 +609,7 @@ function computeAdaptiveParams(
   let kellyMult = 1.0;
   let minEdgeOvr = 0.05; // default
   let polyBetMult = 1.0;
+  let polyCooldownMult = 1.0;
   const polySt = stats['polymarket'];
 
   if (polySt && polySt.totalTrades >= MIN_TRADES_FOR_CONFIDENCE) {
@@ -377,22 +625,31 @@ function computeAdaptiveParams(
 
     // Calibration: if overconfident, raise min edge requirement
     if (polyCal.calibrationGap > 0.1) {
-      minEdgeOvr = 0.05 + polyCal.calibrationGap * 0.5; // e.g. +0.05 for 0.1 gap
+      minEdgeOvr = 0.05 + polyCal.calibrationGap * 0.5;
     }
     if (polyCal.brierScore > 0.35) {
       polyBetMult = 0.6; // poor calibration → smaller bets
+    }
+
+    // Cooldown: slow down betting if poorly calibrated, speed up if well-calibrated
+    if (polyCal.brierScore > 0.3 || polySt.winRate < 0.35) {
+      polyCooldownMult = 1.5; // 50% longer cooldowns
+    } else if (polyCal.brierScore < 0.2 && polySt.winRate > 0.55) {
+      polyCooldownMult = 0.7; // bet more frequently when calibrated well
     }
   }
 
   // ── Hyperliquid adaptations ─────────────────────────────────────
   let hlStopMult = 1.0;
   let hlLevBias = 0;
+  let hlHedgeTargetMult = 1.0;
+  let hlRebalThreshMult = 1.0;
   const hlSt = stats['hyperliquid'];
 
   if (hlSt && hlSt.totalTrades >= MIN_TRADES_FOR_CONFIDENCE) {
     // If max drawdown is severe relative to avg PnL, tighten stops
     if (hlSt.maxDrawdownUsd < -50 && Math.abs(hlSt.maxDrawdownUsd) > hlSt.avgPnlUsd * 5) {
-      hlStopMult = 0.7; // tighter stop
+      hlStopMult = 0.7;
     }
 
     // If win rate is high with positive Sharpe, slightly loosen
@@ -406,19 +663,30 @@ function computeAdaptiveParams(
 
     // Recent regime shift
     if (hlSt.recentAvgPnlUsd < 0 && hlSt.avgPnlUsd > 0) {
-      hlStopMult *= 0.8; // things are getting worse → tighten
+      hlStopMult *= 0.8;
       hlLevBias -= 0.3;
+    }
+
+    // Hedge target: if hedging consistently loses money, reduce target
+    if (hlSt.totalPnlUsd < -10 && hlSt.winRate < 0.3) {
+      hlHedgeTargetMult = 0.7; // hedge less aggressively
+    } else if (hlSt.totalPnlUsd > 0 && hlSt.winRate > 0.5) {
+      hlHedgeTargetMult = 1.1; // hedges are working → lean in
+    }
+
+    // Rebalance threshold: if lots of churn (many open/close with losses), widen
+    if (hlSt.avgHoldHours < 4 && hlSt.avgPnlUsd < 0) {
+      hlRebalThreshMult = 1.3; // widen threshold to reduce churn
     }
   }
 
   // ── LP adaptations (Orca + Krystal) ─────────────────────────────
   let lpRangeMult = 1.0;
   let lpMinAprAdj = 0;
+  let lpRebalTriggerMult = 1.0;
 
   const orcaLp = lpStats['orca_lp'];
   const krystalLp = lpStats['krystal_lp'];
-
-  // Combine LP stats for range width learning
   const allLp = [orcaLp, krystalLp].filter(Boolean);
 
   for (const lp of allLp) {
@@ -427,51 +695,92 @@ function computeAdaptiveParams(
     // If out-of-range rate is high (>40%), widen ranges
     if (lp.outOfRangeRate > 0.4) {
       lpRangeMult = Math.max(lpRangeMult, 1.3);
+      lpRebalTriggerMult = Math.max(lpRebalTriggerMult, 0.8); // tighter rebalance trigger
     } else if (lp.outOfRangeRate < 0.15 && lp.avgPnlPerDayUsd > 0) {
-      // Low OOR + profitable → can tighten for more fees
       lpRangeMult = Math.min(lpRangeMult, 0.85);
     }
 
     // If avg PnL per day is negative, raise APR floor
     if (lp.avgPnlPerDayUsd < 0) {
-      lpMinAprAdj = Math.max(lpMinAprAdj, 10); // +10% APR floor
+      lpMinAprAdj = Math.max(lpMinAprAdj, 10);
     }
   }
 
   // ── Kamino adaptations ──────────────────────────────────────────
   let kaminoLtvMult = 1.0;
+  let kaminoSpreadMult = 1.0;
   const kaminoSt = stats['kamino'];
 
   if (kaminoSt && kaminoSt.totalTrades >= 3) {
-    // If liquidation losses detected, aggressively lower LTV
     if (kaminoSt.maxDrawdownUsd < -20) {
       kaminoLtvMult = 0.8;
     }
-    // If consistently profitable, can be slightly more aggressive
     if (kaminoSt.winRate > 0.7 && kaminoSt.avgPnlUsd > 0) {
       kaminoLtvMult = 1.05;
     }
+    // If avg PnL is negative, actual yield < projected → raise spread floor
+    if (kaminoSt.avgPnlUsd < 0) {
+      kaminoSpreadMult = 1.3; // demand 30% higher borrow spread
+    }
+  }
+
+  // ── EVM Arb adaptations ─────────────────────────────────────────
+  let evmArbMinProfitMult = 1.0;
+  const arbSt = stats['evm_flash_arb'];
+  const arbExec = feeStats.perStrategy['evm_flash_arb'];
+
+  if (arbSt && arbSt.totalTrades >= 3) {
+    // If arb trades are mostly losers (slippage eats profit), raise min threshold
+    if (arbSt.winRate < 0.5 && arbSt.avgPnlUsd < 0) {
+      evmArbMinProfitMult = 1.5; // demand 50% higher min profit
+    } else if (arbSt.winRate > 0.7 && arbSt.avgPnlUsd > 0) {
+      evmArbMinProfitMult = 0.8; // can be more aggressive
+    }
+  }
+  if (arbExec && arbExec.failRate > 0.3) {
+    evmArbMinProfitMult = Math.max(evmArbMinProfitMult, 1.5); // high fail rate → need bigger edge
   }
 
   // ── Strategy scoring (relative performance) ─────────────────────
   const strategyScores: Record<string, number> = {};
   for (const [name, st] of Object.entries(stats)) {
     if (st.totalTrades < MIN_TRADES_FOR_CONFIDENCE) {
-      strategyScores[name] = 50; // neutral score for insufficient data
+      strategyScores[name] = 50;
     } else {
-      // Score = base 50 + Sharpe contribution + win rate contribution
       let score = 50;
-      score += st.sharpeApprox * 20;                    // Sharpe: -2 to +2 → -40 to +40
-      score += (st.winRate - 0.5) * 30;                 // WR: 0.3–0.7 → -6 to +6
-      score += st.avgPnlUsd > 0 ? 10 : -10;            // profitable bonus
-      score += (st.recentWinRate - st.winRate) * 20;    // improving trend bonus
+      score += st.sharpeApprox * 20;
+      score += (st.winRate - 0.5) * 30;
+      score += st.avgPnlUsd > 0 ? 10 : -10;
+      score += (st.recentWinRate - st.winRate) * 20;
+      // Penalize strategies with high execution failure
+      const execInfo = feeStats.perStrategy[name];
+      if (execInfo && execInfo.failRate > 0.15) {
+        score -= 15;
+      }
       strategyScores[name] = Math.max(0, Math.min(100, score));
     }
   }
 
+  // ── Capital allocation weights from scores ──────────────────────
+  const capitalWeights = computeCapitalWeights(strategyScores);
+
+  // ── Global risk multiplier from regime ──────────────────────────
+  let globalRisk = 1.0;
+  if (portfolio.regimeSignal === 'risk-off') {
+    globalRisk = 0.6; // 40% position size reduction across the board
+  } else if (portfolio.regimeSignal === 'risk-on') {
+    globalRisk = 1.15; // slightly more aggressive
+  }
+
   // ── Confidence level (based on total sample size) ───────────────
   const totalSamples = Object.values(stats).reduce((s, st) => s + st.totalTrades, 0);
-  const confidence = Math.min(1, totalSamples / 50); // full confidence at 50+ trades
+  const confidence = Math.min(1, totalSamples / 50);
+
+  // ── Execution failure rates ─────────────────────────────────────
+  const executionFailRates: Record<string, number> = {};
+  for (const [strat, info] of Object.entries(feeStats.perStrategy)) {
+    executionFailRates[strat] = info.failRate;
+  }
 
   // ── Blend with prior using EMA ──────────────────────────────────
   const sampleSizes: Record<string, number> = {};
@@ -481,18 +790,35 @@ function computeAdaptiveParams(
 
   const params: AdaptiveParams = {
     confidenceLevel: confidence,
+    globalRiskMultiplier: blend(globalRisk, prior?.globalRiskMultiplier),
     kellyMultiplier: blend(kellyMult, prior?.kellyMultiplier),
     minEdgeOverride: blend(minEdgeOvr, prior?.minEdgeOverride),
     polyBetSizeMultiplier: blend(polyBetMult, prior?.polyBetSizeMultiplier),
+    polyCooldownMultiplier: blend(polyCooldownMult, prior?.polyCooldownMultiplier),
     hlStopLossMultiplier: blend(hlStopMult, prior?.hlStopLossMultiplier),
     hlLeverageBias: blend(hlLevBias, prior?.hlLeverageBias),
+    hlHedgeTargetMultiplier: blend(hlHedgeTargetMult, prior?.hlHedgeTargetMultiplier),
+    hlRebalanceThresholdMultiplier: blend(hlRebalThreshMult, prior?.hlRebalanceThresholdMultiplier),
     lpRangeWidthMultiplier: blend(lpRangeMult, prior?.lpRangeWidthMultiplier),
     lpMinAprAdjustment: blend(lpMinAprAdj, prior?.lpMinAprAdjustment),
+    lpRebalanceTriggerMultiplier: blend(lpRebalTriggerMult, prior?.lpRebalanceTriggerMultiplier),
     kaminoLtvMultiplier: blend(kaminoLtvMult, prior?.kaminoLtvMultiplier),
+    kaminoSpreadFloorMultiplier: blend(kaminoSpreadMult, prior?.kaminoSpreadFloorMultiplier),
+    evmArbMinProfitMultiplier: blend(evmArbMinProfitMult, prior?.evmArbMinProfitMultiplier),
+    feeDragPct: feeStats.feeDragPct,
+    executionFailRates,
     strategyScores,
+    capitalWeights,
+    portfolioSharpe: portfolio.sharpe,
+    portfolioMaxDrawdownPct: portfolio.maxDrawdownPct,
+    regimeSignal: portfolio.regimeSignal,
+    alerts: [], // populated later by detectDriftAlerts
     sampleSizes,
     lastComputed: Date.now(),
   };
+
+  // Generate alerts (needs the params object built first)
+  params.alerts = detectDriftAlerts(params, prior, stats, feeStats);
 
   return params;
 }
@@ -516,12 +842,22 @@ async function loadPrior(pool: any): Promise<AdaptiveParams | null> {
 
 async function saveLearned(pool: any, params: AdaptiveParams): Promise<void> {
   try {
+    // Save current params (latest)
     await pool.query(
       `INSERT INTO kv_store (key, data, updated_at)
        VALUES ($1, $2, NOW())
        ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = NOW()`,
       [KV_KEY, JSON.stringify(params)],
     );
+
+    // Save historical daily snapshot for trend analysis
+    const dateKey = `${KV_KEY}_${new Date().toISOString().slice(0, 10)}`;
+    await pool.query(
+      `INSERT INTO kv_store (key, data, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = NOW()`,
+      [dateKey, JSON.stringify(params)],
+    ).catch(() => { /* non-critical */ });
   } catch (err) {
     logger.debug('[Learning] Failed to persist params:', err);
   }
@@ -576,25 +912,45 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
     // 4. Polymarket calibration
     const polyCal = await computePolyCalibration(dbPool);
 
-    // 5. Compute adaptive params
-    const params = computeAdaptiveParams(stats, lpStats, polyCal, prior);
+    // 5. Fee-drag & execution quality
+    const feeStats = await computeFeeAndExecStats(dbPool);
 
-    // 6. Persist
+    // 6. Portfolio-level intelligence (regime detection, Sharpe)
+    const portfolio = await computePortfolioStats(dbPool, stats);
+
+    // 7. Compute adaptive params (now with fee + portfolio inputs)
+    const params = computeAdaptiveParams(stats, lpStats, polyCal, prior, feeStats, portfolio);
+
+    // 8. Persist (current + daily snapshot)
     await saveLearned(dbPool, params);
 
-    // 7. Log summary
+    // 9. Log summary
     const totalTrades = Object.values(stats).reduce((s, st) => s + st.totalTrades, 0);
     const topStrategy = Object.entries(params.strategyScores)
       .sort(([, a], [, b]) => b - a)[0];
 
     logger.info(
-      `[Learning] Retrospective: ${totalTrades} trades analysed | ` +
+      `[Learning] Retrospective: ${totalTrades} trades | ` +
       `confidence: ${(params.confidenceLevel * 100).toFixed(0)}% | ` +
+      `regime: ${params.regimeSignal} | ` +
+      `risk×${params.globalRiskMultiplier.toFixed(2)} | ` +
       `kelly×${params.kellyMultiplier.toFixed(2)} | ` +
       `hlStop×${params.hlStopLossMultiplier.toFixed(2)} | ` +
+      `hedge×${params.hlHedgeTargetMultiplier.toFixed(2)} | ` +
       `lpRange×${params.lpRangeWidthMultiplier.toFixed(2)} | ` +
+      `arbMin×${params.evmArbMinProfitMultiplier.toFixed(2)} | ` +
+      `feeDrag=${params.feeDragPct.toFixed(1)}% | ` +
+      `pSharpe=${params.portfolioSharpe.toFixed(2)} | ` +
       `best: ${topStrategy?.[0] ?? 'n/a'}(${topStrategy?.[1]?.toFixed(0) ?? '?'})`,
     );
+
+    // Log alerts
+    if (params.alerts.length > 0) {
+      logger.warn(`[Learning] 🚨 ALERTS (${params.alerts.length}):`);
+      for (const alert of params.alerts) {
+        logger.warn(`[Learning]   ${alert}`);
+      }
+    }
 
     // Log per-strategy detail at debug level
     for (const [name, st] of Object.entries(stats)) {
@@ -633,15 +989,29 @@ export function getAdaptiveParams(): AdaptiveParams {
 export function getDefaultParams(): AdaptiveParams {
   return {
     confidenceLevel: 0,
+    globalRiskMultiplier: 1.0,
     kellyMultiplier: 1.0,
     minEdgeOverride: 0.05,
     polyBetSizeMultiplier: 1.0,
+    polyCooldownMultiplier: 1.0,
     hlStopLossMultiplier: 1.0,
     hlLeverageBias: 0,
+    hlHedgeTargetMultiplier: 1.0,
+    hlRebalanceThresholdMultiplier: 1.0,
     lpRangeWidthMultiplier: 1.0,
     lpMinAprAdjustment: 0,
+    lpRebalanceTriggerMultiplier: 1.0,
     kaminoLtvMultiplier: 1.0,
+    kaminoSpreadFloorMultiplier: 1.0,
+    evmArbMinProfitMultiplier: 1.0,
+    feeDragPct: 0,
+    executionFailRates: {},
     strategyScores: {},
+    capitalWeights: {},
+    portfolioSharpe: 0,
+    portfolioMaxDrawdownPct: 0,
+    regimeSignal: 'neutral',
+    alerts: [],
     sampleSizes: {},
     lastComputed: 0,
   };
@@ -674,6 +1044,15 @@ export function formatLearningSummary(params: AdaptiveParams): string {
     .map(([name, score]) => `${name}(${score.toFixed(0)})`)
     .join(', ');
 
+  // Per-strategy confidence
+  const stratConfidence = Object.entries(params.sampleSizes)
+    .filter(([, n]) => n > 0)
+    .map(([name, n]) => {
+      const level = n >= 20 ? 'high' : n >= MIN_TRADES_FOR_CONFIDENCE ? 'med' : 'low';
+      return `${name}:${level}(${n})`;
+    })
+    .join(', ');
+
   const adjustments: string[] = [];
   if (Math.abs(params.kellyMultiplier - 1) > 0.05) {
     adjustments.push(`Kelly ${params.kellyMultiplier > 1 ? '↑' : '↓'}${(params.kellyMultiplier * 100).toFixed(0)}%`);
@@ -681,16 +1060,55 @@ export function formatLearningSummary(params: AdaptiveParams): string {
   if (Math.abs(params.hlStopLossMultiplier - 1) > 0.05) {
     adjustments.push(`HLstop ${params.hlStopLossMultiplier > 1 ? 'wider' : 'tighter'}`);
   }
+  if (Math.abs(params.hlHedgeTargetMultiplier - 1) > 0.05) {
+    adjustments.push(`Hedge ${params.hlHedgeTargetMultiplier > 1 ? '↑' : '↓'}${(params.hlHedgeTargetMultiplier * 100).toFixed(0)}%`);
+  }
   if (Math.abs(params.lpRangeWidthMultiplier - 1) > 0.05) {
     adjustments.push(`LP range ${params.lpRangeWidthMultiplier > 1 ? 'wider' : 'tighter'}`);
   }
   if (params.lpMinAprAdjustment > 0) {
     adjustments.push(`APR floor +${params.lpMinAprAdjustment.toFixed(0)}%`);
   }
+  if (Math.abs(params.evmArbMinProfitMultiplier - 1) > 0.05) {
+    adjustments.push(`ArbMin ${params.evmArbMinProfitMultiplier > 1 ? '↑' : '↓'}${(params.evmArbMinProfitMultiplier * 100).toFixed(0)}%`);
+  }
+  if (params.globalRiskMultiplier < 0.9) {
+    adjustments.push(`🛡️ RISK-OFF ×${params.globalRiskMultiplier.toFixed(2)}`);
+  } else if (params.globalRiskMultiplier > 1.1) {
+    adjustments.push(`🚀 RISK-ON ×${params.globalRiskMultiplier.toFixed(2)}`);
+  }
+  if (params.feeDragPct > 1) {
+    adjustments.push(`💸 Fees ${params.feeDragPct.toFixed(1)}%`);
+  }
 
-  return (
-    `🧠 Learning: ${totalSamples} trades | confidence ${(params.confidenceLevel * 100).toFixed(0)}%\n` +
-    `   Top strategies: ${top3 || 'n/a'}\n` +
-    (adjustments.length > 0 ? `   Adjustments: ${adjustments.join(', ')}` : '   No adjustments yet (building data)')
-  );
+  const lines = [
+    `🧠 Learning: ${totalSamples} trades | confidence ${(params.confidenceLevel * 100).toFixed(0)}% | regime: ${params.regimeSignal}`,
+    `   Portfolio: Sharpe=${params.portfolioSharpe.toFixed(2)} | MaxDD=${(params.portfolioMaxDrawdownPct * 100).toFixed(1)}%`,
+    `   Top strategies: ${top3 || 'n/a'}`,
+    `   Data quality: ${stratConfidence || 'no data'}`,
+    adjustments.length > 0
+      ? `   Adjustments: ${adjustments.join(', ')}`
+      : '   No adjustments yet (building data)',
+  ];
+
+  // Add capital allocation weights if meaningful
+  const weightEntries = Object.entries(params.capitalWeights)
+    .filter(([, w]) => w > 0.05)
+    .sort(([, a], [, b]) => b - a);
+  if (weightEntries.length > 0) {
+    lines.push(`   Capital weights: ${weightEntries.map(([n, w]) => `${n}=${(w * 100).toFixed(0)}%`).join(', ')}`);
+  }
+
+  // Alerts
+  if (params.alerts.length > 0) {
+    lines.push(`   🚨 Alerts: ${params.alerts.length}`);
+    for (const alert of params.alerts.slice(0, 3)) {
+      lines.push(`      ${alert}`);
+    }
+    if (params.alerts.length > 3) {
+      lines.push(`      ... +${params.alerts.length - 3} more`);
+    }
+  }
+
+  return lines.join('\n');
 }

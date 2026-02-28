@@ -1244,9 +1244,15 @@ export async function generateDecisions(
   const decisions: Decision[] = [];
   const conf = learned.confidenceLevel;
 
+  // ── Global risk from learning (regime detection) ──────────────────
+  const globalRisk = applyAdaptive(1.0, learned.globalRiskMultiplier, conf);
+
   // ── Intel-adjusted parameters ─────────────────────────────────────
-  // In bearish/danger markets, hedge more aggressively. In bullish, less.
-  const adjustedHedgeTarget = Math.min(1.0, config.hedgeTargetRatio * intel.riskMultiplier);
+  // Hedge target: base × intel × learned hedge performance × global regime
+  const learnedHedgeTarget = applyAdaptive(config.hedgeTargetRatio, learned.hlHedgeTargetMultiplier, conf);
+  const adjustedHedgeTarget = Math.min(1.0, learnedHedgeTarget * intel.riskMultiplier * globalRisk);
+  // Hedge rebalance threshold: widen if churn detected
+  const adjustedRebalThreshold = applyAdaptive(config.hedgeRebalanceThreshold, learned.hlRebalanceThresholdMultiplier, conf);
   // Apply learned stop-loss multiplier (tighter if past trades show large drawdowns)
   const learnedStopLoss = applyAdaptive(config.hlStopLossPct, learned.hlStopLossMultiplier, conf);
   const adjustedStopLoss = learnedStopLoss / intel.riskMultiplier; // then intel-adjust
@@ -1334,13 +1340,16 @@ export async function generateDecisions(
       const cooldownKeyClose = `CLOSE_HEDGE_${asset.symbol}`;
 
       // Case 1: Under-hedged — need to open/increase SHORT
-      if (coinHedgeRatio < adjustedHedgeTarget - config.hedgeRebalanceThreshold) {
+      if (coinHedgeRatio < adjustedHedgeTarget - adjustedRebalThreshold) {
         const hedgeNeeded = coinTargetHedgeUsd - coinShortUsd;
-        let capped = Math.min(hedgeNeeded, env.maxHyperliquidUsd - state.hlTotalShortUsd);
+        // Apply global risk + capital weight scaling to hedge size
+        let capped = Math.min(hedgeNeeded * globalRisk, env.maxHyperliquidUsd - state.hlTotalShortUsd);
 
         // Gate: need enough HL margin to open the position (size / leverage)
         // If full hedge doesn't fit, scale down to what margin supports (instead of skipping)
-        const leverage = Math.min(2, env.maxHyperliquidLeverage);
+        // Apply learned leverage bias: negative = reduce, positive = increase (clamped)
+        const learnedMaxLev = Math.max(1, Math.min(5, env.maxHyperliquidLeverage + applyAdaptive(0, learned.hlLeverageBias, conf)));
+        const leverage = Math.min(2, learnedMaxLev);
         const marginRequired = capped / leverage;
         if (state.hlAvailableMargin < marginRequired) {
           // Scale hedge down to what we can afford: affordableSize = margin × leverage × 80% (buffer)
@@ -1360,7 +1369,7 @@ export async function generateDecisions(
               `Current hedge: $${coinShortUsd.toFixed(0)} (${(coinHedgeRatio * 100).toFixed(0)}%). ` +
               `Target: ${(adjustedHedgeTarget * 100).toFixed(0)}%${adjustedHedgeTarget !== config.hedgeTargetRatio ? ` (adjusted from ${(config.hedgeTargetRatio * 100).toFixed(0)}% — market: ${intel.marketCondition})` : ''}. ` +
               `Opening SHORT $${capped.toFixed(0)} ${asset.symbol}-PERP to protect downside.`,
-            params: { coin: asset.symbol, exposureUsd: capped, leverage: Math.min(2, env.maxHyperliquidLeverage) },
+            params: { coin: asset.symbol, exposureUsd: capped, leverage },      // uses learned leverage
             urgency: coinDrift > 0.3 ? 'high' : 'medium',
             estimatedImpactUsd: capped,
             intelUsed: intelSources,
@@ -1372,7 +1381,7 @@ export async function generateDecisions(
       }
 
       // Case 2: Over-hedged — reduce SHORT
-      if (coinHedgeRatio > adjustedHedgeTarget + config.hedgeRebalanceThreshold) {
+      if (coinHedgeRatio > adjustedHedgeTarget + adjustedRebalThreshold) {
         const excessHedgeUsd = coinShortUsd - coinTargetHedgeUsd;
 
         if (excessHedgeUsd > 10 && checkCooldown(cooldownKeyClose, config.hedgeCooldownMs)) {
@@ -1450,7 +1459,9 @@ export async function generateDecisions(
 
   // ── E) Polymarket prediction bets (using scout intel) ─────────────
   if (config.autoPolymarket && env.polymarketEnabled && state.polyHeadroomUsd >= 2) {
-    if (checkCooldown('POLY_BET', config.polyBetCooldownMs)) {
+    // Apply learned cooldown multiplier (slower if poorly calibrated, faster if well-calibrated)
+    const effectiveCooldown = config.polyBetCooldownMs * applyAdaptive(1.0, learned.polyCooldownMultiplier, conf);
+    if (checkCooldown('POLY_BET', effectiveCooldown)) {
       // Build scout context for probability estimation
       const scoutCtx = intel.scoutReceivedAt
         ? { cryptoBullish: intel.scoutBullish, btcAbove: undefined, relevantNarratives: intel.scoutNarratives ?? [] }
@@ -1477,8 +1488,8 @@ export async function generateDecisions(
           if (adjustedEdge < Math.max(0.03, effectiveMinEdge)) continue;
 
           // Cap to actual available balance — kelly reference bankroll is just for sizing math
-          // Apply learned bet-size multiplier (smaller if poor calibration)
-          const learnedBetUsd = opp.recommendedUsd * applyAdaptive(1.0, learned.polyBetSizeMultiplier, conf);
+          // Apply learned bet-size multiplier (smaller if poor calibration) + global risk
+          const learnedBetUsd = opp.recommendedUsd * applyAdaptive(1.0, learned.polyBetSizeMultiplier, conf) * globalRisk;
           const betUsd = Math.min(learnedBetUsd, state.polyHeadroomUsd, env.maxSingleBetUsd);
           if (betUsd < 1) continue;   // lowered from $2 — small wallet shouldn't kill all bets
 
@@ -1547,7 +1558,9 @@ export async function generateDecisions(
         : altMarketUsdcApy;
 
       const spreadPct = (estimatedDeployYield - borrowCost) * 100;
-      if (spreadPct >= (env.kaminoBorrowMinSpreadPct ?? 3)) {
+      // Apply learned Kamino spread floor (higher if actual yield < projected)
+      const effectiveMinSpread = applyAdaptive(env.kaminoBorrowMinSpreadPct ?? 3, learned.kaminoSpreadFloorMultiplier, conf);
+      if (spreadPct >= effectiveMinSpread) {
         const borrowUsd = Math.min(state.kaminoBorrowableUsd * 0.6, env.maxKaminoBorrowUsd * 0.5);
         if (borrowUsd >= 10) {
           const deployTarget = intel.scoutBullish && env.polymarketEnabled && state.polyHeadroomUsd >= borrowUsd
@@ -1585,9 +1598,10 @@ export async function generateDecisions(
       const borrowCostDiag = state.kaminoBorrowApy;
       const deployYieldDiag = altMarketUsdcApy ?? state.kaminoUsdcSupplyApy;
       const spreadDiag = (deployYieldDiag - borrowCostDiag) * 100;
-      if (spreadDiag < (env.kaminoBorrowMinSpreadPct ?? 3)) {
+      const diagMinSpread = applyAdaptive(env.kaminoBorrowMinSpreadPct ?? 3, learned.kaminoSpreadFloorMultiplier, conf);
+      if (spreadDiag < diagMinSpread) {
         logger.debug(
-          `[CFO:Decision] Section F skip: spread=${spreadDiag.toFixed(1)}% (supply=${(deployYieldDiag * 100).toFixed(1)}% - borrow=${(borrowCostDiag * 100).toFixed(1)}%) — need ≥${env.kaminoBorrowMinSpreadPct ?? 3}%`
+          `[CFO:Decision] Section F skip: spread=${spreadDiag.toFixed(1)}% (supply=${(deployYieldDiag * 100).toFixed(1)}% - borrow=${(borrowCostDiag * 100).toFixed(1)}%) — need ≥${diagMinSpread.toFixed(1)}%`
         );
       }
     }
@@ -1625,7 +1639,7 @@ export async function generateDecisions(
       const effectiveJitoApy = Math.max(state.kaminoJitoSupplyApy, jitoStakingYield);
       const loopSpread = effectiveJitoApy - state.kaminoSolBorrowApy;
       if (loopSpread > 0.01) { // need at least 1% spread
-        const targetLtv = (env.kaminoJitoLoopTargetLtv ?? 65) / 100;
+        const targetLtv = applyAdaptive((env.kaminoJitoLoopTargetLtv ?? 65) / 100, learned.kaminoLtvMultiplier, conf);
         const leverage = 1 / (1 - targetLtv);
         const estimatedApy = leverage * effectiveJitoApy - (leverage - 1) * state.kaminoSolBorrowApy;
         const jitoSolToCommit = jitoSolAvailable;
@@ -1657,7 +1671,7 @@ export async function generateDecisions(
       } else if (env.dryRun) {
         // ── Dry-run simulation: show what Kamino WOULD do if rates were favourable ──
         // This gives visibility into the full pipeline even when spread is negative.
-        const targetLtv = (env.kaminoJitoLoopTargetLtv ?? 65) / 100;
+        const targetLtv = applyAdaptive((env.kaminoJitoLoopTargetLtv ?? 65) / 100, learned.kaminoLtvMultiplier, conf);
         const leverage = 1 / (1 - targetLtv);
         const estimatedApy = leverage * effectiveJitoApy - (leverage - 1) * state.kaminoSolBorrowApy;
         const jitoSolToCommit = jitoSolAvailable;
@@ -1736,7 +1750,7 @@ export async function generateDecisions(
         needsSwap: boolean; // true if we need to swap SOL → LST first
       };
 
-      const targetLtv = (env.kaminoJitoLoopTargetLtv ?? 65) / 100;
+      const targetLtv = applyAdaptive((env.kaminoJitoLoopTargetLtv ?? 65) / 100, learned.kaminoLtvMultiplier, conf);
       const leverage = 1 / (1 - targetLtv);
       const solBorrowApy = apys.SOL?.borrowApy ?? state.kaminoSolBorrowApy;
 
@@ -2079,7 +2093,9 @@ export async function generateDecisions(
 
     // I2: Rebalance out-of-range or near-edge positions
     for (const pos of state.orcaPositions) {
-      if (!pos.inRange || pos.rangeUtilisationPct < env.orcaLpRebalanceTriggerPct) {
+      // Apply learned LP rebalance trigger (tighter if OOR rate high from learning)
+      const effectiveRebalTrigger = applyAdaptive(env.orcaLpRebalanceTriggerPct, learned.lpRebalanceTriggerMultiplier, conf);
+      if (!pos.inRange || pos.rangeUtilisationPct < effectiveRebalTrigger) {
         // Look up pool info from discovery cache for adaptive range calculation
         const poolInfo = pos.whirlpoolAddress
           ? await getPoolByAddress(pos.whirlpoolAddress).catch(() => null)
@@ -2305,13 +2321,15 @@ export async function generateDecisions(
       const arbMod   = await import('./evmArbService.ts');
       const ethPrice = intel.analystPrices?.['ETH']?.usd ?? 3000;
       const poolCount = arbMod.getCandidatePoolCount();
-      logger.debug(`[CFO:Decision] Section J: scanning ${poolCount} Arbitrum pools (ETH=$${ethPrice.toFixed(0)})...`);
+      // Apply learned arb min profit multiplier (higher if slippage eats profits)
+      const effectiveArbMinProfit = applyAdaptive(env.evmArbMinProfitUsdc ?? 2, learned.evmArbMinProfitMultiplier, conf);
+      logger.debug(`[CFO:Decision] Section J: scanning ${poolCount} Arbitrum pools (ETH=$${ethPrice.toFixed(0)}, minProfit=$${effectiveArbMinProfit.toFixed(2)})...`);
       const opp      = await arbMod.scanForOpportunity(ethPrice);
 
-      if (opp && opp.netProfitUsd >= (env.evmArbMinProfitUsdc ?? 2)) {
+      if (opp && opp.netProfitUsd >= effectiveArbMinProfit) {
         logger.info(
           `[CFO:Decision] Section J: 💡 ARB FOUND — ${opp.displayPair} net=$${opp.netProfitUsd.toFixed(3)} ` +
-          `(min=$${env.evmArbMinProfitUsdc ?? 2})`,
+          `(min=$${effectiveArbMinProfit.toFixed(2)}${learned.evmArbMinProfitMultiplier !== 1 ? ` [learned×${learned.evmArbMinProfitMultiplier.toFixed(2)}]` : ''})`,
         );
         decisions.push({
           type: 'EVM_FLASH_ARB',
@@ -2332,7 +2350,7 @@ export async function generateDecisions(
       } else if (opp) {
         logger.debug(
           `[CFO:Decision] Section J: opportunity found but below threshold — ` +
-          `${opp.displayPair} net=$${opp.netProfitUsd.toFixed(3)} < min=$${env.evmArbMinProfitUsdc ?? 2}`,
+          `${opp.displayPair} net=$${opp.netProfitUsd.toFixed(3)} < min=$${effectiveArbMinProfit.toFixed(2)}`,
         );
       } else {
         logger.debug(`[CFO:Decision] Section J: no profitable arb found this cycle (${poolCount} pools scanned)`);
@@ -2502,7 +2520,7 @@ export async function generateDecisions(
         e => e.hlListed && e.valueUsd >= config.hedgeMinSolExposureUsd,
       ).length;
       if (hedgeableCount === 0) diag.push('Hedge:no-eligible-assets');
-      else if (state.hedgeRatio >= adjustedHedgeTarget - config.hedgeRebalanceThreshold)
+      else if (state.hedgeRatio >= adjustedHedgeTarget - adjustedRebalThreshold)
         diag.push(`Hedge:OK(${(state.hedgeRatio * 100).toFixed(0)}%)`);
       else if (state.hlAvailableMargin < 10)
         diag.push(`Hedge:margin($${state.hlAvailableMargin.toFixed(0)})`);
