@@ -1984,112 +1984,11 @@ export async function generateDecisions(
   }
 
   // ── I) Orca Concentrated LP ───────────────────────────────────────────────
+  // NOTE: New LP positions are opened via Section K (KAMINO_BORROW_LP) which
+  // borrows USDC from Kamino rather than spending wallet SOL. Wallet SOL is
+  // reserved for staking (Section C) and the Kamino leverage loop (Section G).
+  // Section I only handles rebalancing existing positions.
   if (env.orcaLpEnabled && intel.marketCondition !== 'bearish' && intel.marketCondition !== 'danger') {
-    const orcaHeadroomUsd = Math.max(0, env.orcaLpMaxUsd - state.orcaLpValueUsd);
-
-    // I1: Open new position if we have capital and no active LP
-    if (
-      orcaHeadroomUsd >= 20 &&
-      state.orcaPositions.length === 0 &&
-      checkCooldown('ORCA_LP_OPEN', 2 * 3600_000)
-    ) {
-      // Dynamic pool selection — discovers and scores 50+ Orca pools from DeFiLlama + Orca API
-      const bestPair = await selectBestOrcaPairDynamic(intel);
-      // Reserve SOL for gas + token launches — never touch this for LP
-      const reserveSol = Math.max(config.stakeReserveSol, 0.3);
-      const solForLp = Math.max(0, state.solBalance - reserveSol);
-      const solAvailableUsd = solForLp * state.solPriceUsd;
-
-      if (solAvailableUsd < 10) {
-        logger.debug(`[CFO:Decision] ORCA_LP_OPEN skipped — insufficient SOL after reserve ($${solAvailableUsd.toFixed(2)} available, ${reserveSol} SOL reserved for launches)`);
-      } else {
-        // Available capital: wallet SOL minus reserve (can be swapped to either side) + existing USDC
-        const solCapitalUsd = solAvailableUsd * 0.8; // keep 20% buffer on top of reserve
-        const usdcCapitalUsd = state.solanaUsdcBalance;
-        const totalCapitalUsd = solCapitalUsd + usdcCapitalUsd;
-
-        // Build both LP sides from base capital. If tokenA isn't SOL, swap SOL→tokenA.
-        const deployUsd = Math.min(orcaHeadroomUsd, totalCapitalUsd);
-        if (deployUsd >= 20) {
-          const usdcSide = deployUsd / 2;
-          const tokenASideUsd = deployUsd / 2;
-
-          const tokenAPriceUsd =
-            bestPair.tokenA === 'SOL'
-              ? state.solPriceUsd
-              : (intel.analystPrices?.[bestPair.tokenA]?.usd ?? 1);
-          const tokenAAmount = tokenASideUsd / Math.max(tokenAPriceUsd, 1e-9);
-          const solSide = bestPair.tokenA === 'SOL' ? tokenAAmount : 0;
-
-          // USDC side funding: use wallet USDC first, then SOL→USDC for shortfall.
-          const usdcShortfall = Math.max(0, usdcSide - state.solanaUsdcBalance);
-          const needsSwapForUsdc = usdcShortfall > 1;
-          const solToSwapForUsdc = needsSwapForUsdc ? usdcShortfall / state.solPriceUsd : 0;
-
-          // tokenA side funding: if tokenA is not SOL, swap SOL→tokenA for full A-side.
-          const needsSwapForTokenA = bestPair.tokenA !== 'SOL' && tokenAAmount > 0;
-          const solToSwapForTokenA = needsSwapForTokenA ? tokenASideUsd / state.solPriceUsd : 0;
-          const totalSolToSwap = solToSwapForUsdc + solToSwapForTokenA;
-
-          const adaptiveRange = adaptiveLpRangeWidthPct(
-            bestPair.tokenA,
-            intel,
-            env.orcaLpRangeWidthPct,
-            learned,
-          );
-          const baseTokenChange = Math.abs(intel.analystPrices?.[bestPair.tokenA]?.change24h ?? 0);
-
-          const estApyStr = bestPair.apyBase7d > 0
-            ? `${bestPair.apyBase7d.toFixed(0)}% 7d-avg fee APY`
-            : '~15-25% est. fee APY';
-
-          decisions.push({
-            type: 'ORCA_LP_OPEN',
-            reasoning:
-              `Opening Orca ${bestPair.pair} concentrated LP: $${deployUsd.toFixed(0)} total ` +
-              `(range ±${adaptiveRange / 2}% — adaptive based on ${baseTokenChange.toFixed(0)}% 24h vol). ` +
-              (needsSwapForUsdc
-                ? `Auto-swap ${solToSwapForUsdc.toFixed(3)} SOL → $${usdcShortfall.toFixed(0)} USDC. `
-                : '') +
-              (needsSwapForTokenA
-                ? `Auto-swap ${solToSwapForTokenA.toFixed(3)} SOL → ${bestPair.tokenA} for LP A-side. `
-                : '') +
-              `Pool score: ${bestPair.score}/100 — ${bestPair.reasoning}. ` +
-              (bestPair.tvlUsd > 0 ? `TVL: $${(bestPair.tvlUsd / 1e6).toFixed(1)}M. ` : '') +
-              `${estApyStr} while in-range.`,
-            params: {
-              pair: bestPair.pair,
-              whirlpoolAddress: bestPair.whirlpoolAddress,
-              tokenA: bestPair.tokenA,
-              tokenB: bestPair.tokenB,
-              tokenAMint: bestPair.tokenAMint,
-              tokenBMint: bestPair.tokenBMint,
-              tokenADecimals: bestPair.tokenADecimals,
-              tokenBDecimals: bestPair.tokenBDecimals,
-              tickSpacing: bestPair.tickSpacing,
-              usdcAmount: usdcSide,
-              solAmount: solSide,
-              tokenAAmount,
-              rangeWidthPct: adaptiveRange,
-              needsSwap: needsSwapForUsdc || needsSwapForTokenA,
-              needsSwapForUsdc,
-              needsSwapForTokenA,
-              solToSwapForUsdc,
-              solToSwapForTokenA,
-              totalSolToSwap,
-            },
-            urgency: 'low',
-            estimatedImpactUsd: deployUsd * 0.18,
-            intelUsed: [
-              intel.guardianSnapshotAt ? 'guardian' : '',
-              intel.analystPricesAt ? 'analyst' : '',
-              intel.scoutReceivedAt ? 'scout' : '',
-            ].filter(Boolean),
-            tier: classifyTier('ORCA_LP_OPEN', 'low', deployUsd * 0.18, config, intel.marketCondition),
-          });
-        }
-      }
-    }
 
     // I2: Rebalance out-of-range or near-edge positions
     for (const pos of state.orcaPositions) {
@@ -2569,11 +2468,11 @@ export async function generateDecisions(
       else diag.push(`${loopLabel}:spread?`);
     }
 
-    // I: Orca LP
+    // I: Orca LP (new positions via Section K / Kamino borrow; this tracks rebalance only)
     if (env.orcaLpEnabled) {
       if (state.orcaPositions.length > 0) diag.push(`OrcaLP:active(${state.orcaPositions.length})`);
-      else if (!checkCooldown('ORCA_LP_OPEN', 2 * 3600_000)) diag.push('OrcaLP:cooldown');
-      else diag.push('OrcaLP:conditions?');
+      else if (env.kaminoBorrowLpEnabled) diag.push('OrcaLP:via-kamino-borrow(K)');
+      else diag.push('OrcaLP:needs-borrow-enable');
     }
 
     // I-bis: Krystal EVM LP
