@@ -18,9 +18,10 @@ import { logEngagement } from '../engagement-tracker.ts';
  * Searches for relevant tweets from target accounts and ecosystem keywords,
  * generates substantive data-backed replies, and posts them throughout the day.
  * 
- * Reads: If X_READ_BUDGET_USD is set, uses pay-per-use at $0.005/read (no hard cap).
- * Otherwise falls back to X_MONTHLY_READ_LIMIT hard cap (default 100).
- * Always checks canRead() before API calls and recordRead() after.
+ * Reads: X API bills per POST CONSUMED (~$0.015/post), NOT per API call.
+ * A search returning 5 tweets costs ~$0.075. Budget tracked via X_READ_BUDGET_USD.
+ * Always checks canReadMentions()/canReadSearch() before, and
+ * recordMentionRead()/recordSearchRead() after with actual post count.
  * 
  * Strategy: Search → Filter → Generate reply → Post → Track → Cooldown
  */
@@ -534,8 +535,8 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
   // Mentions
   if (doMentions && canReadMentions()) {
     try {
-      const mentions = await reader.getMentions(10);
-      await recordMentionRead();
+      const mentions = await reader.getMentions(5);
+      await recordMentionRead(mentions.length);  // Track ACTUAL posts consumed
       
       // ── Populate shared data (consumed by brand scheduler) ──
       sharedData.lastMentions = mentions;
@@ -585,7 +586,7 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
         }
         getHealthbeat()?.reportError({ errorType: 'X_READ_429', errorMessage: msg, severity: 'warning', context: { task: 'mentions_fetch' } }).catch(() => {});
       }
-      try { await recordMentionRead(); } catch {}
+      try { await recordMentionRead(0); } catch {}
     }
   } else if (doMentions) {
     const wait = mentionsCooldownRemaining();
@@ -598,8 +599,8 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
     if (queries.length > 0) {
       const query = queries[Math.floor(Math.random() * queries.length)];
       try {
-        const results = await reader.searchTweets(query, 10);
-        await recordSearchRead();
+        const results = await reader.searchTweets(query, 5);
+        await recordSearchRead(results.length);
         let newCount = 0;
         for (const t of results) {
           if (!state.repliedTweetIds.has(t.id)) {
@@ -625,7 +626,7 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
             logger.info(`[ReplyEngine] Search 429 — read backoff active, will retry next round`);
           }
         }
-        try { await recordSearchRead(); } catch {}
+        try { await recordSearchRead(0); } catch {}
       }
     }
   } else if (doSearch) {

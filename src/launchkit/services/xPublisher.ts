@@ -62,6 +62,8 @@ class StandaloneTwitterClient {
   private cachedUserId: string | null = null;
   private search403Logged = false;
   private mentions403Logged = false;
+  private creditsDepletedLogged = false;
+  private creditsDepletedUntil = 0;
 
   initialize(): boolean {
     const env = getEnv();
@@ -186,6 +188,8 @@ class StandaloneTwitterClient {
     createdAt?: string;
   }>> {
     if (!this.client) return [];
+    // Skip if credits depleted (backoff until reset time)
+    if (this.creditsDepletedUntil > Date.now()) return [];
     try {
       const results = await this.client.v2.search(query, {
         max_results: maxResults,
@@ -198,6 +202,16 @@ class StandaloneTwitterClient {
         createdAt: t.created_at,
       })) || [];
     } catch (error: any) {
+      // 402 = credits depleted — suppress until rate limit resets
+      if (error?.code === 402 || error?.data?.title === 'CreditsDepleted') {
+        const resetEpoch = error?.rateLimit?.reset || error?.headers?.['x-rate-limit-reset'];
+        this.creditsDepletedUntil = resetEpoch ? resetEpoch * 1000 : Date.now() + 15 * 60 * 1000;
+        if (!this.creditsDepletedLogged) {
+          logger.warn(`[StandaloneTwitter] X API credits depleted — suppressing read calls until ${new Date(this.creditsDepletedUntil).toISOString()}. Top up at developer.x.com`);
+          this.creditsDepletedLogged = true;
+        }
+        return [];
+      }
       // 403 = app not enrolled in a tier that supports search
       // Pay-per-use DOES support search — if you see this, check your X Developer Portal app settings
       if (error?.code === 403) {
@@ -226,6 +240,8 @@ class StandaloneTwitterClient {
     createdAt?: string;
   }>> {
     if (!this.client) return [];
+    // Skip if credits depleted (backoff until reset time)
+    if (this.creditsDepletedUntil > Date.now()) return [];
     try {
       // Cache user ID to avoid burning an API call every round
       if (!this.cachedUserId) {
@@ -244,6 +260,16 @@ class StandaloneTwitterClient {
         createdAt: t.created_at,
       })) || [];
     } catch (error: any) {
+      // 402 = credits depleted — suppress until rate limit resets
+      if (error?.code === 402 || error?.data?.title === 'CreditsDepleted') {
+        const resetEpoch = error?.rateLimit?.reset || error?.headers?.['x-rate-limit-reset'];
+        this.creditsDepletedUntil = resetEpoch ? resetEpoch * 1000 : Date.now() + 15 * 60 * 1000;
+        if (!this.creditsDepletedLogged) {
+          logger.warn(`[StandaloneTwitter] X API credits depleted — suppressing read calls until ${new Date(this.creditsDepletedUntil).toISOString()}. Top up at developer.x.com`);
+          this.creditsDepletedLogged = true;
+        }
+        return [];
+      }
       if (error?.code === 403) {
         if (!this.mentions403Logged) {
           logger.warn('[StandaloneTwitter] Mentions 403 — check X Developer Portal app access level (Pay-per-use supports mentions)');
@@ -303,6 +329,15 @@ class StandaloneTwitterClient {
       const detail = error?.data?.detail || error?.data?.title || error?.message || 'Unknown error';
       
       // Common Twitter error codes
+      if (code === 402 || error?.data?.title === 'CreditsDepleted') {
+        const resetEpoch = error?.rateLimit?.reset || error?.headers?.['x-rate-limit-reset'];
+        this.creditsDepletedUntil = resetEpoch ? resetEpoch * 1000 : Date.now() + 15 * 60 * 1000;
+        if (!this.creditsDepletedLogged) {
+          logger.warn(`[StandaloneTwitter] X API credits depleted — suppressing calls until ${new Date(this.creditsDepletedUntil).toISOString()}. Top up at developer.x.com`);
+          this.creditsDepletedLogged = true;
+        }
+        throw errorWithCode('X_CREDITS_DEPLETED', 'X API credits depleted — top up at developer.x.com');
+      }
       if (code === 403) {
         if (detail.includes('duplicate') || detail.includes('already posted')) {
           throw errorWithCode('X_DUPLICATE', 'Duplicate tweet - already posted similar content');

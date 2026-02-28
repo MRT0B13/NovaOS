@@ -127,7 +127,7 @@ const EnvSchema = z.object({
   TWITTER_ACCESS_TOKEN_SECRET: z.string().optional(),
   X_MONTHLY_WRITE_LIMIT: z.coerce.number().default(500),  // Free tier: 500 tweets/month
   X_MONTHLY_READ_LIMIT: z.coerce.number().default(100),   // Fallback hard cap (ignored if budget set)
-  X_READ_BUDGET_USD: z.coerce.number().default(0),        // Pay-per-use read budget in USD/month ($0.005/read). 0 = use hard cap instead.
+  X_READ_BUDGET_USD: z.coerce.number().default(0),        // Pay-per-use read budget in USD/month (~$0.015/post consumed). 0 = use hard cap instead.
   
   // ==========================================
   // X Reply Engine Configuration
@@ -136,8 +136,8 @@ const EnvSchema = z.object({
   X_REPLY_ENGINE_ENABLE: z.enum(['true', 'false']).default('false'),
   // Max replies per day (capped by write quota)
   X_REPLY_MAX_PER_DAY: z.coerce.number().default(10),
-  // Min interval between reply rounds (minutes) — 60m default keeps reads under ~30/mo
-  X_REPLY_INTERVAL_MINUTES: z.coerce.number().default(60),
+  // Min interval between reply rounds (minutes) — 120m keeps costs ~$1.50/day (5 posts/round × $0.015/post × 12 rounds)
+  X_REPLY_INTERVAL_MINUTES: z.coerce.number().default(120),
   // Reply engine target accounts (comma-separated handles without @)
   X_REPLY_TARGETS: z.string().default('pumpfun,DexScreener,JupiterExchange,elizaOS,RugCheckXYZ,aixbt_agent,solana,RaydiumProtocol,daboraio,jaboraiapp,shawmakesmagic'),
   // Reply engine search queries (comma-separated)

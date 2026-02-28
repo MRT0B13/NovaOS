@@ -15,7 +15,7 @@ import { logger } from '@elizaos/core';
 import { getHealthbeat } from '../health/singleton';
 import { PostgresScheduleRepository } from '../db/postgresScheduleRepository.ts';
 import { getTwitterReader } from './xPublisher.ts';
-import { canReadSearch } from './xRateLimiter.ts';
+import { canReadSearch, recordSearchRead } from './xRateLimiter.ts';
 
 // =========================================================================
 // Types
@@ -674,33 +674,29 @@ const PRIORITY_KOLS: KOLEntry[] = [
 /**
  * Topic-based search queries for social intelligence.
  * Each one runs through searchTweets() — catches tweets from ANY user.
- * More efficient than pulling individual timelines.
+ * COST WARNING: Each search returns up to 5 tweets. X API bills per post
+ * consumed (~$0.015/post), so each query costs ~$0.075.
+ * We limit to 6 high-value queries to keep costs manageable (~$0.45/cycle).
  * tag maps to the topic ID stored in nova_knowledge (prefixed with 'social_').
  */
 const INTEL_SEARCH_QUERIES: { query: string; tag: string }[] = [
-  // Ecosystem / meme platforms
-  { query: 'pump.fun OR pumpswap OR "bonding curve" graduation -is:retweet lang:en',   tag: 'ecosystem' },
-  { query: 'Solana "meme coin" OR memecoin launch -is:retweet lang:en',                tag: 'meme_meta' },
+  // Ecosystem (combined — broad query catches meme + launch activity)
+  { query: 'pump.fun OR pumpswap OR "bonding curve" OR memecoin launch Solana -is:retweet lang:en', tag: 'ecosystem' },
 
-  // Security
-  { query: 'Solana rug OR rugged OR scam -is:retweet lang:en',                         tag: 'security' },
+  // Security + Rug detection
+  { query: 'Solana rug OR rugged OR scam OR exploit -is:retweet lang:en',                          tag: 'security' },
 
-  // AI agents
-  { query: '"AI agent" crypto OR blockchain OR Solana -is:retweet lang:en',             tag: 'ai_agents' },
-  { query: 'ElizaOS OR ai16z OR "virtuals protocol" -is:retweet lang:en',              tag: 'ai_agents_eco' },
+  // AI agents (combined)
+  { query: '"AI agent" crypto OR ElizaOS OR ai16z OR "virtuals protocol" -is:retweet lang:en',      tag: 'ai_agents' },
 
-  // DeFi
-  { query: 'Solana TVL DeFi Jupiter OR Raydium -is:retweet lang:en',                   tag: 'defi_social' },
-  { query: 'restaking OR "liquid staking" Jito OR Marinade -is:retweet lang:en',        tag: 'staking_social' },
-  { query: 'Hyperliquid OR perps crypto -is:retweet lang:en',                           tag: 'perps_social' },
+  // DeFi (combined)
+  { query: 'Solana DeFi TVL Jupiter OR Raydium OR Jito OR Marinade -is:retweet lang:en',            tag: 'defi_social' },
 
-  // Macro
-  { query: 'Bitcoin ETF inflow OR outflow -is:retweet lang:en',                         tag: 'btc_etf_social' },
-  { query: 'SEC crypto regulation -is:retweet lang:en',                                 tag: 'regulation_social' },
+  // Perps + trading
+  { query: 'Hyperliquid OR perps crypto OR "perpetual futures" -is:retweet lang:en',                tag: 'perps_social' },
 
-  // Culture
-  { query: '"meme coin" meta OR narrative Solana -is:retweet lang:en',                  tag: 'culture_social' },
-  { query: 'airdrop crypto Solana 2026 -is:retweet lang:en',                            tag: 'airdrop_social' },
+  // Macro + sentiment
+  { query: 'Bitcoin ETF OR SEC crypto OR "meme coin" narrative -is:retweet lang:en',                tag: 'macro_social' },
 ];
 
 // =========================================================================
@@ -905,13 +901,16 @@ async function scanKOLs(): Promise<number> {
   const allTweets: Array<{ text: string; author: string; weight: number; tag: string }> = [];
 
   // === Phase A: Topic-based searches (efficient — one query catches many users) ===
+  // Each search returns up to 5 tweets (~$0.075 per query at $0.015/post).
+  // With 6 queries, a full cycle costs ~$0.45 in X credits.
   for (const { query, tag } of INTEL_SEARCH_QUERIES) {
     if (!canReadSearch()) {
       logger.debug('[NovaIntel] Read rate limited — stopping topic searches');
       break;
     }
     try {
-      const results = await reader.searchTweets(query, 10);
+      const results = await reader.searchTweets(query, 5);
+      await recordSearchRead(results.length);  // Track ACTUAL posts consumed
       for (const tweet of results) {
         allTweets.push({
           text: tweet.text,

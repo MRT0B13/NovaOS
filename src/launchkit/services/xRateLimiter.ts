@@ -5,11 +5,18 @@ import { PostgresScheduleRepository, type XUsageData } from '../db/postgresSched
 /**
  * X/Twitter Rate Limiter
  * 
- * Writes: Free tier (500/month, no charge)
- * Reads: Pay-per-use at $0.005/read. Set X_READ_BUDGET_USD to control monthly spend.
+ * Writes: Pay-per-use, ~$0.03 per tweet posted.
+ * Reads: Pay-per-use, billed per POST CONSUMED (each tweet returned by the API),
+ *        NOT per API call. A search returning 10 tweets = 10 posts consumed.
+ *        Approximate cost: ~$0.015 per post consumed.
+ *        Set X_READ_BUDGET_USD to control monthly spend.
  *        If X_READ_BUDGET_USD=0, falls back to X_MONTHLY_READ_LIMIT hard cap (default 100).
  * 
- * Example: X_READ_BUDGET_USD=5 → ~1000 reads/month → ~33 reads/day
+ * Example: X_READ_BUDGET_USD=5 → ~333 posts consumed/month → ~11 posts/day
+ *
+ * IMPORTANT: All callers (reply engine, KOL scanner, etc.) MUST call
+ * recordSearchRead() or recordMentionRead() after each API call so the
+ * budget tracker and cooldown clocks stay accurate.
  */
 
 // PostgreSQL support
@@ -48,9 +55,11 @@ let lastRead429At = 0;
 
 // Per-endpoint read tracking — cooldowns to avoid hammering the API.
 // PPU tier actual rate limits: 300/15min for both mentions and search.
-// We use conservative cooldowns to stay well within budget ($0.005/read).
-const PPU_MENTION_COOLDOWN_MS = 4 * 60 * 1000;   // 4 minutes (conservative, limit is 300/15min)
-const PPU_SEARCH_COOLDOWN_MS  = 1 * 60 * 1000;   // 1 minute  (conservative, limit is 300/15min)
+// However, billing is per POST CONSUMED (~$0.015/post), not per API call.
+// A search returning 10 tweets costs ~$0.15 per call. We use conservative
+// cooldowns to keep monthly spend manageable.
+const PPU_MENTION_COOLDOWN_MS = 15 * 60 * 1000;  // 15 minutes — mentions are expensive (10 posts each)
+const PPU_SEARCH_COOLDOWN_MS  = 10 * 60 * 1000;  // 10 minutes — search returns 10 posts (~$0.15 each call)
 const FREE_ENDPOINT_COOLDOWN_MS = 16 * 60 * 1000; // 16 minutes (1 per 15 min)
 let lastMentionReadAt = 0;
 let lastSearchReadAt  = 0;
@@ -230,25 +239,28 @@ function getWriteLimit(): number {
   return (env as any).X_MONTHLY_WRITE_LIMIT || 500;
 }
 
-const X_READ_COST_USD = 0.005; // $0.005 per read (X pay-per-use)
+// X API bills per POST CONSUMED (~$0.015/post). Each API call can return
+// multiple posts (up to max_results). We track "reads" as posts consumed,
+// not API calls, so that budget math is accurate.
+const X_POST_COST_USD = 0.015; // ~$0.015 per post consumed (X pay-per-use)
 
 function getReadLimit(): number {
   const env = getEnv();
   const budget = (env as any).X_READ_BUDGET_USD || 0;
   if (budget > 0) {
-    // Budget mode: derive max reads from dollar budget
-    return Math.floor(budget / X_READ_COST_USD);
+    // Budget mode: derive max posts consumed from dollar budget
+    return Math.floor(budget / X_POST_COST_USD);
   }
   // Fallback: hard cap (old free-tier style)
   return (env as any).X_MONTHLY_READ_LIMIT || 100;
 }
 
 /**
- * Get current read spend in USD this month
+ * Get current read spend in USD this month (based on posts consumed)
  */
 export function getReadSpendUsd(): number {
   resetIfNewMonth();
-  return usageData.reads * X_READ_COST_USD;
+  return usageData.reads * X_POST_COST_USD;
 }
 
 /**
@@ -389,11 +401,11 @@ export function getUsageSummary(): string {
   if (quota.writes.remaining <= 0) status = '❌';
   
   const readLine = isPayPerUseReads()
-    ? `📖 Reads: ${quota.reads.used} ($${getReadSpendUsd().toFixed(2)} / $${((getEnv() as any).X_READ_BUDGET_USD || 0).toFixed(2)} budget)`
-    : `📖 Reads: ${quota.reads.used}/${quota.reads.limit} (${readPct}% used)`;
+    ? `📖 Posts consumed: ${quota.reads.used} (~$${getReadSpendUsd().toFixed(2)} / $${((getEnv() as any).X_READ_BUDGET_USD || 0).toFixed(2)} budget)`
+    : `📖 Posts consumed: ${quota.reads.used}/${quota.reads.limit} (${readPct}% used)`;
   
   return `${status} X/Twitter Usage (${quota.month}):
-📝 Tweets: ${quota.writes.used}/${quota.writes.limit} (${writePct}% used, ${quota.writes.remaining} remaining) [FREE]
+📝 Tweets: ${quota.writes.used}/${quota.writes.limit} (${writePct}% used, ${quota.writes.remaining} remaining)
 ${readLine}
 ${quota.lastWrite ? `Last tweet: ${new Date(quota.lastWrite).toLocaleString()}` : 'No tweets this month'}`;
 }
@@ -502,22 +514,32 @@ export function searchCooldownRemaining(): number {
   return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
 }
 
-/** Record a mentions read — sets the cooldown clock */
-export async function recordMentionRead(): Promise<void> {
+/**
+ * Record a mentions read — sets the cooldown clock.
+ * @param postsConsumed Number of tweets actually returned (default 10)
+ */
+export async function recordMentionRead(postsConsumed = 10): Promise<void> {
   lastMentionReadAt = Date.now();
   readConsecutive429Count = 0; // Successful read — reset backoff
-  await recordRead();
+  // Record each post consumed individually for accurate budget tracking
+  for (let i = 0; i < postsConsumed; i++) await recordRead();
   const cdMin = (getMentionCooldownMs() / 60000).toFixed(0);
-  logger.info(`[X-RateLimiter] Mentions read recorded. Next allowed in ${cdMin}m`);
+  const cost = (postsConsumed * X_POST_COST_USD).toFixed(3);
+  logger.info(`[X-RateLimiter] Mentions read: ${postsConsumed} posts consumed (~$${cost}). Next in ${cdMin}m`);
 }
 
-/** Record a search read — sets the cooldown clock */
-export async function recordSearchRead(): Promise<void> {
+/**
+ * Record a search read — sets the cooldown clock.
+ * @param postsConsumed Number of tweets actually returned (default 10)
+ */
+export async function recordSearchRead(postsConsumed = 10): Promise<void> {
   lastSearchReadAt = Date.now();
   readConsecutive429Count = 0; // Successful read — reset backoff
-  await recordRead();
-  const cdMin = (getSearchCooldownMs() / 60000).toFixed(1);
-  logger.info(`[X-RateLimiter] Search read recorded. Next allowed in ${cdMin}m`);
+  // Record each post consumed individually for accurate budget tracking
+  for (let i = 0; i < postsConsumed; i++) await recordRead();
+  const cdMin = (getSearchCooldownMs() / 60000).toFixed(0);
+  const cost = (postsConsumed * X_POST_COST_USD).toFixed(3);
+  logger.info(`[X-RateLimiter] Search read: ${postsConsumed} posts consumed (~$${cost}). Next in ${cdMin}m`);
 }
 
 /**
