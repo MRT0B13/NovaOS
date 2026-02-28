@@ -61,18 +61,6 @@ const SWAP_ROUTER_02 = '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45';
 // Avalanche(43114), zkSync(324), Scroll(534352), Linea(59144)
 const KRYSTAL_LP_CHAINS = new Set([1, 10, 56, 137, 8453, 42161, 43114, 324, 534352, 59144]);
 
-// Krystal V3Utils contract addresses per chain (single-token → LP zap)
-// Placeholder addresses — replace with actual V3Utils contract when known per chain
-const KRYSTAL_V3UTILS: Record<number, string> = {
-  // Will be populated when Krystal publishes V3Utils addresses per chain
-  // 42161: '0x...', // Arbitrum
-  // 8453:  '0x...', // Base
-};
-
-const V3UTILS_ABI = [
-  'function swapAndMint((address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint256 amount0, uint256 amount1, address recipient, uint256 deadline, bytes swapData0, bytes swapData1)) external returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
-];
-
 // ============================================================================
 // Types
 // ============================================================================
@@ -935,29 +923,73 @@ export async function openEvmLpPosition(
     const maxToken0 = BigInt(Math.floor((halfUsd / usdPerToken0) * (10 ** dec0)));
     const maxToken1 = BigInt(Math.floor((halfUsd / usdPerToken1) * (10 ** dec1)));
 
-    const amount0Desired = bal0 < maxToken0 ? bal0 : maxToken0;
-    const amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
+    let amount0Desired = bal0 < maxToken0 ? bal0 : maxToken0;
+    let amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
 
     logger.info(`[Krystal] Deploy cap: $${deployUsd} → token0 max=${ethers.formatUnits(maxToken0, dec0)} (have ${ethers.formatUnits(bal0, dec0)}), token1 max=${ethers.formatUnits(maxToken1, dec1)} (have ${ethers.formatUnits(bal1, dec1)})`);
 
-    // If both balances are zero, we can't open
-    if (amount0Desired === BigInt(0) && amount1Desired === BigInt(0)) {
-      return { success: false, error: 'No token0 or token1 balance on target chain' };
+    // 5. Self-zap: if we only have one pool token, swap half into the other
+    //    Replicates Krystal/V3Utils `swapAndMint` logic without needing their
+    //    contract addresses or 0x API calldata. For our position sizes the
+    //    2-tx approach (swap → mint) is functionally identical to an atomic zap.
+    if (amount0Desired > BigInt(0) && amount1Desired === BigInt(0)) {
+      // Have token0 only → swap half into token1
+      logger.info(`[Krystal] Zap: only have ${pool.token0.symbol} — swapping half into ${pool.token1.symbol}`);
+      try {
+        const swap = await import('./evmSwapService.ts');
+        const halfAmt0 = amount0Desired / BigInt(2);
+        const halfUsdVal = Number(ethers.formatUnits(halfAmt0, dec0)) * usdPerToken0;
+        if (halfUsdVal > 0.5) {
+          const quote = await swap.quoteEvmSwap(chainNumericId, pool.token0.address, pool.token1.address, halfUsdVal, pool.feeTier);
+          if (quote && quote.priceImpactPct > 3) {
+            logger.warn(`[Krystal] Zap swap impact ${quote.priceImpactPct.toFixed(1)}% > 3% — skipping zap`);
+          } else {
+            const res = await swap.executeEvmSwap(chainNumericId, pool.token0.address, pool.token1.address, halfUsdVal, pool.feeTier);
+            if (res.success) logger.info(`[Krystal] Zap: $${halfUsdVal.toFixed(2)} ${pool.token0.symbol} → ${pool.token1.symbol}`);
+          }
+        }
+      } catch (err) { logger.warn('[Krystal] Zap swap failed (non-fatal):', err); }
+
+      // Re-read balances + recalculate
+      [bal0, bal1] = await Promise.all([
+        token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+        token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      ]);
+      amount0Desired = bal0 < maxToken0 ? bal0 : maxToken0;
+      amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
+      logger.info(`[Krystal] Post-zap: ${pool.token0.symbol}=${ethers.formatUnits(amount0Desired, dec0)}, ${pool.token1.symbol}=${ethers.formatUnits(amount1Desired, dec1)}`);
+
+    } else if (amount1Desired > BigInt(0) && amount0Desired === BigInt(0)) {
+      // Have token1 only → swap half into token0
+      logger.info(`[Krystal] Zap: only have ${pool.token1.symbol} — swapping half into ${pool.token0.symbol}`);
+      try {
+        const swap = await import('./evmSwapService.ts');
+        const halfAmt1 = amount1Desired / BigInt(2);
+        const halfUsdVal = Number(ethers.formatUnits(halfAmt1, dec1)) * usdPerToken1;
+        if (halfUsdVal > 0.5) {
+          const quote = await swap.quoteEvmSwap(chainNumericId, pool.token1.address, pool.token0.address, halfUsdVal, pool.feeTier);
+          if (quote && quote.priceImpactPct > 3) {
+            logger.warn(`[Krystal] Zap swap impact ${quote.priceImpactPct.toFixed(1)}% > 3% — skipping zap`);
+          } else {
+            const res = await swap.executeEvmSwap(chainNumericId, pool.token1.address, pool.token0.address, halfUsdVal, pool.feeTier);
+            if (res.success) logger.info(`[Krystal] Zap: $${halfUsdVal.toFixed(2)} ${pool.token1.symbol} → ${pool.token0.symbol}`);
+          }
+        }
+      } catch (err) { logger.warn('[Krystal] Zap swap failed (non-fatal):', err); }
+
+      // Re-read balances + recalculate
+      [bal0, bal1] = await Promise.all([
+        token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+        token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      ]);
+      amount0Desired = bal0 < maxToken0 ? bal0 : maxToken0;
+      amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
+      logger.info(`[Krystal] Post-zap: ${pool.token0.symbol}=${ethers.formatUnits(amount0Desired, dec0)}, ${pool.token1.symbol}=${ethers.formatUnits(amount1Desired, dec1)}`);
     }
 
-    // 5. Try V3Utils zap path if available (single-token → LP)
-    const v3UtilsAddr = KRYSTAL_V3UTILS[chainNumericId];
-    if (v3UtilsAddr && (amount0Desired === BigInt(0) || amount1Desired === BigInt(0))) {
-      try {
-        const result = await openViaV3UtilsZap(
-          ethers, wallet, provider, v3UtilsAddr,
-          pool, tickLower, tickUpper,
-          amount0Desired, amount1Desired,
-        );
-        if (result) return result;
-      } catch (err) {
-        logger.warn('[Krystal] V3Utils zap failed, falling back to NFPM mint:', err);
-      }
+    // After zap attempt, if both are still zero, nothing we can do
+    if (amount0Desired === BigInt(0) && amount1Desired === BigInt(0)) {
+      return { success: false, error: 'No token0 or token1 balance on target chain (even after zap attempt)' };
     }
 
     // 6. Gas estimate check — skip if gas > 5% of deployUsd
@@ -1051,74 +1083,6 @@ export async function openEvmLpPosition(
     logger.error('[Krystal] openEvmLpPosition error:', err);
     return { success: false, error: (err as Error).message };
   }
-}
-
-/**
- * Open LP position via Krystal V3Utils zap (single-token → LP).
- * Returns result if successful, null if V3Utils not available or failed.
- */
-async function openViaV3UtilsZap(
-  ethers: typeof import('ethers'),
-  wallet: any,
-  provider: any,
-  v3UtilsAddr: string,
-  pool: { token0: KrystalPoolToken; token1: KrystalPoolToken; feeTier: number },
-  tickLower: number,
-  tickUpper: number,
-  amount0: bigint,
-  amount1: bigint,
-): Promise<EvmLpOpenResult | null> {
-  const v3Utils = new ethers.Contract(v3UtilsAddr, V3UTILS_ABI, wallet);
-
-  // Approve whichever token we have for v3Utils
-  if (amount0 > BigInt(0)) {
-    const token0 = new ethers.Contract(pool.token0.address, ERC20_ABI, wallet);
-    const allowance = await token0.allowance(wallet.address, v3UtilsAddr);
-    if (allowance < amount0) {
-      const tx = await token0.approve(v3UtilsAddr, ethers.MaxUint256);
-      await tx.wait();
-    }
-  }
-  if (amount1 > BigInt(0)) {
-    const token1 = new ethers.Contract(pool.token1.address, ERC20_ABI, wallet);
-    const allowance = await token1.allowance(wallet.address, v3UtilsAddr);
-    if (allowance < amount1) {
-      const tx = await token1.approve(v3UtilsAddr, ethers.MaxUint256);
-      await tx.wait();
-    }
-  }
-
-  const deadline = Math.floor(Date.now() / 1000) + 600;
-  const tx = await v3Utils.swapAndMint({
-    token0: pool.token0.address,
-    token1: pool.token1.address,
-    fee: pool.feeTier,
-    tickLower,
-    tickUpper,
-    amount0,
-    amount1,
-    recipient: wallet.address,
-    deadline,
-    swapData0: '0x', // V3Utils auto-routes internally
-    swapData1: '0x',
-  });
-
-  const receipt = await tx.wait();
-  // Parse tokenId from logs
-  let tokenId: string | undefined;
-  const nfpmIface = new ethers.Interface(NFPM_ABI);
-  for (const log of receipt.logs) {
-    try {
-      const parsed = nfpmIface.parseLog({ topics: log.topics as string[], data: log.data });
-      if (parsed?.name === 'IncreaseLiquidity' || parsed?.name === 'Transfer') {
-        tokenId = parsed.args?.tokenId?.toString();
-        if (tokenId) break;
-      }
-    } catch { /* skip */ }
-  }
-
-  logger.info(`[Krystal] V3Utils zap success: tokenId=${tokenId} tx=${receipt.hash}`);
-  return { success: true, tokenId: tokenId ?? `zap-${receipt.hash.slice(0, 12)}`, txHash: receipt.hash };
 }
 
 // ============================================================================
