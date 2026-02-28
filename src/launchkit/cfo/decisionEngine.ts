@@ -413,7 +413,7 @@ export function getCooldownState(): Record<string, number> {
 
 /** Restore cooldown state from DB on restart — skip entries older than the longest cooldown */
 export function restoreCooldownState(saved: Record<string, number>): void {
-  const maxCooldownMs = 6 * 3600_000; // longest cooldown is 6h (stake)
+  const maxCooldownMs = 24 * 3600_000; // longest cooldown to honor on restart (24h covers all)
   const now = Date.now();
   for (const [type, ts] of Object.entries(saved)) {
     if (typeof ts === 'number' && now - ts < maxCooldownMs) {
@@ -2206,7 +2206,7 @@ export async function generateDecisions(
       state.evmTotalUsdcAllChains >= 20 &&
       state.evmLpPositions.length < env.krystalLpMaxPositions &&
       intel.marketCondition !== 'bearish' &&
-      checkCooldown('KRYSTAL_LP_OPEN', 12 * 3600_000)
+      checkCooldown('KRYSTAL_LP_OPEN', 4 * 3600_000)
     ) {
       try {
         const krystal = await import('./krystalService.ts');
@@ -2582,7 +2582,7 @@ export async function generateDecisions(
       else if (state.evmTotalUsdcAllChains < 20) diag.push(`KrystalLP:low-usdc($${state.evmTotalUsdcAllChains.toFixed(0)})`);
       else if (state.evmLpPositions.length >= env.krystalLpMaxPositions) diag.push(`KrystalLP:max-pos(${state.evmLpPositions.length})`);
       else if (intel.marketCondition === 'bearish') diag.push('KrystalLP:bearish');
-      else if (!checkCooldown('KRYSTAL_LP_OPEN', 12 * 3600_000)) diag.push('KrystalLP:cooldown');
+      else if (!checkCooldown('KRYSTAL_LP_OPEN', 4 * 3600_000)) diag.push('KrystalLP:cooldown');
       else if (state.evmLpPositions.length > 0) diag.push(`KrystalLP:active(${state.evmLpPositions.length})`);
       else diag.push('KrystalLP:conditions?');
     }
