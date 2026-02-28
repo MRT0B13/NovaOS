@@ -2898,21 +2898,56 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       case 'KAMINO_JITO_LOOP': {
         const kamino = await import('./kaminoService.ts');
         const { jitoSolToDeposit, needsStakeFirst, targetLtv, maxLoops, solPriceUsd } = decision.params;
+        let actualJitoSolToDeposit = jitoSolToDeposit;
 
         // If bootstrapping from wallet SOL: stake it first to get JitoSOL, then loop
         if (needsStakeFirst) {
           const jito = await import('./jitoStakingService.ts');
-          const stakeResult = await jito.stakeSol(jitoSolToDeposit);
+
+          // Pre-check: earlier decisions (e.g. AUTO_STAKE) may have already consumed
+          // some wallet SOL. Re-check actual balance before attempting to stake.
+          let solToStake = jitoSolToDeposit;
+          try {
+            const jupMod = await import('./jupiterService.ts');
+            const freshSol = await jupMod.getTokenBalance(jupMod.MINTS.SOL);
+            const reserveSol = 0.3; // always keep gas reserve
+            const availableSol = Math.max(0, freshSol - reserveSol);
+            if (availableSol < 0.05) {
+              return { ...base, executed: true, success: false, error: `Insufficient SOL for pre-loop stake: ${freshSol.toFixed(4)} SOL (reserve ${reserveSol})` };
+            }
+            if (availableSol < solToStake) {
+              logger.info(`[CFO] Pre-loop stake adjusted: ${solToStake.toFixed(4)} → ${availableSol.toFixed(4)} SOL (wallet balance changed)`);
+              solToStake = availableSol;
+            }
+          } catch (err) {
+            logger.warn(`[CFO] Could not pre-check SOL balance for loop stake: ${err}`);
+          }
+
+          const stakeResult = await jito.stakeSol(solToStake);
           if (!stakeResult.success) {
             return { ...base, executed: true, success: false, error: `Pre-loop stake failed: ${stakeResult.error}` };
           }
-          logger.info(`[CFO] Pre-loop stake: ${jitoSolToDeposit.toFixed(4)} SOL → JitoSOL | tx: ${stakeResult.txSignature}`);
+          logger.info(`[CFO] Pre-loop stake: ${solToStake.toFixed(4)} SOL → JitoSOL | tx: ${stakeResult.txSignature}`);
           // Brief wait for stake to settle
           await new Promise(r => setTimeout(r, 3000));
+
+          // Re-check actual JitoSOL balance — staking exchange rate means
+          // we get fewer JitoSOL than SOL we staked (currently ~1:0.88).
+          // Using the stale pre-computed amount would cause "insufficient balance".
+          try {
+            const { getStakePosition } = await import('./jitoStakingService.ts');
+            const pos = await getStakePosition(solPriceUsd);
+            if (pos.jitoSolBalance > 0) {
+              actualJitoSolToDeposit = pos.jitoSolBalance * 0.98; // leave tiny buffer
+              logger.info(`[CFO] Post-stake JitoSOL balance: ${pos.jitoSolBalance.toFixed(4)}, depositing ${actualJitoSolToDeposit.toFixed(4)}`);
+            }
+          } catch (err) {
+            logger.warn(`[CFO] Could not re-check JitoSOL balance, using computed: ${jitoSolToDeposit.toFixed(4)}`);
+          }
         }
 
         // Step 1: Deposit initial JitoSOL as collateral
-        const depositResult = await kamino.deposit('JitoSOL', jitoSolToDeposit);
+        const depositResult = await kamino.deposit('JitoSOL', actualJitoSolToDeposit);
         if (!depositResult.success) {
           return { ...base, executed: true, success: false, error: `Initial JitoSOL deposit failed: ${depositResult.error}` };
         }
