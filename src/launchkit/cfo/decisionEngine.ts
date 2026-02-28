@@ -2519,6 +2519,17 @@ export async function generateDecisions(
       else diag.push('OrcaLP:conditions?');
     }
 
+    // I-bis: Krystal EVM LP
+    if (env.krystalLpEnabled) {
+      if (intel.marketCondition === 'danger') diag.push('KrystalLP:danger');
+      else if (state.evmTotalUsdcAllChains < 20) diag.push(`KrystalLP:low-usdc($${state.evmTotalUsdcAllChains.toFixed(0)})`);
+      else if (state.evmLpPositions.length >= env.krystalLpMaxPositions) diag.push(`KrystalLP:max-pos(${state.evmLpPositions.length})`);
+      else if (intel.marketCondition === 'bearish') diag.push('KrystalLP:bearish');
+      else if (!checkCooldown('KRYSTAL_LP_OPEN', 12 * 3600_000)) diag.push('KrystalLP:cooldown');
+      else if (state.evmLpPositions.length > 0) diag.push(`KrystalLP:active(${state.evmLpPositions.length})`);
+      else diag.push('KrystalLP:conditions?');
+    }
+
     // J: Arb
     if (env.evmArbEnabled) diag.push('Arb:no-opportunity');
 
@@ -3394,7 +3405,8 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
     `kaminoDeposits:$${state.kaminoDepositValueUsd.toFixed(0)} borrowable:$${state.kaminoBorrowableUsd.toFixed(0)} health:${state.kaminoHealthFactor === 999 ? 'none' : state.kaminoHealthFactor.toFixed(2)} | ` +
     `jitoSOL:${state.jitoSolBalance.toFixed(4)} idleSOL:${state.idleSolForStaking.toFixed(4)} | ` +
     `orcaPositions:${state.orcaPositions.length} orcaValue:$${state.orcaLpValueUsd.toFixed(0)} | ` +
-    `polyUSDC:$${state.polyUsdcBalance.toFixed(0)} polyHeadroom:$${state.polyHeadroomUsd.toFixed(0)}`
+    `polyUSDC:$${state.polyUsdcBalance.toFixed(0)} polyHeadroom:$${state.polyHeadroomUsd.toFixed(0)} | ` +
+    `evmLPs:${state.evmLpPositions.length} evmLPval:$${state.evmLpTotalValueUsd.toFixed(0)} evmUSDC:$${state.evmTotalUsdcAllChains.toFixed(0)}`
   );
 
   // 1.5. Hydrate EVM arb profit from DB (survives process restarts)

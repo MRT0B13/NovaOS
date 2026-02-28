@@ -1489,6 +1489,11 @@ export class CFOAgent extends BaseAgent {
     if (env.jitoEnabled) services.push('jito');
     if (env.heliusEnabled) services.push('helius');
     if (env.x402Enabled) services.push('x402');
+    if (env.orcaLpEnabled) services.push('orca-lp');
+    if (env.krystalLpEnabled) services.push('krystal-lp');
+    if (env.wormholeEnabled) services.push('wormhole');
+    if (env.lifiEnabled) services.push('lifi');
+    if (env.evmArbEnabled) services.push('evm-arb');
 
     const pending = this.pendingApprovals.size;
     const intel = this.scoutIntel

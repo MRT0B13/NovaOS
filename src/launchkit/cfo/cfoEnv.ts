@@ -132,10 +132,56 @@ function isValidEvmKey(key: string | undefined): boolean {
   return !!key && key.startsWith('0x') && key.length === 66;
 }
 
-/** Parse CFO_EVM_RPC_URLS JSON env var into Record<number, string>.
- *  Also merges legacy CFO_POLYGON_RPC_URL and CFO_ARBITRUM_RPC_URL as fallbacks. */
+/** Alchemy chain slug → numeric chainId mapping.
+ *  All these chains use the pattern: https://{slug}.g.alchemy.com/v2/{KEY} */
+const ALCHEMY_CHAINS: Record<string, number> = {
+  'eth-mainnet':     1,
+  'opt-mainnet':     10,
+  'polygon-mainnet': 137,
+  'arb-mainnet':     42161,
+  'base-mainnet':    8453,
+  'zksync-mainnet':  324,
+  'scroll-mainnet':  534352,
+  'linea-mainnet':   59144,
+};
+
+/** Free public RPCs for chains Alchemy doesn't support */
+const PUBLIC_FALLBACK_RPCS: Record<number, string> = {
+  56:    'https://bsc-dataseed1.binance.org',   // BSC
+  43114: 'https://api.avax.network/ext/bc/C/rpc', // Avalanche
+  250:   'https://rpc.ftm.tools',                // Fantom
+};
+
+/** Build EVM RPC URL map. Priority (highest first):
+ *  1. CFO_EVM_RPC_URLS explicit JSON overrides
+ *  2. Legacy CFO_POLYGON_RPC_URL / CFO_ARBITRUM_RPC_URL
+ *  3. Auto-generated from CFO_ALCHEMY_API_KEY (all Alchemy-supported chains)
+ *  4. Free public RPCs for BSC, Avalanche, Fantom */
 function parseEvmRpcUrls(): Record<number, string> {
   const result: Record<number, string> = {};
+
+  // Layer 4: Public fallback RPCs (lowest priority)
+  for (const [chainId, url] of Object.entries(PUBLIC_FALLBACK_RPCS)) {
+    result[Number(chainId)] = url;
+  }
+
+  // Layer 3: Auto-generate from Alchemy API key
+  const alchemyKey = process.env.CFO_ALCHEMY_API_KEY;
+  if (alchemyKey) {
+    for (const [slug, chainId] of Object.entries(ALCHEMY_CHAINS)) {
+      result[chainId] = `https://${slug}.g.alchemy.com/v2/${alchemyKey}`;
+    }
+  }
+
+  // Layer 2: Legacy polygon/arbitrum RPC URLs
+  if (process.env.CFO_POLYGON_RPC_URL) {
+    result[137] = process.env.CFO_POLYGON_RPC_URL;
+  }
+  if (process.env.CFO_ARBITRUM_RPC_URL) {
+    result[42161] = process.env.CFO_ARBITRUM_RPC_URL;
+  }
+
+  // Layer 1: Explicit JSON overrides (highest priority)
   const raw = process.env.CFO_EVM_RPC_URLS;
   if (raw) {
     try {
@@ -145,13 +191,7 @@ function parseEvmRpcUrls(): Record<number, string> {
       }
     } catch { /* ignore malformed JSON */ }
   }
-  // Merge legacy polygon/arbitrum RPC URLs (lower priority than explicit map)
-  if (!result[137] && process.env.CFO_POLYGON_RPC_URL) {
-    result[137] = process.env.CFO_POLYGON_RPC_URL;
-  }
-  if (!result[42161] && process.env.CFO_ARBITRUM_RPC_URL) {
-    result[42161] = process.env.CFO_ARBITRUM_RPC_URL;
-  }
+
   return result;
 }
 
