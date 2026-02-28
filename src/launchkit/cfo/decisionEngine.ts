@@ -39,6 +39,7 @@
 
 import { logger } from '@elizaos/core';
 import { getCFOEnv, type CFOEnv } from './cfoEnv.ts';
+import { refreshLearning, getAdaptiveParams, applyAdaptive, formatLearningSummary, setLearningPool, type AdaptiveParams } from './learningEngine.ts';
 
 // ============================================================================
 // Constants
@@ -974,23 +975,29 @@ function adaptiveLpRangeWidthPct(
   tokenSymbol: string,
   intel: SwarmIntel,
   baseWidthPct: number,
+  learned?: AdaptiveParams,
 ): number {
+  // Apply learned LP range multiplier (wider if high OOR rate, tighter if profitable)
+  const learnedBase = learned
+    ? applyAdaptive(baseWidthPct, learned.lpRangeWidthMultiplier, learned.confidenceLevel)
+    : baseWidthPct;
+
   // Gate: if analyst prices are stale (>6h), don't tighten range — use default width
   const STALE_MS = 6 * 3600_000;
   if (!intel.analystPricesAt || Date.now() - intel.analystPricesAt > STALE_MS) {
-    return baseWidthPct; // stale or missing — safe default
+    return learnedBase; // stale or missing — safe default
   }
 
   const analystPrice = intel.analystPrices?.[tokenSymbol];
-  if (!analystPrice) return baseWidthPct;
+  if (!analystPrice) return learnedBase;
 
   const absChange = Math.abs(analystPrice.change24h ?? 0);
 
-  if (absChange > 15) return Math.min(baseWidthPct * 2.0, 60);  // very volatile: ±30% max
-  if (absChange > 10) return Math.min(baseWidthPct * 1.5, 40);  // volatile: ±20%
-  if (absChange > 5)  return baseWidthPct;                       // normal: use configured width
-  if (absChange > 2)  return Math.max(baseWidthPct * 0.75, 10); // calm: tighten to ±7.5%
-  return Math.max(baseWidthPct * 0.5, 8);                        // very calm: ±5-6% for max fees
+  if (absChange > 15) return Math.min(learnedBase * 2.0, 60);  // very volatile: ±30% max
+  if (absChange > 10) return Math.min(learnedBase * 1.5, 40);  // volatile: ±20%
+  if (absChange > 5)  return learnedBase;                       // normal: use configured width
+  if (absChange > 2)  return Math.max(learnedBase * 0.75, 10); // calm: tighten to ±7.5%
+  return Math.max(learnedBase * 0.5, 8);                        // very calm: ±5-6% for max fees
 }
 
 /**
@@ -1002,22 +1009,28 @@ function adaptiveLpRangeWidthTicks(
   tokenSymbol: string,
   intel: SwarmIntel,
   baseWidthTicks: number,
+  learned?: AdaptiveParams,
 ): number {
+  // Apply learned LP range multiplier
+  const learnedBase = learned
+    ? applyAdaptive(baseWidthTicks, learned.lpRangeWidthMultiplier, learned.confidenceLevel)
+    : baseWidthTicks;
+
   const STALE_MS = 6 * 3600_000;
   if (!intel.analystPricesAt || Date.now() - intel.analystPricesAt > STALE_MS) {
-    return baseWidthTicks;
+    return learnedBase;
   }
 
   const analystPrice = intel.analystPrices?.[tokenSymbol];
-  if (!analystPrice) return baseWidthTicks;
+  if (!analystPrice) return learnedBase;
 
   const absChange = Math.abs(analystPrice.change24h ?? 0);
 
-  if (absChange > 15) return Math.min(baseWidthTicks * 2.0, 2000); // very volatile
-  if (absChange > 10) return Math.min(baseWidthTicks * 1.5, 1200);  // volatile
-  if (absChange > 5)  return baseWidthTicks;                        // normal
-  if (absChange > 2)  return Math.max(baseWidthTicks * 0.75, 200); // calm
-  return Math.max(baseWidthTicks * 0.5, 150);                        // very calm
+  if (absChange > 15) return Math.min(learnedBase * 2.0, 2000); // very volatile
+  if (absChange > 10) return Math.min(learnedBase * 1.5, 1200);  // volatile
+  if (absChange > 5)  return learnedBase;                        // normal
+  if (absChange > 2)  return Math.max(learnedBase * 0.75, 200); // calm
+  return Math.max(learnedBase * 0.5, 150);                        // very calm
 }
 
 /**
@@ -1226,13 +1239,17 @@ export async function generateDecisions(
   config: DecisionConfig,
   env: CFOEnv,
   intel: SwarmIntel = { riskMultiplier: 1.0, marketCondition: 'neutral' },
+  learned: AdaptiveParams = getAdaptiveParams(),
 ): Promise<Decision[]> {
   const decisions: Decision[] = [];
+  const conf = learned.confidenceLevel;
 
   // ── Intel-adjusted parameters ─────────────────────────────────────
   // In bearish/danger markets, hedge more aggressively. In bullish, less.
   const adjustedHedgeTarget = Math.min(1.0, config.hedgeTargetRatio * intel.riskMultiplier);
-  const adjustedStopLoss = config.hlStopLossPct / intel.riskMultiplier; // tighter stops in bad markets
+  // Apply learned stop-loss multiplier (tighter if past trades show large drawdowns)
+  const learnedStopLoss = applyAdaptive(config.hlStopLossPct, learned.hlStopLossMultiplier, conf);
+  const adjustedStopLoss = learnedStopLoss / intel.riskMultiplier; // then intel-adjust
 
   // Track which agents contributed to each decision
   const intelSources: string[] = [];
@@ -1455,10 +1472,14 @@ export async function generateDecisions(
           const adjustedEdge = adjustedOurProb - opp.marketProb;
 
           // Skip if intel adjustment killed the edge
-          if (adjustedEdge < 0.03) continue;
+          // Apply learned minEdge (higher if model has been overconfident)
+          const effectiveMinEdge = applyAdaptive(env.minEdge, learned.minEdgeOverride / env.minEdge, conf);
+          if (adjustedEdge < Math.max(0.03, effectiveMinEdge)) continue;
 
           // Cap to actual available balance — kelly reference bankroll is just for sizing math
-          const betUsd = Math.min(opp.recommendedUsd, state.polyHeadroomUsd, env.maxSingleBetUsd);
+          // Apply learned bet-size multiplier (smaller if poor calibration)
+          const learnedBetUsd = opp.recommendedUsd * applyAdaptive(1.0, learned.polyBetSizeMultiplier, conf);
+          const betUsd = Math.min(learnedBetUsd, state.polyHeadroomUsd, env.maxSingleBetUsd);
           if (betUsd < 1) continue;   // lowered from $2 — small wallet shouldn't kill all bets
 
           const d: Decision = {
@@ -2000,6 +2021,7 @@ export async function generateDecisions(
             bestPair.tokenA,
             intel,
             env.orcaLpRangeWidthPct,
+            learned,
           );
           const baseTokenChange = Math.abs(intel.analystPrices?.[bestPair.tokenA]?.change24h ?? 0);
 
@@ -2076,6 +2098,7 @@ export async function generateDecisions(
               tokenASymbol,
               intel,
               env.orcaLpRangeWidthPct,
+              learned,
             ),
           },
           urgency: pos.inRange ? 'low' : 'medium',
@@ -2147,6 +2170,7 @@ export async function generateDecisions(
               pos.token0Symbol,
               intel,
               env.krystalLpRangeWidthTicks,
+              learned,
             ),
           },
           urgency: pos.inRange ? 'low' : 'medium',
@@ -2173,9 +2197,11 @@ export async function generateDecisions(
         const pools = await krystal.discoverKrystalPools();
 
         // Filter to pools meeting env thresholds AND with configured RPC
+        // Apply learned APR floor adjustment (raised if past LP positions underperformed)
+        const learnedMinApr = env.krystalLpMinApr7d + (learned.lpMinAprAdjustment * learned.confidenceLevel);
         const eligible = pools.filter(p =>
           p.tvlUsd >= env.krystalLpMinTvlUsd &&
-          p.apr7d >= env.krystalLpMinApr7d &&
+          p.apr7d >= learnedMinApr &&
           (env.evmRpcUrls[p.chainNumericId] || p.chainNumericId === 42161),
         );
 
@@ -2203,6 +2229,7 @@ export async function generateDecisions(
             best.token0.symbol,
             intel,
             env.krystalLpRangeWidthTicks,
+            learned,
           );
 
           decisions.push({
@@ -2350,7 +2377,7 @@ export async function generateDecisions(
         const estimatedLpFeeApy = 0.15;
         const borrowCost = state.kaminoBorrowApy > 0 ? state.kaminoBorrowApy : 0.08;
         const spreadPct = (estimatedLpFeeApy - borrowCost) * 100;
-        const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct);
+        const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct, learned);
 
         decisions.push({
           type: 'KAMINO_BORROW_LP',
@@ -2411,7 +2438,7 @@ export async function generateDecisions(
       } else {
         const usdcSide = borrowUsd / 2;
         const solSide = borrowUsd / 2 / state.solPriceUsd;
-        const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct);
+        const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct, learned);
 
         decisions.push({
           type: 'KAMINO_BORROW_LP',
@@ -3248,6 +3275,13 @@ export function formatDecisionReport(
     }
   }
 
+  // ── Learning summary ──
+  const learnedParams = getAdaptiveParams();
+  if (learnedParams.lastComputed > 0) {
+    L.push('');
+    L.push(formatLearningSummary(learnedParams));
+  }
+
   return L.join('\n');
 }
 
@@ -3417,6 +3451,15 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
     } catch { /* non-fatal */ }
   }
 
+  // 1.4. Progressive learning — retrospective on past trades
+  if (pool) setLearningPool(pool);
+  let learned: AdaptiveParams = getAdaptiveParams();
+  try {
+    learned = await refreshLearning(pool);
+  } catch (err) {
+    logger.debug('[CFO:Learning] Retrospective failed (using cached/defaults):', err);
+  }
+
   // 1.5. Consult swarm — gather intel from scout, guardian, analyst
   let intel: SwarmIntel = { riskMultiplier: 1.0, marketCondition: 'neutral' };
   if (pool) {
@@ -3558,8 +3601,8 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
     // treasuryExposures retains the SOL-only fallback from gatherPortfolioState
   }
 
-  // 2+3. Assess + Decide (with intel)
-  const decisions = await generateDecisions(state, config, env, intel);
+  // 2+3. Assess + Decide (with intel + learned params)
+  const decisions = await generateDecisions(state, config, env, intel, learned);
   if (decisions.length === 0) {
     logger.info('[CFO:Decision] No actions needed');
   } else {
