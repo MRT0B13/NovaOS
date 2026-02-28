@@ -216,6 +216,8 @@ export async function openPosition(
 
   try {
     const { WhirlpoolContext, buildWhirlpoolClient, PriceMath, TickUtil,
+            TickArrayUtil, WhirlpoolIx, PDAUtil, ORCA_WHIRLPOOL_PROGRAM_ID,
+            IGNORE_CACHE, toTx,
             increaseLiquidityQuoteByInputTokenWithParams, NO_TOKEN_EXTENSION_CONTEXT,
           } = await loadOrcaSdk();
     const { AnchorProvider, Wallet } = await loadAnchor();
@@ -299,6 +301,34 @@ export async function openPosition(
     logger.info(`[Orca] Opening position: lowerTick=${lowerTick}, upperTick=${upperTick}, ` +
       `tokenMaxA=${quote.tokenMaxA.toString()}, tokenMaxB=${quote.tokenMaxB.toString()}, ` +
       `minSqrt=${minSqrtPrice.toString()}, maxSqrt=${maxSqrtPrice.toString()}`);
+
+    // Ensure tick arrays exist for this range.
+    // Exotic pools (USDG/USDC, BONK/SOL, etc.) may not have tick arrays initialized
+    // at the LP range we need. If they don't exist, the IncreaseLiquidity instruction
+    // fails with 0xBBF (AccountOwnedByWrongProgram) because the PDA resolves to an
+    // uninitialized account owned by SystemProgram instead of the Whirlpool program.
+    const uninitArrays = await TickArrayUtil.getUninitializedArraysPDAs(
+      [lowerTick, upperTick],
+      ORCA_WHIRLPOOL_PROGRAM_ID,
+      new PublicKey(poolAddress),
+      effectiveTickSpacing,
+      ctx.fetcher,
+      IGNORE_CACHE,
+    );
+    if (uninitArrays.length > 0) {
+      logger.info(`[Orca] Found ${uninitArrays.length} uninitialized tick array(s) — initializing...`);
+      for (const arr of uninitArrays) {
+        const ix = WhirlpoolIx.initTickArrayIx(ctx.program, {
+          whirlpool: new PublicKey(poolAddress),
+          tickArrayPda: arr.pda,
+          startTick: arr.startIndex,
+          funder: walletKeypair.publicKey,
+        });
+        const txBuilder = toTx(ctx, ix);
+        const initSig = await buildSendAndConfirm(txBuilder, connection, walletKeypair);
+        logger.info(`[Orca] Tick array initialized (startTick=${arr.startIndex}): ${initSig}`);
+      }
+    }
 
     // Open LP position
     const { tx, positionMint } = await whirlpool.openPosition(
