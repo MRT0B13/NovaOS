@@ -2701,8 +2701,12 @@ export async function generateDecisions(
     logger.info(
       `[CFO:Decision] Tier breakdown: 🟢 AUTO=${tierCounts.AUTO} | 🟡 NOTIFY=${tierCounts.NOTIFY} | 🔴 APPROVAL=${tierCounts.APPROVAL}`,
     );
-  } else {
-    // ── Diagnostic summary: explain why no decisions were generated ────────
+  }
+
+  // ── Section evaluation summary — ALWAYS log at info level ────────
+  // Shows which strategies were considered and why they were skipped,
+  // so "just opening LP" is never a mystery.
+  {
     const diag: string[] = [];
 
     // B: Hedging
@@ -2771,9 +2775,27 @@ export async function generateDecisions(
     }
 
     // J: Arb
-    if (env.evmArbEnabled) diag.push('Arb:no-opportunity');
+    if (env.evmArbEnabled) {
+      if (decisions.some(d => d.type === 'EVM_FLASH_ARB')) diag.push('Arb:✓');
+      else diag.push('Arb:no-opportunity');
+    }
 
-    logger.info(`[CFO:Decision] Skip reasons: ${diag.join(' | ')}`);
+    // K: Kamino-funded Orca LP
+    if (env.kaminoBorrowLpEnabled) {
+      if (decisions.some(d => d.type === 'KAMINO_BORROW_LP')) diag.push('BorrowLP:✓');
+      else if (!env.orcaLpEnabled) diag.push('BorrowLP:orca-off');
+      else if (!env.kaminoBorrowEnabled) diag.push('BorrowLP:borrow-off');
+      else if (state.kaminoDepositValueUsd < 10 && !state.kaminoJitoLoopActive && !state.kaminoActiveLstLoop) diag.push('BorrowLP:no-collateral');
+      else if (state.kaminoHealthFactor < 2.0) diag.push(`BorrowLP:HF=${state.kaminoHealthFactor.toFixed(2)}`);
+      else if (state.orcaPositions.length >= env.orcaLpMaxPositions) diag.push(`BorrowLP:max-pos`);
+      else diag.push('BorrowLP:cooldown/spread');
+    }
+
+    // Add active decisions to summary
+    const activeTypes = decisions.map(d => `${d.type}[${d.tier}]`);
+    if (activeTypes.length > 0) diag.push(`→ DECIDED: ${activeTypes.join(', ')}`);
+
+    logger.info(`[CFO:Decision] Sections: ${diag.join(' | ')}`);
   }
 
   // Cap to maxDecisionsPerCycle
@@ -3755,20 +3777,20 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
   // 1. Gather portfolio state
   const state = await gatherPortfolioState();
   const rawSolUsd = state.solBalance * state.solPriceUsd;
-  logger.info(
-    `[CFO:Decision] Portfolio: $${state.totalPortfolioUsd.toFixed(0)} | ` +
-    `SOL: ${state.solBalance.toFixed(2)} ($${rawSolUsd.toFixed(0)}) | ` +
-    `JitoSOL: ${state.jitoSolBalance.toFixed(2)} ($${state.jitoSolValueUsd.toFixed(0)}) | ` +
-    `hedge: ${(state.hedgeRatio * 100).toFixed(0)}% | HL equity: $${state.hlEquity.toFixed(0)}`,
-  );
-  logger.debug(
-    `[CFO:Decision] Strategy state | ` +
-    `kaminoDeposits:$${state.kaminoDepositValueUsd.toFixed(0)} borrowable:$${state.kaminoBorrowableUsd.toFixed(0)} health:${state.kaminoHealthFactor === 999 ? 'none' : state.kaminoHealthFactor.toFixed(2)} | ` +
-    `jitoSOL:${state.jitoSolBalance.toFixed(4)} idleSOL:${state.idleSolForStaking.toFixed(4)} | ` +
-    `orcaPositions:${state.orcaPositions.length} orcaValue:$${state.orcaLpValueUsd.toFixed(0)} | ` +
-    `polyUSDC:$${state.polyUsdcBalance.toFixed(0)} polyHeadroom:$${state.polyHeadroomUsd.toFixed(0)} | ` +
-    `evmLPs:${state.evmLpPositions.length} evmLPval:$${state.evmLpTotalValueUsd.toFixed(0)} evmUSDC:$${state.evmTotalUsdcAllChains.toFixed(0)}`
-  );
+  // Build optional segments so the log line only shows relevant info
+  const _pSegments: string[] = [
+    `$${state.totalPortfolioUsd.toFixed(0)}`,
+    `SOL: ${state.solBalance.toFixed(2)} ($${rawSolUsd.toFixed(0)})`,
+  ];
+  if (state.jitoSolBalance >= 0.01) _pSegments.push(`JitoSOL: ${state.jitoSolBalance.toFixed(2)} ($${state.jitoSolValueUsd.toFixed(0)})`);
+  if (state.kaminoDepositValueUsd > 0) _pSegments.push(`Kamino: dep $${state.kaminoDepositValueUsd.toFixed(0)} borrow $${state.kaminoBorrowValueUsd.toFixed(0)} HF=${state.kaminoHealthFactor === 999 ? 'none' : state.kaminoHealthFactor.toFixed(2)}`);
+  if (state.orcaPositions.length > 0) _pSegments.push(`Orca: ${state.orcaPositions.length} pos $${state.orcaLpValueUsd.toFixed(0)}`);
+  if (state.evmLpPositions.length > 0) _pSegments.push(`EVM LP: ${state.evmLpPositions.length} pos $${state.evmLpTotalValueUsd.toFixed(0)}`);
+  if (state.evmTotalUsdcAllChains > 0) _pSegments.push(`EVM USDC: $${state.evmTotalUsdcAllChains.toFixed(0)}`);
+  _pSegments.push(`hedge: ${(state.hedgeRatio * 100).toFixed(0)}%`);
+  if (state.hlEquity > 0) _pSegments.push(`HL equity: $${state.hlEquity.toFixed(0)}`);
+  if (state.polyUsdcBalance > 0) _pSegments.push(`Poly USDC: $${state.polyUsdcBalance.toFixed(0)}`);
+  logger.info(`[CFO:Decision] Portfolio: ${_pSegments.join(' | ')}`);
 
   // 1.5. Hydrate EVM arb profit from DB (survives process restarts)
   if (env.evmArbEnabled && pool) {
