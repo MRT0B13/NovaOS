@@ -1864,6 +1864,89 @@ export async function exitPosition(
 }
 
 // ============================================================================
+// Market Resolution Query
+// ============================================================================
+
+export interface MarketResolution {
+  resolved: boolean;
+  /** The winning outcome string, e.g. "Yes" or "No" */
+  winningOutcome?: string;
+  /** Price of each outcome at resolution (0 or 1 for resolved markets) */
+  outcomePrices?: Record<string, number>;
+}
+
+/**
+ * Query CLOB + Gamma APIs for market resolution status.
+ * Returns whether the market resolved and which outcome won.
+ * Used to correctly compute PnL when positions disappear from the portfolio API.
+ *
+ * Primary: CLOB API /markets/{conditionId} — has tokens[].winner flag.
+ * Fallback: Gamma API — uses outcomePrices (but zeroed out after resolution).
+ */
+export async function queryMarketResolution(conditionId: string): Promise<MarketResolution> {
+  try {
+    // Primary: CLOB API has reliable winner flag on tokens
+    const clobResp = await fetch(`${CLOB_BASE}/markets/${conditionId}`);
+    if (clobResp.ok) {
+      const data = await clobResp.json() as any;
+      if (data.tokens && data.closed) {
+        const winner = data.tokens.find((t: any) => t.winner);
+        if (winner) {
+          const outcomePrices: Record<string, number> = {};
+          for (const t of data.tokens) outcomePrices[t.outcome] = t.winner ? 1 : 0;
+          return { resolved: true, winningOutcome: winner.outcome, outcomePrices };
+        }
+        // Market closed but no winner yet — might be in resolution process
+        return { resolved: false };
+      }
+      if (!data.closed) return { resolved: false };
+    }
+
+    // Fallback: Gamma API (outcomePrices get zeroed after resolution, so check tokens)
+    const gammaResp = await fetch(`${GAMMA_BASE}/markets?condition_id=${conditionId}&limit=1`);
+    if (gammaResp.ok) {
+      const markets = await gammaResp.json() as GammaMarket[];
+      if (markets.length > 0) {
+        const mkt = markets[0];
+        if (!mkt.closed) return { resolved: false };
+
+        // Check legacy tokens array for winner
+        if (mkt.tokens) {
+          const winner = mkt.tokens.find(t => t.winner);
+          if (winner) {
+            const outcomePrices: Record<string, number> = {};
+            for (const t of mkt.tokens) outcomePrices[t.outcome] = t.winner ? 1 : 0;
+            return { resolved: true, winningOutcome: winner.outcome, outcomePrices };
+          }
+        }
+
+        // Parse outcome prices as last resort
+        let outcomes: string[] = [];
+        let prices: number[] = [];
+        try {
+          outcomes = JSON.parse(mkt.outcomes || '[]');
+          prices = JSON.parse(mkt.outcomePrices || '[]').map(Number);
+        } catch { /* ignore */ }
+
+        const outcomePrices: Record<string, number> = {};
+        let winnerOutcome: string | undefined;
+        for (let i = 0; i < outcomes.length; i++) {
+          outcomePrices[outcomes[i]] = prices[i] ?? 0;
+          if (prices[i] >= 0.95) winnerOutcome = outcomes[i];
+        }
+
+        return { resolved: true, winningOutcome: winnerOutcome, outcomePrices };
+      }
+    }
+
+    return { resolved: false };
+  } catch (err) {
+    logger.debug(`[Polymarket] queryMarketResolution error: ${(err as Error).message}`);
+    return { resolved: false };
+  }
+}
+
+// ============================================================================
 // On-chain Redemption for Resolved Markets
 // ============================================================================
 

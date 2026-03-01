@@ -1078,16 +1078,72 @@ export class CFOAgent extends BaseAgent {
         }
         const freshPos = freshPositions.find((p: any) => p.tokenId === meta.tokenId);
 
-        // ── Dust cleanup: position worth < $1 or not found on-chain ──
+        // ── Position vanished from API — likely market resolved & tokens redeemed ──
+        // Query the Gamma API for market resolution to compute correct PnL
+        // instead of defaulting to $0 received (which made all bets look like total losses).
+        if (!freshPos) {
+          const condId = (meta as any).conditionId;
+          const ourOutcome = dbPos.description.split(' | ')[0]?.trim(); // "Yes" or "No"
+          let receivedUsd = 0;
+          let resolutionNote = 'not-found';
+
+          if (condId) {
+            try {
+              const resolution = await polyMod.queryMarketResolution(condId);
+              if (resolution.resolved && resolution.winningOutcome) {
+                const ourSideWon = resolution.winningOutcome.toLowerCase() === (ourOutcome ?? '').toLowerCase();
+                // Winning: each token redeems for $1 USDC → receivedUsd = sizeUnits
+                receivedUsd = ourSideWon ? dbPos.sizeUnits : 0;
+                resolutionNote = ourSideWon
+                  ? `resolved=${resolution.winningOutcome} ✓ WON`
+                  : `resolved=${resolution.winningOutcome} ✗ LOST`;
+                logger.info(
+                  `[CFO] Market resolution for "${dbPos.description.slice(0, 50)}": ${resolutionNote} ` +
+                  `(${dbPos.sizeUnits.toFixed(1)} shares → $${receivedUsd.toFixed(2)})`,
+                );
+              } else if (resolution.resolved) {
+                resolutionNote = 'resolved-unknown-winner';
+              } else {
+                // Market not resolved — don't close yet, wait for resolution
+                logger.info(
+                  `[CFO] Position disappeared but market not resolved: "${dbPos.description.slice(0, 50)}" — skipping close`,
+                );
+                continue;
+              }
+            } catch (err) {
+              logger.debug(`[CFO] Resolution query failed: ${(err as Error).message}`);
+            }
+          }
+
+          const pnl = receivedUsd - dbPos.costBasisUsd;
+
+          if (!env.dryRun) {
+            await this.positionManager.closePosition(
+              action.positionId, receivedUsd > 0 ? 1 : 0, `market-${resolutionNote}`, receivedUsd,
+            );
+          }
+          logger.info(
+            `[CFO] Closed resolved position: "${dbPos.description.slice(0, 60)}" ` +
+            `(${resolutionNote}, received: $${receivedUsd.toFixed(2)}, PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)})`,
+          );
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(
+            `📊 Polymarket ${resolutionNote}: ${dbPos.description.slice(0, 60)}\n` +
+            `Received: $${receivedUsd.toFixed(2)} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`,
+          );
+          continue;
+        }
+
+        // ── Dust cleanup: position worth < $1 and still on-chain ──
         // For redeemable (resolved) markets: redeem on-chain instead of trying to sell
         // For live markets: attempt sell on CLOB; if sell fails, mark for redemption
-        if (!freshPos || freshPos.currentValueUsd < 1.00) {
-          const dustValue = freshPos?.currentValueUsd ?? 0;
+        if (freshPos.currentValueUsd < 1.00) {
+          const dustValue = freshPos.currentValueUsd;
           const dustPnl = dustValue - dbPos.costBasisUsd;
 
           let redeemTxHash: string | undefined;
           let dustSellSucceeded = false;
-          if (freshPos && freshPos.size > 0 && !env.dryRun) {
+          if (freshPos.size > 0 && !env.dryRun) {
             if (freshPos.redeemable) {
               // Resolved market: redeem on-chain (burns tokens, returns USDC if winning)
               try {
@@ -1114,15 +1170,14 @@ export class CFOAgent extends BaseAgent {
                 logger.debug(`[CFO] Dust sell failed (expected for small positions): ${(err as Error).message}`);
               }
             }
-          } else {
-            // No on-chain position or dry-run — safe to close
+          } else if (env.dryRun) {
             dustSellSucceeded = true;
           }
 
-          if (dustSellSucceeded || !freshPos) {
-            // Tokens cleared on-chain (or never existed) — safe to close in DB
+          if (dustSellSucceeded) {
+            // Tokens cleared on-chain — safe to close in DB
             await this.positionManager.closePosition(
-              action.positionId, freshPos?.currentPrice ?? 0, 'dust-cleanup', dustValue,
+              action.positionId, freshPos.currentPrice, 'dust-cleanup', dustValue,
             );
             logger.info(
               `[CFO] Dust cleanup: closed "${dbPos.description.slice(0, 60)}" ` +
@@ -1131,7 +1186,7 @@ export class CFOAgent extends BaseAgent {
             const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
             const txLine = redeemTxHash ? `\nTX: https://polygonscan.com/tx/${redeemTxHash}` : '';
             await notifyAdminForce(
-              `🧹 ${freshPos?.redeemable ? 'Redeemed' : 'Dust cleanup'}: ${dbPos.description.slice(0, 60)}\n` +
+              `🧹 ${freshPos.redeemable ? 'Redeemed' : 'Dust cleanup'}: ${dbPos.description.slice(0, 60)}\n` +
               `Value: $${dustValue.toFixed(2)} | PnL: $${dustPnl.toFixed(2)}${txLine}`,
             );
           } else {
@@ -2273,6 +2328,8 @@ export class CFOAgent extends BaseAgent {
       const freshPositions = await polyMod.fetchPositions();
 
       // First, redeem any resolved positions on-chain to clear ghost shares
+      // AND close the DB position with proper PnL (before, redemption didn't update DB → next
+      // cycle would EXPIRE the position with $0 received, making every bet look like a total loss).
       const redeemable = freshPositions.filter((p: any) => p.redeemable && p.size > 0);
       if (redeemable.length > 0) {
         logger.info(`[CFO] Found ${redeemable.length} redeemable position(s) on startup — redeeming on-chain`);
@@ -2293,6 +2350,29 @@ export class CFOAgent extends BaseAgent {
                 redeemDetails.push(
                   `  • ${label}\n    TX: https://polygonscan.com/tx/${result.txHash}`,
                 );
+              }
+
+              // ── Close the DB position with correct PnL ───────────
+              // Resolved markets: winning token = $1 per share, losing = $0.
+              // Use the API-reported currentValueUsd (reflects resolution).
+              if (this.repo && this.positionManager) {
+                const openPositions = await this.repo.getOpenPositions('polymarket');
+                const dbPos = openPositions.find((p: any) => {
+                  const meta = p.metadata as { tokenId?: string };
+                  return meta.tokenId === (pos as any).tokenId;
+                });
+                if (dbPos) {
+                  const receivedUsd = (pos as any).currentValueUsd ?? 0;
+                  await this.positionManager.closePosition(
+                    dbPos.id, (pos as any).currentPrice ?? 0,
+                    result.txHash ?? 'redeemed', receivedUsd,
+                  );
+                  const pnl = receivedUsd - dbPos.costBasisUsd;
+                  logger.info(
+                    `[CFO] Closed redeemed position in DB: "${label}" — ` +
+                    `PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (received $${receivedUsd.toFixed(2)})`,
+                  );
+                }
               }
             }
           } catch (err) {
