@@ -1464,10 +1464,19 @@ export class CFOAgent extends BaseAgent {
   // ── Autonomous Decision Engine ────────────────────────────────────
 
   private async runAutonomousDecisionCycle(): Promise<void> {
-    if (!this.running || this.paused) return;
+    if (!this.running || this.paused) {
+      logger.debug(`[CFO] Decision cycle skipped: running=${this.running} paused=${this.paused}`);
+      return;
+    }
 
     const config = getDecisionConfig();
-    if (!config.enabled) return;
+    if (!config.enabled) {
+      logger.debug('[CFO] Decision cycle skipped: config.enabled=false');
+      return;
+    }
+
+    logger.info(`[CFO] Decision cycle #${this.cycleCount + 1} starting...`);
+    const cycleStart = Date.now();
 
     // Lazily enrich SOLANA_TOKEN_MINTS from Kamino registry (first cycle only)
     await enrichTokenMints();
@@ -1478,7 +1487,16 @@ export class CFOAgent extends BaseAgent {
 
       // Cycle was skipped (concurrent lock) — nothing to do
       if (traceId === 'skipped') {
+        logger.info(`[CFO] Decision cycle #${this.cycleCount + 1} skipped (concurrent lock) after ${((Date.now() - cycleStart) / 1000).toFixed(1)}s`);
         await this.updateStatus('idle');
+        return;
+      }
+
+      // Cycle timed out or errored — log and recover for next attempt
+      if (traceId === 'error') {
+        logger.warn(`[CFO] Decision cycle #${this.cycleCount + 1} failed after ${((Date.now() - cycleStart) / 1000).toFixed(1)}s: ${report}`);
+        this.cycleCount++;
+        await this.updateStatus('degraded');
         return;
       }
 
@@ -1654,9 +1672,11 @@ export class CFOAgent extends BaseAgent {
       // Persist cooldown state so hedge/stake timers survive restarts
       await this.persistState();
 
+      this.cycleCount++;
+      logger.info(`[CFO] Decision cycle #${this.cycleCount} completed in ${((Date.now() - cycleStart) / 1000).toFixed(1)}s — ${decisions.length} decision(s), ${results.filter(r => r.executed).length} executed`);
       await this.updateStatus('idle');
     } catch (err) {
-      logger.error('[CFO] Decision cycle error:', err);
+      logger.error(`[CFO] Decision cycle error after ${((Date.now() - cycleStart) / 1000).toFixed(1)}s:`, err);
       await this.updateStatus('degraded');
     }
   }

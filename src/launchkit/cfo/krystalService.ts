@@ -1262,7 +1262,7 @@ export async function openEvmLpPosition(
           type FundCandidate = { symbol: string; addr: string; balance: number; isNative?: boolean };
           const allCandidates: FundCandidate[] = [...stableCandidates];
           if (wethAddr && wethUsdValue > 1) allCandidates.push({ symbol: 'WETH', addr: wethAddr, balance: wethUsdValue });
-          if (nativeUsdValue > 5) allCandidates.push({ symbol: 'NATIVE', addr: '0x0000000000000000000000000000000000000000', balance: nativeUsdValue, isNative: true });
+          if (nativeUsdValue > 5) allCandidates.push({ symbol: 'NATIVE', addr: '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE', balance: nativeUsdValue, isNative: true });
 
           logger.info(`[Krystal] Source chain ${srcChain} funds: ${allCandidates.map(c => `${c.symbol}=$${c.balance.toFixed(2)}`).join(', ') || 'none'}`);
 

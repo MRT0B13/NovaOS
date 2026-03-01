@@ -3733,6 +3733,18 @@ function _humanAction(d: Decision, state: PortfolioState): string {
 let _cycleRunning = false;
 let _cycleStartedAt: number | null = null;
 const CYCLE_LOCK_TIMEOUT_MS = 10 * 60_000; // 10 minutes — if cycle hangs longer, force-reset
+const CYCLE_INNER_TIMEOUT_MS = 5 * 60_000; // 5 minutes — hard timeout for inner cycle execution
+
+/** Race a promise against a timeout — rejects with Error if timeout fires first */
+function raceTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${(ms / 1000).toFixed(0)}s`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
 
 export async function runDecisionCycle(pool?: any): Promise<{
   state: PortfolioState;
@@ -3766,7 +3778,25 @@ export async function runDecisionCycle(pool?: any): Promise<{
   _cycleStartedAt = Date.now();
 
   try {
-    return await _runDecisionCycleInner(pool);
+    // Race inner cycle against a hard 5-minute timeout — prevents indefinite hangs
+    // from stuck DB queries, RPC calls, or API fetches
+    return await raceTimeout(
+      _runDecisionCycleInner(pool),
+      CYCLE_INNER_TIMEOUT_MS,
+      'Decision cycle inner',
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error(`[CFO:Decision] Cycle failed: ${msg}`);
+    // Return empty result so callers don't blow up
+    return {
+      state: {} as PortfolioState,
+      decisions: [],
+      results: [],
+      report: `Cycle failed: ${msg}`,
+      intel: { riskMultiplier: 1.0, marketCondition: 'neutral' },
+      traceId: 'error',
+    };
   } finally {
     _cycleRunning = false;
     _cycleStartedAt = null;
@@ -3790,7 +3820,7 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
   logger.info(`[CFO:Decision] Starting decision cycle (traceId=${traceId})...`);
 
   // 1. Gather portfolio state
-  const state = await gatherPortfolioState();
+  const state = await raceTimeout(gatherPortfolioState(), 60_000, 'gatherPortfolioState');
   const rawSolUsd = state.solBalance * state.solPriceUsd;
   // Build optional segments so the log line only shows relevant info
   const _pSegments: string[] = [
@@ -3828,9 +3858,10 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
   let intel: SwarmIntel = { riskMultiplier: 1.0, marketCondition: 'neutral' };
   if (pool) {
     try {
-      intel = await gatherSwarmIntel(pool);
+      intel = await raceTimeout(gatherSwarmIntel(pool), 30_000, 'gatherSwarmIntel');
     } catch (err) {
-      logger.warn('[CFO:Decision] Swarm intel gathering failed (non-fatal):', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(`[CFO:Decision] Swarm intel gathering failed (non-fatal): ${msg}`);
     }
   } else {
     logger.debug('[CFO:Decision] No DB pool provided — skipping swarm intel');
@@ -3844,10 +3875,14 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
     const jupiter = await import('./jupiterService.ts');
     const hl = await import('./hyperliquidService.ts');
 
-    const [walletBalances, hlCoins] = await Promise.all([
-      jupiter.getWalletTokenBalances(),
-      hl.getHLListedCoins(),
-    ]);
+    const [walletBalances, hlCoins] = await raceTimeout(
+      Promise.all([
+        jupiter.getWalletTokenBalances(),
+        hl.getHLListedCoins(),
+      ]),
+      30_000,
+      'Treasury enrichment (walletBalances + hlCoins)',
+    );
     const hlCoinSet = new Set(hlCoins.map((c: string) => c.toUpperCase()));
 
     // Build price map from analyst/guardian intel + known prices

@@ -97,6 +97,28 @@ _tokenRegistry.set('42161_USDC.e', '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8')
 _tokenRegistry.set('8453_USDbC', '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA');  // Base USDbC (bridged USDC)
 _tokenRegistry.set('10_USDC.e', '0x7F5c764cBc14f9669B88837ca1490cCa17c31607');   // Optimism USDC.e
 _tokenRegistry.set('43114_USDC.e', '0xA7D7079b0FEaD91F3e65f86E8915Cb59c1a4C664'); // Avalanche USDC.e
+// Seed well-known USDT addresses
+_tokenRegistry.set('1_USDT', '0xdAC17F958D2ee523a2206206994597C13D831ec7');      // Ethereum
+_tokenRegistry.set('10_USDT', '0x94b008aA00579c1307B0EF2c499aD98a8ce58e58');     // Optimism
+_tokenRegistry.set('137_USDT', '0xc2132D05D31c914a87C6611C10748AEb04B58e8F');    // Polygon
+_tokenRegistry.set('8453_USDT', '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2');   // Base
+_tokenRegistry.set('42161_USDT', '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9');  // Arbitrum
+_tokenRegistry.set('43114_USDT', '0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7');  // Avalanche
+_tokenRegistry.set('56_USDT', '0x55d398326f99059fF775485246999027B3197955');      // BSC
+
+// Seed native token addresses (LI.FI convention: 0xEeee...eE for native gas token on all EVM chains)
+const LIFI_NATIVE_ADDR = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+for (const chainId of [1, 10, 56, 137, 8453, 42161, 43114, 324, 59144, 534352, 5000]) {
+  _tokenRegistry.set(`${chainId}_ETH`, LIFI_NATIVE_ADDR);
+  _tokenRegistry.set(`${chainId}_NATIVE`, LIFI_NATIVE_ADDR);
+}
+// Also register WETH addresses for common chains
+_tokenRegistry.set('1_WETH', '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2');      // Ethereum
+_tokenRegistry.set('10_WETH', '0x4200000000000000000000000000000000000006');      // Optimism
+_tokenRegistry.set('137_WETH', '0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619');    // Polygon (bridged WETH)
+_tokenRegistry.set('8453_WETH', '0x4200000000000000000000000000000000000006');    // Base
+_tokenRegistry.set('42161_WETH', '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1');  // Arbitrum
+_tokenRegistry.set('43114_WETH', '0x49D5c2BdFfac6CE2BFdB6640F4F80f226bc10bAB');  // Avalanche (WETH.e)
 
 /**
  * Register a token address for a chain + symbol pair.
@@ -591,6 +613,7 @@ export async function bridgeEvmToEvm(
   amountHuman: number,
   fromAddress: string,
   toAddress: string,
+  opts?: { fromTokenAddress?: string; toTokenAddress?: string },
 ): Promise<BridgeResult> {
   const env = getCFOEnv();
   const fromName = chainIdToName(fromChainId);
@@ -607,15 +630,16 @@ export async function bridgeEvmToEvm(
     return fail(`Amount $${amountHuman} exceeds max bridge cap $${env.maxBridgeUsd}`);
   }
 
-  // Resolve token addresses from registry
-  const fromTokenAddr = resolveTokenAddress(fromChainId, tokenSymbol);
-  const toTokenAddr = resolveTokenAddress(toChainId, tokenSymbol);
+  // Resolve token addresses — use explicit overrides if provided, else registry lookup
+  const fromTokenAddr = opts?.fromTokenAddress ?? resolveTokenAddress(fromChainId, tokenSymbol);
+  const toTokenAddr = opts?.toTokenAddress ?? resolveTokenAddress(toChainId, tokenSymbol);
   if (!fromTokenAddr || !toTokenAddr) {
+    logger.debug(`[Bridge] Token resolution failed: from=${fromTokenAddr ?? 'undefined'} to=${toTokenAddr ?? 'undefined'} opts=${JSON.stringify(opts)} symbol=${tokenSymbol}`);
     return fail(`Cannot resolve ${tokenSymbol} address on chain ${fromChainId} or ${toChainId}`);
   }
 
   // Get quote via LI.FI
-  const decimals = tokenSymbol.toUpperCase().includes('USDC') ? 6 : 18;
+  const decimals = tokenSymbol.toUpperCase().includes('USD') ? 6 : 18;
   const fromAmountRaw = Math.floor(amountHuman * 10 ** decimals).toString();
 
   try {
