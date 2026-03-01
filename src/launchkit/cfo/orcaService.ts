@@ -561,16 +561,27 @@ export async function getPositions(): Promise<OrcaPosition[]> {
 
     // Enumerate all token accounts owned by the wallet to find position NFTs.
     // Position NFTs have amount=1 and can be checked via PDA derivation.
-    const { TOKEN_PROGRAM_ID } = await import('@solana/spl-token' as string);
-    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
-      walletKeypair.publicKey,
-      { programId: TOKEN_PROGRAM_ID },
-    );
+    // Scan BOTH legacy Token Program AND Token-2022 (Token Extensions) because
+    // Orca SDK v0.13+ can create position mints under Token-2022.
+    const { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } = await import('@solana/spl-token' as string);
+    const [legacyAccounts, token2022Accounts] = await Promise.all([
+      connection.getParsedTokenAccountsByOwner(
+        walletKeypair.publicKey,
+        { programId: TOKEN_PROGRAM_ID },
+      ),
+      connection.getParsedTokenAccountsByOwner(
+        walletKeypair.publicKey,
+        { programId: TOKEN_2022_PROGRAM_ID },
+      ).catch(() => ({ value: [] })), // Token-2022 may not be supported on all RPCs
+    ]);
+    const allTokenAccounts = [...legacyAccounts.value, ...token2022Accounts.value];
 
     const result: OrcaPosition[] = [];
-    for (const { account } of tokenAccounts.value) {
+    let candidateNfts = 0;
+    for (const { account } of allTokenAccounts) {
       const parsed = account.data.parsed?.info;
       if (!parsed || parsed.tokenAmount?.uiAmount !== 1) continue;
+      candidateNfts++;
 
       const mintPk = new PublicKey(parsed.mint);
       const positionPda = PDAUtil.getPosition(ORCA_WHIRLPOOL_PROGRAM_ID, mintPk);
@@ -669,6 +680,7 @@ export async function getPositions(): Promise<OrcaPosition[]> {
       }
     }
 
+    logger.info(`[Orca] getPositions: scanned ${allTokenAccounts.length} token accounts, ${candidateNfts} NFTs (amount=1), found ${result.length} Whirlpool position(s)`);
     return result;
   } catch (err) {
     logger.warn('[Orca] getPositions top-level error (returning []):', err);

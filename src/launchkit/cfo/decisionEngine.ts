@@ -847,17 +847,32 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     try {
       const orca = await import('./orcaService.ts');
       const positions = await orca.getPositions();
+      logger.info(`[CFO] Orca on-chain scan returned ${positions.length} position(s)`);
       orcaLpValueUsd = positions.reduce((s, p) => s + p.liquidityUsd, 0);
 
       // Infer risk tier from DB position metadata (set at open time)
-      const orcaDbPositions = await dbPool.query(
-        `SELECT asset, metadata FROM cfo_positions WHERE strategy = 'orca_lp' AND status = 'OPEN'`,
-      ).then(r => r.rows).catch(() => [] as any[]);
+      // Wrapped in its own try/catch — DB enrichment must not kill the positions
       const dbTierMap = new Map<string, { tier?: string; tokenA?: string; tokenB?: string }>();
-      for (const row of orcaDbPositions) {
-        const meta = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata;
-        const wp = meta?.whirlpoolAddress;
-        if (wp) dbTierMap.set(wp, { tier: meta?.riskTier, tokenA: meta?.tokenA, tokenB: meta?.tokenB });
+      try {
+        const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+        if (dbUrl) {
+          const { Pool } = await import('pg');
+          const pgPool = new Pool({ connectionString: dbUrl, max: 1 });
+          try {
+            const orcaDbRes = await pgPool.query(
+              `SELECT asset, metadata FROM cfo_positions WHERE strategy = 'orca_lp' AND status = 'OPEN'`,
+            );
+            for (const row of orcaDbRes.rows) {
+              const meta = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata;
+              const wp = meta?.whirlpoolAddress;
+              if (wp) dbTierMap.set(wp, { tier: meta?.riskTier, tokenA: meta?.tokenA, tokenB: meta?.tokenB });
+            }
+          } finally {
+            pgPool.end().catch(() => {});
+          }
+        }
+      } catch (dbErr) {
+        logger.debug('[CFO] Orca DB tier enrichment failed (non-fatal):', dbErr instanceof Error ? dbErr.message : dbErr);
       }
 
       orcaPositions = positions.map(p => {
