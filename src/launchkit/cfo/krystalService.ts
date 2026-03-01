@@ -24,35 +24,125 @@ import { getCFOEnv } from './cfoEnv.ts';
 
 const KRYSTAL_BASE_URL = 'https://cloud-api.krystal.app';
 
-// NonfungiblePositionManager — per-chain mapping
-// Canonical Uniswap V3 NFPM works on ETH, Optimism, Polygon, Arbitrum.
-// Base uses the v1.3.0 deployment at a different address.
-// BSC, Avalanche, zkSync, Scroll, Linea do NOT have Uniswap V3 NFPM.
-const NFPM_BY_CHAIN: Record<number, string> = {
-  1:     '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Ethereum
-  10:    '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Optimism
-  137:   '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Polygon
-  8453:  '0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1', // Base (v1.3.0)
-  42161: '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Arbitrum
-};
+// ============================================================================
+// Multi-Protocol Registry
+// ============================================================================
+// Supports Uniswap V3, PancakeSwap V3 (same ABI), and Aerodrome CL (different ABI).
+// Each protocol has its own NFPM + Factory addresses per chain.
 
-/** Get the NonfungiblePositionManager address for a given chain. Returns undefined for unsupported chains. */
-function getNfpmAddress(chainId: number): string | undefined {
-  return NFPM_BY_CHAIN[chainId];
+type AbiVariant = 'uniswap-v3' | 'aerodrome-cl';
+
+interface ProtocolDef {
+  /** Regex patterns to match Krystal API protocol key/name (case-insensitive) */
+  matchPatterns: RegExp[];
+  /** ABI variant — determines mint params shape */
+  abi: AbiVariant;
+  /** NonfungiblePositionManager addresses per chainId */
+  nfpm: Record<number, string>;
+  /** Factory addresses per chainId (for pool verification) */
+  factory: Record<number, string>;
+  /** Human-readable label */
+  label: string;
+  /** Score bonus (0-10) for protocol quality */
+  scoreBonus: number;
 }
 
-// Uniswap V3 Factory — per-chain mapping (needed to verify pools before minting)
-const UNI_V3_FACTORY_BY_CHAIN: Record<number, string> = {
-  1:     '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Ethereum (canonical)
-  10:    '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Optimism
-  137:   '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Polygon
-  8453:  '0x33128a8fC17869897dcE68Ed026d694621f6FDfD', // Base (v1.3.0 deployer)
-  42161: '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Arbitrum
-};
+const PROTOCOL_REGISTRY: ProtocolDef[] = [
+  {
+    label: 'Uniswap V3',
+    matchPatterns: [/uniswap.*v3/i, /uniswapv3/i],
+    abi: 'uniswap-v3',
+    scoreBonus: 10,
+    nfpm: {
+      1:     '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Ethereum
+      10:    '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Optimism
+      137:   '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Polygon
+      8453:  '0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1', // Base (v1.3.0)
+      42161: '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Arbitrum
+    },
+    factory: {
+      1:     '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Ethereum
+      10:    '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Optimism
+      137:   '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Polygon
+      8453:  '0x33128a8fC17869897dcE68Ed026d694621f6FDfD', // Base (v1.3.0)
+      42161: '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Arbitrum
+    },
+  },
+  {
+    label: 'PancakeSwap V3',
+    matchPatterns: [/pancake.*v3/i, /pancakeswap/i],
+    abi: 'uniswap-v3',  // Same ABI as Uniswap V3 (direct fork)
+    scoreBonus: 8,
+    nfpm: {
+      1:     '0x46A15B0b27311cedF172AB29E4f4766fbE7F4364', // Ethereum
+      56:    '0x46A15B0b27311cedF172AB29E4f4766fbE7F4364', // BSC
+      8453:  '0x46A15B0b27311cedF172AB29E4f4766fbE7F4364', // Base
+      42161: '0x46A15B0b27311cedF172AB29E4f4766fbE7F4364', // Arbitrum
+    },
+    factory: {
+      1:     '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // Ethereum
+      56:    '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // BSC
+      8453:  '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // Base
+      42161: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // Arbitrum
+    },
+  },
+  {
+    label: 'Aerodrome CL',
+    matchPatterns: [/aerodrome/i, /slipstream/i],
+    abi: 'aerodrome-cl',  // Different ABI: tickSpacing instead of fee, extra sqrtPriceX96
+    scoreBonus: 7,
+    nfpm: {
+      8453:  '0x827922686190790b37229fd06084350E74485b72', // Base only
+    },
+    factory: {
+      8453:  '0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A', // Base only
+    },
+  },
+];
 
-// Backward compat — default for chains where canonical works
+/** Resolved protocol config for a specific pool + chain */
+interface ResolvedProtocol {
+  def: ProtocolDef;
+  nfpmAddress: string;
+  factoryAddress: string;
+}
+
+/** Match a Krystal API protocol key to our registry entry */
+function resolveProtocolDef(protoKey: string): ProtocolDef | undefined {
+  for (const def of PROTOCOL_REGISTRY) {
+    if (def.matchPatterns.some(p => p.test(protoKey))) return def;
+  }
+  return undefined;
+}
+
+/** Resolve protocol + chain → NFPM/Factory addresses. Returns undefined if unsupported. */
+function resolveProtocol(protoKey: string, chainId: number): ResolvedProtocol | undefined {
+  const def = resolveProtocolDef(protoKey);
+  if (!def) return undefined;
+  const nfpmAddress = def.nfpm[chainId];
+  const factoryAddress = def.factory[chainId];
+  if (!nfpmAddress) return undefined; // protocol not deployed on this chain
+  return { def, nfpmAddress, factoryAddress: factoryAddress ?? '' };
+}
+
+// Backward compat helpers — used internally when protocol is unknown (DB positions)
+function getNfpmAddress(chainId: number): string | undefined {
+  // Try Uniswap V3 first (most common), then PancakeSwap V3, then Aerodrome
+  for (const def of PROTOCOL_REGISTRY) {
+    if (def.nfpm[chainId]) return def.nfpm[chainId];
+  }
+  return undefined;
+}
+
+function getFactoryForProtocol(protoKey: string, chainId: number): string | undefined {
+  const resolved = resolveProtocol(protoKey, chainId);
+  return resolved?.factoryAddress;
+}
+
+// Legacy constant for backward compatibility
 const NFPM_ADDRESS = '0xC36442b4a4522E871399CD717aBDD847Ab11FE88';
 
+// Uniswap V3 / PancakeSwap V3 NFPM ABI (identical interface)
 const NFPM_ABI = [
   'function mint((address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, address recipient, uint256 deadline)) returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
   'function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
@@ -65,6 +155,25 @@ const NFPM_ABI = [
   'event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
   'event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)',
 ];
+
+// Aerodrome CL (Slipstream) NFPM ABI — uses tickSpacing instead of fee, extra sqrtPriceX96 in mint
+const AERODROME_NFPM_ABI = [
+  'function mint((address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, address recipient, uint256 deadline, uint160 sqrtPriceX96)) returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
+  'function decreaseLiquidity((uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint256 amount0, uint256 amount1)',
+  'function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)',
+  'function burn(uint256 tokenId)',
+  'function balanceOf(address owner) view returns (uint256)',
+  'function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)',
+  'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
+  'event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)',
+];
+
+/** Get the correct NFPM ABI based on protocol variant */
+function getNfpmAbiForProtocol(abi: AbiVariant): string[] {
+  return abi === 'aerodrome-cl' ? AERODROME_NFPM_ABI : NFPM_ABI;
+}
 
 const ERC20_ABI = [
   'function approve(address spender, uint256 amount) returns (bool)',
@@ -396,13 +505,10 @@ export async function discoverKrystalPools(forceRefresh = false): Promise<Scored
         factoryAddress: protoRaw.factoryAddress ?? '',
       };
 
-      // Support all concentrated-liquidity V3-compatible protocols
-      // (Uniswap V3, QuickSwap V3, PancakeSwap V3, SushiSwap V3, Camelot V3, Aerodrome CL)
+      // Accept pools from supported CL protocols (Uniswap V3, PancakeSwap V3, Aerodrome CL)
       const protoKey = String(protoRaw.key ?? protoRaw.name ?? '').toLowerCase();
-      const isV3Compatible = protoKey.includes('v3') || protoKey.includes('cl');
-      // Exclude V4 and plain V2 (no concentrated liquidity)
-      const isExcluded = protoKey.includes('v4') || (protoKey.includes('v2') && !protoKey.includes('v3'));
-      if (!isV3Compatible || isExcluded) continue;
+      const resolvedProto = resolveProtocol(protoKey, chainNumId);
+      if (!resolvedProto) continue; // unsupported protocol or not deployed on this chain
 
       // Numeric stats — API returns numbers, our interface allows strings
       const tvlUsd = Number(raw.tvl ?? 0);
@@ -527,15 +633,11 @@ function scoreKrystalPool(pool: ScoredKrystalPool): void {
     breakdown.consistency = 10; // insufficient data
   }
 
-  // ── 4. Protocol (0-10 pts) ──
-  const proto = pool.protocol.name.toLowerCase();
-  if (proto.includes('uniswap')) { breakdown.protocol = 10; reasons.push('Uniswap V3'); }
-  else if (proto.includes('pancake')) { breakdown.protocol = 8; reasons.push('PancakeSwap V3'); }
-  else if (proto.includes('sushi')) { breakdown.protocol = 8; reasons.push('SushiSwap V3'); }
-  else if (proto.includes('quickswap')) { breakdown.protocol = 7; reasons.push('QuickSwap V3'); }
-  else if (proto.includes('algebra') || proto.includes('camelot')) { breakdown.protocol = 7; }
-  else if (proto.includes('aerodrome')) { breakdown.protocol = 7; reasons.push('Aerodrome CL'); }
-  else { breakdown.protocol = 5; }
+  // ── 4. Protocol (0-10 pts) — scored by protocol quality ──
+  const protoKey = pool.protocol.name.toLowerCase();
+  const protoDef = resolveProtocolDef(protoKey);
+  breakdown.protocol = protoDef?.scoreBonus ?? 5;
+  reasons.push(protoDef?.label ?? pool.protocol.name);
 
   // ── 5. Range Safety / Risk Tier (0-5 pts) ──
   const stableSymbols = ['USDC', 'USDT', 'DAI', 'USDG', 'FRAX', 'TUSD', 'BUSD', 'USDCE', 'USDC.E'];
@@ -639,9 +741,12 @@ export async function fetchKrystalPositions(
         try {
           const ethers = await loadEthers();
           const provider = await getEvmProvider(numericId);
-          const nfpmAddr = getNfpmAddress(numericId);
+          // Resolve protocol → correct NFPM address + ABI
+          const protoResolved = resolveProtocol(protocol.toLowerCase(), numericId);
+          const nfpmAddr = protoResolved?.nfpmAddress ?? getNfpmAddress(numericId);
           if (!nfpmAddr) continue; // no NFPM on this chain — skip on-chain reads
-          const nfpm = new ethers.Contract(nfpmAddr, NFPM_ABI, provider);
+          const nfpmAbi = protoResolved ? getNfpmAbiForProtocol(protoResolved.def.abi) : NFPM_ABI;
+          const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, provider);
           const posData = await nfpm.positions(posId);
           tickLower = Number(posData.tickLower ?? posData[5] ?? 0);
           tickUpper = Number(posData.tickUpper ?? posData[6] ?? 0);
@@ -722,12 +827,15 @@ export async function fetchKrystalPositions(
             continue;
           }
 
-          const nfpmAddr = getNfpmAddress(dbRec.chainNumericId);
+          const dbProtoKey = (dbRec.protocol || 'uniswap_v3').toLowerCase();
+          const dbProtoResolved = resolveProtocol(dbProtoKey, dbRec.chainNumericId);
+          const nfpmAddr = dbProtoResolved?.nfpmAddress ?? getNfpmAddress(dbRec.chainNumericId);
           if (!nfpmAddr || !env.evmRpcUrls[dbRec.chainNumericId]) continue;
 
           const ethers = await loadEthers();
           const provider = await getEvmProvider(dbRec.chainNumericId);
-          const nfpm = new ethers.Contract(nfpmAddr, NFPM_ABI, provider);
+          const nfpmAbi = dbProtoResolved ? getNfpmAbiForProtocol(dbProtoResolved.def.abi) : NFPM_ABI;
+          const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, provider);
 
           // Read position data from NFPM
           const posData = await nfpm.positions(dbRec.posId);
@@ -758,12 +866,15 @@ export async function fetchKrystalPositions(
           // Get current tick from pool via factory
           let currentTick = 0;
           let poolAddress = dbRec.poolAddress;
-          const factoryAddr = UNI_V3_FACTORY_BY_CHAIN[dbRec.chainNumericId];
+          const isAerodrome = dbProtoResolved?.def.abi === 'aerodrome-cl';
+          const factoryAddr = dbProtoResolved?.factoryAddress || getFactoryForProtocol('uniswap_v3', dbRec.chainNumericId);
           if (factoryAddr) {
             try {
-              const factory = new ethers.Contract(factoryAddr, [
-                'function getPool(address, address, uint24) view returns (address)',
-              ], provider);
+              // Aerodrome uses getPool(addr, addr, int24 tickSpacing); Uniswap/PCS use getPool(addr, addr, uint24 fee)
+              const factoryAbiStr = isAerodrome
+                ? 'function getPool(address, address, int24) view returns (address)'
+                : 'function getPool(address, address, uint24) view returns (address)';
+              const factory = new ethers.Contract(factoryAddr, [factoryAbiStr], provider);
               const discoveredPool = await factory.getPool(token0Addr, token1Addr, feeTier);
               if (discoveredPool && discoveredPool !== ethers.ZeroAddress) {
                 poolAddress = discoveredPool;
@@ -865,26 +976,33 @@ export async function openEvmLpPosition(
     const wallet = await getEvmWallet(chainNumericId);
     const provider = await getEvmProvider(chainNumericId);
 
-    // 0. Pre-flight: verify pool exists on Uniswap V3 factory (prevents minting into Aerodrome/PancakeSwap/etc. pools)
-    const nfpmAddrEarly = getNfpmAddress(chainNumericId);
+    // 0. Pre-flight: resolve protocol → NFPM + factory addresses
+    const protoName = typeof pool.protocol === 'string' ? pool.protocol : pool.protocol?.name ?? '';
+    const protoResolved = resolveProtocol(protoName.toLowerCase(), chainNumericId);
+    const nfpmAddrEarly = protoResolved?.nfpmAddress ?? getNfpmAddress(chainNumericId);
+    const isAerodromeCl = protoResolved?.def.abi === 'aerodrome-cl';
     if (!nfpmAddrEarly) {
-      return { success: false, error: `No Uniswap V3 NFPM deployed on chainId ${chainNumericId}` };
+      return { success: false, error: `No NFPM deployed on chainId ${chainNumericId} for protocol ${protoName}` };
     }
 
-    const earlyFactoryAddr = UNI_V3_FACTORY_BY_CHAIN[chainNumericId];
+    // Verify pool exists on the protocol's factory
+    const earlyFactoryAddr = protoResolved?.factoryAddress;
     if (earlyFactoryAddr) {
-      const factoryAbi = ['function getPool(address,address,uint24) view returns (address)'];
-      const factory = new ethers.Contract(earlyFactoryAddr, factoryAbi, provider);
-      const uniPool = await factory.getPool(pool.token0.address, pool.token1.address, pool.feeTier);
-      if (!uniPool || uniPool === ethers.ZeroAddress) {
-        const proto = typeof pool.protocol === 'string' ? pool.protocol : pool.protocol?.name;
+      const factoryAbiStr = isAerodromeCl
+        ? 'function getPool(address,address,int24) view returns (address)'
+        : 'function getPool(address,address,uint24) view returns (address)';
+      const factory = new ethers.Contract(earlyFactoryAddr, [factoryAbiStr], provider);
+      // Aerodrome uses tickSpacing as 3rd param; Uniswap/PCS use feeTier
+      const poolLookupParam = isAerodromeCl ? pool.feeTier : pool.feeTier; // feeTier field carries tickSpacing for Aerodrome pools
+      const verifiedPool = await factory.getPool(pool.token0.address, pool.token1.address, poolLookupParam);
+      if (!verifiedPool || verifiedPool === ethers.ZeroAddress) {
         logger.warn(
           `[Krystal] Pool ${pool.token0.symbol}/${pool.token1.symbol} fee=${pool.feeTier} ` +
-          `NOT found on Uniswap V3 factory (protocol: ${proto}). Skipping — NFPM can only mint Uniswap V3 positions.`,
+          `NOT found on ${protoResolved?.def.label ?? protoName} factory. Skipping.`,
         );
-        return { success: false, error: `Pool not on Uniswap V3 factory (protocol: ${proto}) — cannot mint via NFPM` };
+        return { success: false, error: `Pool not on ${protoResolved?.def.label ?? protoName} factory — cannot mint` };
       }
-      logger.info(`[Krystal] ✓ Pool verified on Uniswap V3 factory: ${uniPool}`);
+      logger.info(`[Krystal] ✓ Pool verified on ${protoResolved?.def.label} factory: ${verifiedPool}`);
     }
 
     // 1. Read current tick from pool
@@ -893,8 +1011,13 @@ export async function openEvmLpPosition(
     const currentTick = Number(slot0.tick ?? slot0[1]);
 
     // 2. Compute tick range centred on current tick, aligned to tick spacing
-    const feeToTickSpacing: Record<number, number> = { 100: 1, 500: 10, 3000: 60, 10000: 200 };
-    const tickSpacing = feeToTickSpacing[pool.feeTier] ?? 60;
+    //    Aerodrome: feeTier field IS the tickSpacing directly
+    //    PancakeSwap V3: same as Uniswap V3 but adds 2500 fee tier (tickSpacing 50)
+    //    Uniswap V3: standard fee→tickSpacing mapping
+    const feeToTickSpacing: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
+    const tickSpacing = isAerodromeCl
+      ? pool.feeTier  // Aerodrome stores tickSpacing directly in the feeTier field
+      : (feeToTickSpacing[pool.feeTier] ?? 60);
     const rawLower = currentTick - rangeWidthTicks;
     const rawUpper = currentTick + rangeWidthTicks;
     const tickLower = Math.floor(rawLower / tickSpacing) * tickSpacing;
@@ -1252,7 +1375,8 @@ export async function openEvmLpPosition(
 
     // 6b. Gas estimate check — skip if gas > 5% of deployUsd
     const nfpmAddr = nfpmAddrEarly;
-    const nfpmContract = new ethers.Contract(nfpmAddr, NFPM_ABI, wallet);
+    const nfpmAbiToUse = protoResolved ? getNfpmAbiForProtocol(protoResolved.def.abi) : NFPM_ABI;
+    const nfpmContract = new ethers.Contract(nfpmAddr, nfpmAbiToUse, wallet);
     const feeData = await provider.getFeeData();
     const gasPrice = feeData.gasPrice ?? BigInt(0);
     const estimatedGas = BigInt(500_000); // conservative estimate for mint
@@ -1297,23 +1421,42 @@ export async function openEvmLpPosition(
 
     // 9. Mint LP position (using sorted token addresses)
     const deadline = Math.floor(Date.now() / 1000) + 600; // 10 minutes
-    const mintParams = {
-      token0: sorted0Addr,
-      token1: sorted1Addr,
-      fee: pool.feeTier,
-      tickLower,
-      tickUpper,
-      amount0Desired,
-      amount1Desired,
-      amount0Min,
-      amount1Min,
-      recipient: wallet.address,
-      deadline,
-    };
+
+    // Aerodrome CL uses tickSpacing instead of fee, and adds sqrtPriceX96 (0 = don't create pool)
+    const mintParams = isAerodromeCl
+      ? {
+          token0: sorted0Addr,
+          token1: sorted1Addr,
+          tickSpacing: pool.feeTier,  // Aerodrome stores tickSpacing in feeTier field
+          tickLower,
+          tickUpper,
+          amount0Desired,
+          amount1Desired,
+          amount0Min,
+          amount1Min,
+          recipient: wallet.address,
+          deadline,
+          sqrtPriceX96: BigInt(0),  // 0 = pool already exists, don't create
+        }
+      : {
+          token0: sorted0Addr,
+          token1: sorted1Addr,
+          fee: pool.feeTier,
+          tickLower,
+          tickUpper,
+          amount0Desired,
+          amount1Desired,
+          amount0Min,
+          amount1Min,
+          recipient: wallet.address,
+          deadline,
+        };
+
+    const protoLabel = protoResolved?.def.label ?? 'Uniswap V3';
 
     logger.info(
-      `[Krystal] Minting LP: ${sortedToken0.symbol}/${sortedToken1.symbol} on chain ${chainNumericId}, ` +
-      `ticks [${tickLower}, ${tickUpper}], fee ${pool.feeTier}, ` +
+      `[Krystal] Minting LP via ${protoLabel}: ${sortedToken0.symbol}/${sortedToken1.symbol} on chain ${chainNumericId}, ` +
+      `ticks [${tickLower}, ${tickUpper}], ${isAerodromeCl ? 'tickSpacing' : 'fee'} ${pool.feeTier}, ` +
       `amt0=${ethers.formatUnits(amount0Desired, sortedDec0)}, amt1=${ethers.formatUnits(amount1Desired, sortedDec1)}`,
     );
 
@@ -1378,6 +1521,8 @@ export async function closeEvmLpPosition(params: {
   posId: string;
   chainId: string;
   chainNumericId: number;
+  /** Protocol name for NFPM routing (e.g. 'Uniswap V3', 'Aerodrome Concentrated', 'PancakeSwap V3') */
+  protocol?: string;
   /** Token info for USD value estimation (optional — improves rebalance sizing) */
   token0?: { address: string; symbol: string; decimals: number };
   token1?: { address: string; symbol: string; decimals: number };
@@ -1403,8 +1548,10 @@ export async function closeEvmLpPosition(params: {
   try {
     const ethers = await loadEthers();
     const wallet = await getEvmWallet(chainNumericId);
-    const nfpmAddr = getNfpmAddress(chainNumericId) ?? NFPM_ADDRESS;
-    const nfpm = new ethers.Contract(nfpmAddr, NFPM_ABI, wallet);
+    const protoResolved = params.protocol ? resolveProtocol(params.protocol.toLowerCase(), chainNumericId) : undefined;
+    const nfpmAddr = protoResolved?.nfpmAddress ?? getNfpmAddress(chainNumericId) ?? NFPM_ADDRESS;
+    const nfpmAbi = protoResolved ? getNfpmAbiForProtocol(protoResolved.def.abi) : NFPM_ABI;
+    const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, wallet);
 
     // 1. Read position data
     const posData = await nfpm.positions(posId);
@@ -1525,6 +1672,8 @@ export async function claimEvmLpFees(params: {
   posId: string;
   chainId: string;
   chainNumericId: number;
+  /** Protocol name for NFPM routing */
+  protocol?: string;
 }): Promise<EvmLpClaimResult> {
   const env = getCFOEnv();
   const { posId, chainNumericId } = params;
@@ -1537,8 +1686,10 @@ export async function claimEvmLpFees(params: {
   try {
     const ethers = await loadEthers();
     const wallet = await getEvmWallet(chainNumericId);
-    const nfpmAddr = getNfpmAddress(chainNumericId) ?? NFPM_ADDRESS;
-    const nfpm = new ethers.Contract(nfpmAddr, NFPM_ABI, wallet);
+    const protoResolved = params.protocol ? resolveProtocol(params.protocol.toLowerCase(), chainNumericId) : undefined;
+    const nfpmAddr = protoResolved?.nfpmAddress ?? getNfpmAddress(chainNumericId) ?? NFPM_ADDRESS;
+    const nfpmAbi = protoResolved ? getNfpmAbiForProtocol(protoResolved.def.abi) : NFPM_ABI;
+    const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, wallet);
 
     const tx = await nfpm.collect({
       tokenId: posId,
@@ -1740,6 +1891,8 @@ export async function rebalanceEvmLpPosition(params: {
   /** Token info for USD value estimation (improves rebalance deploy sizing) */
   token0?: { address: string; symbol: string; decimals: number };
   token1?: { address: string; symbol: string; decimals: number };
+  /** Protocol key for multi-protocol NFPM routing */
+  protocol?: string;
 }): Promise<{
   closeResult: EvmLpCloseResult;
   openResult?: EvmLpOpenResult;
@@ -1752,6 +1905,7 @@ export async function rebalanceEvmLpPosition(params: {
     posId, chainId, chainNumericId,
     token0: params.token0,
     token1: params.token1,
+    protocol: params.protocol,
   });
   if (!closeResult.success) {
     return { closeResult };

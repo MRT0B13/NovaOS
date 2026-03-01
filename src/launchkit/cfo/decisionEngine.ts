@@ -269,6 +269,7 @@ export interface PortfolioState {
     posId: string;
     chainName: string;
     chainNumericId: number;
+    protocol: string; // e.g. 'Uniswap V3', 'PancakeSwap V3', 'Aerodrome Concentrated'
     token0Symbol: string;
     token1Symbol: string;
     token0Address: string;
@@ -910,6 +911,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
           posId: p.posId,
           chainName: p.chainName,
           chainNumericId: p.chainNumericId,
+          protocol: p.protocol,
           token0Symbol: p.token0.symbol,
           token1Symbol: p.token1.symbol,
           token0Address: p.token0.address,
@@ -2113,6 +2115,7 @@ export async function generateDecisions(
             posId: pos.posId,
             chainNumericId: pos.chainNumericId,
             chainName: pos.chainName,
+            protocol: pos.protocol,
             token0Symbol: pos.token0Symbol,
             token1Symbol: pos.token1Symbol,
             feesOwedUsd: pos.feesOwedUsd,
@@ -2152,6 +2155,7 @@ export async function generateDecisions(
             posId: pos.posId,
             chainNumericId: pos.chainNumericId,
             chainName: pos.chainName,
+            protocol: pos.protocol,
             token0Symbol: pos.token0Symbol,
             token1Symbol: pos.token1Symbol,
             token0Address: pos.token0Address,
@@ -3361,7 +3365,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
       case 'KRYSTAL_LP_REBALANCE': {
         const krystal = await import('./krystalService.ts');
-        const { posId, chainNumericId, closeOnly, rangeWidthTicks } = decision.params;
+        const { posId, chainNumericId, closeOnly, rangeWidthTicks, protocol: rebalProto } = decision.params;
         const chainId = decision.params.chainName
           ? `${decision.params.chainName}@${chainNumericId}`
           : String(chainNumericId);
@@ -3383,6 +3387,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           closeOnly,
           token0,
           token1,
+          protocol: rebalProto,
         });
 
         if (!closeResult.success) {
@@ -3407,9 +3412,9 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
       case 'KRYSTAL_LP_CLAIM_FEES': {
         const krystal = await import('./krystalService.ts');
-        const { posId, chainNumericId, chainName } = decision.params;
+        const { posId, chainNumericId, chainName, protocol: claimProto } = decision.params;
         const chainId = `${chainName}@${chainNumericId}`;
-        const result = await krystal.claimEvmLpFees({ posId, chainId, chainNumericId });
+        const result = await krystal.claimEvmLpFees({ posId, chainId, chainNumericId, protocol: claimProto });
         if (result.success) markDecision(`KRYSTAL_LP_CLAIM_${posId}`);
         return {
           ...base,
