@@ -875,18 +875,33 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
         logger.debug('[CFO] Orca DB tier enrichment failed (non-fatal):', dbErr instanceof Error ? dbErr.message : dbErr);
       }
 
+      // Also try pool discovery cache for risk tier / symbols as a fallback
+      let discoveryCache: Map<string, { tier?: string; tokenA?: string; tokenB?: string }> | null = null;
+      try {
+        const { getCachedPools } = await import('./orcaPoolDiscovery.ts');
+        const cached = getCachedPools();
+        if (cached.length > 0) {
+          discoveryCache = new Map();
+          for (const c of cached) {
+            discoveryCache.set(c.whirlpoolAddress, { tier: c.riskTier, tokenA: c.tokenA.symbol, tokenB: c.tokenB.symbol });
+          }
+        }
+      } catch { /* non-fatal */ }
+
       orcaPositions = positions.map(p => {
         const dbInfo = p.whirlpoolAddress ? dbTierMap.get(p.whirlpoolAddress) : undefined;
+        const discInfo = p.whirlpoolAddress && discoveryCache ? discoveryCache.get(p.whirlpoolAddress) : undefined;
         // Convert unclaimed fees to USD (SOL fees * SOL price + USDC fees * $1)
         const feesUsd = (p.unclaimedFeesSol * solPriceUsd) + p.unclaimedFeesUsdc;
+        // Priority: on-chain position data > DB metadata > pool discovery cache
         return {
           positionMint: p.positionMint,
           rangeUtilisationPct: p.rangeUtilisationPct,
           inRange: p.inRange,
           whirlpoolAddress: p.whirlpoolAddress,
-          riskTier: dbInfo?.tier,
-          tokenA: dbInfo?.tokenA,
-          tokenB: dbInfo?.tokenB,
+          riskTier: p.riskTier ?? dbInfo?.tier ?? discInfo?.tier,
+          tokenA: p.tokenA ?? dbInfo?.tokenA ?? discInfo?.tokenA,
+          tokenB: p.tokenB ?? dbInfo?.tokenB ?? discInfo?.tokenB,
           valueUsd: p.liquidityUsd,
           feesUsd,
         };

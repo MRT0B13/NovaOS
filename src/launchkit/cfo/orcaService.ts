@@ -130,6 +130,9 @@ async function buildSendAndConfirm(
 export interface OrcaPosition {
   positionMint: string;
   whirlpoolAddress?: string;
+  tokenA?: string;               // symbol, e.g. 'SOL'
+  tokenB?: string;               // symbol, e.g. 'USDC'
+  riskTier?: 'low' | 'medium' | 'high';
   lowerPrice: number;
   upperPrice: number;
   currentPrice: number;
@@ -658,9 +661,19 @@ export async function getPositions(): Promise<OrcaPosition[]> {
           logger.debug('[Orca] fee calc failed, defaulting to 0:', feeErr);
         }
 
+        // Derive risk tier from token composition (same logic as orcaPoolDiscovery)
+        const _stables = new Set(['USDC', 'USDT', 'DAI', 'USDH', 'UXD', 'PYUSD', 'USDS']);
+        const symA = knownPool?.tokenASymbol ?? '';
+        const symB = knownPool?.tokenBSymbol ?? '';
+        const sA = _stables.has(symA.toUpperCase()), sB = _stables.has(symB.toUpperCase());
+        const riskTier: 'low' | 'medium' | 'high' = (sA && sB) ? 'low' : (sA || sB) ? 'medium' : 'high';
+
         result.push({
           positionMint: parsed.mint,
           whirlpoolAddress: poolAddress,
+          tokenA: symA || undefined,
+          tokenB: symB || undefined,
+          riskTier: (symA || symB) ? riskTier : undefined,
           lowerPrice,
           upperPrice,
           currentPrice,
