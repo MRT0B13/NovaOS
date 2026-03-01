@@ -775,16 +775,19 @@ export class CFOAgent extends BaseAgent {
           case 'KRYSTAL_LP_OPEN': {
             const pool = p.pool ?? {};
             const resultAny = r as any;
+            // Use actual deployed USD from the mint result if available, fall back to target
+            const actualUsd = resultAny.actualDeployUsd ?? p.deployUsd ?? 0;
             await this.repo.insertTransaction({
               id: `tx-krystal-lp-open-${r.txId ?? Date.now()}`, timestamp: now,
               chain: p.chainName ?? 'evm', strategyTag: 'krystal_lp', txType: 'liquidity_add' as TransactionType,
-              tokenIn: pool.token0?.symbol ?? '?', amountIn: p.deployUsd ?? 0,
-              tokenOut: `${pool.token0?.symbol ?? '?'}/${pool.token1?.symbol ?? '?'}-LP`, amountOut: p.deployUsd ?? 0,
+              tokenIn: pool.token0?.symbol ?? '?', amountIn: actualUsd,
+              tokenOut: `${pool.token0?.symbol ?? '?'}/${pool.token1?.symbol ?? '?'}-LP`, amountOut: actualUsd,
               feeUsd: 0, txHash: resultAny.txHash ?? r.txId, walletAddress: '', status: 'confirmed',
               metadata: {
                 pair: p.pair, chainName: p.chainName, chainNumericId: pool.chainNumericId,
                 poolAddress: pool.poolAddress, feeTier: pool.feeTier,
                 rangeWidthTicks: p.rangeWidthTicks, reasoning: d.reasoning,
+                targetDeployUsd: p.deployUsd,
               },
             });
             // Persist EVM LP record to kv_store
@@ -797,10 +800,10 @@ export class CFOAgent extends BaseAgent {
               poolAddress: pool.poolAddress ?? '',
               token0Symbol: pool.token0?.symbol ?? '?',
               token1Symbol: pool.token1?.symbol ?? '?',
-              entryUsd: p.deployUsd ?? 0,
+              entryUsd: actualUsd,
               openedAt: Date.now(),
             });
-            logger.info(`[CFO] Persisted KRYSTAL_LP_OPEN: ${p.pair} on ${p.chainName} $${(p.deployUsd ?? 0).toFixed(0)}`);
+            logger.info(`[CFO] Persisted KRYSTAL_LP_OPEN: ${p.pair} on ${p.chainName} $${actualUsd.toFixed(2)} (target $${(p.deployUsd ?? 0).toFixed(0)})`);
             break;
           }
 

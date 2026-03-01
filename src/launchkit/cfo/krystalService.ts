@@ -151,6 +151,8 @@ export interface EvmLpOpenResult {
   tokenId?: string;
   txHash?: string;
   error?: string;
+  /** Actual USD value deposited (may differ from target deployUsd if underfunded) */
+  actualDeployUsd?: number;
 }
 
 export interface EvmLpCloseResult {
@@ -782,10 +784,46 @@ export async function openEvmLpPosition(
       token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
     ]);
 
+    // ── Compute token USD prices early (needed for value-based funding decisions) ──
+    const sqrtPriceX96 = slot0.sqrtPriceX96 ?? slot0[0] ?? BigInt(0);
+    const dec0 = pool.token0.decimals ?? 18;
+    const dec1 = pool.token1.decimals ?? 18;
+    const sqrtP = Number(sqrtPriceX96) / (2 ** 96);
+    const rawPrice = sqrtP * sqrtP;
+    const price0In1 = rawPrice * (10 ** dec0) / (10 ** dec1);
+
+    const stableSymbols = ['USDC', 'USDT', 'DAI', 'BUSD', 'USDCE', 'USDC.E', 'USDT0'];
+    const is0Stable = stableSymbols.includes(pool.token0.symbol.toUpperCase());
+    const is1Stable = stableSymbols.includes(pool.token1.symbol.toUpperCase());
+
+    let usdPerToken0: number;
+    let usdPerToken1: number;
+
+    if (is1Stable) {
+      usdPerToken1 = 1;
+      usdPerToken0 = price0In1;
+    } else if (is0Stable) {
+      usdPerToken0 = 1;
+      usdPerToken1 = 1 / price0In1;
+    } else {
+      const nPrice = await getNativeTokenPrice(chainNumericId);
+      usdPerToken0 = nPrice;
+      usdPerToken1 = nPrice * price0In1;
+    }
+
+    // Compute total value of currently-held tokens
+    const heldUsd0 = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+    const heldUsd1 = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+    const totalHeldUsd = heldUsd0 + heldUsd1;
+    const fundingGapUsd = deployUsd - totalHeldUsd;
+
+    logger.info(`[Krystal] Pre-funding: held $${totalHeldUsd.toFixed(2)} (${pool.token0.symbol}=$${heldUsd0.toFixed(2)}, ${pool.token1.symbol}=$${heldUsd1.toFixed(2)}), target $${deployUsd.toFixed(2)}, gap $${fundingGapUsd.toFixed(2)}`);
+
     // ── Bridge + Swap Funding Flow ──────────────────────────────────
-    // Phase 1: Bridge — only if BOTH balances are zero and bridge funding is available
-    if (bal0 === BigInt(0) && bal1 === BigInt(0) && bridgeFunding) {
-      logger.info(`[Krystal] No token balances on chain ${chainNumericId} — attempting bridge funding from chain ${bridgeFunding.sourceChainId}`);
+    // Phase 1: Bridge — if held value < 50% of deploy target and bridge funding is available
+    if (totalHeldUsd < deployUsd * 0.5 && bridgeFunding) {
+      const bridgeAmountUsd = deployUsd - totalHeldUsd; // bridge the gap
+      logger.info(`[Krystal] Underfunded ($${totalHeldUsd.toFixed(2)} < 50% of $${deployUsd.toFixed(2)}) — attempting bridge of $${bridgeAmountUsd.toFixed(2)} from chain ${bridgeFunding.sourceChainId}`);
       try {
         const bridge = await import('./wormholeService.ts');
 
@@ -801,13 +839,13 @@ export async function openEvmLpPosition(
               bridgeFunding.walletAddress,
             );
 
-            if (sourceBalance >= deployUsd) {
-              // Bridge USDC to target chain
+            if (sourceBalance >= bridgeAmountUsd) {
+              // Bridge USDC to target chain (only the gap, not the full deploy)
               const bridgeResult = await bridge.bridgeEvmToEvm(
                 bridgeFunding.sourceChainId,
                 chainNumericId,
                 'USDC',
-                deployUsd,
+                bridgeAmountUsd,
                 bridgeFunding.walletAddress,
                 wallet.address,
               );
@@ -827,7 +865,7 @@ export async function openEvmLpPosition(
                 logger.warn(`[Krystal] Bridge failed: ${bridgeResult.error}`);
               }
             } else {
-              logger.warn(`[Krystal] Insufficient USDC on source chain: $${sourceBalance.toFixed(2)} < $${deployUsd}`);
+              logger.warn(`[Krystal] Insufficient USDC on source chain: $${sourceBalance.toFixed(2)} < $${bridgeAmountUsd.toFixed(2)} needed`);
             }
           }
         }
@@ -836,9 +874,14 @@ export async function openEvmLpPosition(
       }
     }
 
-    // Phase 2: Swap USDC into pool tokens if we have USDC but are missing one side
+    // Phase 2: Swap USDC into pool tokens if we have USDC but are missing/underfunded on one side
     // This runs ALWAYS (not just after bridge) — handles cases where wallet has USDC
     // on the target chain already, or where one pool token is USDC and we need the other.
+    // Re-read balances first (bridge may have deposited USDC)
+    [bal0, bal1] = await Promise.all([
+      token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+    ]);
     try {
       const swap = await import('./evmSwapService.ts');
       const bridge = await import('./wormholeService.ts');
@@ -849,44 +892,50 @@ export async function openEvmLpPosition(
         const isToken0Usdc = pool.token0.address.toLowerCase() === usdcAddr.toLowerCase();
         const isToken1Usdc = pool.token1.address.toLowerCase() === usdcAddr.toLowerCase();
 
-        // Determine if swaps are needed: we have USDC but are missing (or have negligible) a pool token
-        // Use a dust threshold: if token balance < 0.01% of max possible on-chain (by raw amount), treat as "missing"
-        const dustThreshold0 = BigInt(Math.max(1, Math.floor(0.001 * (10 ** (pool.token0.decimals ?? 18))))); // ~0.001 units
-        const dustThreshold1 = BigInt(Math.max(1, Math.floor(0.001 * (10 ** (pool.token1.decimals ?? 18))))); // ~0.001 units
-        const needSwap0 = !isToken0Usdc && bal0 < dustThreshold0 && usdcBal > 0.5;
-        const needSwap1 = !isToken1Usdc && bal1 < dustThreshold1 && usdcBal > 0.5;
+        // Value-based check: swap if a token's USD value < 30% of its target half
+        const halfTarget = deployUsd / 2;
+        const held0Usd = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+        const held1Usd = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+        const needSwap0 = !isToken0Usdc && held0Usd < halfTarget * 0.3 && usdcBal > 0.5;
+        const needSwap1 = !isToken1Usdc && held1Usd < halfTarget * 0.3 && usdcBal > 0.5;
 
         if ((needSwap0 || needSwap1) && usdcBal > 0) {
-          // If one pool token IS USDC, swap the other half only; else split 50/50
-          const swapPortion = (isToken0Usdc || isToken1Usdc) ? usdcBal / 2 : usdcBal / 2;
-          logger.info(`[Krystal] Auto-swap: USDC bal=$${usdcBal.toFixed(2)} → swapping for missing pool tokens`);
+          // Calculate how much USDC to swap into each missing side
+          const neededUsd0 = needSwap0 ? Math.max(0, halfTarget - held0Usd) : 0;
+          const neededUsd1 = needSwap1 ? Math.max(0, halfTarget - held1Usd) : 0;
+          const totalNeeded = neededUsd0 + neededUsd1;
+          // Pro-rate if we don't have enough USDC for both
+          const scale = totalNeeded > 0 && usdcBal < totalNeeded ? usdcBal / totalNeeded : 1;
+          const swapPortion0 = neededUsd0 * scale;
+          const swapPortion1 = neededUsd1 * scale;
+          logger.info(`[Krystal] Auto-swap: USDC bal=$${usdcBal.toFixed(2)}, need0=$${neededUsd0.toFixed(2)}, need1=$${neededUsd1.toFixed(2)} (scale=${scale.toFixed(2)})`);
 
-          if (needSwap0 && swapPortion > 0.5) {
-            const quote0 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token0.address, swapPortion, pool.feeTier);
+          if (needSwap0 && swapPortion0 > 0.5) {
+            const quote0 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token0.address, swapPortion0, pool.feeTier);
             if (quote0 && quote0.priceImpactPct > 3) {
               logger.warn(`[Krystal] Swap USDC→${pool.token0.symbol} price impact ${quote0.priceImpactPct.toFixed(1)}% > 3% — skipping`);
             } else if (!quote0) {
               logger.warn(`[Krystal] Swap USDC→${pool.token0.symbol}: no quote available`);
             } else {
               const swapResult = await swap.executeEvmSwap(
-                chainNumericId, usdcAddr, pool.token0.address, swapPortion, pool.feeTier,
+                chainNumericId, usdcAddr, pool.token0.address, swapPortion0, pool.feeTier,
               );
-              if (swapResult.success) logger.info(`[Krystal] Swapped $${swapPortion.toFixed(2)} USDC → ${pool.token0.symbol}`);
+              if (swapResult.success) logger.info(`[Krystal] Swapped $${swapPortion0.toFixed(2)} USDC → ${pool.token0.symbol}`);
               else logger.warn(`[Krystal] Swap USDC→${pool.token0.symbol} failed: ${swapResult.error}`);
             }
           }
 
-          if (needSwap1 && swapPortion > 0.5) {
-            const quote1 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token1.address, swapPortion, pool.feeTier);
+          if (needSwap1 && swapPortion1 > 0.5) {
+            const quote1 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token1.address, swapPortion1, pool.feeTier);
             if (quote1 && quote1.priceImpactPct > 3) {
               logger.warn(`[Krystal] Swap USDC→${pool.token1.symbol} price impact ${quote1.priceImpactPct.toFixed(1)}% > 3% — skipping`);
             } else if (!quote1) {
               logger.warn(`[Krystal] Swap USDC→${pool.token1.symbol}: no quote available`);
             } else {
               const swapResult = await swap.executeEvmSwap(
-                chainNumericId, usdcAddr, pool.token1.address, swapPortion, pool.feeTier,
+                chainNumericId, usdcAddr, pool.token1.address, swapPortion1, pool.feeTier,
               );
-              if (swapResult.success) logger.info(`[Krystal] Swapped $${swapPortion.toFixed(2)} USDC → ${pool.token1.symbol}`);
+              if (swapResult.success) logger.info(`[Krystal] Swapped $${swapPortion1.toFixed(2)} USDC → ${pool.token1.symbol}`);
               else logger.warn(`[Krystal] Swap USDC→${pool.token1.symbol} failed: ${swapResult.error}`);
             }
           }
@@ -913,7 +962,8 @@ export async function openEvmLpPosition(
         const t0IsWrapped = pool.token0.address.toLowerCase() === wrapped.address.toLowerCase();
         const t1IsWrapped = pool.token1.address.toLowerCase() === wrapped.address.toLowerCase();
 
-        if ((t0IsWrapped && bal0 === BigInt(0)) || (t1IsWrapped && bal1 === BigInt(0))) {
+        if ((t0IsWrapped && Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0 < deployUsd * 0.2) ||
+            (t1IsWrapped && Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1 < deployUsd * 0.2)) {
           const nativeBal = await provider.getBalance(wallet.address);
           // Keep 0.005 native for gas, wrap the rest (up to deployUsd/2 worth)
           const gasReserve = ethers.parseEther('0.005');
@@ -946,37 +996,7 @@ export async function openEvmLpPosition(
     ]);
 
     // 4. Calculate desired amounts — cap at deployUsd equivalent
-    //    Use sqrtPriceX96 to derive token0 price in token1 terms, then limit each side.
-    const sqrtPriceX96 = slot0.sqrtPriceX96 ?? slot0[0] ?? BigInt(0);
-    const dec0 = pool.token0.decimals ?? 18;
-    const dec1 = pool.token1.decimals ?? 18;
-
-    // price = (sqrtPriceX96 / 2^96)^2  in token1-per-token0 (adjusted for decimals)
-    const sqrtP = Number(sqrtPriceX96) / (2 ** 96);
-    const rawPrice = sqrtP * sqrtP;                 // token1-units-per-token0-unit (raw)
-    const price0In1 = rawPrice * (10 ** dec0) / (10 ** dec1);   // human-readable
-
-    // We want ~deployUsd / 2 worth of each token
-    // Need a USD price for at least one token. Heuristic: if one token is a stablecoin, its price ≈ $1
-    const stableSymbols = ['USDC', 'USDT', 'DAI', 'BUSD', 'USDCE', 'USDC.E', 'USDT0'];
-    const is0Stable = stableSymbols.includes(pool.token0.symbol.toUpperCase());
-    const is1Stable = stableSymbols.includes(pool.token1.symbol.toUpperCase());
-
-    let usdPerToken0: number;
-    let usdPerToken1: number;
-
-    if (is1Stable) {
-      usdPerToken1 = 1;
-      usdPerToken0 = price0In1; // token0 costs price0In1 stablecoin units
-    } else if (is0Stable) {
-      usdPerToken0 = 1;
-      usdPerToken1 = 1 / price0In1;
-    } else {
-      // Neither is stable — use native token price heuristic
-      const nPrice = await getNativeTokenPrice(chainNumericId);
-      usdPerToken0 = nPrice; // rough — assumes token0 is the native-like one
-      usdPerToken1 = nPrice * price0In1;
-    }
+    //    Price data already computed above (pre-funding) using sqrtPriceX96.
 
     const halfUsd = deployUsd / 2;
     const maxToken0 = BigInt(Math.floor((halfUsd / usdPerToken0) * (10 ** dec0)));
@@ -1073,6 +1093,19 @@ export async function openEvmLpPosition(
       const missing = post0Ratio < NEGLIGIBLE_PCT ? pool.token0.symbol : pool.token1.symbol;
       logger.warn(`[Krystal] One-sided: have ${oneSide} (${Math.max(post0Ratio, post1Ratio)}%) but ${missing} negligible (${Math.min(post0Ratio, post1Ratio)}%). Tick range is in-range — both tokens required. Aborting.`);
       return { success: false, error: `Zap swap failed to acquire ${missing} — cannot mint in-range LP with only ${oneSide}` };
+    }
+
+    // Minimum deploy guard: if actual token value < 30% of target, abort (not worth gas)
+    const actualUsd0 = Number(ethers.formatUnits(amount0Desired, dec0)) * usdPerToken0;
+    const actualUsd1 = Number(ethers.formatUnits(amount1Desired, dec1)) * usdPerToken1;
+    const actualDeployUsd = actualUsd0 + actualUsd1;
+    if (actualDeployUsd < deployUsd * 0.3) {
+      logger.warn(
+        `[Krystal] Underfunded: actual $${actualDeployUsd.toFixed(2)} < 30% of target $${deployUsd.toFixed(2)} ` +
+        `(${pool.token0.symbol}=$${actualUsd0.toFixed(2)}, ${pool.token1.symbol}=$${actualUsd1.toFixed(2)}). ` +
+        `Aborting — not worth gas for a tiny position.`,
+      );
+      return { success: false, error: `Insufficient funding: $${actualDeployUsd.toFixed(2)} < 30% of $${deployUsd.toFixed(2)} target` };
     }
 
     // 6a. Verify tokens are in correct order (NFPM requires token0 < token1 by address)
@@ -1204,8 +1237,8 @@ export async function openEvmLpPosition(
       tokenId = `unknown-${receipt.hash.slice(0, 12)}`;
     }
 
-    logger.info(`[Krystal] LP minted: tokenId=${tokenId} tx=${receipt.hash}`);
-    return { success: true, tokenId, txHash: receipt.hash };
+    logger.info(`[Krystal] LP minted: tokenId=${tokenId} tx=${receipt.hash} actual=$${actualDeployUsd.toFixed(2)}`);
+    return { success: true, tokenId, txHash: receipt.hash, actualDeployUsd };
   } catch (err) {
     logger.error('[Krystal] openEvmLpPosition error:', err);
     return { success: false, error: (err as Error).message };
