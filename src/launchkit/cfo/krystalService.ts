@@ -189,6 +189,86 @@ const POOL_ABI = [
 
 const MaxUint128 = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF');
 
+// ============================================================================
+// V3 Math Helpers — compute token amounts from on-chain liquidity
+// ============================================================================
+const Q96 = BigInt(1) << BigInt(96);
+
+/**
+ * Convert a Uniswap V3 tick index to sqrtPriceX96 (Q64.96 fixed-point).
+ * Formula: floor( sqrt(1.0001^tick) * 2^96 )
+ */
+function tickToSqrtPriceX96(tick: number): bigint {
+  // Use the standard absTick bit-decomposition approach for precision.
+  const absTick = Math.abs(tick);
+  // Start with ratio = 1 in Q128
+  let ratio = BigInt('0x100000000000000000000000000000000'); // 1 << 128
+
+  // Each bit of absTick multiplies by a precomputed magic constant
+  if (absTick & 0x1)     ratio = (ratio * BigInt('0xfffcb933bd6fad37aa2d162d1a594001')) >> BigInt(128);
+  if (absTick & 0x2)     ratio = (ratio * BigInt('0xfff97272373d413259a46990580e213a')) >> BigInt(128);
+  if (absTick & 0x4)     ratio = (ratio * BigInt('0xfff2e50f5f656932ef12357cf3c7fdcc')) >> BigInt(128);
+  if (absTick & 0x8)     ratio = (ratio * BigInt('0xffe5caca7e10e4e61c3624eaa0941cd0')) >> BigInt(128);
+  if (absTick & 0x10)    ratio = (ratio * BigInt('0xffcb9843d60f6159c9db58835c926644')) >> BigInt(128);
+  if (absTick & 0x20)    ratio = (ratio * BigInt('0xff973b41fa98c081472e6896dfb254c0')) >> BigInt(128);
+  if (absTick & 0x40)    ratio = (ratio * BigInt('0xff2ea16466c96a3843ec78b326b52861')) >> BigInt(128);
+  if (absTick & 0x80)    ratio = (ratio * BigInt('0xfe5dee046a99a2a811c461f1969c3053')) >> BigInt(128);
+  if (absTick & 0x100)   ratio = (ratio * BigInt('0xfcbe86c7900a88aedcffc83b479aa3a4')) >> BigInt(128);
+  if (absTick & 0x200)   ratio = (ratio * BigInt('0xf987a7253ac413176f2b074cf7815e54')) >> BigInt(128);
+  if (absTick & 0x400)   ratio = (ratio * BigInt('0xf3392b0822b70005940c7a398e4b70f3')) >> BigInt(128);
+  if (absTick & 0x800)   ratio = (ratio * BigInt('0xe7159475a2c29b7443b29c7fa6e889d9')) >> BigInt(128);
+  if (absTick & 0x1000)  ratio = (ratio * BigInt('0xd097f3bdfd2022b8845ad8f792aa5825')) >> BigInt(128);
+  if (absTick & 0x2000)  ratio = (ratio * BigInt('0xa9f746462d870fdf8a65dc1f90e061e5')) >> BigInt(128);
+  if (absTick & 0x4000)  ratio = (ratio * BigInt('0x70d869a156d2a1b890bb3df62baf32f7')) >> BigInt(128);
+  if (absTick & 0x8000)  ratio = (ratio * BigInt('0x31be135f97d08fd981231505542fcfa6')) >> BigInt(128);
+  if (absTick & 0x10000) ratio = (ratio * BigInt('0x9aa508b5b7a84e1c677de54f3e99bc9')) >> BigInt(128);
+  if (absTick & 0x20000) ratio = (ratio * BigInt('0x5d6af8dedb81196699c329225ee604')) >> BigInt(128);
+  if (absTick & 0x40000) ratio = (ratio * BigInt('0x2216e584f5fa1ea926041bedfe98')) >> BigInt(128);
+  if (absTick & 0x80000) ratio = (ratio * BigInt('0x48a170391f7dc42444e8fa2')) >> BigInt(128);
+
+  // If tick > 0, invert
+  if (tick > 0) {
+    ratio = (BigInt(1) << BigInt(256)) / ratio; // type(uint256).max / ratio, simplified
+  }
+
+  // Shift from Q128 to Q96
+  return (ratio >> BigInt(32)) + (ratio % (BigInt(1) << BigInt(32)) === BigInt(0) ? BigInt(0) : BigInt(1));
+}
+
+/**
+ * Compute token amounts for a V3 position given liquidity and price bounds.
+ * Mirrors Uniswap V3's LiquidityAmounts.getAmountsForLiquidity().
+ */
+function getAmountsForLiquidity(
+  sqrtPriceX96: bigint,
+  sqrtPriceLower: bigint,
+  sqrtPriceUpper: bigint,
+  liquidity: bigint,
+): { amount0: bigint; amount1: bigint } {
+  if (sqrtPriceLower > sqrtPriceUpper) {
+    [sqrtPriceLower, sqrtPriceUpper] = [sqrtPriceUpper, sqrtPriceLower];
+  }
+
+  let amount0 = BigInt(0);
+  let amount1 = BigInt(0);
+
+  if (sqrtPriceX96 <= sqrtPriceLower) {
+    // Current price below range — position is entirely token0
+    amount0 = (liquidity * Q96 * (sqrtPriceUpper - sqrtPriceLower))
+      / (sqrtPriceLower * sqrtPriceUpper);
+  } else if (sqrtPriceX96 >= sqrtPriceUpper) {
+    // Current price above range — position is entirely token1
+    amount1 = (liquidity * (sqrtPriceUpper - sqrtPriceLower)) / Q96;
+  } else {
+    // In range — position holds both tokens
+    amount0 = (liquidity * Q96 * (sqrtPriceUpper - sqrtPriceX96))
+      / (sqrtPriceX96 * sqrtPriceUpper);
+    amount1 = (liquidity * (sqrtPriceX96 - sqrtPriceLower)) / Q96;
+  }
+
+  return { amount0, amount1 };
+}
+
 // Uniswap V3 SwapRouter02 (universal, for pre-position swaps)
 const SWAP_ROUTER_02 = '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45';
 
@@ -890,9 +970,42 @@ export async function fetchKrystalPositions(
             ? computeRangeUtilisation(tickLower, tickUpper, currentTick)
             : (inRange ? 50 : 0);
 
-          // Estimate value from entryUsd (we don't have on-chain amounts without complex math)
-          // This is a conservative estimate — actual value tracked via entryUsd
-          const valueUsd = dbRec.entryUsd;
+          // ── Compute real on-chain liquidity value via V3 math ──
+          // Uses getAmountsForLiquidity: given current sqrtPrice and tick range,
+          // calculate how much of each token the position holds.
+          let valueUsd = 0;
+          try {
+            const ethersLib = ethers; // use the already-imported ethers
+            // We already have currentTick + slot0 from pool lookup above.
+            // If we have a poolAddress, read slot0 to get sqrtPriceX96
+            if (poolAddress && currentTick !== 0) {
+              const poolContract = new ethersLib.Contract(poolAddress, POOL_ABI, provider);
+              const slot0 = await poolContract.slot0();
+              const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96 ?? slot0[0] ?? 0);
+
+              // V3 getAmountsForLiquidity
+              const sqrtPriceLower = tickToSqrtPriceX96(tickLower);
+              const sqrtPriceUpper = tickToSqrtPriceX96(tickUpper);
+
+              const { amount0, amount1 } = getAmountsForLiquidity(
+                sqrtPriceX96, sqrtPriceLower, sqrtPriceUpper, liquidity,
+              );
+
+              const ui0 = Number(ethersLib.formatUnits(amount0, Number(dec0)));
+              const ui1 = Number(ethersLib.formatUnits(amount1, Number(dec1)));
+
+              // Price tokens: stablecoins ≈ $1, others ≈ native price
+              const nativePriceForVal = await getNativeTokenPrice(dbRec.chainNumericId);
+              const usd0 = isStablecoin(String(sym0)) ? ui0 : ui0 * nativePriceForVal;
+              const usd1 = isStablecoin(String(sym1)) ? ui1 : ui1 * nativePriceForVal;
+              valueUsd = usd0 + usd1;
+              logger.debug(`[Krystal] On-chain value: ${sym0}=${ui0.toFixed(6)} ($${usd0.toFixed(2)}), ${sym1}=${ui1.toFixed(6)} ($${usd1.toFixed(2)}) → $${valueUsd.toFixed(2)}`);
+            }
+          } catch (valErr) {
+            logger.debug(`[Krystal] On-chain value calc failed, falling back to entryUsd:`, valErr);
+          }
+          // Fallback to entryUsd if on-chain calc failed or returned 0
+          if (valueUsd <= 0) valueUsd = dbRec.entryUsd;
 
           // Pending fees from NFPM positions data
           const tokensOwed0 = Number(ethers.formatUnits(posData.tokensOwed0 ?? posData[10] ?? 0, Number(dec0)));
@@ -1472,14 +1585,20 @@ export async function openEvmLpPosition(
     const tx = await nfpmContract.mint(mintParams);
     const receipt = await tx.wait();
 
-    // Parse tokenId from Transfer event (ERC721) or IncreaseLiquidity
+    // Parse tokenId AND actual amounts from IncreaseLiquidity event
     let tokenId: string | undefined;
+    let mintedAmount0 = BigInt(0);
+    let mintedAmount1 = BigInt(0);
     for (const log of receipt.logs) {
       try {
         const parsed = nfpmContract.interface.parseLog({ topics: log.topics as string[], data: log.data });
-        if (parsed?.name === 'IncreaseLiquidity' || parsed?.name === 'Transfer') {
+        if (parsed?.name === 'IncreaseLiquidity') {
           tokenId = parsed.args?.tokenId?.toString();
+          mintedAmount0 = BigInt(parsed.args?.amount0?.toString() ?? '0');
+          mintedAmount1 = BigInt(parsed.args?.amount1?.toString() ?? '0');
           if (tokenId) break;
+        } else if (parsed?.name === 'Transfer' && !tokenId) {
+          tokenId = parsed.args?.tokenId?.toString();
         }
       } catch { /* skip non-NFPM logs */ }
     }
@@ -1505,8 +1624,25 @@ export async function openEvmLpPosition(
       tokenId = `unknown-${receipt.hash.slice(0, 12)}`;
     }
 
-    logger.info(`[Krystal] LP minted: tokenId=${tokenId} tx=${receipt.hash} actual=$${actualDeployUsd.toFixed(2)}`);
-    return { success: true, tokenId, txHash: receipt.hash, actualDeployUsd };
+    // Compute REAL deposited USD from IncreaseLiquidity event amounts (not pre-mint estimates)
+    // The NFPM only deposits tokens in the ratio dictated by tickRange × currentTick;
+    // excess tokens stay in the wallet. Pre-mint 'actualDeployUsd' can overstate badly.
+    let realDeployUsd = actualDeployUsd; // fallback to pre-mint estimate
+    if (mintedAmount0 > BigInt(0) || mintedAmount1 > BigInt(0)) {
+      // Use sorted decimals (amounts are in sorted token order)
+      const minted0Ui = Number(ethers.formatUnits(mintedAmount0, sortedDec0));
+      const minted1Ui = Number(ethers.formatUnits(mintedAmount1, sortedDec1));
+      // Compute USD per sorted token
+      const sorted0IsStable = stableSymbols.includes(sortedToken0.symbol.toUpperCase());
+      const sorted1IsStable = stableSymbols.includes(sortedToken1.symbol.toUpperCase());
+      const usdPerSorted0 = tokensSwapped ? usdPerToken1 : usdPerToken0;
+      const usdPerSorted1 = tokensSwapped ? usdPerToken0 : usdPerToken1;
+      realDeployUsd = minted0Ui * usdPerSorted0 + minted1Ui * usdPerSorted1;
+      logger.info(`[Krystal] Mint actual amounts: ${sortedToken0.symbol}=${minted0Ui.toFixed(6)} ($${(minted0Ui * usdPerSorted0).toFixed(2)}), ${sortedToken1.symbol}=${minted1Ui.toFixed(6)} ($${(minted1Ui * usdPerSorted1).toFixed(2)}) → real=$${realDeployUsd.toFixed(2)} (pre-mint estimate was $${actualDeployUsd.toFixed(2)})`);
+    }
+
+    logger.info(`[Krystal] LP minted: tokenId=${tokenId} tx=${receipt.hash} actual=$${realDeployUsd.toFixed(2)}`);
+    return { success: true, tokenId, txHash: receipt.hash, actualDeployUsd: realDeployUsd };
   } catch (err) {
     logger.error('[Krystal] openEvmLpPosition error:', err);
     return { success: false, error: (err as Error).message };
