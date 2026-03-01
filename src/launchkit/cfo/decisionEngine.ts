@@ -88,6 +88,7 @@ export type DecisionType =
   | 'KAMINO_MULTIPLY_VAULT'  // deposit into a Kamino Multiply vault (managed auto-leverage)
   | 'ORCA_LP_OPEN'           // open a new concentrated LP position
   | 'ORCA_LP_REBALANCE'      // close out-of-range position and reopen centred on new price
+  | 'ORCA_LP_CLOSE'          // close Orca LP position without reopening (capital withdrawal)
   | 'KAMINO_BORROW_LP'       // borrow from Kamino → swap → open Orca LP, fees repay loan
   | 'EVM_FLASH_ARB'          // Arbitrum: atomic flash loan arb via Aave v3 + DEX spread
   | 'KRYSTAL_LP_OPEN'        // open EVM concentrated LP via Krystal-discovered pool
@@ -256,7 +257,7 @@ export interface PortfolioState {
   // Orca concentrated LP state
   orcaLpValueUsd: number;            // total value in Orca LP positions
   orcaLpFeeApy: number;              // estimated fee APY on current LP positions
-  orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string; riskTier?: string; tokenA?: string; tokenB?: string }>;
+  orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string; riskTier?: string; tokenA?: string; tokenB?: string; valueUsd?: number; feesUsd?: number }>;
 
   // EVM Flash Arb state
   evmArbProfit24h: number;        // confirmed flash arb profit last 24h (in-memory)
@@ -840,7 +841,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
 
   // Orca LP state
   let orcaLpValueUsd = 0, orcaLpFeeApy = 0;
-  let orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string; riskTier?: string; tokenA?: string; tokenB?: string }> = [];
+  let orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string; riskTier?: string; tokenA?: string; tokenB?: string; valueUsd?: number; feesUsd?: number }> = [];
   if (env.orcaLpEnabled) {
     try {
       const orca = await import('./orcaService.ts');
@@ -860,6 +861,8 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
 
       orcaPositions = positions.map(p => {
         const dbInfo = p.whirlpoolAddress ? dbTierMap.get(p.whirlpoolAddress) : undefined;
+        // Convert unclaimed fees to USD (SOL fees * SOL price + USDC fees * $1)
+        const feesUsd = (p.unclaimedFeesSol * solPriceUsd) + p.unclaimedFeesUsdc;
         return {
           positionMint: p.positionMint,
           rangeUtilisationPct: p.rangeUtilisationPct,
@@ -868,6 +871,8 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
           riskTier: dbInfo?.tier,
           tokenA: dbInfo?.tokenA,
           tokenB: dbInfo?.tokenB,
+          valueUsd: p.liquidityUsd,
+          feesUsd,
         };
       });
       // Orca 0.3% fee pool at full utilisation ≈ 20-40% APY depending on volume
@@ -2068,6 +2073,9 @@ export async function generateDecisions(
             positionMint: pos.positionMint,
             whirlpoolAddress: pos.whirlpoolAddress,
             riskTier: posTier,
+            tokenA: pos.tokenA,
+            tokenB: pos.tokenB,
+            pair: pos.tokenA && pos.tokenB ? `${pos.tokenA}/${pos.tokenB}` : undefined,
             rangeWidthPct: adaptiveLpRangeWidthPct(
               tokenASymbol,
               intel,
@@ -3047,10 +3055,10 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           solToSwapForTokenA: lpSolToSwapForTokenA,
         } = decision.params;
 
-        // Register decimals for this pool so orcaService can read positions correctly
+        // Register decimals + symbols for this pool so orcaService can read positions correctly
         if (whirlpoolAddress && tokenADecimals != null && tokenBDecimals != null) {
           const orcaSvc = await import('./orcaService.ts');
-          orcaSvc.registerPoolDecimals(whirlpoolAddress, tokenADecimals, tokenBDecimals);
+          orcaSvc.registerPoolDecimals(whirlpoolAddress, tokenADecimals, tokenBDecimals, tokenA, decision.params.tokenB);
         }
 
         const jupMod = await import('./jupiterService.ts');
@@ -3083,7 +3091,16 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const orca = await import('./orcaService.ts');
         const result = await orca.openPosition(usdcAmount, tokenAInputAmount, rangeWidthPct, whirlpoolAddress, tokenADecimals ?? 9, tokenBDecimals ?? 6, poolTickSpacing);
         if (result.success) markDecision('ORCA_LP_OPEN');
-        return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
+        return {
+          ...base,
+          executed: true,
+          success: result.success,
+          // Use positionMint as txId so cfo.ts externalId matches what rebalance looks up
+          txId: result.positionMint ?? result.txSignature,
+          txHash: result.txSignature,
+          positionMint: result.positionMint,
+          error: result.error,
+        } as DecisionResult & { txHash?: string; positionMint?: string };
       }
 
       case 'ORCA_LP_REBALANCE': {
@@ -3091,7 +3108,38 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const { positionMint, whirlpoolAddress, rangeWidthPct } = decision.params;
         const result = await orca.rebalancePosition(positionMint, rangeWidthPct, whirlpoolAddress);
         if (result.success) markDecision('ORCA_LP_OPEN'); // reuses OPEN cooldown
-        return { ...base, executed: true, success: result.success, txId: result.txSignature, error: result.error };
+        return {
+          ...base,
+          executed: true,
+          success: result.success,
+          // Use newPositionMint as txId so cfo.ts can create new position record with correct externalId
+          txId: result.newPositionMint ?? result.txSignature,
+          txHash: result.txSignature,
+          valueRecoveredUsd: result.valueRecoveredUsd,
+          newPositionMint: result.newPositionMint,
+          usdcReceived: result.usdcReceived,
+          solReceived: result.solReceived,
+          error: result.error,
+        } as DecisionResult & { txHash?: string; valueRecoveredUsd?: number; newPositionMint?: string; usdcReceived?: number; solReceived?: number };
+      }
+
+      case 'ORCA_LP_CLOSE': {
+        const orca = await import('./orcaService.ts');
+        const { positionMint } = decision.params;
+        const closeResult = await orca.closePosition(positionMint);
+        if (closeResult.success) markDecision('ORCA_LP_CLOSE');
+        // Compute recovered value for PnL tracking
+        let solPrice = 85;
+        try { const pyth = await import('./pythOracleService.ts'); solPrice = await pyth.getSolPrice(); } catch { /* fallback */ }
+        const recoveredUsd = (closeResult.usdcReceived ?? 0) + (closeResult.solReceived ?? 0) * solPrice;
+        return {
+          ...base,
+          executed: true,
+          success: closeResult.success,
+          txId: closeResult.txSignature,
+          valueRecoveredUsd: recoveredUsd,
+          error: closeResult.error,
+        } as DecisionResult & { valueRecoveredUsd?: number };
       }
 
       case 'KAMINO_BORROW_LP': {
@@ -3127,13 +3175,16 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         }
 
         markDecision('KAMINO_BORROW_LP');
-        logger.info(`[CFO] KAMINO_BORROW_LP step 3: opened Orca LP | tx: ${lpResult.txSignature}`);
+        logger.info(`[CFO] KAMINO_BORROW_LP step 3: opened Orca LP ${lpResult.positionMint?.slice(0, 8)} | tx: ${lpResult.txSignature}`);
         return {
           ...base,
           executed: true,
           success: true,
-          txId: lpResult.txSignature,
-        };
+          // Use positionMint as txId so cfo.ts externalId matches
+          txId: lpResult.positionMint ?? lpResult.txSignature,
+          txHash: lpResult.txSignature,
+          positionMint: lpResult.positionMint,
+        } as DecisionResult & { txHash?: string; positionMint?: string };
       }
 
       case 'EVM_FLASH_ARB': {
@@ -3571,6 +3622,8 @@ function _humanAction(d: Decision, state: PortfolioState): string {
       return `<b>Open LP</b> — $${((p.usdcAmount ?? 0) * 2).toFixed(0)} in ${p.pair ?? 'SOL/USDC'} (±${(p.rangeWidthPct ?? 20) / 2}% range)${p.needsSwap ? ' (auto-swap)' : ''}`;
     case 'ORCA_LP_REBALANCE':
       return `<b>Rebalance LP</b> — price moved out of range, re-centering`;
+    case 'ORCA_LP_CLOSE':
+      return `<b>Close Orca LP</b> — withdrawing ${p.pair ?? 'LP'} position`;
     case 'KAMINO_BORROW_LP':
       if (p.blocked) {
         return `⏸ <b>Borrow→LP waiting</b> — ${p.blockReason === 'no_collateral' ? 'needs Jito loop collateral first' : 'blocked'}. Would borrow $${p.borrowUsd?.toFixed(0) ?? '?'} → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;

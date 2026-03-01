@@ -121,7 +121,7 @@ interface CFOSnapshot {
   orcaEnabled: boolean;
   orcaLpValueUsd: number;
   orcaLpFeeApy: number;
-  orcaPositions: Array<{ positionMint: string; inRange: boolean; rangeUtilisationPct: number; riskTier?: string; tokenA?: string; tokenB?: string }>;
+  orcaPositions: Array<{ positionMint: string; inRange: boolean; rangeUtilisationPct: number; riskTier?: string; tokenA?: string; tokenB?: string; valueUsd?: number; feesUsd?: number }>;
 
   // Jito staking
   jitoSolBalance: number;
@@ -689,6 +689,8 @@ async function gatherCFOSnapshot(): Promise<CFOSnapshot | null> {
         riskTier: p.riskTier,
         tokenA: p.tokenA,
         tokenB: p.tokenB,
+        valueUsd: p.valueUsd,
+        feesUsd: p.feesUsd,
       })),
 
       jitoSolBalance: ps.jitoSolBalance,
@@ -1089,7 +1091,9 @@ async function sendStatusReport(): Promise<void> {
         const rangeEmoji = pos.inRange ? '🟢' : '🔴';
         const tierTag = pos.riskTier === 'high' ? '🔥' : pos.riskTier === 'low' ? '🛡️' : '⚖️';
         const pairLabel = pos.tokenA && pos.tokenB ? `${pos.tokenA}/${pos.tokenB}` : pos.positionMint.slice(0, 6) + '…';
-        message += `    ${rangeEmoji}${tierTag} ${pairLabel} — ${pos.rangeUtilisationPct.toFixed(0)}% util${pos.inRange ? '' : ' (out of range)'}${pos.riskTier ? ` [${pos.riskTier}]` : ''}\n`;
+        const valueStr = pos.valueUsd != null && pos.valueUsd > 0 ? ` — $${pos.valueUsd.toFixed(2)}` : '';
+        const feeStr = pos.feesUsd != null && pos.feesUsd > 0.001 ? ` | fees: $${pos.feesUsd.toFixed(4)}` : '';
+        message += `    ${rangeEmoji}${tierTag} ${pairLabel}${valueStr} | ${pos.rangeUtilisationPct.toFixed(0)}% util${pos.inRange ? '' : ' (out of range)'}${pos.riskTier ? ` [${pos.riskTier}]` : ''}${feeStr}\n`;
       }
       message += `    Est. fee APY: ${(c.orcaLpFeeApy * 100).toFixed(1)}%\n\n`;
     }

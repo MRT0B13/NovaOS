@@ -37,9 +37,9 @@ const DEFAULT_TICK_SPACING = 64;
  * Callers can register decimals via registerPoolDecimals() before
  * opening/reading positions. Falls back to SOL/USDC (9/6) if unknown.
  */
-const _poolDecimalRegistry: Record<string, { tokenADecimals: number; tokenBDecimals: number }> = {
+const _poolDecimalRegistry: Record<string, { tokenADecimals: number; tokenBDecimals: number; tokenASymbol?: string; tokenBSymbol?: string }> = {
   // Seed with SOL/USDC so it always works even before discovery runs
-  'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ': { tokenADecimals: 9, tokenBDecimals: 6 }, // SOL/USDC
+  'HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ': { tokenADecimals: 9, tokenBDecimals: 6, tokenASymbol: 'SOL', tokenBSymbol: 'USDC' }, // SOL/USDC
 };
 
 /**
@@ -50,8 +50,10 @@ export function registerPoolDecimals(
   whirlpoolAddress: string,
   tokenADecimals: number,
   tokenBDecimals: number,
+  tokenASymbol?: string,
+  tokenBSymbol?: string,
 ): void {
-  _poolDecimalRegistry[whirlpoolAddress] = { tokenADecimals, tokenBDecimals };
+  _poolDecimalRegistry[whirlpoolAddress] = { tokenADecimals, tokenBDecimals, tokenASymbol, tokenBSymbol };
 }
 
 /**
@@ -59,12 +61,14 @@ export function registerPoolDecimals(
  * Convenience wrapper for orcaPoolDiscovery integration.
  */
 export function registerPoolDecimalsBulk(
-  pools: Array<{ whirlpoolAddress: string; tokenA: { decimals: number }; tokenB: { decimals: number } }>,
+  pools: Array<{ whirlpoolAddress: string; tokenA: { decimals: number; symbol?: string }; tokenB: { decimals: number; symbol?: string } }>,
 ): void {
   for (const p of pools) {
     _poolDecimalRegistry[p.whirlpoolAddress] = {
       tokenADecimals: p.tokenA.decimals,
       tokenBDecimals: p.tokenB.decimals,
+      tokenASymbol: p.tokenA.symbol,
+      tokenBSymbol: p.tokenB.symbol,
     };
   }
 }
@@ -456,11 +460,24 @@ export async function closePosition(positionMint: string): Promise<OrcaCloseResu
  * @param positionMint  NFT mint of the position to rebalance
  * @param rangeWidthPct total range width as % of current price (e.g. 20 = ±10%)
  */
+export interface OrcaRebalanceResult {
+  success: boolean;
+  newPositionMint?: string;
+  txSignature?: string;
+  error?: string;
+  /** USD value recovered from closing the old position (SOL converted at market) */
+  valueRecoveredUsd?: number;
+  /** USDC received from close */
+  usdcReceived?: number;
+  /** SOL received from close */
+  solReceived?: number;
+}
+
 export async function rebalancePosition(
   positionMint: string,
   rangeWidthPct?: number,
   whirlpoolAddress?: string,
-): Promise<{ success: boolean; newPositionMint?: string; txSignature?: string; error?: string }> {
+): Promise<OrcaRebalanceResult> {
   const env = getCFOEnv();
   const width = rangeWidthPct ?? env.orcaLpRangeWidthPct ?? 20;
 
@@ -480,16 +497,24 @@ export async function rebalancePosition(
   const usdcReceived = closeResult.usdcReceived ?? 0;
   const solReceived = closeResult.solReceived ?? 0;
 
+  // Compute USD value recovered (SOL at market price + USDC at $1)
+  let solPriceUsd = 85;
+  try {
+    const pyth = await import('./pythOracleService.ts');
+    solPriceUsd = await pyth.getSolPrice();
+  } catch { /* fallback */ }
+  const valueRecoveredUsd = usdcReceived + solReceived * solPriceUsd;
+
   if (usdcReceived <= 0 && solReceived <= 0) {
     logger.warn(`[Orca] Rebalance: position closed but got no tokens back (already empty?)`);
-    return { success: true, txSignature: closeResult.txSignature };
+    return { success: true, txSignature: closeResult.txSignature, valueRecoveredUsd: 0, usdcReceived, solReceived };
   }
 
   // Step 2: Reopen centred on current price using the tokens we got back
-  logger.info(`[Orca] Rebalance: reopening with ${solReceived.toFixed(6)} SOL + ${usdcReceived.toFixed(4)} USDC`);
+  logger.info(`[Orca] Rebalance: reopening with ${solReceived.toFixed(6)} SOL + ${usdcReceived.toFixed(4)} USDC (≈$${valueRecoveredUsd.toFixed(2)})`);
   const openResult = await openPosition(usdcReceived, solReceived, width, whirlpoolAddress);
   if (!openResult.success) {
-    return { success: false, error: `Reopen failed: ${openResult.error} (closed OK, funds in wallet)` };
+    return { success: false, error: `Reopen failed: ${openResult.error} (closed OK, funds in wallet)`, valueRecoveredUsd, usdcReceived, solReceived };
   }
 
   logger.info(`[Orca] Rebalance complete: old=${positionMint.slice(0, 8)} → new=${openResult.positionMint?.slice(0, 8)} ` +
@@ -498,6 +523,9 @@ export async function rebalancePosition(
     success: true,
     newPositionMint: openResult.positionMint,
     txSignature: openResult.txSignature,
+    valueRecoveredUsd,
+    usdcReceived,
+    solReceived,
   };
 }
 
@@ -512,7 +540,7 @@ export async function rebalancePosition(
 export async function getPositions(): Promise<OrcaPosition[]> {
   try {
     const { WhirlpoolContext, buildWhirlpoolClient, PriceMath, PDAUtil,
-            ORCA_WHIRLPOOL_PROGRAM_ID } = await loadOrcaSdk();
+            ORCA_WHIRLPOOL_PROGRAM_ID, PoolUtil } = await loadOrcaSdk();
     const { AnchorProvider, Wallet } = await loadAnchor();
 
     const walletKeypair = loadWallet();
@@ -520,6 +548,13 @@ export async function getPositions(): Promise<OrcaPosition[]> {
     const provider = new AnchorProvider(connection, new Wallet(walletKeypair), {});
     const ctx = WhirlpoolContext.withProvider(provider);
     const client = buildWhirlpoolClient(ctx);
+
+    // Fetch SOL price once for USD conversion (token A is typically SOL)
+    let solPriceUsd = 85; // fallback
+    try {
+      const pyth = await import('./pythOracleService.ts');
+      solPriceUsd = await pyth.getSolPrice();
+    } catch { /* use fallback */ }
 
     // Do NOT pre-fetch currentPrice here — each position belongs to a different pool.
     // currentPrice is fetched per-position inside the loop.
@@ -571,15 +606,51 @@ export async function getPositions(): Promise<OrcaPosition[]> {
           ? Math.max(0, (1 - distFromCentre / rangeHalf) * 100)
           : 0;
 
+        // ── Compute real liquidityUsd from on-chain position data ──
+        // PoolUtil.getTokenAmountsFromLiquidity returns the underlying token
+        // amounts for the position's liquidity at the current pool price.
+        let liquidityUsd = 0;
+        try {
+          const lowerSqrtPrice = PriceMath.tickIndexToSqrtPriceX64(data.tickLowerIndex);
+          const upperSqrtPrice = PriceMath.tickIndexToSqrtPriceX64(data.tickUpperIndex);
+          const amounts = PoolUtil.getTokenAmountsFromLiquidity(
+            data.liquidity,
+            poolData.sqrtPrice,
+            lowerSqrtPrice,
+            upperSqrtPrice,
+            false,
+          );
+          const tokenAUi = Number(amounts.tokenA.toString()) / (10 ** tokenADec);
+          const tokenBUi = Number(amounts.tokenB.toString()) / (10 ** tokenBDec);
+          // Token B is typically the quote token (USDC/stables) priced at $1
+          // Token A is typically the base token (SOL, etc.) priced via oracle
+          const tokenAIsStable = _isStableToken(knownPool?.tokenASymbol);
+          const tokenBIsStable = _isStableToken(knownPool?.tokenBSymbol);
+          const tokenAPriceUsd = tokenAIsStable ? 1 : (currentPrice > 0 ? solPriceUsd : 1);
+          const tokenBPriceUsd = tokenBIsStable ? 1 : solPriceUsd;
+          liquidityUsd = tokenAUi * tokenAPriceUsd + tokenBUi * tokenBPriceUsd;
+        } catch {
+          // Fallback: look up cost basis from DB
+          liquidityUsd = 0;
+        }
+
+        // ── Unclaimed fees from on-chain position data ──
+        // position.feeOwedA/B are the accumulated fees in raw token amounts
+        const feeOwedAUi = Number(data.feeOwedA.toString()) / (10 ** tokenADec);
+        const feeOwedBUi = Number(data.feeOwedB.toString()) / (10 ** tokenBDec);
+        // Convert to SOL/USDC denomination
+        const unclaimedFeesSol = feeOwedAUi;    // tokenA fees (in tokenA units, typically SOL)
+        const unclaimedFeesUsdc = feeOwedBUi;   // tokenB fees (in tokenB units, typically USDC)
+
         result.push({
           positionMint: parsed.mint,
           whirlpoolAddress: poolAddress,
           lowerPrice,
           upperPrice,
           currentPrice,
-          liquidityUsd: 0,
-          unclaimedFeesUsdc: 0,
-          unclaimedFeesSol: 0,
+          liquidityUsd,
+          unclaimedFeesUsdc,
+          unclaimedFeesSol,
           inRange,
           rangeUtilisationPct,
         });
@@ -594,4 +665,11 @@ export async function getPositions(): Promise<OrcaPosition[]> {
     logger.debug('[Orca] getPositions error:', err);
     return [];
   }
+}
+
+// Helper: determine if a token symbol is a stablecoin
+function _isStableToken(symbol?: string): boolean {
+  if (!symbol) return false;
+  const stables = new Set(['USDC', 'USDT', 'DAI', 'USDH', 'UXD', 'PYUSD', 'USDG', 'USDS']);
+  return stables.has(symbol.toUpperCase());
 }

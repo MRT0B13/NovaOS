@@ -689,27 +689,31 @@ export class CFOAgent extends BaseAgent {
 
           // ── Orca LP OPEN ───────────────────────────────────────
           case 'ORCA_LP_OPEN': {
+            const resultAnyOpen = r as any;
             const deployUsd = (p.usdcAmount ?? 0) * 2;
             const pair = p.pair ?? 'SOL/USDC';
             const orcaRiskTier = p.riskTier ?? 'medium';
             const tokenA = p.tokenA ?? pair.split('/')[0] ?? 'SOL';
             const tokenB = p.tokenB ?? pair.split('/')[1] ?? 'USDC';
+            // positionMint is the NFT mint that identifies the on-chain position
+            const positionMint = resultAnyOpen.positionMint ?? r.txId;
             await this.repo.insertTransaction({
               id: `tx-orca-lp-${r.txId ?? Date.now()}`, timestamp: now,
               chain: 'solana', strategyTag: 'orca_lp', txType: 'liquidity_add',
               tokenIn: 'USDC+tokenA', amountIn: deployUsd,
               tokenOut: `orca-lp-${pair}`, amountOut: deployUsd,
-              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              feeUsd: 0, txHash: resultAnyOpen.txHash ?? r.txId, walletAddress: '', status: 'confirmed',
               metadata: {
                 pair, whirlpoolAddress: p.whirlpoolAddress, rangeWidthPct: p.rangeWidthPct,
                 usdcAmount: p.usdcAmount, tokenAAmount: p.tokenAAmount,
-                riskTier: orcaRiskTier,
+                riskTier: orcaRiskTier, positionMint,
                 reasoning: d.reasoning,
               },
             });
-            logger.info(`[CFO] Persisted ORCA_LP_OPEN [${orcaRiskTier}]: $${deployUsd.toFixed(0)} ${pair} LP`);
+            logger.info(`[CFO] Persisted ORCA_LP_OPEN [${orcaRiskTier}]: $${deployUsd.toFixed(0)} ${pair} LP (mint: ${positionMint?.slice(0, 8)})`);
             // Track in cfo_positions for learning engine
-            const orcaPosId = `orca-lp-${r.txId ?? Date.now()}`;
+            // externalId = positionMint (NFT) so getPositionByExternalId works during rebalance
+            const orcaPosId = `orca-lp-${positionMint ?? Date.now()}`;
             await this.repo.upsertPosition({
               id: orcaPosId,
               strategy: 'orca_lp',
@@ -724,9 +728,9 @@ export class CFOAgent extends BaseAgent {
               currentValueUsd: deployUsd,
               realizedPnlUsd: 0,
               unrealizedPnlUsd: 0,
-              entryTxHash: r.txId,
-              externalId: r.txId,
-              metadata: { pair, whirlpoolAddress: p.whirlpoolAddress, rangeWidthPct: p.rangeWidthPct, riskTier: orcaRiskTier, tokenA, tokenB },
+              entryTxHash: resultAnyOpen.txHash ?? r.txId,
+              externalId: positionMint,
+              metadata: { pair, whirlpoolAddress: p.whirlpoolAddress, rangeWidthPct: p.rangeWidthPct, riskTier: orcaRiskTier, tokenA, tokenB, positionMint },
               openedAt: new Date().toISOString(),
               updatedAt: new Date().toISOString(),
             });
@@ -741,22 +745,104 @@ export class CFOAgent extends BaseAgent {
 
           // ── Orca LP REBALANCE ──────────────────────────────────
           case 'ORCA_LP_REBALANCE': {
+            const resultAny = r as any;
+            const recoveredUsd = resultAny.valueRecoveredUsd ?? 0;
+            const newPosMint = resultAny.newPositionMint;
+            const rebalTier = p.riskTier ?? 'medium';
+            const rebalPair = p.pair ?? (p.tokenA && p.tokenB ? `${p.tokenA}/${p.tokenB}` : 'SOL/USDC');
+            const rebalTokenA = p.tokenA ?? rebalPair.split('/')[0] ?? 'SOL';
+            const rebalTokenB = p.tokenB ?? rebalPair.split('/')[1] ?? 'USDC';
+
             await this.repo.insertTransaction({
               id: `tx-orca-rebalance-${r.txId ?? Date.now()}`, timestamp: now,
               chain: 'solana', strategyTag: 'orca_lp', txType: 'liquidity_rebalance',
-              tokenIn: 'orca-lp', amountIn: 0,
-              tokenOut: 'orca-lp', amountOut: 0,
-              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
-              metadata: { positionMint: p.positionMint, rangeWidthPct: p.rangeWidthPct, reasoning: d.reasoning },
+              tokenIn: 'orca-lp', amountIn: recoveredUsd,
+              tokenOut: 'orca-lp', amountOut: recoveredUsd,
+              feeUsd: 0, txHash: resultAny.txHash ?? r.txId, walletAddress: '', status: 'confirmed',
+              metadata: {
+                positionMint: p.positionMint, newPositionMint: newPosMint,
+                rangeWidthPct: p.rangeWidthPct, riskTier: rebalTier,
+                valueRecoveredUsd: recoveredUsd, reasoning: d.reasoning,
+              },
             });
-            logger.info(`[CFO] Persisted ORCA_LP_REBALANCE: ${(p.positionMint as string)?.slice(0, 8)}`);
-            // Close the old position in cfo_positions for learning engine
+            logger.info(`[CFO] Persisted ORCA_LP_REBALANCE [${rebalTier}]: ${(p.positionMint as string)?.slice(0, 8)} → ${newPosMint?.slice(0, 8)} ($${recoveredUsd.toFixed(2)} recovered)`);
+
+            // Close the old position in cfo_positions — calculate realized PnL
             try {
               const oldPos = await this.repo.getPositionByExternalId(p.positionMint as string);
               if (oldPos) {
+                const realizedPnl = recoveredUsd > 0 ? recoveredUsd - oldPos.costBasisUsd : 0;
                 await this.repo.upsertPosition({
                   ...oldPos,
                   status: 'CLOSED',
+                  realizedPnlUsd: realizedPnl,
+                  currentValueUsd: recoveredUsd,
+                  closedAt: new Date().toISOString(),
+                  updatedAt: new Date().toISOString(),
+                  exitTxHash: resultAny.txHash ?? r.txId,
+                  metadata: { ...oldPos.metadata, rebalanced: true, rebalancedTo: newPosMint },
+                });
+              }
+            } catch { /* best effort */ }
+
+            // Create NEW position record for the reopened position
+            if (newPosMint) {
+              try {
+                const newDeployUsd = recoveredUsd > 0 ? recoveredUsd : (resultAny.usdcReceived ?? 0) * 2;
+                await this.repo.upsertPosition({
+                  id: `orca-lp-${newPosMint}`,
+                  strategy: 'orca_lp',
+                  asset: rebalPair,
+                  description: `Orca LP [${rebalTier}]: ${rebalPair} (rebalanced)`,
+                  chain: 'solana',
+                  status: 'OPEN',
+                  entryPrice: 1, currentPrice: 1,
+                  sizeUnits: newDeployUsd,
+                  costBasisUsd: newDeployUsd,
+                  currentValueUsd: newDeployUsd,
+                  realizedPnlUsd: 0, unrealizedPnlUsd: 0,
+                  entryTxHash: resultAny.txHash ?? r.txId,
+                  externalId: newPosMint,
+                  metadata: {
+                    pair: rebalPair, whirlpoolAddress: p.whirlpoolAddress,
+                    rangeWidthPct: p.rangeWidthPct, riskTier: rebalTier,
+                    tokenA: rebalTokenA, tokenB: rebalTokenB,
+                    rebalanceOf: p.positionMint,
+                  },
+                  openedAt: new Date().toISOString(),
+                  updatedAt: new Date().toISOString(),
+                });
+              } catch { /* best effort */ }
+            }
+            break;
+          }
+
+          // ── Orca LP CLOSE (standalone) ─────────────────────────
+          case 'ORCA_LP_CLOSE': {
+            const closeResultAny = r as any;
+            const closeRecoveredUsd = closeResultAny.valueRecoveredUsd ?? 0;
+            const closeTier = p.riskTier ?? 'medium';
+            const closePair = p.pair ?? 'SOL/USDC';
+
+            await this.repo.insertTransaction({
+              id: `tx-orca-close-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'orca_lp', txType: 'liquidity_rebalance' as TransactionType,
+              tokenIn: 'orca-lp', amountIn: closeRecoveredUsd,
+              tokenOut: 'USDC+SOL', amountOut: closeRecoveredUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { positionMint: p.positionMint, riskTier: closeTier, valueRecoveredUsd: closeRecoveredUsd, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted ORCA_LP_CLOSE [${closeTier}]: ${(p.positionMint as string)?.slice(0, 8)} ($${closeRecoveredUsd.toFixed(2)} recovered)`);
+
+            try {
+              const closeOldPos = await this.repo.getPositionByExternalId(p.positionMint as string);
+              if (closeOldPos) {
+                const closePnl = closeRecoveredUsd > 0 ? closeRecoveredUsd - closeOldPos.costBasisUsd : 0;
+                await this.repo.upsertPosition({
+                  ...closeOldPos,
+                  status: 'CLOSED',
+                  realizedPnlUsd: closePnl,
+                  currentValueUsd: closeRecoveredUsd,
                   closedAt: new Date().toISOString(),
                   updatedAt: new Date().toISOString(),
                   exitTxHash: r.txId,
@@ -768,18 +854,21 @@ export class CFOAgent extends BaseAgent {
 
           // ── Kamino Borrow → Orca LP ────────────────────────────
           case 'KAMINO_BORROW_LP': {
+            const borrowResultAny = r as any;
             const borrowUsd = p.borrowUsd ?? 0;
             const borrowLpTier = p.riskTier ?? 'medium';
             const borrowLpPair = p.pair ?? 'SOL/USDC';
             const borrowLpTokenA = p.tokenA ?? borrowLpPair.split('/')[0] ?? 'SOL';
             const borrowLpTokenB = p.tokenB ?? borrowLpPair.split('/')[1] ?? 'USDC';
+            // positionMint is the on-chain NFT mint that identifies the LP position
+            const borrowLpPosMint = borrowResultAny.positionMint ?? r.txId;
             // Record the borrow transaction
             await this.repo.insertTransaction({
               id: `tx-kamino-borrow-lp-${r.txId ?? Date.now()}`, timestamp: now,
               chain: 'solana', strategyTag: 'kamino_loop', txType: 'borrow',
               tokenIn: 'collateral', amountIn: 0,
               tokenOut: 'USDC', amountOut: borrowUsd,
-              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              feeUsd: 0, txHash: borrowResultAny.txHash ?? r.txId, walletAddress: '', status: 'confirmed',
               metadata: { deployTarget: 'orca_lp', borrowApy: p.borrowApy, spreadPct: p.spreadPct, riskTier: borrowLpTier, reasoning: d.reasoning },
             });
             // Record the LP deployment
@@ -788,16 +877,17 @@ export class CFOAgent extends BaseAgent {
               chain: 'solana', strategyTag: 'orca_lp', txType: 'liquidity_add',
               tokenIn: 'USDC(borrowed)', amountIn: borrowUsd,
               tokenOut: `orca-lp-${borrowLpPair}`, amountOut: borrowUsd,
-              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              feeUsd: 0, txHash: borrowResultAny.txHash ?? r.txId, walletAddress: '', status: 'confirmed',
               metadata: {
                 pair: borrowLpPair, fundingSource: 'kamino_borrow', riskTier: borrowLpTier,
-                tokenA: borrowLpTokenA, tokenB: borrowLpTokenB,
+                tokenA: borrowLpTokenA, tokenB: borrowLpTokenB, positionMint: borrowLpPosMint,
                 borrowUsd, estimatedLpApy: p.estimatedLpApy, borrowApy: p.borrowApy,
                 rangeWidthPct: p.rangeWidthPct, reasoning: d.reasoning,
               },
             });
             // Also track as cfo_position for learning engine
-            const borrowLpPosId = `orca-lp-${r.txId ?? Date.now()}`;
+            // externalId = positionMint so getPositionByExternalId works during rebalance
+            const borrowLpPosId = `orca-lp-${borrowLpPosMint ?? Date.now()}`;
             await this.repo.upsertPosition({
               id: borrowLpPosId,
               strategy: 'orca_lp',
@@ -812,13 +902,13 @@ export class CFOAgent extends BaseAgent {
               currentValueUsd: borrowUsd,
               realizedPnlUsd: 0,
               unrealizedPnlUsd: 0,
-              entryTxHash: r.txId,
-              externalId: r.txId,
+              entryTxHash: borrowResultAny.txHash ?? r.txId,
+              externalId: borrowLpPosMint,
               metadata: {
                 pair: borrowLpPair, whirlpoolAddress: p.whirlpoolAddress,
                 rangeWidthPct: p.rangeWidthPct, riskTier: borrowLpTier,
                 tokenA: borrowLpTokenA, tokenB: borrowLpTokenB,
-                fundingSource: 'kamino_borrow',
+                fundingSource: 'kamino_borrow', positionMint: borrowLpPosMint,
               },
               openedAt: new Date().toISOString(),
               updatedAt: new Date().toISOString(),
