@@ -1654,9 +1654,9 @@ export async function generateDecisions(
               `Spread: ${spreadPct.toFixed(1)}% | LTV: ${(state.kaminoLtv * 100).toFixed(1)}% | Health: ${state.kaminoHealthFactor.toFixed(2)}`,
             params: { borrowUsd, deployTarget, borrowApy: borrowCost, deployApy: estimatedDeployYield, spreadPct },
             urgency: 'low',
-            estimatedImpactUsd: borrowUsd * (spreadPct / 100),
+            estimatedImpactUsd: borrowUsd,
             intelUsed: intel.scoutBullish !== undefined ? ['scout'] : [],
-            tier: classifyTier('KAMINO_BORROW_DEPLOY', 'low', borrowUsd * (spreadPct / 100), config, intel.marketCondition),
+            tier: 'APPROVAL',   // ALWAYS require admin approval for borrowing (was auto-approving based on spread profit)
           });
         }
       }
@@ -3694,6 +3694,8 @@ function _humanAction(d: Decision, state: PortfolioState): string {
 // ============================================================================
 
 let _cycleRunning = false;
+let _cycleStartedAt: number | null = null;
+const CYCLE_LOCK_TIMEOUT_MS = 10 * 60_000; // 10 minutes — if cycle hangs longer, force-reset
 
 export async function runDecisionCycle(pool?: any): Promise<{
   state: PortfolioState;
@@ -3705,22 +3707,32 @@ export async function runDecisionCycle(pool?: any): Promise<{
 }> {
   // Prevent concurrent / duplicate cycles (e.g. SIGTERM race, timer overlap)
   if (_cycleRunning) {
-    logger.debug('[CFO:Decision] Cycle already in progress — skipping duplicate');
-    return {
-      state: {} as PortfolioState,
-      decisions: [],
-      results: [],
-      report: '',
-      intel: { riskMultiplier: 1.0, marketCondition: 'neutral' },
-      traceId: 'skipped',
-    };
+    // If the lock has been held for >10 minutes, the previous cycle is hung — force-reset
+    if (_cycleStartedAt && Date.now() - _cycleStartedAt > CYCLE_LOCK_TIMEOUT_MS) {
+      logger.warn(`[CFO:Decision] Cycle lock stuck for ${((Date.now() - _cycleStartedAt) / 60_000).toFixed(1)}min — force-resetting`);
+      _cycleRunning = false;
+      _cycleStartedAt = null;
+    } else {
+      const elapsed = _cycleStartedAt ? ((Date.now() - _cycleStartedAt) / 1000).toFixed(0) : '?';
+      logger.debug(`[CFO:Decision] Cycle already in progress (${elapsed}s) — skipping duplicate`);
+      return {
+        state: {} as PortfolioState,
+        decisions: [],
+        results: [],
+        report: '',
+        intel: { riskMultiplier: 1.0, marketCondition: 'neutral' },
+        traceId: 'skipped',
+      };
+    }
   }
   _cycleRunning = true;
+  _cycleStartedAt = Date.now();
 
   try {
     return await _runDecisionCycleInner(pool);
   } finally {
     _cycleRunning = false;
+    _cycleStartedAt = null;
   }
 }
 
