@@ -691,6 +691,9 @@ export class CFOAgent extends BaseAgent {
           case 'ORCA_LP_OPEN': {
             const deployUsd = (p.usdcAmount ?? 0) * 2;
             const pair = p.pair ?? 'SOL/USDC';
+            const orcaRiskTier = p.riskTier ?? 'medium';
+            const tokenA = p.tokenA ?? pair.split('/')[0] ?? 'SOL';
+            const tokenB = p.tokenB ?? pair.split('/')[1] ?? 'USDC';
             await this.repo.insertTransaction({
               id: `tx-orca-lp-${r.txId ?? Date.now()}`, timestamp: now,
               chain: 'solana', strategyTag: 'orca_lp', txType: 'liquidity_add',
@@ -700,17 +703,18 @@ export class CFOAgent extends BaseAgent {
               metadata: {
                 pair, whirlpoolAddress: p.whirlpoolAddress, rangeWidthPct: p.rangeWidthPct,
                 usdcAmount: p.usdcAmount, tokenAAmount: p.tokenAAmount,
+                riskTier: orcaRiskTier,
                 reasoning: d.reasoning,
               },
             });
-            logger.info(`[CFO] Persisted ORCA_LP_OPEN: $${deployUsd.toFixed(0)} ${pair} LP`);
+            logger.info(`[CFO] Persisted ORCA_LP_OPEN [${orcaRiskTier}]: $${deployUsd.toFixed(0)} ${pair} LP`);
             // Track in cfo_positions for learning engine
             const orcaPosId = `orca-lp-${r.txId ?? Date.now()}`;
             await this.repo.upsertPosition({
               id: orcaPosId,
               strategy: 'orca_lp',
               asset: pair,
-              description: `Orca LP: ${pair}`,
+              description: `Orca LP [${orcaRiskTier}]: ${pair}`,
               chain: 'solana',
               status: 'OPEN',
               entryPrice: 1,
@@ -722,7 +726,7 @@ export class CFOAgent extends BaseAgent {
               unrealizedPnlUsd: 0,
               entryTxHash: r.txId,
               externalId: r.txId,
-              metadata: { pair, whirlpoolAddress: p.whirlpoolAddress, rangeWidthPct: p.rangeWidthPct },
+              metadata: { pair, whirlpoolAddress: p.whirlpoolAddress, rangeWidthPct: p.rangeWidthPct, riskTier: orcaRiskTier, tokenA, tokenB },
               openedAt: new Date().toISOString(),
               updatedAt: new Date().toISOString(),
             });
@@ -765,6 +769,10 @@ export class CFOAgent extends BaseAgent {
           // ── Kamino Borrow → Orca LP ────────────────────────────
           case 'KAMINO_BORROW_LP': {
             const borrowUsd = p.borrowUsd ?? 0;
+            const borrowLpTier = p.riskTier ?? 'medium';
+            const borrowLpPair = p.pair ?? 'SOL/USDC';
+            const borrowLpTokenA = p.tokenA ?? borrowLpPair.split('/')[0] ?? 'SOL';
+            const borrowLpTokenB = p.tokenB ?? borrowLpPair.split('/')[1] ?? 'USDC';
             // Record the borrow transaction
             await this.repo.insertTransaction({
               id: `tx-kamino-borrow-lp-${r.txId ?? Date.now()}`, timestamp: now,
@@ -772,26 +780,54 @@ export class CFOAgent extends BaseAgent {
               tokenIn: 'collateral', amountIn: 0,
               tokenOut: 'USDC', amountOut: borrowUsd,
               feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
-              metadata: { deployTarget: 'orca_lp', borrowApy: p.borrowApy, spreadPct: p.spreadPct, reasoning: d.reasoning },
+              metadata: { deployTarget: 'orca_lp', borrowApy: p.borrowApy, spreadPct: p.spreadPct, riskTier: borrowLpTier, reasoning: d.reasoning },
             });
             // Record the LP deployment
             await this.repo.insertTransaction({
               id: `tx-orca-lp-borrowed-${r.txId ?? Date.now()}`, timestamp: now,
               chain: 'solana', strategyTag: 'orca_lp', txType: 'liquidity_add',
               tokenIn: 'USDC(borrowed)', amountIn: borrowUsd,
-              tokenOut: 'orca-lp-SOL/USDC', amountOut: borrowUsd,
+              tokenOut: `orca-lp-${borrowLpPair}`, amountOut: borrowUsd,
               feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
               metadata: {
-                pair: 'SOL/USDC', fundingSource: 'kamino_borrow',
+                pair: borrowLpPair, fundingSource: 'kamino_borrow', riskTier: borrowLpTier,
+                tokenA: borrowLpTokenA, tokenB: borrowLpTokenB,
                 borrowUsd, estimatedLpApy: p.estimatedLpApy, borrowApy: p.borrowApy,
                 rangeWidthPct: p.rangeWidthPct, reasoning: d.reasoning,
               },
             });
-            logger.info(`[CFO] Persisted KAMINO_BORROW_LP: borrowed $${borrowUsd.toFixed(0)} → SOL/USDC LP`);
-            // Register SOL + USDC with Guardian
-            const lpMintsBorrow = orcaPairMints('SOL/USDC').map(mint => ({
+            // Also track as cfo_position for learning engine
+            const borrowLpPosId = `orca-lp-${r.txId ?? Date.now()}`;
+            await this.repo.upsertPosition({
+              id: borrowLpPosId,
+              strategy: 'orca_lp',
+              asset: borrowLpPair,
+              description: `Orca LP [${borrowLpTier}]: ${borrowLpPair} (borrowed)`,
+              chain: 'solana',
+              status: 'OPEN',
+              entryPrice: 1,
+              currentPrice: 1,
+              sizeUnits: borrowUsd,
+              costBasisUsd: borrowUsd,
+              currentValueUsd: borrowUsd,
+              realizedPnlUsd: 0,
+              unrealizedPnlUsd: 0,
+              entryTxHash: r.txId,
+              externalId: r.txId,
+              metadata: {
+                pair: borrowLpPair, whirlpoolAddress: p.whirlpoolAddress,
+                rangeWidthPct: p.rangeWidthPct, riskTier: borrowLpTier,
+                tokenA: borrowLpTokenA, tokenB: borrowLpTokenB,
+                fundingSource: 'kamino_borrow',
+              },
+              openedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+            logger.info(`[CFO] Persisted KAMINO_BORROW_LP [${borrowLpTier}]: borrowed $${borrowUsd.toFixed(0)} → ${borrowLpPair} LP`);
+            // Register LP pair tokens with Guardian
+            const lpMintsBorrow = orcaPairMints(borrowLpPair).map(mint => ({
               mint,
-              ticker: ['SOL', 'USDC'].find(sym => SOLANA_TOKEN_MINTS[sym] === mint) ?? mint.slice(0, 8),
+              ticker: borrowLpPair.split('/').find((sym: string) => SOLANA_TOKEN_MINTS[sym] === mint) ?? mint.slice(0, 8),
             }));
             await this.registerCFOExposure(lpMintsBorrow);
             break;

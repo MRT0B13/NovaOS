@@ -121,7 +121,7 @@ interface CFOSnapshot {
   orcaEnabled: boolean;
   orcaLpValueUsd: number;
   orcaLpFeeApy: number;
-  orcaPositions: Array<{ positionMint: string; inRange: boolean; rangeUtilisationPct: number }>;
+  orcaPositions: Array<{ positionMint: string; inRange: boolean; rangeUtilisationPct: number; riskTier?: string; tokenA?: string; tokenB?: string }>;
 
   // Jito staking
   jitoSolBalance: number;
@@ -686,6 +686,9 @@ async function gatherCFOSnapshot(): Promise<CFOSnapshot | null> {
         positionMint: p.positionMint,
         inRange: p.inRange,
         rangeUtilisationPct: p.rangeUtilisationPct,
+        riskTier: p.riskTier,
+        tokenA: p.tokenA,
+        tokenB: p.tokenB,
       })),
 
       jitoSolBalance: ps.jitoSolBalance,
@@ -1084,7 +1087,9 @@ async function sendStatusReport(): Promise<void> {
       message += `  <b>🌊 Orca LP ($${c.orcaLpValueUsd.toFixed(2)}):</b>\n`;
       for (const pos of c.orcaPositions) {
         const rangeEmoji = pos.inRange ? '🟢' : '🔴';
-        message += `    ${rangeEmoji} <code>${pos.positionMint.slice(0, 6)}…</code> ${pos.rangeUtilisationPct.toFixed(0)}% util${pos.inRange ? '' : ' (out of range)'}\n`;
+        const tierTag = pos.riskTier === 'high' ? '🔥' : pos.riskTier === 'low' ? '🛡️' : '⚖️';
+        const pairLabel = pos.tokenA && pos.tokenB ? `${pos.tokenA}/${pos.tokenB}` : pos.positionMint.slice(0, 6) + '…';
+        message += `    ${rangeEmoji}${tierTag} ${pairLabel} — ${pos.rangeUtilisationPct.toFixed(0)}% util${pos.inRange ? '' : ' (out of range)'}${pos.riskTier ? ` [${pos.riskTier}]` : ''}\n`;
       }
       message += `    Est. fee APY: ${(c.orcaLpFeeApy * 100).toFixed(1)}%\n\n`;
     }
@@ -1295,7 +1300,10 @@ async function sendDailySummary(): Promise<void> {
 
     if (c.orcaEnabled && c.orcaPositions.length > 0) {
       const inRange = c.orcaPositions.filter(p => p.inRange).length;
-      message += `  • Orca LP: $${c.orcaLpValueUsd.toFixed(2)} | ${inRange}/${c.orcaPositions.length} in range | ${(c.orcaLpFeeApy * 100).toFixed(1)}% APY\n`;
+      const orcaTierCounts = { low: 0, medium: 0, high: 0 } as Record<string, number>;
+      for (const p of c.orcaPositions) orcaTierCounts[p.riskTier ?? 'medium'] = (orcaTierCounts[p.riskTier ?? 'medium'] ?? 0) + 1;
+      const orcaTierStr = Object.entries(orcaTierCounts).filter(([, v]) => v > 0).map(([k, v]) => `${v}×${k}`).join(' ');
+      message += `  • Orca LP: $${c.orcaLpValueUsd.toFixed(2)} | ${inRange}/${c.orcaPositions.length} in range | ${orcaTierStr} | ${(c.orcaLpFeeApy * 100).toFixed(1)}% APY\n`;
     }
 
     if (c.krystalEnabled && c.krystalPositions.length > 0) {

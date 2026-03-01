@@ -74,6 +74,8 @@ export interface CFOEnv {
   orcaLpRangeWidthPct: number;                    // range width as % of current price (default 20%)
   orcaLpMaxUsd: number;                           // max USD deployed into Orca LP (default 500)
   orcaLpRebalanceTriggerPct: number;              // rebalance when price within X% of range edge (default 5%)
+  orcaLpMaxPositions: number;                     // max concurrent Orca LP positions (default 3)
+  orcaLpRiskTiers: string[];                      // enabled risk tiers: low,medium,high (default: low,medium)
 
   // ── Krystal EVM Concentrated LP ──────────────────────────────────
   krystalLpEnabled: boolean;                      // enable Krystal EVM LP (default false)
@@ -271,6 +273,9 @@ export function getCFOEnv(bust = false): CFOEnv {
     orcaLpRangeWidthPct: Number(process.env.CFO_ORCA_LP_RANGE_WIDTH_PCT ?? 20),
     orcaLpMaxUsd: Number(process.env.CFO_ORCA_LP_MAX_USD ?? 500),
     orcaLpRebalanceTriggerPct: Number(process.env.CFO_ORCA_LP_REBALANCE_TRIGGER_PCT ?? 5),
+    orcaLpMaxPositions: Number(process.env.CFO_ORCA_LP_MAX_POSITIONS ?? 3),
+    orcaLpRiskTiers: (process.env.CFO_ORCA_LP_RISK_TIERS ?? 'low,medium')
+      .split(',').map(t => t.trim().toLowerCase()).filter(t => ['low', 'medium', 'high'].includes(t)),
 
     krystalLpEnabled: process.env.CFO_KRYSTAL_LP_ENABLE === 'true',
     krystalApiKey: process.env.CFO_KRYSTAL_API_KEY,

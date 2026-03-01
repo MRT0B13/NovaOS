@@ -256,7 +256,7 @@ export interface PortfolioState {
   // Orca concentrated LP state
   orcaLpValueUsd: number;            // total value in Orca LP positions
   orcaLpFeeApy: number;              // estimated fee APY on current LP positions
-  orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string }>;
+  orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string; riskTier?: string; tokenA?: string; tokenB?: string }>;
 
   // EVM Flash Arb state
   evmArbProfit24h: number;        // confirmed flash arb profit last 24h (in-memory)
@@ -840,18 +840,36 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
 
   // Orca LP state
   let orcaLpValueUsd = 0, orcaLpFeeApy = 0;
-  let orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string }> = [];
+  let orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string; riskTier?: string; tokenA?: string; tokenB?: string }> = [];
   if (env.orcaLpEnabled) {
     try {
       const orca = await import('./orcaService.ts');
       const positions = await orca.getPositions();
       orcaLpValueUsd = positions.reduce((s, p) => s + p.liquidityUsd, 0);
-      orcaPositions = positions.map(p => ({
-        positionMint: p.positionMint,
-        rangeUtilisationPct: p.rangeUtilisationPct,
-        inRange: p.inRange,
-        whirlpoolAddress: p.whirlpoolAddress,
-      }));
+
+      // Infer risk tier from DB position metadata (set at open time)
+      const orcaDbPositions = await dbPool.query(
+        `SELECT asset, metadata FROM cfo_positions WHERE strategy = 'orca_lp' AND status = 'OPEN'`,
+      ).then(r => r.rows).catch(() => [] as any[]);
+      const dbTierMap = new Map<string, { tier?: string; tokenA?: string; tokenB?: string }>();
+      for (const row of orcaDbPositions) {
+        const meta = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata;
+        const wp = meta?.whirlpoolAddress;
+        if (wp) dbTierMap.set(wp, { tier: meta?.riskTier, tokenA: meta?.tokenA, tokenB: meta?.tokenB });
+      }
+
+      orcaPositions = positions.map(p => {
+        const dbInfo = p.whirlpoolAddress ? dbTierMap.get(p.whirlpoolAddress) : undefined;
+        return {
+          positionMint: p.positionMint,
+          rangeUtilisationPct: p.rangeUtilisationPct,
+          inRange: p.inRange,
+          whirlpoolAddress: p.whirlpoolAddress,
+          riskTier: dbInfo?.tier,
+          tokenA: dbInfo?.tokenA,
+          tokenB: dbInfo?.tokenB,
+        };
+      });
       // Orca 0.3% fee pool at full utilisation ≈ 20-40% APY depending on volume
       // Conservative estimate: 15% if in-range, 0% if out-of-range
       const inRangePositions = positions.filter(p => p.inRange).length;
@@ -2014,29 +2032,46 @@ export async function generateDecisions(
   // Section I only handles rebalancing existing positions.
   if (env.orcaLpEnabled && intel.marketCondition !== 'bearish' && intel.marketCondition !== 'danger') {
 
+    // ── Tier-based range width multipliers (mirrored from Krystal) ──
+    const ORCA_TIER_RANGE_MULT: Record<string, number> = {
+      low: 0.4,    // stables barely move → narrow range captures more fees
+      medium: 1.0, // standard range
+      high: 2.0,   // volatile pairs need wide range to stay in-range
+    };
+    const ORCA_TIER_REBALANCE_MULT: Record<string, number> = {
+      low: 0.8,    // stables rebalance sooner (tight range)
+      medium: 1.0,
+      high: 1.3,   // volatile pairs tolerate more drift
+    };
+
     // I2: Rebalance out-of-range or near-edge positions
     for (const pos of state.orcaPositions) {
+      const posTier = pos.riskTier ?? 'medium';
+      const tierRebalMult = ORCA_TIER_REBALANCE_MULT[posTier] ?? 1.0;
+      const tierRangeMult = ORCA_TIER_RANGE_MULT[posTier] ?? 1.0;
+      const learnedTierMult = learned.lpTierRangeMultipliers?.[posTier] ?? 1.0;
       // Apply learned LP rebalance trigger (tighter if OOR rate high from learning)
-      const effectiveRebalTrigger = applyAdaptive(env.orcaLpRebalanceTriggerPct, learned.lpRebalanceTriggerMultiplier, conf);
+      const effectiveRebalTrigger = applyAdaptive(env.orcaLpRebalanceTriggerPct * tierRebalMult, learned.lpRebalanceTriggerMultiplier, conf);
       if (!pos.inRange || pos.rangeUtilisationPct < effectiveRebalTrigger) {
         // Look up pool info from discovery cache for adaptive range calculation
         const poolInfo = pos.whirlpoolAddress
           ? await getPoolByAddress(pos.whirlpoolAddress).catch(() => null)
           : null;
-        const tokenASymbol = poolInfo?.tokenA.symbol ?? 'SOL';
+        const tokenASymbol = pos.tokenA ?? poolInfo?.tokenA.symbol ?? 'SOL';
 
         decisions.push({
           type: 'ORCA_LP_REBALANCE',
           reasoning:
-            `Orca LP ${pos.positionMint.slice(0, 8)} ${pos.inRange ? 'near range edge' : 'OUT OF RANGE'} ` +
+            `[${posTier.toUpperCase()} risk] Orca LP ${pos.positionMint.slice(0, 8)} ${pos.inRange ? 'near range edge' : 'OUT OF RANGE'} ` +
             `(utilisation: ${pos.rangeUtilisationPct.toFixed(0)}%). Closing and reopening centred on current price.`,
           params: {
             positionMint: pos.positionMint,
             whirlpoolAddress: pos.whirlpoolAddress,
+            riskTier: posTier,
             rangeWidthPct: adaptiveLpRangeWidthPct(
               tokenASymbol,
               intel,
-              env.orcaLpRangeWidthPct,
+              env.orcaLpRangeWidthPct * tierRangeMult * learnedTierMult,
               learned,
             ),
           },
@@ -2423,8 +2458,8 @@ export async function generateDecisions(
       borrowLpSkip(`health factor ${state.kaminoHealthFactor.toFixed(2)} < 2.0 — too risky to borrow more`);
     } else if (state.kaminoLtv >= (env.kaminoBorrowLpMaxLtvPct / 100) * 0.90) {
       borrowLpSkip(`LTV ${(state.kaminoLtv * 100).toFixed(1)}% too close to cap ${env.kaminoBorrowLpMaxLtvPct}%`);
-    } else if (state.orcaPositions.length > 0) {
-      borrowLpSkip('already have an active Orca LP — one at a time');
+    } else if (state.orcaPositions.length >= env.orcaLpMaxPositions) {
+      borrowLpSkip(`already at max Orca LP positions (${state.orcaPositions.length}/${env.orcaLpMaxPositions})`);
     } else if (!checkCooldown('KAMINO_BORROW_LP', 24 * 3600_000)) {
       borrowLpSkip('cooldown (24h)');
     } else {
@@ -2434,7 +2469,7 @@ export async function generateDecisions(
         state.kaminoDepositValueUsd * maxBorrowLtv - state.kaminoBorrowValueUsd,
       );
       const fractionToUse = (env.kaminoBorrowLpCapacityPct ?? 20) / 100;
-      const borrowUsd = Math.min(
+      const totalBorrowBudget = Math.min(
         headroomUsd * fractionToUse,       // tiny fraction of capacity
         env.kaminoBorrowLpMaxUsd ?? 200,   // hard USD cap
         env.orcaLpMaxUsd - state.orcaLpValueUsd, // Orca headroom
@@ -2446,46 +2481,163 @@ export async function generateDecisions(
       const borrowCost = state.kaminoBorrowApy > 0 ? state.kaminoBorrowApy : 0.08;
       const spreadPct = (estimatedLpFeeApy - borrowCost) * 100;
 
-      if (borrowUsd < 20) {
-        borrowLpSkip(`borrow amount $${borrowUsd.toFixed(0)} too small (need ≥$20)`);
+      if (totalBorrowBudget < 20) {
+        borrowLpSkip(`borrow amount $${totalBorrowBudget.toFixed(0)} too small (need ≥$20)`);
       } else if (spreadPct < (env.kaminoBorrowLpMinSpreadPct ?? 5)) {
         borrowLpSkip(`spread ${spreadPct.toFixed(1)}% < min ${env.kaminoBorrowLpMinSpreadPct ?? 5}% (LP ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow ~${(borrowCost * 100).toFixed(0)}%)`);
       } else {
-        const usdcSide = borrowUsd / 2;
-        const solSide = borrowUsd / 2 / state.solPriceUsd;
-        const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct, learned);
+        // ── 3-tier risk system: discover pools, infer tiers, open one per enabled tier ──
+        const ORCA_TIER_RANGE_MULT_K: Record<string, number> = { low: 0.4, medium: 1.0, high: 2.0 };
+        const _stableSetOrca = new Set(['USDC', 'USDT', 'DAI', 'USDH', 'UXD', 'PYUSD']);
+        const _inferOrcaTier = (tA: string, tB: string): 'low' | 'medium' | 'high' => {
+          const sA = _stableSetOrca.has(tA.toUpperCase()), sB = _stableSetOrca.has(tB.toUpperCase());
+          return sA && sB ? 'low' : (sA || sB) ? 'medium' : 'high';
+        };
 
-        decisions.push({
-          type: 'KAMINO_BORROW_LP',
-          reasoning:
-            `Borrow $${borrowUsd.toFixed(0)} USDC from Kamino (${(fractionToUse * 100).toFixed(0)}% of headroom) → ` +
-            `deploy into SOL/USDC concentrated LP (range ±${adaptiveRange / 2}%). ` +
-            `Est. LP fee yield ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow cost ~${(borrowCost * 100).toFixed(0)}% ` +
-            `= ${spreadPct.toFixed(1)}% spread. Post-borrow LTV: ~${((state.kaminoLtv + borrowUsd / state.kaminoDepositValueUsd) * 100).toFixed(0)}%. ` +
-            `LP fees accrue → close LP → repay borrow → keep profit.`,
-          params: {
-            borrowUsd,
-            usdcAmount: usdcSide,
-            solAmount: solSide,
-            rangeWidthPct: adaptiveRange,
-            estimatedLpApy: estimatedLpFeeApy,
-            borrowApy: borrowCost,
-            spreadPct,
-            postBorrowLtv: state.kaminoLtv + borrowUsd / Math.max(state.kaminoDepositValueUsd, 1),
-          },
-          urgency: 'low',
-          estimatedImpactUsd: borrowUsd * (estimatedLpFeeApy - borrowCost),
-          intelUsed: [
-            intel.guardianReceivedAt ? 'guardian' : '',
-            intel.analystPricesAt ? 'analyst' : '',
-          ].filter(Boolean),
-          tier: 'APPROVAL',   // ALWAYS require admin approval for borrowed money
-        });
+        // Get discovered pools (cached — refreshes every 2h)
+        let discoveredPools: any[] = [];
+        try {
+          discoveredPools = await discoverOrcaPools();
+        } catch { /* fallback below */ }
 
-        logger.info(
-          `[CFO:Decision] Section K: KAMINO_BORROW_LP — borrow $${borrowUsd.toFixed(0)} → SOL/USDC LP ` +
-          `(spread ${spreadPct.toFixed(1)}%, post-LTV ${((state.kaminoLtv + borrowUsd / state.kaminoDepositValueUsd) * 100).toFixed(0)}%)`,
-        );
+        // Build set of existing Orca LP pool addresses to avoid duplicates
+        const existingOrcaPools = new Set(state.orcaPositions.map(p => p.whirlpoolAddress).filter(Boolean));
+
+        // Annotate with risk tier
+        const tieredPools = discoveredPools
+          .filter(p => !existingOrcaPools.has(p.whirlpoolAddress))
+          .map(p => ({
+            ...p,
+            riskTier: _inferOrcaTier(p.tokenA.symbol, p.tokenB.symbol),
+          }));
+
+        const enabledTiers = env.orcaLpRiskTiers;
+        const slotsAvailable = env.orcaLpMaxPositions - state.orcaPositions.length;
+        const perTierBudget = totalBorrowBudget / Math.max(enabledTiers.length, 1);
+        let tiersOpened = 0;
+
+        for (const tier of enabledTiers) {
+          if (tiersOpened >= slotsAvailable) break;
+
+          const tierPools = tieredPools.filter(p => p.riskTier === tier).sort((a, b) => b.score - a.score);
+
+          // Fallback: if no discovered pools for this tier, use selectBestOrcaPairDynamic for medium tier
+          let selectedPool: any = tierPools[0];
+          if (!selectedPool && tier === 'medium') {
+            try {
+              const dynamicPick = await selectBestOrcaPairDynamic(intel);
+              if (dynamicPick && !existingOrcaPools.has(dynamicPick.whirlpoolAddress)) {
+                selectedPool = dynamicPick;
+              }
+            } catch { /* skip */ }
+          }
+
+          if (!selectedPool) {
+            borrowLpSkip(`no ${tier}-risk Orca pools available (${tieredPools.length} total)`);
+            continue;
+          }
+
+          const tierRangeMult = ORCA_TIER_RANGE_MULT_K[tier] ?? 1.0;
+          const learnedTierMult = learned.lpTierRangeMultipliers?.[tier] ?? 1.0;
+          const borrowUsd = Math.min(perTierBudget, totalBorrowBudget - tiersOpened * perTierBudget);
+          if (borrowUsd < 15) {
+            borrowLpSkip(`${tier} tier: borrow amount $${borrowUsd.toFixed(0)} too small`);
+            continue;
+          }
+
+          const usdcSide = borrowUsd / 2;
+          const solSide = borrowUsd / 2 / state.solPriceUsd;
+          const tokenA = selectedPool.tokenA?.symbol ?? selectedPool.tokenA ?? 'SOL';
+          const tokenB = selectedPool.tokenB?.symbol ?? selectedPool.tokenB ?? 'USDC';
+          const pair = selectedPool.pair ?? `${tokenA}/${tokenB}`;
+          const adaptiveRange = adaptiveLpRangeWidthPct(
+            tokenA,
+            intel,
+            env.orcaLpRangeWidthPct * tierRangeMult * learnedTierMult,
+            learned,
+          );
+
+          decisions.push({
+            type: 'KAMINO_BORROW_LP',
+            reasoning:
+              `[${tier.toUpperCase()} risk] Borrow $${borrowUsd.toFixed(0)} USDC from Kamino (${(fractionToUse * 100).toFixed(0)}% of headroom) → ` +
+              `deploy into ${pair} concentrated LP (range ±${adaptiveRange / 2}%). ` +
+              `Est. LP fee yield ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow cost ~${(borrowCost * 100).toFixed(0)}% ` +
+              `= ${spreadPct.toFixed(1)}% spread. Post-borrow LTV: ~${((state.kaminoLtv + borrowUsd / state.kaminoDepositValueUsd) * 100).toFixed(0)}%. ` +
+              `LP fees accrue → close LP → repay borrow → keep profit.`,
+            params: {
+              borrowUsd,
+              usdcAmount: usdcSide,
+              solAmount: solSide,
+              rangeWidthPct: adaptiveRange,
+              estimatedLpApy: estimatedLpFeeApy,
+              borrowApy: borrowCost,
+              spreadPct,
+              riskTier: tier,
+              pair,
+              tokenA,
+              tokenB,
+              whirlpoolAddress: selectedPool.whirlpoolAddress,
+              tokenAMint: selectedPool.tokenA?.mint ?? selectedPool.tokenAMint,
+              tokenBMint: selectedPool.tokenB?.mint ?? selectedPool.tokenBMint,
+              tokenADecimals: selectedPool.tokenA?.decimals ?? selectedPool.tokenADecimals,
+              tokenBDecimals: selectedPool.tokenB?.decimals ?? selectedPool.tokenBDecimals,
+              tickSpacing: selectedPool.tickSpacing,
+              postBorrowLtv: state.kaminoLtv + borrowUsd / Math.max(state.kaminoDepositValueUsd, 1),
+            },
+            urgency: 'low',
+            estimatedImpactUsd: borrowUsd * (estimatedLpFeeApy - borrowCost),
+            intelUsed: [
+              intel.guardianReceivedAt ? 'guardian' : '',
+              intel.analystPricesAt ? 'analyst' : '',
+            ].filter(Boolean),
+            tier: 'APPROVAL',   // ALWAYS require admin approval for borrowed money
+          });
+          tiersOpened++;
+
+          logger.info(
+            `[CFO:Decision] Section K: KAMINO_BORROW_LP [${tier}] — borrow $${borrowUsd.toFixed(0)} → ${pair} LP ` +
+            `(spread ${spreadPct.toFixed(1)}%, post-LTV ${((state.kaminoLtv + borrowUsd / state.kaminoDepositValueUsd) * 100).toFixed(0)}%)`,
+          );
+        }
+
+        if (tiersOpened === 0 && discoveredPools.length === 0) {
+          // Fallback: no discovery available, open SOL/USDC (medium tier) as before
+          const borrowUsd = totalBorrowBudget;
+          const usdcSide = borrowUsd / 2;
+          const solSide = borrowUsd / 2 / state.solPriceUsd;
+          const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct, learned);
+
+          decisions.push({
+            type: 'KAMINO_BORROW_LP',
+            reasoning:
+              `[MEDIUM risk] Borrow $${borrowUsd.toFixed(0)} USDC from Kamino → ` +
+              `deploy into SOL/USDC concentrated LP (range ±${adaptiveRange / 2}%). ` +
+              `Est. LP fee yield ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow cost ~${(borrowCost * 100).toFixed(0)}% ` +
+              `= ${spreadPct.toFixed(1)}% spread (pool discovery unavailable — fallback).`,
+            params: {
+              borrowUsd,
+              usdcAmount: usdcSide,
+              solAmount: solSide,
+              rangeWidthPct: adaptiveRange,
+              estimatedLpApy: estimatedLpFeeApy,
+              borrowApy: borrowCost,
+              spreadPct,
+              riskTier: 'medium',
+              pair: 'SOL/USDC',
+              tokenA: 'SOL',
+              tokenB: 'USDC',
+              postBorrowLtv: state.kaminoLtv + borrowUsd / Math.max(state.kaminoDepositValueUsd, 1),
+            },
+            urgency: 'low',
+            estimatedImpactUsd: borrowUsd * (estimatedLpFeeApy - borrowCost),
+            intelUsed: [
+              intel.guardianReceivedAt ? 'guardian' : '',
+              intel.analystPricesAt ? 'analyst' : '',
+            ].filter(Boolean),
+            tier: 'APPROVAL',
+          });
+        }
       }
     }
   } else if (env.kaminoBorrowLpEnabled) {
@@ -2556,8 +2708,9 @@ export async function generateDecisions(
 
     // I: Orca LP (new positions via Section K / Kamino borrow; this tracks rebalance only)
     if (env.orcaLpEnabled) {
-      if (state.orcaPositions.length > 0) diag.push(`OrcaLP:active(${state.orcaPositions.length})`);
-      else if (env.kaminoBorrowLpEnabled) diag.push('OrcaLP:via-kamino-borrow(K)');
+      const orcaTierTag = env.orcaLpRiskTiers.join('/');
+      if (state.orcaPositions.length > 0) diag.push(`OrcaLP:active(${state.orcaPositions.length})[${orcaTierTag}]`);
+      else if (env.kaminoBorrowLpEnabled) diag.push(`OrcaLP:via-kamino-borrow(K)[${orcaTierTag}]`);
       else diag.push('OrcaLP:needs-borrow-enable');
     }
 

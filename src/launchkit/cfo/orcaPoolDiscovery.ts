@@ -163,6 +163,9 @@ export interface OrcaPoolCandidate {
   score: number;
   scoreBreakdown: Record<string, number>;
   reasoning: string[];
+
+  // Risk tier (inferred from token composition)
+  riskTier?: 'low' | 'medium' | 'high';
 }
 
 /** The result of pool selection — what decisionEngine needs */
@@ -296,6 +299,11 @@ export async function discoverOrcaPools(forceRefresh = false): Promise<OrcaPoolC
         score: 0,
         scoreBreakdown: {},
         reasoning: [],
+        riskTier: (() => {
+          const _stables = new Set(['USDC', 'USDT', 'DAI', 'USDH', 'UXD', 'PYUSD']);
+          const sA = _stables.has(symbolA.toUpperCase()), sB = _stables.has(symbolB.toUpperCase());
+          return sA && sB ? 'low' as const : (sA || sB) ? 'medium' as const : 'high' as const;
+        })(),
       });
     }
 

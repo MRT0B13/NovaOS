@@ -725,28 +725,37 @@ function computeAdaptiveParams(
     }
   }
 
-  // ── Per-tier LP adaptations (Krystal risk tiers) ────────────────
+  // ── Per-tier LP adaptations (both Orca and Krystal risk tiers) ─────────
   // Each tier learns independently: high-risk OOR doesn't widen low-risk ranges
   const lpTierRangeMultipliers: Record<string, number> = { low: 1.0, medium: 1.0, high: 1.0 };
   const lpTierMinAprAdjustments: Record<string, number> = { low: 0, medium: 0, high: 0 };
 
   for (const tier of ['low', 'medium', 'high'] as const) {
-    const tierLp = lpStats[`krystal_lp_${tier}`];
-    if (!tierLp || tierLp.totalPositions < 2) continue;
+    // Merge Orca + Krystal per-tier data for combined learning
+    const orcaTier = lpStats[`orca_lp_${tier}`];
+    const krystalTier = lpStats[`krystal_lp_${tier}`];
+
+    // Use whichever has more data, or combine if both have enough
+    const tierCandidates = [orcaTier, krystalTier].filter(t => t && t.totalPositions >= 2);
+    if (tierCandidates.length === 0) continue;
+
+    // Average stats across both LP providers for this tier
+    const avgOorRate = tierCandidates.reduce((s, t) => s + (t?.outOfRangeRate ?? 0), 0) / tierCandidates.length;
+    const avgPnlPerDay = tierCandidates.reduce((s, t) => s + (t?.avgPnlPerDayUsd ?? 0), 0) / tierCandidates.length;
 
     // Tier-specific range adaptation
-    if (tierLp.outOfRangeRate > 0.5) {
+    if (avgOorRate > 0.5) {
       lpTierRangeMultipliers[tier] = 1.4; // frequent OOR → widen this tier's range
-    } else if (tierLp.outOfRangeRate > 0.3) {
+    } else if (avgOorRate > 0.3) {
       lpTierRangeMultipliers[tier] = 1.2;
-    } else if (tierLp.outOfRangeRate < 0.1 && tierLp.avgPnlPerDayUsd > 0) {
+    } else if (avgOorRate < 0.1 && avgPnlPerDay > 0) {
       lpTierRangeMultipliers[tier] = 0.85; // always in range + profitable → tighten for more fees
     }
 
     // Tier-specific APR floor
-    if (tierLp.avgPnlPerDayUsd < -0.5) {
+    if (avgPnlPerDay < -0.5) {
       lpTierMinAprAdjustments[tier] = 15; // losing money → demand much higher APR
-    } else if (tierLp.avgPnlPerDayUsd < 0) {
+    } else if (avgPnlPerDay < 0) {
       lpTierMinAprAdjustments[tier] = 5;
     }
   }
@@ -954,9 +963,15 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
     );
     const stats: Record<string, StrategyStats> = Object.fromEntries(statsEntries);
 
-    // 3. LP-specific stats (aggregate + per-tier for Krystal)
-    const [orcaLpStats, krystalLpStats, krystalLow, krystalMed, krystalHigh] = await Promise.all([
+    // 3. LP-specific stats (aggregate + per-tier for both Orca and Krystal)
+    const [
+      orcaLpStats, orcaLow, orcaMed, orcaHigh,
+      krystalLpStats, krystalLow, krystalMed, krystalHigh,
+    ] = await Promise.all([
       computeLPStats(dbPool, 'orca_lp'),
+      computeLPStats(dbPool, 'orca_lp', 'low'),
+      computeLPStats(dbPool, 'orca_lp', 'medium'),
+      computeLPStats(dbPool, 'orca_lp', 'high'),
       computeLPStats(dbPool, 'krystal_lp'),
       computeLPStats(dbPool, 'krystal_lp', 'low'),
       computeLPStats(dbPool, 'krystal_lp', 'medium'),
@@ -964,6 +979,9 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
     ]);
     const lpStats: Record<string, LPStats> = {
       orca_lp: orcaLpStats,
+      orca_lp_low: orcaLow,
+      orca_lp_medium: orcaMed,
+      orca_lp_high: orcaHigh,
       krystal_lp: krystalLpStats,
       krystal_lp_low: krystalLow,
       krystal_lp_medium: krystalMed,
