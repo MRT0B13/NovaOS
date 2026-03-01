@@ -94,6 +94,9 @@ for (const [chainId, addr] of Object.entries(WELL_KNOWN_USDC)) {
 // Seed legacy bridged USDC variants
 _tokenRegistry.set('137_USDC.e', '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174');  // Polygon USDC.e
 _tokenRegistry.set('42161_USDC.e', '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8'); // Arbitrum USDC.e
+_tokenRegistry.set('8453_USDbC', '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA');  // Base USDbC (bridged USDC)
+_tokenRegistry.set('10_USDC.e', '0x7F5c764cBc14f9669B88837ca1490cCa17c31607');   // Optimism USDC.e
+_tokenRegistry.set('43114_USDC.e', '0xA7D7079b0FEaD91F3e65f86E8915Cb59c1a4C664'); // Avalanche USDC.e
 
 /**
  * Register a token address for a chain + symbol pair.

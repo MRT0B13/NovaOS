@@ -280,12 +280,17 @@ export interface PortfolioState {
     chainId: number;
     chainName: string;
     usdcBalance: number;
+    usdcBridgedBalance: number;
+    totalStableUsd: number;
+    wethBalance: number;
+    wethValueUsd: number;
     nativeBalance: number;
     nativeSymbol: string;
     nativeValueUsd: number;
+    totalValueUsd: number;
   }>;
-  evmTotalUsdcAllChains: number;   // sum of USDC across all EVM chains
-  evmTotalNativeAllChains: number; // sum of native token USD value across all chains
+  evmTotalUsdcAllChains: number;   // sum of all stablecoins across EVM chains
+  evmTotalNativeAllChains: number; // sum of native + WETH USD value across all chains
 }
 
 // ============================================================================
@@ -891,8 +896,8 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
       const krystal = await import('./krystalService.ts');
       const balances = await krystal.getMultiChainEvmBalances();
       evmChainBalances = balances;
-      evmTotalUsdcAllChains = balances.reduce((s, b) => s + b.usdcBalance, 0);
-      evmTotalNativeAllChains = balances.reduce((s, b) => s + b.nativeValueUsd, 0);
+      evmTotalUsdcAllChains = balances.reduce((s, b) => s + b.totalStableUsd, 0);
+      evmTotalNativeAllChains = balances.reduce((s, b) => s + b.nativeValueUsd + b.wethValueUsd, 0);
     } catch { /* 0 */ }
   }
 
@@ -2116,10 +2121,10 @@ export async function generateDecisions(
         // Apply learned APR floor adjustment (raised if past LP positions underperformed)
         const learnedMinApr = env.krystalLpMinApr7d + (learned.lpMinAprAdjustment * learned.confidenceLevel);
 
-        // Build set of chains where we actually have deployable value (USDC + native >= $10)
+        // Build set of chains where we actually have deployable value (stables + native + WETH >= $10)
         const fundedChainIds = new Set(
           state.evmChainBalances
-            .filter(b => (b.usdcBalance + b.nativeValueUsd) >= 10)
+            .filter(b => b.totalValueUsd >= 10)
             .map(b => b.chainId),
         );
 
@@ -2181,11 +2186,11 @@ export async function generateDecisions(
               rangeWidthTicks,
               chainName: best.chainName,
               pair: `${best.token0.symbol}/${best.token1.symbol}`,
-              // Bridge funding: pick the chain with the most USDC (if not same chain)
+              // Bridge funding: pick the chain with the most stablecoin balance (if not same chain)
               bridgeFunding: (() => {
                 const bestBal = state.evmChainBalances
-                  .filter(b => b.chainId !== best.chainNumericId && b.usdcBalance >= deployUsd * 0.5)
-                  .sort((a, b) => b.usdcBalance - a.usdcBalance)[0];
+                  .filter(b => b.chainId !== best.chainNumericId && b.totalStableUsd >= deployUsd * 0.5)
+                  .sort((a, b) => b.totalStableUsd - a.totalStableUsd)[0];
                 if (bestBal && env.evmPrivateKey) {
                   // Wallet address will be computed by the executor from env.evmPrivateKey
                   return { sourceChainId: bestBal.chainId, walletAddress: '' };
@@ -3203,12 +3208,19 @@ export function formatDecisionReport(
     L.push(`   EVM LP: $${state.evmLpTotalValueUsd.toFixed(0)}${feeStr}`);
   }
 
-  // EVM chain balances (USDC staged on chains)
-  if (state.evmTotalUsdcAllChains > 1 && state.evmChainBalances.length > 0) {
-    const chains = state.evmChainBalances
-      .filter(b => b.usdcBalance > 0.5)
-      .map(b => `$${b.usdcBalance.toFixed(0)} ${b.chainName}`);
-    if (chains.length > 0) L.push(`   EVM USDC: ${chains.join(', ')}`);
+  // EVM chain balances (all assets per chain)
+  if (state.evmChainBalances.length > 0) {
+    const chainsWithValue = state.evmChainBalances.filter(b => b.totalValueUsd > 1);
+    if (chainsWithValue.length > 0) {
+      const chainParts = chainsWithValue.map(b => {
+        const parts: string[] = [];
+        if (b.totalStableUsd > 0.5) parts.push(`$${b.totalStableUsd.toFixed(0)} USDC`);
+        if (b.wethValueUsd > 0.5) parts.push(`$${b.wethValueUsd.toFixed(0)} W${b.nativeSymbol}`);
+        if (b.nativeValueUsd > 0.5) parts.push(`$${b.nativeValueUsd.toFixed(0)} ${b.nativeSymbol}`);
+        return `${b.chainName}: ${parts.join(' + ')} ($${b.totalValueUsd.toFixed(0)})`;
+      });
+      L.push(`   EVM wallets: ${chainParts.join(' · ')}`);
+    }
   }
 
   // ── Strategies ──

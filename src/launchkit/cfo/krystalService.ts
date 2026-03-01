@@ -191,10 +191,15 @@ export interface EvmLpRecord {
 export interface ChainBalance {
   chainId: number;
   chainName: string;
-  usdcBalance: number;        // USDC (native or bridged) in human units
+  usdcBalance: number;        // Native USDC in human units
+  usdcBridgedBalance: number; // Bridged USDC.e/USDC.E in human units
+  totalStableUsd: number;     // usdcBalance + usdcBridgedBalance
+  wethBalance: number;        // Wrapped native token (WETH/WMATIC) in human units
+  wethValueUsd: number;       // wethBalance × native price
   nativeBalance: number;      // ETH/MATIC/AVAX etc. in human units
   nativeSymbol: string;
   nativeValueUsd: number;     // nativeBalance × price estimate
+  totalValueUsd: number;      // totalStableUsd + wethValueUsd + nativeValueUsd
 }
 
 // ============================================================================
@@ -1495,8 +1500,27 @@ const NATIVE_SYMBOLS: Record<number, string> = {
   137: 'MATIC', 56: 'BNB', 43114: 'AVAX', 324: 'ETH', 5000: 'MNT',
 };
 
+// Bridged USDC variants (USDC.e / USDC.E) per chain
+const BRIDGED_USDC: Record<number, string> = {
+  8453:  '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA', // Base USDbC (bridged)
+  137:   '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', // Polygon USDC.e
+  42161: '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8', // Arbitrum USDC.e
+  10:    '0x7F5c764cBc14f9669B88837ca1490cCa17c31607', // Optimism USDC.e
+  43114: '0xA7D7079b0FEaD91F3e65f86E8915Cb59c1a4C664', // Avalanche USDC.e
+};
+
+// Wrapped native token addresses per chain (for balance tracking)
+const WRAPPED_NATIVE_ADDR: Record<number, string> = {
+  1:     '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', // WETH
+  10:    '0x4200000000000000000000000000000000000006', // WETH (Optimism)
+  137:   '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270', // WMATIC
+  8453:  '0x4200000000000000000000000000000000000006', // WETH (Base)
+  42161: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', // WETH (Arbitrum)
+  43114: '0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7', // WAVAX
+};
+
 /**
- * Scan all configured EVM chains for USDC and native token balances.
+ * Scan all configured EVM chains for USDC (native + bridged), WETH, and native token balances.
  * Returns per-chain balances for portfolio tracking.
  */
 export async function getMultiChainEvmBalances(): Promise<ChainBalance[]> {
@@ -1516,25 +1540,41 @@ export async function getMultiChainEvmBalances(): Promise<ChainBalance[]> {
     try {
       const bridge = await import('./wormholeService.ts');
       const usdcAddr = bridge.WELL_KNOWN_USDC[chainId];
+      const bridgedUsdcAddr = BRIDGED_USDC[chainId];
+      const wethAddr = WRAPPED_NATIVE_ADDR[chainId];
       const chainName = bridge.chainIdToName(chainId);
 
-      const [usdcBalance, nativeBalance] = await Promise.all([
+      const [usdcBalance, usdcBridgedBalance, wethBalance, nativeBalance] = await Promise.all([
         usdcAddr
           ? bridge.getEvmTokenBalance(chainId, usdcAddr, walletAddress)
+          : Promise.resolve(0),
+        bridgedUsdcAddr
+          ? bridge.getEvmTokenBalance(chainId, bridgedUsdcAddr, walletAddress)
+          : Promise.resolve(0),
+        wethAddr
+          ? bridge.getEvmTokenBalance(chainId, wethAddr, walletAddress)
           : Promise.resolve(0),
         bridge.getEvmNativeBalance(chainId, walletAddress),
       ]);
 
       const nativePrice = await getNativeTokenPrice(chainId);
       const nativeSymbol = NATIVE_SYMBOLS[chainId] ?? 'ETH';
+      const totalStableUsd = usdcBalance + usdcBridgedBalance;
+      const wethValueUsd = wethBalance * nativePrice;
+      const nativeValueUsd = nativeBalance * nativePrice;
 
       return {
         chainId,
         chainName,
         usdcBalance,
+        usdcBridgedBalance,
+        totalStableUsd,
+        wethBalance,
+        wethValueUsd,
         nativeBalance,
         nativeSymbol,
-        nativeValueUsd: nativeBalance * nativePrice,
+        nativeValueUsd,
+        totalValueUsd: totalStableUsd + wethValueUsd + nativeValueUsd,
       } satisfies ChainBalance;
     } catch {
       return null;
