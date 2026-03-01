@@ -140,6 +140,12 @@ interface CFOSnapshot {
   polyPositionCount: number;
   polyUsdcBalance: number;
 
+  // Krystal EVM LP
+  krystalEnabled: boolean;
+  krystalLpValueUsd: number;
+  krystalLpFeesUsd: number;
+  krystalPositions: Array<{ posId: string; chainName: string; token0Symbol: string; token1Symbol: string; inRange: boolean; rangeUtilisationPct: number; valueUsd: number; feesOwedUsd: number }>;
+
   // x402 revenue
   x402TotalCalls: number;
   x402TotalEarned: number;
@@ -695,6 +701,20 @@ async function gatherCFOSnapshot(): Promise<CFOSnapshot | null> {
         leverage: p.leverage,
       })),
 
+      krystalEnabled: env.krystalLpEnabled,
+      krystalLpValueUsd: ps.evmLpTotalValueUsd,
+      krystalLpFeesUsd: ps.evmLpTotalFeesUsd,
+      krystalPositions: ps.evmLpPositions.map(p => ({
+        posId: p.posId,
+        chainName: p.chainName,
+        token0Symbol: p.token0Symbol,
+        token1Symbol: p.token1Symbol,
+        inRange: p.inRange,
+        rangeUtilisationPct: p.rangeUtilisationPct,
+        valueUsd: p.valueUsd,
+        feesOwedUsd: p.feesOwedUsd,
+      })),
+
       polyEnabled: env.polymarketEnabled,
       polyDeployedUsd: ps.polyDeployedUsd,
       polyHeadroomUsd: ps.polyHeadroomUsd,
@@ -1053,6 +1073,18 @@ async function sendStatusReport(): Promise<void> {
       message += `    Est. fee APY: ${(c.orcaLpFeeApy * 100).toFixed(1)}%\n\n`;
     }
 
+    // Krystal EVM LP
+    if (c.krystalEnabled && c.krystalPositions.length > 0) {
+      message += `  <b>💎 Krystal LP ($${c.krystalLpValueUsd.toFixed(2)}):</b>\n`;
+      for (const pos of c.krystalPositions) {
+        const rangeEmoji = pos.inRange ? '🟢' : '🔴';
+        message += `    ${rangeEmoji} ${pos.token0Symbol}/${pos.token1Symbol} on ${pos.chainName} — $${pos.valueUsd.toFixed(2)} | ${pos.rangeUtilisationPct.toFixed(0)}% util`;
+        if (pos.feesOwedUsd > 0.001) message += ` | fees: $${pos.feesOwedUsd.toFixed(4)}`;
+        message += `\n`;
+      }
+      message += `\n`;
+    }
+
     // Jito Staking
     if (c.jitoSolBalance > 0) {
       message += `  <b>⚡ Jito Staking:</b>\n`;
@@ -1236,6 +1268,12 @@ async function sendDailySummary(): Promise<void> {
     if (c.orcaEnabled && c.orcaPositions.length > 0) {
       const inRange = c.orcaPositions.filter(p => p.inRange).length;
       message += `  • Orca LP: $${c.orcaLpValueUsd.toFixed(2)} | ${inRange}/${c.orcaPositions.length} in range | ${(c.orcaLpFeeApy * 100).toFixed(1)}% APY\n`;
+    }
+
+    if (c.krystalEnabled && c.krystalPositions.length > 0) {
+      const inRange = c.krystalPositions.filter(p => p.inRange).length;
+      const chains = [...new Set(c.krystalPositions.map(p => p.chainName))].join(',');
+      message += `  • Krystal LP: $${c.krystalLpValueUsd.toFixed(2)} | ${inRange}/${c.krystalPositions.length} in range | ${chains}\n`;
     }
 
     if (c.jitoSolBalance > 0) {
