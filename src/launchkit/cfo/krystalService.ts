@@ -41,6 +41,15 @@ function getNfpmAddress(chainId: number): string | undefined {
   return NFPM_BY_CHAIN[chainId];
 }
 
+// Uniswap V3 Factory — per-chain mapping (needed to verify pools before minting)
+const UNI_V3_FACTORY_BY_CHAIN: Record<number, string> = {
+  1:     '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Ethereum (canonical)
+  10:    '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Optimism
+  137:   '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Polygon
+  8453:  '0x33128a8fC17869897dcE68Ed026d694621f6FDfD', // Base (v1.3.0 deployer)
+  42161: '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Arbitrum
+};
+
 // Backward compat — default for chains where canonical works
 const NFPM_ADDRESS = '0xC36442b4a4522E871399CD717aBDD847Ab11FE88';
 
@@ -729,6 +738,28 @@ export async function openEvmLpPosition(
     const wallet = await getEvmWallet(chainNumericId);
     const provider = await getEvmProvider(chainNumericId);
 
+    // 0. Pre-flight: verify pool exists on Uniswap V3 factory (prevents minting into Aerodrome/PancakeSwap/etc. pools)
+    const nfpmAddrEarly = getNfpmAddress(chainNumericId);
+    if (!nfpmAddrEarly) {
+      return { success: false, error: `No Uniswap V3 NFPM deployed on chainId ${chainNumericId}` };
+    }
+
+    const earlyFactoryAddr = UNI_V3_FACTORY_BY_CHAIN[chainNumericId];
+    if (earlyFactoryAddr) {
+      const factoryAbi = ['function getPool(address,address,uint24) view returns (address)'];
+      const factory = new ethers.Contract(earlyFactoryAddr, factoryAbi, provider);
+      const uniPool = await factory.getPool(pool.token0.address, pool.token1.address, pool.feeTier);
+      if (!uniPool || uniPool === ethers.ZeroAddress) {
+        const proto = typeof pool.protocol === 'string' ? pool.protocol : pool.protocol?.name;
+        logger.warn(
+          `[Krystal] Pool ${pool.token0.symbol}/${pool.token1.symbol} fee=${pool.feeTier} ` +
+          `NOT found on Uniswap V3 factory (protocol: ${proto}). Skipping — NFPM can only mint Uniswap V3 positions.`,
+        );
+        return { success: false, error: `Pool not on Uniswap V3 factory (protocol: ${proto}) — cannot mint via NFPM` };
+      }
+      logger.info(`[Krystal] ✓ Pool verified on Uniswap V3 factory: ${uniPool}`);
+    }
+
     // 1. Read current tick from pool
     const poolContract = new ethers.Contract(pool.poolAddress, POOL_ABI, provider);
     const slot0 = await poolContract.slot0();
@@ -1044,11 +1075,25 @@ export async function openEvmLpPosition(
       return { success: false, error: `Zap swap failed to acquire ${missing} — cannot mint in-range LP with only ${oneSide}` };
     }
 
-    // 6. Gas estimate check — skip if gas > 5% of deployUsd
-    const nfpmAddr = getNfpmAddress(chainNumericId);
-    if (!nfpmAddr) {
-      return { success: false, error: `No Uniswap V3 NFPM deployed on chainId ${chainNumericId}` };
+    // 6a. Verify tokens are in correct order (NFPM requires token0 < token1 by address)
+    const sortedToken0 = pool.token0.address.toLowerCase() < pool.token1.address.toLowerCase()
+      ? pool.token0 : pool.token1;
+    const sortedToken1 = pool.token0.address.toLowerCase() < pool.token1.address.toLowerCase()
+      ? pool.token1 : pool.token0;
+    const sorted0Addr = sortedToken0.address;
+    const sorted1Addr = sortedToken1.address;
+    const sortedDec0 = sortedToken0.decimals ?? 18;
+    const sortedDec1 = sortedToken1.decimals ?? 18;
+
+    // If tokens were swapped, also swap the desired amounts
+    const tokensSwapped = sorted0Addr.toLowerCase() !== pool.token0.address.toLowerCase();
+    if (tokensSwapped) {
+      [amount0Desired, amount1Desired] = [amount1Desired, amount0Desired];
+      logger.info(`[Krystal] Token order swapped: ${sortedToken0.symbol}/${sortedToken1.symbol} (NFPM requires sorted addresses)`);
     }
+
+    // 6b. Gas estimate check — skip if gas > 5% of deployUsd
+    const nfpmAddr = nfpmAddrEarly;
     const nfpmContract = new ethers.Contract(nfpmAddr, NFPM_ABI, wallet);
     const feeData = await provider.getFeeData();
     const gasPrice = feeData.gasPrice ?? BigInt(0);
@@ -1062,9 +1107,9 @@ export async function openEvmLpPosition(
       return { success: false, error: `Gas too expensive: $${gasCostUsd.toFixed(2)}` };
     }
 
-    // 7. Approve tokens for NFPM
-    const token0Signer = new ethers.Contract(pool.token0.address, ERC20_ABI, wallet);
-    const token1Signer = new ethers.Contract(pool.token1.address, ERC20_ABI, wallet);
+    // 7. Approve tokens for NFPM (using sorted addresses)
+    const token0Signer = new ethers.Contract(sorted0Addr, ERC20_ABI, wallet);
+    const token1Signer = new ethers.Contract(sorted1Addr, ERC20_ABI, wallet);
 
     const [allowance0, allowance1] = await Promise.all([
       token0Signer.allowance(wallet.address, nfpmAddr),
@@ -1074,12 +1119,12 @@ export async function openEvmLpPosition(
     if (allowance0 < amount0Desired) {
       const approveTx = await token0Signer.approve(nfpmAddr, ethers.MaxUint256);
       await approveTx.wait();
-      logger.info(`[Krystal] Approved ${pool.token0.symbol} for NFPM`);
+      logger.info(`[Krystal] Approved ${sortedToken0.symbol} for NFPM`);
     }
     if (allowance1 < amount1Desired) {
       const approveTx = await token1Signer.approve(nfpmAddr, ethers.MaxUint256);
       await approveTx.wait();
-      logger.info(`[Krystal] Approved ${pool.token1.symbol} for NFPM`);
+      logger.info(`[Krystal] Approved ${sortedToken1.symbol} for NFPM`);
     }
 
     // 8. Slippage: For V3 concentrated LP mints, set mins to 0.
@@ -1092,11 +1137,11 @@ export async function openEvmLpPosition(
     const amount0Min = BigInt(0);
     const amount1Min = BigInt(0);
 
-    // 9. Mint LP position
+    // 9. Mint LP position (using sorted token addresses)
     const deadline = Math.floor(Date.now() / 1000) + 600; // 10 minutes
     const mintParams = {
-      token0: pool.token0.address,
-      token1: pool.token1.address,
+      token0: sorted0Addr,
+      token1: sorted1Addr,
       fee: pool.feeTier,
       tickLower,
       tickUpper,
@@ -1109,9 +1154,19 @@ export async function openEvmLpPosition(
     };
 
     logger.info(
-      `[Krystal] Minting LP: ${pool.token0.symbol}/${pool.token1.symbol} on chain ${chainNumericId}, ` +
-      `ticks [${tickLower}, ${tickUpper}], fee ${pool.feeTier}`,
+      `[Krystal] Minting LP: ${sortedToken0.symbol}/${sortedToken1.symbol} on chain ${chainNumericId}, ` +
+      `ticks [${tickLower}, ${tickUpper}], fee ${pool.feeTier}, ` +
+      `amt0=${ethers.formatUnits(amount0Desired, sortedDec0)}, amt1=${ethers.formatUnits(amount1Desired, sortedDec1)}`,
     );
+
+    // Pre-flight: estimateGas to catch reverts before burning gas on-chain
+    try {
+      await nfpmContract.mint.estimateGas(mintParams);
+    } catch (estErr) {
+      const reason = (estErr as any)?.reason ?? (estErr as Error).message;
+      logger.warn(`[Krystal] Mint estimateGas failed: ${reason}`);
+      return { success: false, error: `Mint would revert: ${reason}` };
+    }
 
     const tx = await nfpmContract.mint(mintParams);
     const receipt = await tx.wait();
