@@ -183,10 +183,22 @@ const ERC20_ABI = [
   'function symbol() view returns (string)',
 ];
 
+// Uniswap V3 / PancakeSwap V3 pool ABI (7 slot0 return values including feeProtocol)
 const POOL_ABI = [
   'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
   'function tickSpacing() view returns (int24)',
 ];
+
+// Aerodrome CL (Slipstream) pool ABI — slot0 returns 6 values (no feeProtocol)
+const AERODROME_POOL_ABI = [
+  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, bool unlocked)',
+  'function tickSpacing() view returns (int24)',
+];
+
+/** Pick correct pool ABI based on protocol variant */
+function getPoolAbi(isAerodrome: boolean): string[] {
+  return isAerodrome ? AERODROME_POOL_ABI : POOL_ABI;
+}
 
 const MaxUint128 = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF');
 
@@ -840,7 +852,8 @@ export async function fetchKrystalPositions(
             if (cached && Date.now() - cached.ts < SLOT0_CACHE_TTL) {
               currentTick = cached.tick;
             } else {
-              const poolContract = new ethers.Contract(poolAddress, POOL_ABI, provider);
+              const isAero = protoResolved?.def.abi === 'aerodrome-cl';
+              const poolContract = new ethers.Contract(poolAddress, getPoolAbi(isAero), provider);
               const slot0 = await poolContract.slot0();
               currentTick = Number(slot0.tick ?? slot0[1] ?? 0);
               _slot0Cache.set(poolKey, { tick: currentTick, ts: Date.now() });
@@ -959,7 +972,7 @@ export async function fetchKrystalPositions(
               const discoveredPool = await factory.getPool(token0Addr, token1Addr, feeTier);
               if (discoveredPool && discoveredPool !== ethers.ZeroAddress) {
                 poolAddress = discoveredPool;
-                const poolContract = new ethers.Contract(discoveredPool, POOL_ABI, provider);
+                const poolContract = new ethers.Contract(discoveredPool, getPoolAbi(isAerodrome), provider);
                 const slot0 = await poolContract.slot0();
                 currentTick = Number(slot0.tick ?? slot0[1] ?? 0);
               }
@@ -980,7 +993,7 @@ export async function fetchKrystalPositions(
             // We already have currentTick + slot0 from pool lookup above.
             // If we have a poolAddress, read slot0 to get sqrtPriceX96
             if (poolAddress && currentTick !== 0) {
-              const poolContract = new ethersLib.Contract(poolAddress, POOL_ABI, provider);
+              const poolContract = new ethersLib.Contract(poolAddress, getPoolAbi(isAerodrome), provider);
               const slot0 = await poolContract.slot0();
               const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96 ?? slot0[0] ?? 0);
 
@@ -1103,7 +1116,8 @@ export async function openEvmLpPosition(
     //    We read tickSpacing() on-chain because the Krystal API feeTier field
     //    may not match the on-chain value (e.g. Aerodrome returns feeTier=402
     //    but the real tickSpacing is 100). All V3-style pools expose tickSpacing().
-    const poolContract = new ethers.Contract(pool.poolAddress, POOL_ABI, provider);
+    //    Aerodrome CL slot0() returns 6 values (no feeProtocol); Uniswap V3 returns 7.
+    const poolContract = new ethers.Contract(pool.poolAddress, getPoolAbi(isAerodromeCl), provider);
     const [slot0, onChainTickSpacing] = await Promise.all([
       poolContract.slot0(),
       poolContract.tickSpacing().catch(() => null),
