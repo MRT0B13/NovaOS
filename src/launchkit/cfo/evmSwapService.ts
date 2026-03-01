@@ -19,8 +19,26 @@ import { getCFOEnv } from './cfoEnv.ts';
 // Constants
 // ============================================================================
 
-const SWAP_ROUTER_02 = '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45';
-const QUOTER_V2      = '0x61fFE014bA17989E743c5F6cB21bF9697530B21e';
+/** Default SwapRouter02 / QuoterV2 — works on ETH, OP, Polygon, Arb, etc. */
+const DEFAULT_SWAP_ROUTER = '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45';
+const DEFAULT_QUOTER_V2   = '0x61fFE014bA17989E743c5F6cB21bF9697530B21e';
+
+/** Chain-specific overrides (Base & newer chains use different deployer addresses) */
+const CHAIN_SWAP_ROUTER: Record<number, string> = {
+  8453:   '0x2626664c2603336E57B271c5C0b26F421741e481', // Base
+  43114:  '0xbb00FF08d01D300023C629E8fFfFcb65A5a578cE', // Avalanche
+};
+const CHAIN_QUOTER_V2: Record<number, string> = {
+  8453:   '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a', // Base
+  43114:  '0xbe0F5544EC67e9B3b2D979aaA43f18Fd87E6257F', // Avalanche
+};
+
+function getSwapRouter(chainId: number): string {
+  return CHAIN_SWAP_ROUTER[chainId] ?? DEFAULT_SWAP_ROUTER;
+}
+function getQuoterV2(chainId: number): string {
+  return CHAIN_QUOTER_V2[chainId] ?? DEFAULT_QUOTER_V2;
+}
 
 const LIFI_API_BASE = 'https://li.quest/v1';
 
@@ -115,7 +133,7 @@ async function quoteViaUniswap(
     const amountInRaw = ethers.parseUnits(amountInHuman.toString(), inDecimals);
 
     // Call QuoterV2 (staticCall — doesn't consume gas)
-    const quoter = new ethers.Contract(QUOTER_V2, QUOTER_ABI, provider);
+    const quoter = new ethers.Contract(getQuoterV2(chainId), QUOTER_ABI, provider);
     const result = await quoter.quoteExactInputSingle.staticCall({
       tokenIn: tokenInAddr,
       tokenOut: tokenOutAddr,
@@ -304,15 +322,16 @@ async function executeViaUniswap(
     );
 
     // Approve
-    const allowance = await inToken.allowance(wallet.address, SWAP_ROUTER_02);
+    const swapRouterAddr = getSwapRouter(chainId);
+    const allowance = await inToken.allowance(wallet.address, swapRouterAddr);
     if (allowance < amountInRaw) {
-      const approveTx = await inToken.approve(SWAP_ROUTER_02, ethers.MaxUint256);
+      const approveTx = await inToken.approve(swapRouterAddr, ethers.MaxUint256);
       await approveTx.wait();
       logger.info(`[EvmSwap] Approved ${tokenInAddr.slice(0, 10)} for SwapRouter02`);
     }
 
     // Execute swap
-    const router = new ethers.Contract(SWAP_ROUTER_02, SWAP_ROUTER_ABI, wallet);
+    const router = new ethers.Contract(swapRouterAddr, SWAP_ROUTER_ABI, wallet);
     const deadline = Math.floor(Date.now() / 1000) + 600;
 
     const tx = await router.exactInputSingle({
@@ -378,7 +397,42 @@ async function executeViaLifiSwap(
 
     const data = await resp.json() as any;
 
-    // Execute via LI.FI SDK
+    const outToken = new ethers.Contract(tokenOutAddr, ERC20_ABI, provider);
+    const outDecimals = Number(await outToken.decimals().catch(() => 18));
+    const amountOut = Number(data.estimate?.toAmount ?? 0) / 10 ** outDecimals;
+
+    // ── Same-chain: send transactionRequest directly (no SDK needed) ──
+    // The LI.FI /quote response includes a ready-to-send transactionRequest
+    // for same-chain swaps. Using executeRoute() can crash on missing `steps`.
+    if (data.transactionRequest) {
+      const txReq = data.transactionRequest;
+
+      // Approve if needed (LI.FI response includes the spender in txReq.to)
+      const allowance = await inToken.allowance(wallet.address, txReq.to);
+      const amountInBigInt = BigInt(amountInRaw);
+      if (allowance < amountInBigInt) {
+        const approveTx = await (new ethers.Contract(tokenInAddr, ERC20_ABI, wallet)).approve(txReq.to, ethers.MaxUint256);
+        await approveTx.wait();
+        logger.info(`[EvmSwap:LiFi] Approved ${tokenInAddr.slice(0, 10)} for LI.FI router`);
+      }
+
+      const tx = await wallet.sendTransaction({
+        to: txReq.to,
+        data: txReq.data,
+        value: txReq.value ? BigInt(txReq.value) : BigInt(0),
+        gasLimit: txReq.gasLimit ? BigInt(txReq.gasLimit) : undefined,
+      });
+      const receipt = await tx.wait();
+      logger.info(`[EvmSwap:LiFi] Swap executed on chain ${chainId} tx=${receipt.hash}`);
+
+      return { success: true, txHash: receipt.hash, amountIn: amountInHuman, amountOut, route: 'lifi' };
+    }
+
+    // ── Fallback: SDK executeRoute (cross-chain / bridge scenarios) ──
+    if (!data.steps || !Array.isArray(data.steps) || data.steps.length === 0) {
+      throw new Error('LI.FI quote returned no steps or transactionRequest — swap not available for this pair');
+    }
+
     const lifi = await import('@lifi/sdk');
     lifi.createConfig({ integrator: 'nova-cfo' });
 
@@ -391,10 +445,6 @@ async function executeViaLifiSwap(
 
     const lastStep = (execution as any).steps?.at(-1);
     const txHash = lastStep?.execution?.process?.at(-1)?.txHash;
-
-    const outToken = new ethers.Contract(tokenOutAddr, ERC20_ABI, provider);
-    const outDecimals = Number(await outToken.decimals().catch(() => 18));
-    const amountOut = Number(data.estimate?.toAmount ?? 0) / 10 ** outDecimals;
 
     return { success: true, txHash, amountIn: amountInHuman, amountOut, route: 'lifi' };
   } catch (err) {
