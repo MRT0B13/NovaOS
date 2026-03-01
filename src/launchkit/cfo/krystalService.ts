@@ -71,6 +71,7 @@ const ERC20_ABI = [
   'function balanceOf(address account) view returns (uint256)',
   'function allowance(address owner, address spender) view returns (uint256)',
   'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)',
 ];
 
 const POOL_ABI = [
@@ -565,9 +566,14 @@ export async function fetchKrystalPositions(
   if (!env.krystalLpEnabled) return [];
 
   try {
-    const data = await krystalFetch('/v1/positions', { wallet: ownerAddress });
-    const rawPositions: any[] = Array.isArray(data) ? data : (data?.positions ?? []);
-    if (!Array.isArray(rawPositions) || rawPositions.length === 0) return [];
+    let rawPositions: any[] = [];
+    try {
+      const data = await krystalFetch('/v1/positions', { wallet: ownerAddress });
+      rawPositions = Array.isArray(data) ? data : (data?.positions ?? []);
+      if (!Array.isArray(rawPositions)) rawPositions = [];
+    } catch (apiErr) {
+      logger.warn('[Krystal] Positions API failed, will try on-chain fallback:', apiErr);
+    }
 
     // Build lookup from DB records for openedAt timestamps
     const dbLookup = new Map<string, EvmLpRecord>();
@@ -690,13 +696,110 @@ export async function fetchKrystalPositions(
       });
     }
 
-    // Cross-reference: if DB has positions not in API response, they may have been closed externally
-    if (dbRecords) {
+    // ── On-chain NFPM fallback for DB positions missing from API ────────
+    // Positions minted directly via NFPM (not through Krystal) won't appear
+    // in the Krystal API. Read them on-chain using the NFPM contract.
+    if (dbRecords && dbRecords.length > 0) {
       const apiPosIds = new Set(positions.map(p => `${p.posId}_${p.chainNumericId}`));
-      for (const dbRec of dbRecords) {
-        const key = `${dbRec.posId}_${dbRec.chainNumericId}`;
-        if (!apiPosIds.has(key)) {
-          logger.warn(`[Krystal] DB position ${dbRec.posId} (${dbRec.chainName}) not found in API — may have been closed externally`);
+      const missingRecords = dbRecords.filter(r => !apiPosIds.has(`${r.posId}_${r.chainNumericId}`));
+
+      for (const dbRec of missingRecords) {
+        try {
+          const nfpmAddr = getNfpmAddress(dbRec.chainNumericId);
+          if (!nfpmAddr || !env.evmRpcUrls[dbRec.chainNumericId]) continue;
+
+          const ethers = await loadEthers();
+          const provider = await getEvmProvider(dbRec.chainNumericId);
+          const nfpm = new ethers.Contract(nfpmAddr, NFPM_ABI, provider);
+
+          // Read position data from NFPM
+          const posData = await nfpm.positions(dbRec.posId);
+          const liquidity = BigInt(posData.liquidity ?? posData[7] ?? 0);
+
+          // If liquidity is 0, position has been closed on-chain
+          if (liquidity === 0n) {
+            logger.info(`[Krystal] On-chain position ${dbRec.posId} has 0 liquidity — closed externally`);
+            continue;
+          }
+
+          const token0Addr = posData.token0 ?? posData[2] ?? '';
+          const token1Addr = posData.token1 ?? posData[3] ?? '';
+          const feeTier = Number(posData.fee ?? posData[4] ?? 0);
+          const tickLower = Number(posData.tickLower ?? posData[5] ?? 0);
+          const tickUpper = Number(posData.tickUpper ?? posData[6] ?? 0);
+
+          // Read token symbols and decimals
+          const token0Contract = new ethers.Contract(token0Addr, ERC20_ABI, provider);
+          const token1Contract = new ethers.Contract(token1Addr, ERC20_ABI, provider);
+          const [sym0, dec0, sym1, dec1] = await Promise.all([
+            token0Contract.symbol().catch(() => dbRec.token0Symbol || '?'),
+            token0Contract.decimals().catch(() => 18),
+            token1Contract.symbol().catch(() => dbRec.token1Symbol || '?'),
+            token1Contract.decimals().catch(() => 18),
+          ]);
+
+          // Get current tick from pool via factory
+          let currentTick = 0;
+          let poolAddress = dbRec.poolAddress;
+          const factoryAddr = UNI_V3_FACTORY_BY_CHAIN[dbRec.chainNumericId];
+          if (factoryAddr) {
+            try {
+              const factory = new ethers.Contract(factoryAddr, [
+                'function getPool(address, address, uint24) view returns (address)',
+              ], provider);
+              const discoveredPool = await factory.getPool(token0Addr, token1Addr, feeTier);
+              if (discoveredPool && discoveredPool !== ethers.ZeroAddress) {
+                poolAddress = discoveredPool;
+                const poolContract = new ethers.Contract(discoveredPool, POOL_ABI, provider);
+                const slot0 = await poolContract.slot0();
+                currentTick = Number(slot0.tick ?? slot0[1] ?? 0);
+              }
+            } catch { /* use 0 tick — inRange will fall back to DB state */ }
+          }
+
+          const inRange = currentTick !== 0 ? (currentTick > tickLower && currentTick < tickUpper) : true;
+          const rangeUtilisationPct = currentTick !== 0
+            ? computeRangeUtilisation(tickLower, tickUpper, currentTick)
+            : (inRange ? 50 : 0);
+
+          // Estimate value from entryUsd (we don't have on-chain amounts without complex math)
+          // This is a conservative estimate — actual value tracked via entryUsd
+          const valueUsd = dbRec.entryUsd;
+
+          // Pending fees from NFPM positions data
+          const tokensOwed0 = Number(ethers.formatUnits(posData.tokensOwed0 ?? posData[10] ?? 0, Number(dec0)));
+          const tokensOwed1 = Number(ethers.formatUnits(posData.tokensOwed1 ?? posData[11] ?? 0, Number(dec1)));
+          // Rough fee USD estimation: stablecoins ≈ $1, native tokens ≈ native price
+          const nativePrice = await getNativeTokenPrice(dbRec.chainNumericId);
+          const fee0Usd = isStablecoin(String(sym0)) ? tokensOwed0 : tokensOwed0 * nativePrice;
+          const fee1Usd = isStablecoin(String(sym1)) ? tokensOwed1 : tokensOwed1 * nativePrice;
+
+          const chainName = dbRec.chainName || NATIVE_SYMBOLS[dbRec.chainNumericId]?.toLowerCase() || 'evm';
+
+          positions.push({
+            posId: dbRec.posId,
+            chainId: `${chainName}@${dbRec.chainNumericId}`,
+            chainNumericId: dbRec.chainNumericId,
+            chainName,
+            protocol: dbRec.protocol || 'uniswapv3',
+            poolAddress: poolAddress || '',
+            token0: { address: token0Addr, symbol: String(sym0), decimals: Number(dec0) },
+            token1: { address: token1Addr, symbol: String(sym1), decimals: Number(dec1) },
+            valueUsd,
+            inRange,
+            rangeUtilisationPct,
+            tickLower,
+            tickUpper,
+            currentTick,
+            feesOwed0: tokensOwed0,
+            feesOwed1: tokensOwed1,
+            feesOwedUsd: fee0Usd + fee1Usd,
+            openedAt: dbRec.openedAt,
+          });
+
+          logger.info(`[Krystal] On-chain fallback: position ${dbRec.posId} (${sym0}/${sym1} on ${chainName}) — $${valueUsd.toFixed(0)}, ${inRange ? 'in-range' : 'out-of-range'}`);
+        } catch (err) {
+          logger.warn(`[Krystal] On-chain read failed for position ${dbRec.posId}:`, err);
         }
       }
     }
@@ -1499,6 +1602,13 @@ const NATIVE_SYMBOLS: Record<number, string> = {
   1: 'ETH', 10: 'ETH', 42161: 'ETH', 8453: 'ETH', 59144: 'ETH', 534352: 'ETH', 81457: 'ETH',
   137: 'MATIC', 56: 'BNB', 43114: 'AVAX', 324: 'ETH', 5000: 'MNT',
 };
+
+/** Check if a token symbol is a stablecoin (for fee USD estimation) */
+function isStablecoin(symbol: string): boolean {
+  const s = symbol.toUpperCase();
+  return s === 'USDC' || s === 'USDT' || s === 'DAI' || s === 'USDC.E' || s === 'USDBC'
+    || s === 'BUSD' || s === 'FRAX' || s === 'TUSD' || s === 'LUSD';
+}
 
 // Bridged USDC variants (USDC.e / USDC.E) per chain
 const BRIDGED_USDC: Record<number, string> = {

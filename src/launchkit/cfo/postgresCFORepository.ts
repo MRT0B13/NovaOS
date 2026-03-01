@@ -27,7 +27,7 @@ export interface CFOPosition {
   strategy: PositionStrategy;
   asset: string;                // ticker or condition_id or token_id
   description: string;          // human-readable (market question or pair)
-  chain: 'solana' | 'polygon' | 'arbitrum' | 'base';
+  chain: 'solana' | 'polygon' | 'arbitrum' | 'base' | 'ethereum' | 'optimism' | 'avalanche' | 'evm';
   status: PositionStatus;
   entryPrice: number;
   currentPrice: number;

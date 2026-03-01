@@ -25,7 +25,13 @@ import { PositionManager } from '../launchkit/cfo/positionManager.ts';
 import { getDecisionConfig, runDecisionCycle, classifyTier, getCooldownState, restoreCooldownState } from '../launchkit/cfo/decisionEngine.ts';
 import type { DecisionResult } from '../launchkit/cfo/decisionEngine.ts';
 import type { PlacedOrder, MarketOpportunity } from '../launchkit/cfo/polymarketService.ts';
-import type { TransactionType, PositionStrategy } from '../launchkit/cfo/postgresCFORepository.ts';
+import type { TransactionType, PositionStrategy, CFOPosition } from '../launchkit/cfo/postgresCFORepository.ts';
+
+/** Map EVM chain name strings to the CFOPosition chain union type */
+function mapEvmChain(name: string): CFOPosition['chain'] {
+  const m: Record<string, CFOPosition['chain']> = { base: 'base', polygon: 'polygon', arbitrum: 'arbitrum', ethereum: 'ethereum', optimism: 'optimism', avalanche: 'avalanche' };
+  return m[name] ?? 'evm';
+}
 
 // Lazy service loaders
 let _poly:    any = null; const poly    = async () => _poly    ??= await import('../launchkit/cfo/polymarketService.ts');
@@ -698,6 +704,28 @@ export class CFOAgent extends BaseAgent {
               },
             });
             logger.info(`[CFO] Persisted ORCA_LP_OPEN: $${deployUsd.toFixed(0)} ${pair} LP`);
+            // Track in cfo_positions for learning engine
+            const orcaPosId = `orca-lp-${r.txId ?? Date.now()}`;
+            await this.repo.upsertPosition({
+              id: orcaPosId,
+              strategy: 'orca_lp',
+              asset: pair,
+              description: `Orca LP: ${pair}`,
+              chain: 'solana',
+              status: 'OPEN',
+              entryPrice: 1,
+              currentPrice: 1,
+              sizeUnits: deployUsd,
+              costBasisUsd: deployUsd,
+              currentValueUsd: deployUsd,
+              realizedPnlUsd: 0,
+              unrealizedPnlUsd: 0,
+              entryTxHash: r.txId,
+              externalId: r.txId,
+              metadata: { pair, whirlpoolAddress: p.whirlpoolAddress, rangeWidthPct: p.rangeWidthPct },
+              openedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
             // Register the LP pair tokens with Guardian for targeted alert forwarding
             const lpMints = orcaPairMints(pair).map(mint => ({
               mint,
@@ -718,6 +746,19 @@ export class CFOAgent extends BaseAgent {
               metadata: { positionMint: p.positionMint, rangeWidthPct: p.rangeWidthPct, reasoning: d.reasoning },
             });
             logger.info(`[CFO] Persisted ORCA_LP_REBALANCE: ${(p.positionMint as string)?.slice(0, 8)}`);
+            // Close the old position in cfo_positions for learning engine
+            try {
+              const oldPos = await this.repo.getPositionByExternalId(p.positionMint as string);
+              if (oldPos) {
+                await this.repo.upsertPosition({
+                  ...oldPos,
+                  status: 'CLOSED',
+                  closedAt: new Date().toISOString(),
+                  updatedAt: new Date().toISOString(),
+                  exitTxHash: r.txId,
+                });
+              }
+            } catch { /* best effort */ }
             break;
           }
 
@@ -804,6 +845,29 @@ export class CFOAgent extends BaseAgent {
               openedAt: Date.now(),
             });
             logger.info(`[CFO] Persisted KRYSTAL_LP_OPEN: ${p.pair} on ${p.chainName} $${actualUsd.toFixed(2)} (target $${(p.deployUsd ?? 0).toFixed(0)})`);
+            // Track in cfo_positions for learning engine
+            const krystalPosId = `krystal-lp-${r.txId ?? Date.now()}`;
+            const krystalChain = mapEvmChain(p.chainName ?? '');
+            await this.repo.upsertPosition({
+              id: krystalPosId,
+              strategy: 'krystal_lp',
+              asset: p.pair ?? `${pool.token0?.symbol ?? '?'}/${pool.token1?.symbol ?? '?'}`,
+              description: `Krystal LP: ${p.pair} on ${p.chainName}`,
+              chain: krystalChain,
+              status: 'OPEN',
+              entryPrice: 1,
+              currentPrice: 1,
+              sizeUnits: actualUsd,
+              costBasisUsd: actualUsd,
+              currentValueUsd: actualUsd,
+              realizedPnlUsd: 0,
+              unrealizedPnlUsd: 0,
+              entryTxHash: resultAny.txHash ?? r.txId,
+              externalId: r.txId, // NFPM tokenId
+              metadata: { pair: p.pair, chainName: p.chainName, chainNumericId: pool.chainNumericId, poolAddress: pool.poolAddress, nfpmTokenId: r.txId },
+              openedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
             break;
           }
 
@@ -840,6 +904,44 @@ export class CFOAgent extends BaseAgent {
               });
             }
             logger.info(`[CFO] Persisted KRYSTAL_LP_REBALANCE: posId=${p.posId} closeOnly=${p.closeOnly}`);
+            // Close old position in cfo_positions for learning engine
+            try {
+              const oldKPos = await this.repo.getPositionByExternalId(String(p.posId));
+              if (oldKPos) {
+                const closeResult = r as any;
+                const recoveredUsd = closeResult.valueRecoveredUsd ?? oldKPos.currentValueUsd;
+                await this.repo.upsertPosition({
+                  ...oldKPos,
+                  status: 'CLOSED',
+                  realizedPnlUsd: recoveredUsd - oldKPos.costBasisUsd,
+                  currentValueUsd: recoveredUsd,
+                  closedAt: new Date().toISOString(),
+                  updatedAt: new Date().toISOString(),
+                  exitTxHash: closeResult.txHash ?? r.txId,
+                });
+              }
+            } catch { /* best effort */ }
+            // If reopened, track new position
+            if (!p.closeOnly && r.txId) {
+              const rebalChain = mapEvmChain(p.chainName ?? '');
+              await this.repo.upsertPosition({
+                id: `krystal-lp-${r.txId}`,
+                strategy: 'krystal_lp',
+                asset: `${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'}`,
+                description: `Krystal LP: ${p.token0Symbol}/${p.token1Symbol} on ${p.chainName}`,
+                chain: rebalChain,
+                status: 'OPEN',
+                entryPrice: 1, currentPrice: 1,
+                sizeUnits: p.deployUsd ?? 0,
+                costBasisUsd: p.deployUsd ?? 0,
+                currentValueUsd: p.deployUsd ?? 0,
+                realizedPnlUsd: 0, unrealizedPnlUsd: 0,
+                entryTxHash: r.txId, externalId: r.txId,
+                metadata: { chainName: p.chainName, chainNumericId: p.chainNumericId, nfpmTokenId: r.txId },
+                openedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+            }
             break;
           }
 
@@ -854,6 +956,17 @@ export class CFOAgent extends BaseAgent {
               metadata: { posId: p.posId, chainName: p.chainName, feesOwedUsd: p.feesOwedUsd, reasoning: d.reasoning },
             });
             logger.info(`[CFO] Persisted KRYSTAL_LP_CLAIM_FEES: posId=${p.posId} fees=$${(p.feesOwedUsd ?? 0).toFixed(2)}`);
+            // Update cfo_positions with realized fee income
+            try {
+              const feePos = await this.repo.getPositionByExternalId(String(p.posId));
+              if (feePos) {
+                await this.repo.upsertPosition({
+                  ...feePos,
+                  realizedPnlUsd: feePos.realizedPnlUsd + (p.feesOwedUsd ?? 0),
+                  updatedAt: new Date().toISOString(),
+                });
+              }
+            } catch { /* best effort */ }
             break;
           }
 
