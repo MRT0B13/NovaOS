@@ -827,7 +827,7 @@ export class CFOAgent extends BaseAgent {
               metadata: {
                 pair: p.pair, chainName: p.chainName, chainNumericId: pool.chainNumericId,
                 poolAddress: pool.poolAddress, feeTier: pool.feeTier,
-                rangeWidthTicks: p.rangeWidthTicks, reasoning: d.reasoning,
+                rangeWidthTicks: p.rangeWidthTicks, riskTier: p.riskTier, reasoning: d.reasoning,
                 targetDeployUsd: p.deployUsd,
               },
             });
@@ -864,7 +864,7 @@ export class CFOAgent extends BaseAgent {
               unrealizedPnlUsd: 0,
               entryTxHash: resultAny.txHash ?? r.txId,
               externalId: r.txId, // NFPM tokenId
-              metadata: { pair: p.pair, chainName: p.chainName, chainNumericId: pool.chainNumericId, poolAddress: pool.poolAddress, nfpmTokenId: r.txId },
+              metadata: { pair: p.pair, chainName: p.chainName, chainNumericId: pool.chainNumericId, poolAddress: pool.poolAddress, nfpmTokenId: r.txId, riskTier: p.riskTier },
               openedAt: new Date().toISOString(),
               updatedAt: new Date().toISOString(),
             });

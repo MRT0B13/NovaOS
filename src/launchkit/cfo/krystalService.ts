@@ -114,6 +114,8 @@ export interface KrystalPool {
   stats30d?: { volume: string; fee: string; apr: string };
 }
 
+export type LpRiskTier = 'low' | 'medium' | 'high';
+
 export interface ScoredKrystalPool extends KrystalPool {
   chainNumericId: number;
   chainName: string;
@@ -124,6 +126,7 @@ export interface ScoredKrystalPool extends KrystalPool {
   score: number;
   scoreBreakdown: Record<string, number>;
   reasoning: string[];
+  riskTier: LpRiskTier;
 }
 
 export interface KrystalPosition {
@@ -444,6 +447,7 @@ export async function discoverKrystalPools(forceRefresh = false): Promise<Scored
         score: 0,
         scoreBreakdown: {},
         reasoning: [],
+        riskTier: 'medium', // classified properly in scoreKrystalPool
       });
     }
 
@@ -456,10 +460,12 @@ export async function discoverKrystalPools(forceRefresh = false): Promise<Scored
     _cachedPools = candidates;
     _cacheTimestamp = Date.now();
 
+    const tierCounts = { low: 0, medium: 0, high: 0 };
+    for (const c of candidates) tierCounts[c.riskTier]++;
     const top10 = candidates.slice(0, 10).map((c, i) =>
-      `${i + 1}. ${c.token0.symbol}/${c.token1.symbol} (${c.chainName}) score=${c.score.toFixed(0)} APR7d=${c.apr7d.toFixed(1)}% TVL=$${(c.tvlUsd / 1e6).toFixed(1)}M`,
+      `${i + 1}. [${c.riskTier.toUpperCase()}] ${c.token0.symbol}/${c.token1.symbol} (${c.chainName}) score=${c.score.toFixed(0)} APR7d=${c.apr7d.toFixed(1)}% TVL=$${(c.tvlUsd / 1e6).toFixed(1)}M`,
     ).join('\n');
-    logger.info(`[KrystalDiscovery] ${candidates.length} pools scored. Top 10:\n${top10}`);
+    logger.info(`[KrystalDiscovery] ${candidates.length} pools scored (low:${tierCounts.low} med:${tierCounts.medium} high:${tierCounts.high}). Top 10:\n${top10}`);
 
     return candidates;
   } catch (err) {
@@ -531,18 +537,23 @@ function scoreKrystalPool(pool: ScoredKrystalPool): void {
   else if (proto.includes('aerodrome')) { breakdown.protocol = 7; reasons.push('Aerodrome CL'); }
   else { breakdown.protocol = 5; }
 
-  // ── 5. Range Safety (0-5 pts) ──
-  const stableSymbols = ['USDC', 'USDT', 'DAI', 'USDG', 'FRAX', 'TUSD', 'BUSD', 'USDCE'];
-  const isStable = stableSymbols.includes(pool.token0.symbol.toUpperCase()) &&
-                   stableSymbols.includes(pool.token1.symbol.toUpperCase());
-  if (isStable) {
+  // ── 5. Range Safety / Risk Tier (0-5 pts) ──
+  const stableSymbols = ['USDC', 'USDT', 'DAI', 'USDG', 'FRAX', 'TUSD', 'BUSD', 'USDCE', 'USDC.E'];
+  const is0Stable = stableSymbols.includes(pool.token0.symbol.toUpperCase());
+  const is1Stable = stableSymbols.includes(pool.token1.symbol.toUpperCase());
+
+  if (is0Stable && is1Stable) {
+    pool.riskTier = 'low';
     breakdown.range = 5;
-    reasons.push('stablecoin pair — minimal IL');
-  } else if (stableSymbols.includes(pool.token0.symbol.toUpperCase()) ||
-             stableSymbols.includes(pool.token1.symbol.toUpperCase())) {
-    breakdown.range = 3; // one stable side
+    reasons.push('LOW risk — stablecoin pair, minimal IL');
+  } else if (is0Stable || is1Stable) {
+    pool.riskTier = 'medium';
+    breakdown.range = 3;
+    reasons.push('MEDIUM risk — one volatile side');
   } else {
-    breakdown.range = 1; // volatile pair
+    pool.riskTier = 'high';
+    breakdown.range = 2; // don't penalise volatile pairs heavily — APR compensates
+    reasons.push('HIGH risk — volatile pair, higher IL but higher APR');
   }
 
   pool.score = Object.values(breakdown).reduce((s, v) => s + v, 0);

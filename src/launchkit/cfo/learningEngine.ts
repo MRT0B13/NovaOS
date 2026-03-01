@@ -53,6 +53,7 @@ export interface StrategyStats {
 
 export interface LPStats {
   strategy: 'orca_lp' | 'krystal_lp';
+  riskTier?: 'low' | 'medium' | 'high'; // per-tier breakdown (undefined = aggregate)
   totalPositions: number;
   avgFeesEarnedUsd: number;
   avgHoldHours: number;
@@ -92,10 +93,14 @@ export interface AdaptiveParams {
   hlHedgeTargetMultiplier: number; // scale hedge target ratio based on hedge performance
   hlRebalanceThresholdMultiplier: number; // wider if frequent rebalance = churn losses
 
-  // LP (Orca + Krystal)
+  // LP (Orca + Krystal) — global
   lpRangeWidthMultiplier: number;  // wider/narrower ranges based on rebalance frequency
   lpMinAprAdjustment: number;      // increase min APR floor if LP positions underperform
   lpRebalanceTriggerMultiplier: number; // tighter if OOR rate high, looser if profitable
+
+  // LP per-risk-tier overrides (multiplied on top of the relevant tier's base range)
+  lpTierRangeMultipliers: Record<string, number>;   // { low: 1.0, medium: 1.0, high: 1.3 }
+  lpTierMinAprAdjustments: Record<string, number>;  // per-tier APR floor nudges
 
   // Kamino
   kaminoLtvMultiplier: number;     // tighten/loosen LTV target
@@ -220,15 +225,22 @@ async function computeStrategyStats(
 
 /**
  * Compute LP-specific stats (rebalance frequency, out-of-range rate, per-chain/pair performance).
+ * When riskTier is provided, only positions with matching metadata.riskTier are included.
  */
-async function computeLPStats(pool: any, strategy: 'orca_lp' | 'krystal_lp'): Promise<LPStats> {
+async function computeLPStats(
+  pool: any,
+  strategy: 'orca_lp' | 'krystal_lp',
+  riskTier?: 'low' | 'medium' | 'high',
+): Promise<LPStats> {
   const empty: LPStats = {
-    strategy, totalPositions: 0, avgFeesEarnedUsd: 0,
+    strategy, riskTier, totalPositions: 0, avgFeesEarnedUsd: 0,
     avgHoldHours: 0, rebalanceCount: 0, outOfRangeRate: 0,
     avgPnlPerDayUsd: 0, bestChains: [], bestPairs: [],
   };
 
   try {
+    // If riskTier filter is specified, filter in JS after fetch (metadata is JSONB, filtering in SQL
+    // would require casting and is fragile). Volume is small so this is fine.
     const res = await pool.query(
       `SELECT realized_pnl_usd, cost_basis_usd, asset, chain, metadata,
               EXTRACT(EPOCH FROM (COALESCE(closed_at, NOW()) - opened_at)) / 3600 AS hold_hours
@@ -239,7 +251,14 @@ async function computeLPStats(pool: any, strategy: 'orca_lp' | 'krystal_lp'): Pr
       [strategy],
     );
 
-    const rows = res.rows;
+    let rows = res.rows;
+    // Filter by risk tier if specified (metadata.riskTier)
+    if (riskTier && rows.length > 0) {
+      rows = rows.filter((r: any) => {
+        const meta = typeof r.metadata === 'string' ? JSON.parse(r.metadata) : (r.metadata || {});
+        return meta.riskTier === riskTier;
+      });
+    }
     if (rows.length === 0) return empty;
 
     const holdHours: number[] = rows.map((r: any) => Number(r.hold_hours || 1));
@@ -706,6 +725,32 @@ function computeAdaptiveParams(
     }
   }
 
+  // ── Per-tier LP adaptations (Krystal risk tiers) ────────────────
+  // Each tier learns independently: high-risk OOR doesn't widen low-risk ranges
+  const lpTierRangeMultipliers: Record<string, number> = { low: 1.0, medium: 1.0, high: 1.0 };
+  const lpTierMinAprAdjustments: Record<string, number> = { low: 0, medium: 0, high: 0 };
+
+  for (const tier of ['low', 'medium', 'high'] as const) {
+    const tierLp = lpStats[`krystal_lp_${tier}`];
+    if (!tierLp || tierLp.totalPositions < 2) continue;
+
+    // Tier-specific range adaptation
+    if (tierLp.outOfRangeRate > 0.5) {
+      lpTierRangeMultipliers[tier] = 1.4; // frequent OOR → widen this tier's range
+    } else if (tierLp.outOfRangeRate > 0.3) {
+      lpTierRangeMultipliers[tier] = 1.2;
+    } else if (tierLp.outOfRangeRate < 0.1 && tierLp.avgPnlPerDayUsd > 0) {
+      lpTierRangeMultipliers[tier] = 0.85; // always in range + profitable → tighten for more fees
+    }
+
+    // Tier-specific APR floor
+    if (tierLp.avgPnlPerDayUsd < -0.5) {
+      lpTierMinAprAdjustments[tier] = 15; // losing money → demand much higher APR
+    } else if (tierLp.avgPnlPerDayUsd < 0) {
+      lpTierMinAprAdjustments[tier] = 5;
+    }
+  }
+
   // ── Kamino adaptations ──────────────────────────────────────────
   let kaminoLtvMult = 1.0;
   let kaminoSpreadMult = 1.0;
@@ -802,6 +847,16 @@ function computeAdaptiveParams(
     lpRangeWidthMultiplier: blend(lpRangeMult, prior?.lpRangeWidthMultiplier),
     lpMinAprAdjustment: blend(lpMinAprAdj, prior?.lpMinAprAdjustment),
     lpRebalanceTriggerMultiplier: blend(lpRebalTriggerMult, prior?.lpRebalanceTriggerMultiplier),
+    lpTierRangeMultipliers: {
+      low: blend(lpTierRangeMultipliers.low, prior?.lpTierRangeMultipliers?.low),
+      medium: blend(lpTierRangeMultipliers.medium, prior?.lpTierRangeMultipliers?.medium),
+      high: blend(lpTierRangeMultipliers.high, prior?.lpTierRangeMultipliers?.high),
+    },
+    lpTierMinAprAdjustments: {
+      low: blend(lpTierMinAprAdjustments.low, prior?.lpTierMinAprAdjustments?.low),
+      medium: blend(lpTierMinAprAdjustments.medium, prior?.lpTierMinAprAdjustments?.medium),
+      high: blend(lpTierMinAprAdjustments.high, prior?.lpTierMinAprAdjustments?.high),
+    },
     kaminoLtvMultiplier: blend(kaminoLtvMult, prior?.kaminoLtvMultiplier),
     kaminoSpreadFloorMultiplier: blend(kaminoSpreadMult, prior?.kaminoSpreadFloorMultiplier),
     evmArbMinProfitMultiplier: blend(evmArbMinProfitMult, prior?.evmArbMinProfitMultiplier),
@@ -899,14 +954,20 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
     );
     const stats: Record<string, StrategyStats> = Object.fromEntries(statsEntries);
 
-    // 3. LP-specific stats
-    const [orcaLpStats, krystalLpStats] = await Promise.all([
+    // 3. LP-specific stats (aggregate + per-tier for Krystal)
+    const [orcaLpStats, krystalLpStats, krystalLow, krystalMed, krystalHigh] = await Promise.all([
       computeLPStats(dbPool, 'orca_lp'),
       computeLPStats(dbPool, 'krystal_lp'),
+      computeLPStats(dbPool, 'krystal_lp', 'low'),
+      computeLPStats(dbPool, 'krystal_lp', 'medium'),
+      computeLPStats(dbPool, 'krystal_lp', 'high'),
     ]);
     const lpStats: Record<string, LPStats> = {
       orca_lp: orcaLpStats,
       krystal_lp: krystalLpStats,
+      krystal_lp_low: krystalLow,
+      krystal_lp_medium: krystalMed,
+      krystal_lp_high: krystalHigh,
     };
 
     // 4. Polymarket calibration
@@ -938,6 +999,7 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
       `hlStop×${params.hlStopLossMultiplier.toFixed(2)} | ` +
       `hedge×${params.hlHedgeTargetMultiplier.toFixed(2)} | ` +
       `lpRange×${params.lpRangeWidthMultiplier.toFixed(2)} | ` +
+      `lpTiers: L×${params.lpTierRangeMultipliers.low?.toFixed(2) ?? '1'} M×${params.lpTierRangeMultipliers.medium?.toFixed(2) ?? '1'} H×${params.lpTierRangeMultipliers.high?.toFixed(2) ?? '1'} | ` +
       `arbMin×${params.evmArbMinProfitMultiplier.toFixed(2)} | ` +
       `feeDrag=${params.feeDragPct.toFixed(1)}% | ` +
       `pSharpe=${params.portfolioSharpe.toFixed(2)} | ` +
@@ -1001,6 +1063,8 @@ export function getDefaultParams(): AdaptiveParams {
     lpRangeWidthMultiplier: 1.0,
     lpMinAprAdjustment: 0,
     lpRebalanceTriggerMultiplier: 1.0,
+    lpTierRangeMultipliers: { low: 1.0, medium: 1.0, high: 1.0 },
+    lpTierMinAprAdjustments: { low: 0, medium: 0, high: 0 },
     kaminoLtvMultiplier: 1.0,
     kaminoSpreadFloorMultiplier: 1.0,
     evmArbMinProfitMultiplier: 1.0,
@@ -1093,6 +1157,16 @@ export function formatLearningSummary(params: AdaptiveParams): string {
   }
   if (params.lpMinAprAdjustment > 0) {
     adj.push(`Min APR raised by ${params.lpMinAprAdjustment.toFixed(0)}%`);
+  }
+  // Per-tier LP adjustments
+  if (params.lpTierRangeMultipliers) {
+    const tierAdj: string[] = [];
+    for (const [tier, mult] of Object.entries(params.lpTierRangeMultipliers)) {
+      if (Math.abs(mult - 1) > 0.05) {
+        tierAdj.push(`${tier} ×${mult.toFixed(2)}`);
+      }
+    }
+    if (tierAdj.length > 0) adj.push(`LP tier ranges: ${tierAdj.join(', ')}`);
   }
   if (Math.abs(params.evmArbMinProfitMultiplier - 1) > 0.05) {
     adj.push(`Arb min profit ${params.evmArbMinProfitMultiplier > 1 ? 'raised' : 'lowered'}`);

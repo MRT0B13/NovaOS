@@ -203,6 +203,14 @@ export interface PortfolioState {
   polyHeadroomUsd: number;        // how much more USDC we can deploy
   polyPositionCount: number;
   polyUsdcBalance: number;        // USDC available on Polygon
+  polyPositions: Array<{          // individual Polymarket bets
+    question: string;
+    outcome: string;
+    costBasisUsd: number;
+    currentValueUsd: number;
+    unrealizedPnlUsd: number;
+    currentPrice: number;
+  }>;
 
   // Computed
   totalPortfolioUsd: number;
@@ -708,6 +716,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
   let polyDeployedUsd = 0;
   let polyUsdcBalance = 0;
   let polyPositionCount = 0;
+  let polyPositions: PortfolioState['polyPositions'] = [];
   if (env.polymarketEnabled) {
     try {
       const polyMod = await import('./polymarketService.ts');
@@ -715,6 +724,14 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
       const positions = await polyMod.fetchPositions();
       polyPositionCount = positions.length;
       polyDeployedUsd = positions.reduce((s: number, p: any) => s + (p.currentValueUsd ?? 0), 0);
+      polyPositions = positions.map((p: any) => ({
+        question: p.question ?? 'Unknown',
+        outcome: p.outcome ?? '?',
+        costBasisUsd: p.costBasisUsd ?? 0,
+        currentValueUsd: p.currentValueUsd ?? 0,
+        unrealizedPnlUsd: p.unrealizedPnlUsd ?? 0,
+        currentPrice: p.currentPrice ?? 0,
+      }));
       polyUsdcBalance = await evmMod.getUSDCBalance();
     } catch (err) {
       logger.warn('[CFO] Polymarket state fetch failed:', err);
@@ -921,6 +938,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     polyHeadroomUsd,
     polyPositionCount,
     polyUsdcBalance,
+    polyPositions,
     totalPortfolioUsd,
     hedgeRatio,
     idleSolForStaking,
@@ -2065,7 +2083,18 @@ export async function generateDecisions(
     }
 
     // I-bis.1: Rebalance out-of-range or near-edge EVM LP positions
+    // Infer risk tier from token composition → use tier-specific range widths
+    const _stableSet = new Set(['USDC', 'USDT', 'DAI', 'USDG', 'FRAX', 'TUSD', 'BUSD', 'USDCE', 'USDC.E']);
+    const _inferTier = (t0: string, t1: string): 'low' | 'medium' | 'high' => {
+      const s0 = _stableSet.has(t0.toUpperCase()), s1 = _stableSet.has(t1.toUpperCase());
+      return s0 && s1 ? 'low' : (s0 || s1) ? 'medium' : 'high';
+    };
+    const _tierRangeMults: Record<string, number> = { low: 0.4, medium: 1.0, high: 2.0 };
+
     for (const pos of state.evmLpPositions) {
+      const posTier = _inferTier(pos.token0Symbol, pos.token1Symbol);
+      const tierMult = _tierRangeMults[posTier] ?? 1.0;
+      const learnedTierMult = learned.lpTierRangeMultipliers?.[posTier] ?? 1.0;
       if (
         (!pos.inRange || pos.rangeUtilisationPct < env.krystalLpRebalanceTriggerPct) &&
         checkCooldown(`KRYSTAL_LP_REBALANCE_${pos.posId}`, 6 * 3600_000) // 6h per-position cooldown
@@ -2073,7 +2102,7 @@ export async function generateDecisions(
         decisions.push({
           type: 'KRYSTAL_LP_REBALANCE',
           reasoning:
-            `EVM LP ${pos.posId.slice(0, 8)} (${pos.token0Symbol}/${pos.token1Symbol}, ${pos.chainName}) ` +
+            `[${posTier.toUpperCase()} risk] EVM LP ${pos.posId.slice(0, 8)} (${pos.token0Symbol}/${pos.token1Symbol}, ${pos.chainName}) ` +
             `${pos.inRange ? 'near range edge' : 'OUT OF RANGE'} ` +
             `(utilisation: ${pos.rangeUtilisationPct.toFixed(0)}%). Closing and reopening centred.`,
           params: {
@@ -2087,12 +2116,13 @@ export async function generateDecisions(
             token0Decimals: pos.token0Decimals,
             token1Decimals: pos.token1Decimals,
             closeOnly: false,
-            rangeWidthTicks: adaptiveLpRangeWidthTicks(
+            riskTier: posTier,
+            rangeWidthTicks: Math.round(adaptiveLpRangeWidthTicks(
               pos.token0Symbol,
               intel,
-              env.krystalLpRangeWidthTicks,
+              env.krystalLpRangeWidthTicks * tierMult * learnedTierMult,
               learned,
-            ),
+            )),
           },
           urgency: pos.inRange ? 'low' : 'medium',
           estimatedImpactUsd: pos.valueUsd * 0.02, // rebalance cost ~2%
@@ -2102,7 +2132,15 @@ export async function generateDecisions(
       }
     }
 
-    // I-bis.2: Open new EVM LP position if we have headroom
+    // I-bis.2: Open new EVM LP position(s) — 3-tier risk system
+    // Enabled tiers: env.krystalLpRiskTiers (e.g. ['low','medium','high'])
+    // Each tier picks the best pool of its class so the portfolio gets diversified
+    // exposure across risk levels.
+    //
+    //   low    = stable/stable (USDC/USDT)  → narrow range, minimal IL
+    //   medium = volatile/stable (WETH/USDC) → normal range
+    //   high   = volatile/volatile (WETH/ARB) → wide range, high APR, high IL
+    //
     const evmLpHeadroomUsd = Math.max(0, env.krystalLpMaxUsd - state.evmLpTotalValueUsd);
     // Cap deploy to 80% of available EVM USDC across all chains
     const evmUsdcCap = state.evmTotalUsdcAllChains * 0.8;
@@ -2117,7 +2155,6 @@ export async function generateDecisions(
         const krystal = await import('./krystalService.ts');
         const pools = await krystal.discoverKrystalPools();
 
-        // Filter to pools meeting env thresholds AND with configured RPC
         // Apply learned APR floor adjustment (raised if past LP positions underperformed)
         const learnedMinApr = env.krystalLpMinApr7d + (learned.lpMinAprAdjustment * learned.confidenceLevel);
 
@@ -2137,7 +2174,6 @@ export async function generateDecisions(
 
         // Check: not already in the same pool
         const existingPoolAddrs = new Set(state.evmLpPositions.map(p => {
-          // We track by token symbols + chain — find matching pool addresses
           return `${p.chainNumericId}_${p.token0Symbol}_${p.token1Symbol}`;
         }));
         const deduped = eligible.filter(p => {
@@ -2146,31 +2182,73 @@ export async function generateDecisions(
           return !existingPoolAddrs.has(key) && !existingPoolAddrs.has(keyRev);
         });
 
-        if (deduped.length > 0) {
-          const best = deduped[0]; // already sorted by score
+        // ── Tier-based range width multipliers ──
+        const TIER_RANGE_MULT: Record<string, number> = {
+          low: 0.4,    // stables barely move → narrow range captures more fees
+          medium: 1.0, // standard range
+          high: 2.0,   // volatile pairs need wide range to stay in-range
+        };
 
-          // Check: EVM APR must beat best Solana LP APR by 5%
-          const bestSolanaApr = state.orcaLpFeeApy ?? 0;
-          if (best.apr7d <= bestSolanaApr + 5) {
-            krystalSkip(`best EVM APR ${best.apr7d.toFixed(1)}% doesn't beat Solana ${bestSolanaApr.toFixed(1)}% + 5%`);
-          } else {
+        // ── Tier-based rebalance trigger adjustments (lower = more sensitive) ──
+        const TIER_REBALANCE_MULT: Record<string, number> = {
+          low: 0.8,    // stables rebalance sooner (tight range = less tolerance)
+          medium: 1.0,
+          high: 1.3,   // volatile pairs tolerate more drift before rebalance
+        };
+
+        // Split headroom across enabled tiers (equal share)
+        const enabledTiers = env.krystalLpRiskTiers;
+        const perTierMaxUsd = evmLpHeadroomUsd / Math.max(enabledTiers.length, 1);
+
+        // Group eligible pools by tier and pick the best from each
+        const bestSolanaApr = state.orcaLpFeeApy ?? 0;
+        let tiersOpened = 0;
+
+        for (const tier of enabledTiers) {
+          // Respect max positions (could have filled up from another tier)
+          if (state.evmLpPositions.length + tiersOpened >= env.krystalLpMaxPositions) break;
+
+          const tierPools = deduped.filter(p => p.riskTier === tier);
+          if (tierPools.length === 0) {
+            krystalSkip(`no ${tier}-risk pools pass filters (${deduped.length} total deduped)`);
+            continue;
+          }
+
+          const best = tierPools[0]; // already sorted by score
+
+          // Check: EVM APR must beat best Solana LP APR by 5% (skip this check for high-risk — APR compensates)
+          if (tier !== 'high' && best.apr7d <= bestSolanaApr + 5) {
+            krystalSkip(`${tier} tier: best EVM APR ${best.apr7d.toFixed(1)}% doesn't beat Solana ${bestSolanaApr.toFixed(1)}% + 5%`);
+            continue;
+          }
+
           // Cap deploy to available value on the target chain (USDC + native token value)
           const targetChainBal = state.evmChainBalances.find(b => b.chainId === best.chainNumericId);
           const targetChainValue = (targetChainBal?.usdcBalance ?? 0) + (targetChainBal?.nativeValueUsd ?? 0);
-          const deployUsd = Math.min(evmLpHeadroomUsd, env.krystalLpMaxUsd, evmUsdcCap, targetChainValue * 0.9);
-          const rangeWidthTicks = adaptiveLpRangeWidthTicks(
+          const deployUsd = Math.min(perTierMaxUsd, env.krystalLpMaxUsd, evmUsdcCap, targetChainValue * 0.9);
+
+          if (deployUsd < 15) {
+            krystalSkip(`${tier} tier: deploy amount too small ($${deployUsd.toFixed(0)})`);
+            continue;
+          }
+
+          // Tier-specific range width (base × tier multiplier × learned tier multiplier)
+          const tierRangeMult = TIER_RANGE_MULT[tier] ?? 1.0;
+          const learnedTierMult = learned.lpTierRangeMultipliers?.[tier] ?? 1.0;
+          const rangeWidthTicks = Math.round(adaptiveLpRangeWidthTicks(
             best.token0.symbol,
             intel,
-            env.krystalLpRangeWidthTicks,
+            env.krystalLpRangeWidthTicks * tierRangeMult * learnedTierMult,
             learned,
-          );
+          ));
 
           decisions.push({
             type: 'KRYSTAL_LP_OPEN',
             reasoning:
-              `Opening EVM LP: ${best.token0.symbol}/${best.token1.symbol} on ${best.chainName} ` +
+              `Opening [${tier.toUpperCase()} risk] EVM LP: ${best.token0.symbol}/${best.token1.symbol} on ${best.chainName} ` +
               `($${deployUsd.toFixed(0)}). Pool score: ${best.score.toFixed(0)}/100 — ` +
-              `APR7d ${best.apr7d.toFixed(1)}%, TVL $${(best.tvlUsd / 1e6).toFixed(1)}M. ` +
+              `APR7d ${best.apr7d.toFixed(1)}%, TVL $${(best.tvlUsd / 1e6).toFixed(1)}M, ` +
+              `range ${rangeWidthTicks} ticks. ` +
               `${best.reasoning.join(', ')}.`,
             params: {
               pool: {
@@ -2184,6 +2262,7 @@ export async function generateDecisions(
               },
               deployUsd,
               rangeWidthTicks,
+              riskTier: tier,
               chainName: best.chainName,
               pair: `${best.token0.symbol}/${best.token1.symbol}`,
               // Bridge funding: pick the chain with the most stablecoin balance (if not same chain)
@@ -2192,7 +2271,6 @@ export async function generateDecisions(
                   .filter(b => b.chainId !== best.chainNumericId && b.totalStableUsd >= deployUsd * 0.5)
                   .sort((a, b) => b.totalStableUsd - a.totalStableUsd)[0];
                 if (bestBal && env.evmPrivateKey) {
-                  // Wallet address will be computed by the executor from env.evmPrivateKey
                   return { sourceChainId: bestBal.chainId, walletAddress: '' };
                 }
                 return undefined;
@@ -2206,8 +2284,10 @@ export async function generateDecisions(
             ].filter(Boolean),
             tier: classifyTier('KRYSTAL_LP_OPEN', 'low', deployUsd, config, intel.marketCondition),
           });
-          }
-        } else {
+          tiersOpened++;
+        }
+
+        if (tiersOpened === 0 && deduped.length === 0) {
           krystalSkip(`no eligible pools (${pools.length} total, 0 pass TVL/APR/RPC/dedup filters)`);
         }
       } catch (err) {
@@ -2481,15 +2561,16 @@ export async function generateDecisions(
       else diag.push('OrcaLP:needs-borrow-enable');
     }
 
-    // I-bis: Krystal EVM LP
+    // I-bis: Krystal EVM LP (3-tier risk system)
     if (env.krystalLpEnabled) {
-      if (intel.marketCondition === 'danger') diag.push('KrystalLP:danger');
+      const tierTag = env.krystalLpRiskTiers.join('/');
+      if (state.evmLpPositions.length > 0) diag.push(`KrystalLP:active(${state.evmLpPositions.length})[${tierTag}]`);
+      else if (intel.marketCondition === 'danger') diag.push('KrystalLP:danger');
       else if (state.evmTotalUsdcAllChains < 20) diag.push(`KrystalLP:low-usdc($${state.evmTotalUsdcAllChains.toFixed(0)})`);
       else if (state.evmLpPositions.length >= env.krystalLpMaxPositions) diag.push(`KrystalLP:max-pos(${state.evmLpPositions.length})`);
       else if (intel.marketCondition === 'bearish') diag.push('KrystalLP:bearish');
       else if (!checkCooldown('KRYSTAL_LP_OPEN', 4 * 3600_000)) diag.push('KrystalLP:cooldown');
-      else if (state.evmLpPositions.length > 0) diag.push(`KrystalLP:active(${state.evmLpPositions.length})`);
-      else diag.push('KrystalLP:conditions?');
+      else diag.push(`KrystalLP:seeking[${tierTag}]`);
     }
 
     // J: Arb
@@ -3194,18 +3275,11 @@ export function formatDecisionReport(
   if (state.kaminoDepositValueUsd > 1) L.push(`   Kamino: $${state.kaminoDepositValueUsd.toFixed(0)}`);
   if (state.orcaLpValueUsd > 1) L.push(`   Orca LP: $${state.orcaLpValueUsd.toFixed(0)}`);
 
-  // EVM LP positions
-  if (state.evmLpPositions.length > 0) {
-    const chainNames: Record<number, string> = { 1: 'Ethereum', 10: 'Optimism', 56: 'BSC', 137: 'Polygon', 8453: 'Base', 42161: 'Arbitrum', 43114: 'Avalanche', 324: 'zkSync', 534352: 'Scroll', 59144: 'Linea' };
-    for (const pos of state.evmLpPositions) {
-      const chain = chainNames[pos.chainNumericId] ?? `Chain ${pos.chainNumericId}`;
-      const range = pos.inRange ? '🟢' : '🔴';
-      const fee = pos.feesOwedUsd > 0.01 ? ` (+$${pos.feesOwedUsd.toFixed(2)} fees)` : '';
-      L.push(`   ${range} LP: ${pos.token0Symbol}/${pos.token1Symbol} on ${chain} — $${pos.valueUsd.toFixed(0)}${fee}`);
-    }
-  } else if (state.evmLpTotalValueUsd > 1) {
+  // EVM LP (summary only — per-position detail shown in Krystal LP section of system report)
+  if (state.evmLpTotalValueUsd > 1) {
+    const inRange = state.evmLpPositions.filter(p => p.inRange).length;
     const feeStr = state.evmLpTotalFeesUsd > 0.01 ? ` (+$${state.evmLpTotalFeesUsd.toFixed(2)} fees)` : '';
-    L.push(`   EVM LP: $${state.evmLpTotalValueUsd.toFixed(0)}${feeStr}`);
+    L.push(`   Krystal LP: $${state.evmLpTotalValueUsd.toFixed(0)} (${inRange}/${state.evmLpPositions.length} in-range)${feeStr}`);
   }
 
   // EVM chain balances (all assets per chain)

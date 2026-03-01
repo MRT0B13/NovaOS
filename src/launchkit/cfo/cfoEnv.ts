@@ -84,6 +84,7 @@ export interface CFOEnv {
   krystalLpMaxPositions: number;                  // max concurrent EVM LP positions (default 3)
   krystalLpRangeWidthTicks: number;               // range width in ticks (default 400)
   krystalLpRebalanceTriggerPct: number;           // rebalance when utilisation drops below X% (default 10)
+  krystalLpRiskTiers: string[];                   // enabled risk tiers: low,medium,high (default: low,medium)
   evmRpcUrls: Record<number, string>;             // chainId → RPC URL mapping
 
   // ── Kamino-funded LP (borrow → LP → fees repay loan) ─────────────
@@ -279,6 +280,8 @@ export function getCFOEnv(bust = false): CFOEnv {
     krystalLpMaxPositions: Number(process.env.CFO_KRYSTAL_LP_MAX_POSITIONS ?? 3),
     krystalLpRangeWidthTicks: Number(process.env.CFO_KRYSTAL_LP_RANGE_WIDTH_TICKS ?? 400),
     krystalLpRebalanceTriggerPct: Number(process.env.CFO_KRYSTAL_LP_REBALANCE_TRIGGER_PCT ?? 10),
+    krystalLpRiskTiers: (process.env.CFO_KRYSTAL_LP_RISK_TIERS ?? 'low,medium')
+      .split(',').map(t => t.trim().toLowerCase()).filter(t => ['low', 'medium', 'high'].includes(t)),
     evmRpcUrls: parseEvmRpcUrls(),
 
     kaminoBorrowLpEnabled: process.env.CFO_KAMINO_BORROW_LP_ENABLE === 'true',

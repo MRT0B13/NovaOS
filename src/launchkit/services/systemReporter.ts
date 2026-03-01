@@ -139,12 +139,13 @@ interface CFOSnapshot {
   polyHeadroomUsd: number;
   polyPositionCount: number;
   polyUsdcBalance: number;
+  polyPositions: Array<{ question: string; outcome: string; costBasisUsd: number; currentValueUsd: number; unrealizedPnlUsd: number; currentPrice: number }>;
 
   // Krystal EVM LP
   krystalEnabled: boolean;
   krystalLpValueUsd: number;
   krystalLpFeesUsd: number;
-  krystalPositions: Array<{ posId: string; chainName: string; token0Symbol: string; token1Symbol: string; inRange: boolean; rangeUtilisationPct: number; valueUsd: number; feesOwedUsd: number }>;
+  krystalPositions: Array<{ posId: string; chainName: string; token0Symbol: string; token1Symbol: string; inRange: boolean; rangeUtilisationPct: number; valueUsd: number; feesOwedUsd: number; riskTier: string }>;
 
   // x402 revenue
   x402TotalCalls: number;
@@ -704,22 +705,37 @@ async function gatherCFOSnapshot(): Promise<CFOSnapshot | null> {
       krystalEnabled: env.krystalLpEnabled,
       krystalLpValueUsd: ps.evmLpTotalValueUsd,
       krystalLpFeesUsd: ps.evmLpTotalFeesUsd,
-      krystalPositions: ps.evmLpPositions.map(p => ({
-        posId: p.posId,
-        chainName: p.chainName,
-        token0Symbol: p.token0Symbol,
-        token1Symbol: p.token1Symbol,
-        inRange: p.inRange,
-        rangeUtilisationPct: p.rangeUtilisationPct,
-        valueUsd: p.valueUsd,
-        feesOwedUsd: p.feesOwedUsd,
-      })),
+      krystalPositions: ps.evmLpPositions.map(p => {
+        const _stables = new Set(['USDC', 'USDT', 'DAI', 'USDG', 'FRAX', 'TUSD', 'BUSD', 'USDCE', 'USDC.E']);
+        const s0 = _stables.has(p.token0Symbol.toUpperCase());
+        const s1 = _stables.has(p.token1Symbol.toUpperCase());
+        const riskTier = s0 && s1 ? 'low' : (s0 || s1) ? 'medium' : 'high';
+        return {
+          posId: p.posId,
+          chainName: p.chainName,
+          token0Symbol: p.token0Symbol,
+          token1Symbol: p.token1Symbol,
+          inRange: p.inRange,
+          rangeUtilisationPct: p.rangeUtilisationPct,
+          valueUsd: p.valueUsd,
+          feesOwedUsd: p.feesOwedUsd,
+          riskTier,
+        };
+      }),
 
       polyEnabled: env.polymarketEnabled,
       polyDeployedUsd: ps.polyDeployedUsd,
       polyHeadroomUsd: ps.polyHeadroomUsd,
       polyPositionCount: ps.polyPositionCount,
       polyUsdcBalance: ps.polyUsdcBalance,
+      polyPositions: (ps.polyPositions ?? []).map((p: any) => ({
+        question: p.question ?? 'Unknown',
+        outcome: p.outcome ?? '?',
+        costBasisUsd: p.costBasisUsd ?? 0,
+        currentValueUsd: p.currentValueUsd ?? 0,
+        unrealizedPnlUsd: p.unrealizedPnlUsd ?? 0,
+        currentPrice: p.currentPrice ?? 0,
+      })),
 
       x402TotalCalls,
       x402TotalEarned,
@@ -1078,7 +1094,8 @@ async function sendStatusReport(): Promise<void> {
       message += `  <b>💎 Krystal LP ($${c.krystalLpValueUsd.toFixed(2)}):</b>\n`;
       for (const pos of c.krystalPositions) {
         const rangeEmoji = pos.inRange ? '🟢' : '🔴';
-        message += `    ${rangeEmoji} ${pos.token0Symbol}/${pos.token1Symbol} on ${pos.chainName} — $${pos.valueUsd.toFixed(2)} | ${pos.rangeUtilisationPct.toFixed(0)}% util`;
+        const tierTag = pos.riskTier === 'high' ? '🔥' : pos.riskTier === 'low' ? '🛡️' : '⚖️';
+        message += `    ${rangeEmoji}${tierTag} ${pos.token0Symbol}/${pos.token1Symbol} on ${pos.chainName} — $${pos.valueUsd.toFixed(2)} | ${pos.rangeUtilisationPct.toFixed(0)}% util [${pos.riskTier}]`;
         if (pos.feesOwedUsd > 0.001) message += ` | fees: $${pos.feesOwedUsd.toFixed(4)}`;
         message += `\n`;
       }
@@ -1109,7 +1126,18 @@ async function sendStatusReport(): Promise<void> {
       message += `  <b>🎰 Polymarket:</b>\n`;
       message += `    Deployed: $${c.polyDeployedUsd.toFixed(2)} (${c.polyPositionCount} positions)\n`;
       message += `    USDC balance: $${c.polyUsdcBalance.toFixed(2)}\n`;
-      message += `    Headroom: $${c.polyHeadroomUsd.toFixed(2)}\n\n`;
+      message += `    Headroom: $${c.polyHeadroomUsd.toFixed(2)}\n`;
+      // Individual positions
+      if (c.polyPositions && c.polyPositions.length > 0) {
+        for (const pos of c.polyPositions) {
+          const pnlEmoji = pos.unrealizedPnlUsd >= 0 ? '🟢' : '🔴';
+          const pnlSign = pos.unrealizedPnlUsd >= 0 ? '+' : '';
+          const shortQ = pos.question.length > 50 ? pos.question.slice(0, 47) + '...' : pos.question;
+          message += `    ${pnlEmoji} ${shortQ}\n`;
+          message += `      ${pos.outcome} @ ${(pos.currentPrice * 100).toFixed(0)}¢ | $${pos.currentValueUsd.toFixed(2)} (${pnlSign}$${pos.unrealizedPnlUsd.toFixed(2)})\n`;
+        }
+      }
+      message += `\n`;
     }
 
     // x402 Revenue
@@ -1273,7 +1301,10 @@ async function sendDailySummary(): Promise<void> {
     if (c.krystalEnabled && c.krystalPositions.length > 0) {
       const inRange = c.krystalPositions.filter(p => p.inRange).length;
       const chains = [...new Set(c.krystalPositions.map(p => p.chainName))].join(',');
-      message += `  • Krystal LP: $${c.krystalLpValueUsd.toFixed(2)} | ${inRange}/${c.krystalPositions.length} in range | ${chains}\n`;
+      const tierCounts = { low: 0, medium: 0, high: 0 } as Record<string, number>;
+      for (const p of c.krystalPositions) tierCounts[p.riskTier] = (tierCounts[p.riskTier] ?? 0) + 1;
+      const tierStr = Object.entries(tierCounts).filter(([, v]) => v > 0).map(([k, v]) => `${v}×${k}`).join(' ');
+      message += `  • Krystal LP: $${c.krystalLpValueUsd.toFixed(2)} | ${inRange}/${c.krystalPositions.length} in range | ${tierStr} | ${chains}\n`;
     }
 
     if (c.jitoSolBalance > 0) {
@@ -1291,7 +1322,10 @@ async function sendDailySummary(): Promise<void> {
     }
 
     if (c.polyEnabled && (c.polyDeployedUsd > 0 || c.polyUsdcBalance > 0)) {
-      message += `  • Poly: $${c.polyDeployedUsd.toFixed(2)} deployed (${c.polyPositionCount} pos) | $${c.polyUsdcBalance.toFixed(2)} USDC\n`;
+      const totalPnl = c.polyPositions.reduce((s, p) => s + p.unrealizedPnlUsd, 0);
+      const pnlSign = totalPnl >= 0 ? '+' : '';
+      const winning = c.polyPositions.filter(p => p.unrealizedPnlUsd >= 0).length;
+      message += `  • Poly: $${c.polyDeployedUsd.toFixed(2)} deployed (${winning}/${c.polyPositionCount} winning) | PnL: ${pnlSign}$${totalPnl.toFixed(2)} | $${c.polyUsdcBalance.toFixed(2)} USDC\n`;
     }
 
     if (c.x402TotalCalls > 0 || c.x402TotalEarned > 0) {
