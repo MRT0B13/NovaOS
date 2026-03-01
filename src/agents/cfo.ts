@@ -169,7 +169,7 @@ export class CFOAgent extends BaseAgent {
     await this.initServices(env);
 
     this.startHeartbeat(60_000);
-    this.addInterval(() => this.runOpportunityScan(),    60 * 60_000);   // 1h
+    this.addInterval(() => this.runOpportunityScan(),    60 * 60_000);   // 1h (no-ops when decision engine is on)
     this.addInterval(() => this.monitorPositions(),      10 * 60_000);   // 10m
     this.addInterval(() => this.monitorYield(),          30 * 60_000);   // 30m
     this.addInterval(() => this.monitorHyperliquid(),    15 * 60_000);   // 15m
@@ -178,14 +178,15 @@ export class CFOAgent extends BaseAgent {
     this.addInterval(() => this.checkDailyDigest(),       5 * 60_000);
     this.addInterval(() => this.expirePendingApprovals(), 2 * 60_000);
     this.addInterval(() => this.logLifeSign(),            5 * 60_000);   // visible heartbeat every 5m
-    setTimeout(() => this.runOpportunityScan(), 90_000);
 
     // ── Autonomous Decision Engine ───────────────────────────────
     const dConfig = getDecisionConfig();
     if (dConfig.enabled) {
       const intervalMs = dConfig.intervalMinutes * 60_000;
       this.addInterval(() => this.runAutonomousDecisionCycle(), intervalMs);
-      // First decision cycle after 2 minutes (let services warm up)
+      // Single first-cycle trigger (2 min warmup) — replaces both the legacy
+      // 90s runOpportunityScan kickoff AND the old 120s direct call that
+      // caused duplicate CFO reports on startup.
       setTimeout(() => this.runAutonomousDecisionCycle(), 2 * 60_000);
       logger.info(
         `[CFO] 🧠 Decision engine ON — interval: ${dConfig.intervalMinutes}m | ` +
@@ -193,6 +194,8 @@ export class CFOAgent extends BaseAgent {
         `stake: ${dConfig.autoStake} | dryRun: ${env.dryRun}`,
       );
     } else {
+      // Legacy Polymarket-only scan — only when decision engine is OFF
+      setTimeout(() => this.runOpportunityScan(), 90_000);
       logger.info('[CFO] Decision engine OFF — set CFO_AUTO_DECISIONS=true to enable autonomous trading');
     }
 
@@ -251,20 +254,19 @@ export class CFOAgent extends BaseAgent {
 
   // ── Polymarket scan + execution ───────────────────────────────────
   // Polymarket bets now go through the decision engine (tier-gated).
-  // This scan just triggers a decision cycle which includes Polymarket scanning.
+  // This method is the LEGACY fallback — only runs when decision engine is OFF.
+  // When decision engine is ON, runAutonomousDecisionCycle handles everything
+  // on its own interval, so this 1h call gracefully no-ops.
 
   private async runOpportunityScan(): Promise<void> {
     if (!this.running || this.paused) return;
     const env = getCFOEnv();
     if (!env.polymarketEnabled) return;
 
-    // Decision engine handles Polymarket bets now (with tier gating + scout intel)
+    // Decision engine already runs on its own interval — skip to avoid duplicates
     const config = getDecisionConfig();
     if (config.enabled) {
-      await this.runAutonomousDecisionCycle();
-      this.cycleCount++;
-      this.lastOpportunityScanAt = Date.now();
-      await this.persistState();
+      logger.debug('[CFO] runOpportunityScan skipped — decision engine handles this');
       return;
     }
 
