@@ -705,6 +705,12 @@ export async function fetchKrystalPositions(
 
       for (const dbRec of missingRecords) {
         try {
+          // posId must be a numeric NFPM token ID (uint256) for on-chain reads
+          if (!dbRec.posId || !/^\d+$/.test(String(dbRec.posId))) {
+            logger.debug(`[Krystal] Skipping non-numeric posId "${dbRec.posId}" — not a valid NFPM tokenId`);
+            continue;
+          }
+
           const nfpmAddr = getNfpmAddress(dbRec.chainNumericId);
           if (!nfpmAddr || !env.evmRpcUrls[dbRec.chainNumericId]) continue;
 
