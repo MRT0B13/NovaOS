@@ -323,6 +323,8 @@ export interface KaminoPosition {
   healthFactor: number;  // >= 1.0 means not liquidatable
   ltv: number;           // current LTV
   maxLtv: number;        // maximum allowed LTV
+  borrowLimitUsd: number;        // on-chain risk-weighted max borrow value (from SDK borrowLimit)
+  borrowWeightedUsd: number;     // current borrow-factor-adjusted borrow value
 }
 
 export type KaminoMarketApy = { [symbol: string]: { supplyApy: number; borrowApy: number } };
@@ -862,7 +864,7 @@ export async function getPosition(): Promise<KaminoPosition> {
 
     const market = await klend.KaminoMarket.load(rpc, KAMINO_MAIN_MARKET_ADDR, 400);
     if (!market) {
-      return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.85 };
+      return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.85, borrowLimitUsd: 0, borrowWeightedUsd: 0 };
     }
 
     // klend-sdk v7 uses getUserVanillaObligation (throws if no obligation exists)
@@ -871,7 +873,7 @@ export async function getPosition(): Promise<KaminoPosition> {
       obligation = await market.getUserVanillaObligation(wallet.publicKey.toBase58() as any);
     } catch {
       // No obligation found — wallet hasn't deposited yet
-      return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.85 };
+      return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.85, borrowLimitUsd: 0, borrowWeightedUsd: 0 };
     }
 
     const apys = await fetchKaminoApys();
@@ -1006,15 +1008,23 @@ export async function getPosition(): Promise<KaminoPosition> {
       ? Number(stats.unhealthyBorrowValue) / depositValueUsd
       : 0.85;
 
+    // On-chain risk-weighted borrow limits (accounts for collateral factors + borrow factors)
+    // borrowLimit = max allowed weighted borrow; borrowWeightedUsd = current weighted borrow
+    const borrowLimitUsd = stats?.borrowLimit ? Number(stats.borrowLimit) : depositValueUsd * maxLtv;
+    const borrowWeightedUsd = stats?.userTotalBorrowBorrowFactorAdjusted
+      ? Number(stats.userTotalBorrowBorrowFactorAdjusted)
+      : borrowValueUsd;
+
     logger.debug(
       `[Kamino] Position: ${deposits.length} deposits ($${depositValueUsd.toFixed(2)}), ` +
       `${borrows.length} borrows ($${borrowValueUsd.toFixed(2)}), ` +
-      `LTV=${(ltv * 100).toFixed(1)}%, health=${healthFactor.toFixed(3)}`
+      `LTV=${(ltv * 100).toFixed(1)}%, health=${healthFactor.toFixed(3)}, ` +
+      `borrowLimit=$${borrowLimitUsd.toFixed(2)}, borrowWeighted=$${borrowWeightedUsd.toFixed(2)}`
     );
-    return { deposits, borrows, netValueUsd, healthFactor, ltv, maxLtv };
+    return { deposits, borrows, netValueUsd, healthFactor, ltv, maxLtv, borrowLimitUsd, borrowWeightedUsd };
   } catch (err) {
     logger.warn('[Kamino] getPosition error:', err);
-    return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.85 };
+    return { deposits: [], borrows: [], netValueUsd: 0, healthFactor: 999, ltv: 0, maxLtv: 0.85, borrowLimitUsd: 0, borrowWeightedUsd: 0 };
   }
 }
 
@@ -1085,6 +1095,25 @@ export async function borrow(
       success: false, asset, amountBorrowed: 0,
       error: `LTV ${(pos.ltv * 100).toFixed(1)}% exceeds borrow cap ${(borrowLtvCap * 100).toFixed(0)}% for ${asset}`,
     };
+  }
+
+  // On-chain headroom guard — reject if this borrow would exceed risk-weighted limit
+  if (pos.borrowLimitUsd > 0) {
+    const headroom = pos.borrowLimitUsd - pos.borrowWeightedUsd;
+    // Rough USD estimate — SOL borrows use market price, stablecoins ≈ $1
+    let borrowValueEstimate = amount;
+    if (asset === 'SOL') {
+      try {
+        const pyth = await import('./pythOracleService.ts');
+        borrowValueEstimate = amount * await pyth.getSolPrice();
+      } catch { borrowValueEstimate = amount * 80; } // conservative fallback
+    }
+    if (borrowValueEstimate > headroom * 0.95) {
+      return {
+        success: false, asset, amountBorrowed: 0,
+        error: `Borrow $${borrowValueEstimate.toFixed(2)} would exceed on-chain limit (headroom: $${headroom.toFixed(2)}, limit: $${pos.borrowLimitUsd.toFixed(2)})`,
+      };
+    }
   }
 
   try {
@@ -1443,11 +1472,21 @@ export async function loopJitoSol(
     }
 
     // How much SOL can we borrow to reach target LTV without overshooting?
+    // Use on-chain risk-weighted borrowLimit (accounts for collateral factors + borrow factors)
+    // instead of naive depositVal × targetLtv which ignores risk weights.
     const depositValUsd = pos.deposits.reduce((s, d) => s + d.valueUsd, 0);
     const currentBorrowValUsd = pos.borrows.reduce((s, b) => s + b.valueUsd, 0);
-    const targetBorrowValUsd = depositValUsd * targetLtv;
-    const canBorrowUsd = Math.max(0, targetBorrowValUsd - currentBorrowValUsd) * 0.9; // 90% of headroom
+    const naiveTargetBorrow = depositValUsd * targetLtv;
+    // Cap at the on-chain borrowLimit (risk-weighted) if available
+    const onChainHeadroom = pos.borrowLimitUsd > 0
+      ? Math.max(0, pos.borrowLimitUsd - pos.borrowWeightedUsd)
+      : Infinity;
+    const naiveHeadroom = Math.max(0, naiveTargetBorrow - currentBorrowValUsd);
+    // Use whichever is smaller — on-chain limit is authoritative
+    const rawHeadroom = Math.min(naiveHeadroom, onChainHeadroom);
+    const canBorrowUsd = rawHeadroom * 0.85; // 85% safety margin (was 90% but borrow factors inflate effective value)
 
+    logger.info(`[Kamino:Loop] Headroom: naive=$${naiveHeadroom.toFixed(2)}, onChain=$${onChainHeadroom.toFixed(2)}, safe=$${canBorrowUsd.toFixed(2)}`);
     if (canBorrowUsd < 1) { logger.info(`[Kamino:Loop] Headroom too small ($${canBorrowUsd.toFixed(2)}) — stopping`); break; }
 
     const borrowSolAmount = canBorrowUsd / solPriceUsd;
@@ -1616,11 +1655,18 @@ export async function loopLst(
       break;
     }
 
+    // Use on-chain risk-weighted borrowLimit (same logic as loopJitoSol)
     const depositValUsd = pos.deposits.reduce((s, d) => s + d.valueUsd, 0);
     const currentBorrowValUsd = pos.borrows.reduce((s, b) => s + b.valueUsd, 0);
-    const targetBorrowValUsd = depositValUsd * targetLtv;
-    const canBorrowUsd = Math.max(0, targetBorrowValUsd - currentBorrowValUsd) * 0.9;
+    const naiveTargetBorrow = depositValUsd * targetLtv;
+    const onChainHeadroom = pos.borrowLimitUsd > 0
+      ? Math.max(0, pos.borrowLimitUsd - pos.borrowWeightedUsd)
+      : Infinity;
+    const naiveHeadroom = Math.max(0, naiveTargetBorrow - currentBorrowValUsd);
+    const rawHeadroom = Math.min(naiveHeadroom, onChainHeadroom);
+    const canBorrowUsd = rawHeadroom * 0.85;
 
+    logger.info(`[Kamino:Loop:${lst}] Headroom: naive=$${naiveHeadroom.toFixed(2)}, onChain=$${onChainHeadroom.toFixed(2)}, safe=$${canBorrowUsd.toFixed(2)}`);
     if (canBorrowUsd < 1) { logger.info(`[Kamino:Loop:${lst}] Headroom too small ($${canBorrowUsd.toFixed(2)}) — stopping`); break; }
 
     const solToBorrow = canBorrowUsd / solPriceUsd;
