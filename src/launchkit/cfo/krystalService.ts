@@ -185,6 +185,7 @@ const ERC20_ABI = [
 
 const POOL_ABI = [
   'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+  'function tickSpacing() view returns (int24)',
 ];
 
 const MaxUint128 = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF');
@@ -1098,6 +1099,31 @@ export async function openEvmLpPosition(
       return { success: false, error: `No NFPM deployed on chainId ${chainNumericId} for protocol ${protoName}` };
     }
 
+    // 1. Read current tick + on-chain tickSpacing from pool contract
+    //    We read tickSpacing() on-chain because the Krystal API feeTier field
+    //    may not match the on-chain value (e.g. Aerodrome returns feeTier=402
+    //    but the real tickSpacing is 100). All V3-style pools expose tickSpacing().
+    const poolContract = new ethers.Contract(pool.poolAddress, POOL_ABI, provider);
+    const [slot0, onChainTickSpacing] = await Promise.all([
+      poolContract.slot0(),
+      poolContract.tickSpacing().catch(() => null),
+    ]);
+    const currentTick = Number(slot0.tick ?? slot0[1]);
+
+    // Resolve effective tickSpacing: prefer on-chain, fall back to feeTier mapping
+    const feeToTickSpacing: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
+    const tickSpacing = onChainTickSpacing != null
+      ? Number(onChainTickSpacing)
+      : isAerodromeCl
+        ? pool.feeTier  // last resort for Aerodrome
+        : (feeToTickSpacing[pool.feeTier] ?? 60);
+
+    if (isAerodromeCl && onChainTickSpacing != null && pool.feeTier !== Number(onChainTickSpacing)) {
+      logger.info(
+        `[Krystal] Aerodrome feeTier=${pool.feeTier} differs from on-chain tickSpacing=${onChainTickSpacing}; using on-chain value`,
+      );
+    }
+
     // Verify pool exists on the protocol's factory
     const earlyFactoryAddr = protoResolved?.factoryAddress;
     if (earlyFactoryAddr) {
@@ -1106,11 +1132,11 @@ export async function openEvmLpPosition(
         : 'function getPool(address,address,uint24) view returns (address)';
       const factory = new ethers.Contract(earlyFactoryAddr, [factoryAbiStr], provider);
       // Aerodrome uses tickSpacing as 3rd param; Uniswap/PCS use feeTier
-      const poolLookupParam = isAerodromeCl ? pool.feeTier : pool.feeTier; // feeTier field carries tickSpacing for Aerodrome pools
+      const poolLookupParam = isAerodromeCl ? tickSpacing : pool.feeTier;
       const verifiedPool = await factory.getPool(pool.token0.address, pool.token1.address, poolLookupParam);
       if (!verifiedPool || verifiedPool === ethers.ZeroAddress) {
         logger.warn(
-          `[Krystal] Pool ${pool.token0.symbol}/${pool.token1.symbol} fee=${pool.feeTier} ` +
+          `[Krystal] Pool ${pool.token0.symbol}/${pool.token1.symbol} fee=${pool.feeTier} (tickSpacing=${tickSpacing}) ` +
           `NOT found on ${protoResolved?.def.label ?? protoName} factory. Skipping.`,
         );
         return { success: false, error: `Pool not on ${protoResolved?.def.label ?? protoName} factory — cannot mint` };
@@ -1118,19 +1144,7 @@ export async function openEvmLpPosition(
       logger.info(`[Krystal] ✓ Pool verified on ${protoResolved?.def.label} factory: ${verifiedPool}`);
     }
 
-    // 1. Read current tick from pool
-    const poolContract = new ethers.Contract(pool.poolAddress, POOL_ABI, provider);
-    const slot0 = await poolContract.slot0();
-    const currentTick = Number(slot0.tick ?? slot0[1]);
-
     // 2. Compute tick range centred on current tick, aligned to tick spacing
-    //    Aerodrome: feeTier field IS the tickSpacing directly
-    //    PancakeSwap V3: same as Uniswap V3 but adds 2500 fee tier (tickSpacing 50)
-    //    Uniswap V3: standard fee→tickSpacing mapping
-    const feeToTickSpacing: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
-    const tickSpacing = isAerodromeCl
-      ? pool.feeTier  // Aerodrome stores tickSpacing directly in the feeTier field
-      : (feeToTickSpacing[pool.feeTier] ?? 60);
     const rawLower = currentTick - rangeWidthTicks;
     const rawUpper = currentTick + rangeWidthTicks;
     const tickLower = Math.floor(rawLower / tickSpacing) * tickSpacing;
@@ -1540,7 +1554,7 @@ export async function openEvmLpPosition(
       ? {
           token0: sorted0Addr,
           token1: sorted1Addr,
-          tickSpacing: pool.feeTier,  // Aerodrome stores tickSpacing in feeTier field
+          tickSpacing,  // on-chain resolved tickSpacing (not Krystal API feeTier)
           tickLower,
           tickUpper,
           amount0Desired,
@@ -1569,7 +1583,7 @@ export async function openEvmLpPosition(
 
     logger.info(
       `[Krystal] Minting LP via ${protoLabel}: ${sortedToken0.symbol}/${sortedToken1.symbol} on chain ${chainNumericId}, ` +
-      `ticks [${tickLower}, ${tickUpper}], ${isAerodromeCl ? 'tickSpacing' : 'fee'} ${pool.feeTier}, ` +
+      `ticks [${tickLower}, ${tickUpper}], ${isAerodromeCl ? 'tickSpacing' : 'fee'} ${isAerodromeCl ? tickSpacing : pool.feeTier}, ` +
       `amt0=${ethers.formatUnits(amount0Desired, sortedDec0)}, amt1=${ethers.formatUnits(amount1Desired, sortedDec1)}`,
     );
 
