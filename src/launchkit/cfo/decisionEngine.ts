@@ -116,6 +116,7 @@ export interface DecisionResult {
   success: boolean;
   txId?: string;
   error?: string;
+  receivedUsd?: number;       // actual USD received (for sell/exit operations)
   dryRun: boolean;
   pendingApproval?: boolean;  // true if queued for admin approval
   traceId?: string;           // correlation ID linking all decisions in one cycle
@@ -2570,11 +2571,17 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const reduceSizeCoin = reduceUsd / coinShort.markPrice;
         const result = await hl.closePosition(coin, reduceSizeCoin, true); // buy back to reduce short
         if (result.success) markDecision(`CLOSE_HEDGE_${coin}`);
+        // receivedUsd = portion of cost basis returned + PnL from the short
+        // For a SHORT: if price dropped, we profit; if price rose, we lose.
+        // Use the mark-to-market fraction of unrealized PnL proportional to the close size.
+        const closeFraction = coinShort.sizeUsd > 0 ? reduceUsd / coinShort.sizeUsd : 1;
+        const closeReceivedUsd = reduceUsd + (coinShort.unrealizedPnlUsd ?? 0) * closeFraction;
         return {
           ...base,
           executed: true,
           success: result.success,
           txId: result.orderId?.toString(),
+          receivedUsd: result.success ? Math.max(0, closeReceivedUsd) : undefined,
           error: result.error,
         };
       }
@@ -2591,6 +2598,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
         const sizeInCoin = pos.sizeUsd / pos.markPrice;
         const isBuy = pos.side === 'SHORT'; // buy to close short, sell to close long
+        // Actual return = cost basis + unrealized PnL (which is negative for losers)
+        const closeReceivedUsd = Math.max(0, pos.sizeUsd + (pos.unrealizedPnlUsd ?? 0));
         const result = await hl.closePosition(pos.coin, sizeInCoin, isBuy);
         if (result.success) markDecision('CLOSE_LOSING');
         return {
@@ -2598,6 +2607,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           executed: true,
           success: result.success,
           txId: result.orderId?.toString(),
+          receivedUsd: result.success ? closeReceivedUsd : undefined,
           error: result.error,
         };
       }
@@ -2708,6 +2718,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           executed: true,
           success: polyExitSuccess,
           txId: exitOrder.transactionHash ?? exitOrder.orderId,
+          receivedUsd: exitOrder.status === 'MATCHED' ? exitOrder.sizeUsd : undefined,
           error: polyExitSuccess ? undefined : `Exit order status: ${exitOrder.status}`,
         };
       }

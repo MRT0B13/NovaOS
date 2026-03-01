@@ -1567,15 +1567,30 @@ export async function placeBuyOrder(
 export async function getOrderStatus(orderId: string): Promise<{
   status: 'MATCHED' | 'LIVE' | 'CANCELLED' | 'EXPIRED' | 'UNKNOWN';
   filledSize?: number;
+  avgFillPrice?: number;
+  receivedUsd?: number;
   transactionHashes?: string[];
 } | null> {
   try {
     const data = await clobGet<any>(`/data/order/${orderId}`, true);
     if (!data) return null;
     const status = (data.status ?? '').toUpperCase();
+    const filledSize = data.size_matched ? parseFloat(data.size_matched) : undefined;
+    // CLOB API returns average_match_price (or price) — critical for accurate PnL
+    const avgFillPrice = data.average_match_price
+      ? parseFloat(data.average_match_price)
+      : data.price
+        ? parseFloat(data.price)
+        : undefined;
+    // Compute actual USDC received: filledShares × fillPrice
+    const receivedUsd = filledSize != null && avgFillPrice != null
+      ? filledSize * avgFillPrice
+      : undefined;
     return {
       status: ['MATCHED', 'LIVE', 'CANCELLED', 'EXPIRED'].includes(status) ? status : 'UNKNOWN',
-      filledSize: data.size_matched ? parseFloat(data.size_matched) : undefined,
+      filledSize,
+      avgFillPrice,
+      receivedUsd,
       transactionHashes: data.transactions_hashes ?? data.transactionsHashes ?? [],
     };
   } catch (err) {

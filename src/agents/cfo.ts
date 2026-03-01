@@ -409,7 +409,7 @@ export class CFOAgent extends BaseAgent {
             const dbPos = p.tokenId
               ? await this.repo.getPositionByExternalId(p.tokenId)
               : null;
-            const receivedUsd = p.sizeUsd ?? 0;
+            const receivedUsd = r.receivedUsd ?? p.sizeUsd ?? 0;
             if (dbPos) {
               await this.positionManager.closePosition(
                 dbPos.id, 0, r.txId ?? '', receivedUsd,
@@ -466,7 +466,7 @@ export class CFOAgent extends BaseAgent {
           // ── Hyperliquid CLOSE hedge ────────────────────────────
           case 'CLOSE_HEDGE': {
             const coin = p.coin ?? 'SOL';
-            const reduceUsd = p.reduceUsd ?? d.estimatedImpactUsd;
+            const reduceUsd = r.receivedUsd ?? p.reduceUsd ?? d.estimatedImpactUsd;
             // Find matching open HL position and close it
             const openHL = await this.repo.getOpenPositions('hyperliquid' as PositionStrategy);
             const coinShort = openHL.find(pos =>
@@ -495,15 +495,19 @@ export class CFOAgent extends BaseAgent {
             const match = openHL.find(pos =>
               (pos.metadata as any)?.coin === p.coin && (pos.metadata as any)?.side === p.side,
             );
+            // Use actual receivedUsd from executor (includes unrealized PnL),
+            // not 0 which would record a 100% loss
+            const lossReceivedUsd = r.receivedUsd ?? 0;
             if (match) {
-              await this.positionManager.closePosition(match.id, 0, r.txId ?? '', 0);
-              logger.info(`[CFO] Persisted CLOSE_LOSING: closed ${match.id} (${p.coin} ${p.side})`);
+              await this.positionManager.closePosition(match.id, 0, r.txId ?? '', lossReceivedUsd);
+              const lossPnl = lossReceivedUsd - match.costBasisUsd;
+              logger.info(`[CFO] Persisted CLOSE_LOSING: closed ${match.id} (${p.coin} ${p.side}) PnL $${lossPnl.toFixed(2)}`);
             }
             await this.repo.insertTransaction({
               id: `tx-hl-stop-${r.txId ?? Date.now()}`, timestamp: now,
               chain: 'arbitrum', strategyTag: 'hyperliquid', txType: 'swap',
               tokenIn: `${p.coin}-PERP-${p.side}`, amountIn: d.estimatedImpactUsd,
-              tokenOut: 'USDC', amountOut: 0,
+              tokenOut: 'USDC', amountOut: lossReceivedUsd,
               feeUsd: 0, txHash: r.txId, walletAddress: '',
               positionId: match?.id, status: 'confirmed',
               metadata: { reason: 'stop_loss', reasoning: d.reasoning },
@@ -902,9 +906,10 @@ export class CFOAgent extends BaseAgent {
             }
 
             if (orderStatus.status === 'MATCHED') {
-              // Order filled! Now close the position
+              // Order filled! Use actual fill price from CLOB, not stale mark-to-market
               const dbPos = await this.repo?.getPosition(pending.positionId);
-              const receivedUsd = dbPos ? (dbPos.currentValueUsd ?? 0) : 0;
+              const receivedUsd = orderStatus.receivedUsd
+                ?? (dbPos ? (dbPos.currentValueUsd ?? 0) : 0);
               const pnl = receivedUsd - pending.costBasisUsd;
               await this.positionManager?.closePosition(
                 pending.positionId, 0,
@@ -1048,10 +1053,12 @@ export class CFOAgent extends BaseAgent {
 
         const exitOrder = await polyMod.exitPosition(freshPos, 1.0);
         if (exitOrder.status === 'MATCHED') {
-          // Order was immediately filled — close the position
+          // Order was immediately filled — use actual sell price, not mark-to-market estimate
+          const fillReceivedUsd = exitOrder.sizeUsd ?? freshPos.currentValueUsd;
+          const fillPnl = fillReceivedUsd - dbPos.costBasisUsd;
           await this.positionManager.closePosition(
             action.positionId, freshPos.currentPrice,
-            exitOrder.transactionHash ?? exitOrder.orderId, freshPos.currentValueUsd,
+            exitOrder.transactionHash ?? exitOrder.orderId, fillReceivedUsd,
           );
           const onChainHash = exitOrder.transactionHash;
           const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
@@ -1060,13 +1067,13 @@ export class CFOAgent extends BaseAgent {
             : `CLOB Order: ${exitOrder.orderId.slice(0, 16)}…`;
           await notifyAdminForce(
             `🏦 CFO ${action.action}: ${dbPos.description.slice(0, 60)}\n` +
-            `P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Received: $${freshPos.currentValueUsd.toFixed(2)}\n` +
+            `P&L: ${fillPnl >= 0 ? '+' : ''}$${fillPnl.toFixed(2)} | Received: $${fillReceivedUsd.toFixed(2)}\n` +
             txLine,
           );
           await this.reportToSupervisor('alert', action.urgency as any, {
             event: 'cfo_position_closed', action: action.action,
-            pnlUsd: pnl, reason: action.reason,
-            message: `${action.action}: ${dbPos.description.slice(0, 60)} — PnL $${pnl.toFixed(2)}`,
+            pnlUsd: fillPnl, reason: action.reason,
+            message: `${action.action}: ${dbPos.description.slice(0, 60)} — PnL $${fillPnl.toFixed(2)}`,
           });
         } else if (exitOrder.status === 'LIVE') {
           // Order is on the book but not yet filled — track it for later confirmation
