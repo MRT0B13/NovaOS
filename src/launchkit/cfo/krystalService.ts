@@ -399,7 +399,8 @@ export interface ChainBalance {
   chainName: string;
   usdcBalance: number;        // Native USDC in human units
   usdcBridgedBalance: number; // Bridged USDC.e/USDC.E in human units
-  totalStableUsd: number;     // usdcBalance + usdcBridgedBalance
+  usdtBalance: number;        // USDT in human units
+  totalStableUsd: number;     // usdcBalance + usdcBridgedBalance + usdtBalance
   wethBalance: number;        // Wrapped native token (WETH/WMATIC) in human units
   wethValueUsd: number;       // wethBalance × native price
   nativeBalance: number;      // ETH/MATIC/AVAX etc. in human units
@@ -1216,46 +1217,94 @@ export async function openEvmLpPosition(
       try {
         const bridge = await import('./wormholeService.ts');
 
-        // Check if LI.FI is enabled and we have USDC on source chain
+        // Check if LI.FI is enabled
         if (!env.lifiEnabled) {
           logger.warn('[Krystal] Bridge funding skipped — LI.FI not enabled');
         } else {
-          const sourceUsdcAddr = bridge.resolveTokenAddress(bridgeFunding.sourceChainId, 'USDC');
-          if (sourceUsdcAddr) {
-            const sourceBalance = await bridge.getEvmTokenBalance(
-              bridgeFunding.sourceChainId,
-              sourceUsdcAddr,
+          // Scan all stablecoin variants on source chain (native USDC, USDC.e, USDT)
+          const srcChain = bridgeFunding.sourceChainId;
+          const stableCandidates: Array<{ symbol: string; addr: string; balance: number }> = [];
+
+          const nativeUsdcAddr = bridge.WELL_KNOWN_USDC[srcChain];
+          const bridgedUsdcAddr = BRIDGED_USDC[srcChain];
+          const usdtAddr = WELL_KNOWN_USDT[srcChain];
+
+          const [nativeUsdcBal, bridgedUsdcBal, usdtBal] = await Promise.all([
+            nativeUsdcAddr
+              ? bridge.getEvmTokenBalance(srcChain, nativeUsdcAddr, bridgeFunding.walletAddress)
+              : Promise.resolve(0),
+            bridgedUsdcAddr
+              ? bridge.getEvmTokenBalance(srcChain, bridgedUsdcAddr, bridgeFunding.walletAddress)
+              : Promise.resolve(0),
+            usdtAddr
+              ? bridge.getEvmTokenBalance(srcChain, usdtAddr, bridgeFunding.walletAddress)
+              : Promise.resolve(0),
+          ]);
+
+          if (nativeUsdcAddr && nativeUsdcBal > 0.5) stableCandidates.push({ symbol: 'USDC', addr: nativeUsdcAddr, balance: nativeUsdcBal });
+          if (bridgedUsdcAddr && bridgedUsdcBal > 0.5) stableCandidates.push({ symbol: 'USDC.e', addr: bridgedUsdcAddr, balance: bridgedUsdcBal });
+          if (usdtAddr && usdtBal > 0.5) stableCandidates.push({ symbol: 'USDT', addr: usdtAddr, balance: usdtBal });
+
+          // Also check native + WETH as funding sources (can bridge via LI.FI swap)
+          const nativePrice = await getNativeTokenPrice(srcChain);
+          const nativeBal = await bridge.getEvmNativeBalance(srcChain, bridgeFunding.walletAddress);
+          const nativeUsdValue = nativeBal * nativePrice;
+          const wethAddr = WRAPPED_NATIVE_ADDR[srcChain];
+          const wethBal = wethAddr
+            ? await bridge.getEvmTokenBalance(srcChain, wethAddr, bridgeFunding.walletAddress)
+            : 0;
+          const wethUsdValue = wethBal * nativePrice;
+
+          // Sort by balance descending — try the richest source first
+          stableCandidates.sort((a, b) => b.balance - a.balance);
+
+          // Build full funding candidates list (stables first, then WETH, then native)
+          type FundCandidate = { symbol: string; addr: string; balance: number; isNative?: boolean };
+          const allCandidates: FundCandidate[] = [...stableCandidates];
+          if (wethAddr && wethUsdValue > 1) allCandidates.push({ symbol: 'WETH', addr: wethAddr, balance: wethUsdValue });
+          if (nativeUsdValue > 5) allCandidates.push({ symbol: 'NATIVE', addr: '0x0000000000000000000000000000000000000000', balance: nativeUsdValue, isNative: true });
+
+          logger.info(`[Krystal] Source chain ${srcChain} funds: ${allCandidates.map(c => `${c.symbol}=$${c.balance.toFixed(2)}`).join(', ') || 'none'}`);
+
+          // Find a token with enough balance to cover the bridge
+          const bestSource = allCandidates.find(c => c.balance >= bridgeAmountUsd);
+          if (bestSource) {
+            // Destination: always bridge into native USDC on target chain
+            const destUsdcAddr = bridge.WELL_KNOWN_USDC[chainNumericId];
+            logger.info(`[Krystal] Bridging $${bridgeAmountUsd.toFixed(2)} ${bestSource.symbol} from chain ${srcChain} → chain ${chainNumericId}`);
+
+            // For non-stablecoin sources (ETH, WETH), bridge amount is in USD value, not token units
+            // LI.FI handles cross-token routing natively (ETH → USDC cross-chain)
+            const isStableSource = !bestSource.isNative && bestSource.symbol !== 'WETH';
+            const bridgeTokenSymbol = isStableSource ? bestSource.symbol : 'ETH';
+            const bridgeResult = await bridge.bridgeEvmToEvm(
+              srcChain,
+              chainNumericId,
+              bridgeTokenSymbol,
+              isStableSource ? bridgeAmountUsd : bridgeAmountUsd / nativePrice,  // convert $ to native units
               bridgeFunding.walletAddress,
+              wallet.address,
+              // Pass explicit addresses so LI.FI can handle cross-token routing
+              destUsdcAddr ? { fromTokenAddress: bestSource.addr, toTokenAddress: destUsdcAddr } : undefined,
             );
 
-            if (sourceBalance >= bridgeAmountUsd) {
-              // Bridge USDC to target chain (only the gap, not the full deploy)
-              const bridgeResult = await bridge.bridgeEvmToEvm(
-                bridgeFunding.sourceChainId,
-                chainNumericId,
-                'USDC',
-                bridgeAmountUsd,
-                bridgeFunding.walletAddress,
-                wallet.address,
+            if (bridgeResult.success && bridgeResult.txHash) {
+              const bridgeStatus = await bridge.awaitBridgeCompletion(
+                bridgeResult.txHash,
+                bridge.chainIdToName(srcChain),
               );
-
-              if (bridgeResult.success && bridgeResult.txHash) {
-                // Wait for bridge to complete (poll every 15s, max 5min)
-                const bridgeStatus = await bridge.awaitBridgeCompletion(
-                  bridgeResult.txHash,
-                  bridge.chainIdToName(bridgeFunding.sourceChainId),
-                );
-                if (bridgeStatus !== 'DONE') {
-                  logger.warn(`[Krystal] Bridge ${bridgeStatus} — proceeding with whatever balance is available`);
-                } else {
-                  logger.info(`[Krystal] Bridge completed — USDC now on chain ${chainNumericId}`);
-                }
+              if (bridgeStatus !== 'DONE') {
+                logger.warn(`[Krystal] Bridge ${bridgeStatus} — proceeding with whatever balance is available`);
               } else {
-                logger.warn(`[Krystal] Bridge failed: ${bridgeResult.error}`);
+                logger.info(`[Krystal] Bridge completed — USDC now on chain ${chainNumericId}`);
               }
             } else {
-              logger.warn(`[Krystal] Insufficient USDC on source chain: $${sourceBalance.toFixed(2)} < $${bridgeAmountUsd.toFixed(2)} needed`);
+              logger.warn(`[Krystal] Bridge failed: ${bridgeResult.error}`);
             }
+          } else {
+            // No single source covers the full amount — log total available
+            const totalAvailable = allCandidates.reduce((s, c) => s + c.balance, 0);
+            logger.warn(`[Krystal] Insufficient funds on source chain ${srcChain}: $${totalAvailable.toFixed(2)} available < $${bridgeAmountUsd.toFixed(2)} needed`);
           }
         }
       } catch (err) {
@@ -1334,8 +1383,85 @@ export async function openEvmLpPosition(
       logger.warn('[Krystal] Pre-position swap failed (non-fatal):', err);
     }
 
-    // Phase 3: Wrap native token if we have native balance but no WETH/WMATIC
-    // Handles cases where wallet has ETH/MATIC but the pool needs WETH/WMATIC
+    // Phase 2b: Swap native/WETH into pool tokens if no USDC is available on target chain
+    // This handles the common case: wallet has ETH/WETH but zero stables
+    try {
+      // Re-read after Phase 2
+      [bal0, bal1] = await Promise.all([
+        token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+        token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      ]);
+      const held0Usd = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+      const held1Usd = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+      const heldTotal = held0Usd + held1Usd;
+
+      // Only proceed if still underfunded after USDC swap attempts
+      if (heldTotal < deployUsd * 0.4) {
+        const swap = await import('./evmSwapService.ts');
+        const bridge = await import('./wormholeService.ts');
+
+        // Check WETH balance (already an ERC20, easy to swap)
+        const wethInfo = WRAPPED_NATIVE_ADDR[chainNumericId];
+        const wethBal = wethInfo
+          ? await bridge.getEvmTokenBalance(chainNumericId, wethInfo, wallet.address)
+          : 0;
+        const nativePrice = await getNativeTokenPrice(chainNumericId);
+        const wethUsd = wethBal * nativePrice;
+
+        // Check native balance
+        const nativeBal = await provider.getBalance(wallet.address);
+        const nativeBalHuman = Number(ethers.formatEther(nativeBal));
+        const gasReserve = 0.005;
+        const usableNative = Math.max(0, nativeBalHuman - gasReserve);
+        const nativeUsd = usableNative * nativePrice;
+
+        const totalFundableUsd = wethUsd + nativeUsd;
+        if (totalFundableUsd > 2) {
+          logger.info(`[Krystal] Phase 2b: No USDC — using native assets: WETH=$${wethUsd.toFixed(2)}, native=$${nativeUsd.toFixed(2)}`);
+          const halfTarget = deployUsd / 2;
+          const needToken0 = held0Usd < halfTarget * 0.3;
+          const needToken1 = held1Usd < halfTarget * 0.3;
+
+          // If we have WETH and need a pool token, swap WETH → pool token via LI.FI
+          if (wethInfo && wethBal > 0.0001) {
+            const t0IsWeth = pool.token0.address.toLowerCase() === wethInfo.toLowerCase();
+            const t1IsWeth = pool.token1.address.toLowerCase() === wethInfo.toLowerCase();
+
+            // Swap WETH into whichever pool token we need
+            // If WETH IS a pool token, swap into the OTHER token only
+            if (needToken0 && !t0IsWeth && wethUsd > 1) {
+              const swapAmt = Math.min(wethBal, (halfTarget - held0Usd) / nativePrice);
+              if (swapAmt > 0.0001) {
+                const result = await swap.executeEvmSwap(chainNumericId, wethInfo, pool.token0.address, swapAmt, pool.feeTier);
+                if (result.success) logger.info(`[Krystal] Swapped ${swapAmt.toFixed(4)} WETH → ${pool.token0.symbol}`);
+                else logger.warn(`[Krystal] Swap WETH→${pool.token0.symbol} failed: ${result.error}`);
+              }
+            }
+            if (needToken1 && !t1IsWeth && wethUsd > 1) {
+              // Re-check WETH balance (may have swapped some above)
+              const currentWeth = await bridge.getEvmTokenBalance(chainNumericId, wethInfo, wallet.address);
+              const swapAmt = Math.min(currentWeth, (halfTarget - held1Usd) / nativePrice);
+              if (swapAmt > 0.0001) {
+                const result = await swap.executeEvmSwap(chainNumericId, wethInfo, pool.token1.address, swapAmt, pool.feeTier);
+                if (result.success) logger.info(`[Krystal] Swapped ${swapAmt.toFixed(4)} WETH → ${pool.token1.symbol}`);
+                else logger.warn(`[Krystal] Swap WETH→${pool.token1.symbol} failed: ${result.error}`);
+              }
+            }
+          }
+
+          // If we still need funds, wrap native → WETH then swap into missing token
+          // (Phase 3 below handles wrapping when pool directly needs WETH/WMATIC,
+          //  but this handles a different case: pool doesn't have WETH but we need to
+          //  convert native → arbitrary token via WETH intermediate)
+        }
+      }
+    } catch (err) {
+      logger.warn('[Krystal] Phase 2b native/WETH swap failed (non-fatal):', err);
+    }
+
+    // Phase 3: Wrap native token → WETH/WMATIC
+    // Case A: Pool directly needs WETH/WMATIC and we have native
+    // Case B: Pool doesn't need WETH but we're underfunded — wrap native then swap WETH → pool tokens
     try {
       const WRAPPED_NATIVE: Record<number, { symbol: string; address: string }> = {
         1:     { symbol: 'WETH',   address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' },
@@ -1346,21 +1472,42 @@ export async function openEvmLpPosition(
         43114: { symbol: 'WAVAX',  address: '0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7' },
       };
 
+      // Re-read balances first
+      [bal0, bal1] = await Promise.all([
+        token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+        token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      ]);
+      const p3Held0Usd = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+      const p3Held1Usd = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+      const p3HeldTotal = p3Held0Usd + p3Held1Usd;
+
       const wrapped = WRAPPED_NATIVE[chainNumericId];
       if (wrapped) {
         const t0IsWrapped = pool.token0.address.toLowerCase() === wrapped.address.toLowerCase();
         const t1IsWrapped = pool.token1.address.toLowerCase() === wrapped.address.toLowerCase();
+        const poolNeedsWrapped = t0IsWrapped || t1IsWrapped;
 
-        if ((t0IsWrapped && Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0 < deployUsd * 0.2) ||
-            (t1IsWrapped && Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1 < deployUsd * 0.2)) {
+        // Determine if we should wrap native
+        const shouldWrapForPool = poolNeedsWrapped &&
+          ((t0IsWrapped && p3Held0Usd < deployUsd * 0.2) ||
+           (t1IsWrapped && p3Held1Usd < deployUsd * 0.2));
+        const shouldWrapForSwap = !poolNeedsWrapped && p3HeldTotal < deployUsd * 0.4;
+
+        if (shouldWrapForPool || shouldWrapForSwap) {
           const nativeBal = await provider.getBalance(wallet.address);
-          // Keep 0.005 native for gas, wrap the rest (up to deployUsd/2 worth)
+          // Keep 0.005 native for gas, wrap the rest (up to what we need)
           const gasReserve = ethers.parseEther('0.005');
           if (nativeBal > gasReserve) {
             const nativePrice = await getNativeTokenPrice(chainNumericId);
+
+            // How much to wrap: pool needs → half. Swap needs → full gap
+            const targetWrap = shouldWrapForPool
+              ? (deployUsd / 2) / nativePrice
+              : (deployUsd - p3HeldTotal) / nativePrice;
+
             const halfDeployWei = ethers.parseEther(String(Math.min(
               Number(ethers.formatEther(nativeBal - gasReserve)),
-              (deployUsd / 2) / nativePrice,
+              targetWrap,
             )));
 
             if (halfDeployWei > BigInt(0)) {
@@ -1370,6 +1517,30 @@ export async function openEvmLpPosition(
               await wrapTx.wait();
               const wrappedAmt = Number(ethers.formatEther(halfDeployWei));
               logger.info(`[Krystal] Wrapped ${wrappedAmt.toFixed(4)} native → ${wrapped.symbol} ($${(wrappedAmt * nativePrice).toFixed(2)})`);
+
+              // If pool doesn't need WETH directly, swap WETH → pool tokens
+              if (shouldWrapForSwap && wrappedAmt > 0) {
+                const swap = await import('./evmSwapService.ts');
+                const halfSwap = wrappedAmt / 2;
+                const need0 = p3Held0Usd < deployUsd * 0.2;
+                const need1 = p3Held1Usd < deployUsd * 0.2;
+
+                if (need0) {
+                  const amt = need1 ? halfSwap : wrappedAmt;
+                  const result = await swap.executeEvmSwap(chainNumericId, wrapped.address, pool.token0.address, amt, pool.feeTier);
+                  if (result.success) logger.info(`[Krystal] Swapped ${amt.toFixed(4)} ${wrapped.symbol} → ${pool.token0.symbol}`);
+                  else logger.warn(`[Krystal] Swap ${wrapped.symbol}→${pool.token0.symbol} failed: ${result.error}`);
+                }
+                if (need1) {
+                  const bridge = await import('./wormholeService.ts');
+                  const currentWeth = await bridge.getEvmTokenBalance(chainNumericId, wrapped.address, wallet.address);
+                  if (currentWeth > 0.0001) {
+                    const result = await swap.executeEvmSwap(chainNumericId, wrapped.address, pool.token1.address, currentWeth, pool.feeTier);
+                    if (result.success) logger.info(`[Krystal] Swapped ${currentWeth.toFixed(4)} ${wrapped.symbol} → ${pool.token1.symbol}`);
+                    else logger.warn(`[Krystal] Swap ${wrapped.symbol}→${pool.token1.symbol} failed: ${result.error}`);
+                  }
+                }
+              }
             }
           }
         }
@@ -1932,7 +2103,7 @@ async function getNativeTokenPrice(chainId: number): Promise<number> {
 /** Native token symbol per chain */
 const NATIVE_SYMBOLS: Record<number, string> = {
   1: 'ETH', 10: 'ETH', 42161: 'ETH', 8453: 'ETH', 59144: 'ETH', 534352: 'ETH', 81457: 'ETH',
-  137: 'MATIC', 56: 'BNB', 43114: 'AVAX', 324: 'ETH', 5000: 'MNT',
+  137: 'POL', 56: 'BNB', 43114: 'AVAX', 324: 'ETH', 5000: 'MNT',
 };
 
 /** Check if a token symbol is a stablecoin (for fee USD estimation) */
@@ -1949,6 +2120,17 @@ const BRIDGED_USDC: Record<number, string> = {
   42161: '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8', // Arbitrum USDC.e
   10:    '0x7F5c764cBc14f9669B88837ca1490cCa17c31607', // Optimism USDC.e
   43114: '0xA7D7079b0FEaD91F3e65f86E8915Cb59c1a4C664', // Avalanche USDC.e
+};
+
+// USDT addresses per chain (for balance tracking)
+const WELL_KNOWN_USDT: Record<number, string> = {
+  1:     '0xdAC17F958D2ee523a2206206994597C13D831ec7', // Ethereum
+  10:    '0x94b008aA00579c1307B0EF2c499aD98a8ce58e58', // Optimism
+  137:   '0xc2132D05D31c914a87C6611C10748AEb04B58e8F', // Polygon
+  8453:  '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2', // Base
+  42161: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', // Arbitrum
+  43114: '0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7', // Avalanche
+  56:    '0x55d398326f99059fF775485246999027B3197955', // BSC
 };
 
 // Wrapped native token addresses per chain (for balance tracking)
@@ -1983,15 +2165,19 @@ export async function getMultiChainEvmBalances(): Promise<ChainBalance[]> {
       const bridge = await import('./wormholeService.ts');
       const usdcAddr = bridge.WELL_KNOWN_USDC[chainId];
       const bridgedUsdcAddr = BRIDGED_USDC[chainId];
+      const usdtAddr = WELL_KNOWN_USDT[chainId];
       const wethAddr = WRAPPED_NATIVE_ADDR[chainId];
       const chainName = bridge.chainIdToName(chainId);
 
-      const [usdcBalance, usdcBridgedBalance, wethBalance, nativeBalance] = await Promise.all([
+      const [usdcBalance, usdcBridgedBalance, usdtBalance, wethBalance, nativeBalance] = await Promise.all([
         usdcAddr
           ? bridge.getEvmTokenBalance(chainId, usdcAddr, walletAddress)
           : Promise.resolve(0),
         bridgedUsdcAddr
           ? bridge.getEvmTokenBalance(chainId, bridgedUsdcAddr, walletAddress)
+          : Promise.resolve(0),
+        usdtAddr
+          ? bridge.getEvmTokenBalance(chainId, usdtAddr, walletAddress)
           : Promise.resolve(0),
         wethAddr
           ? bridge.getEvmTokenBalance(chainId, wethAddr, walletAddress)
@@ -2001,7 +2187,7 @@ export async function getMultiChainEvmBalances(): Promise<ChainBalance[]> {
 
       const nativePrice = await getNativeTokenPrice(chainId);
       const nativeSymbol = NATIVE_SYMBOLS[chainId] ?? 'ETH';
-      const totalStableUsd = usdcBalance + usdcBridgedBalance;
+      const totalStableUsd = usdcBalance + usdcBridgedBalance + usdtBalance;
       const wethValueUsd = wethBalance * nativePrice;
       const nativeValueUsd = nativeBalance * nativePrice;
 
@@ -2010,6 +2196,7 @@ export async function getMultiChainEvmBalances(): Promise<ChainBalance[]> {
         chainName,
         usdcBalance,
         usdcBridgedBalance,
+        usdtBalance,
         totalStableUsd,
         wethBalance,
         wethValueUsd,

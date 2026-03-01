@@ -291,6 +291,7 @@ export interface PortfolioState {
     chainName: string;
     usdcBalance: number;
     usdcBridgedBalance: number;
+    usdtBalance: number;
     totalStableUsd: number;
     wethBalance: number;
     wethValueUsd: number;
@@ -2238,17 +2239,24 @@ export async function generateDecisions(
         const learnedMinApr = env.krystalLpMinApr7d + (learned.lpMinAprAdjustment * learned.confidenceLevel);
 
         // Build set of chains where we actually have deployable value (stables + native + WETH >= $10)
+        // OR chains we can bridge to from a funded chain (any configured RPC chain)
         const fundedChainIds = new Set(
           state.evmChainBalances
             .filter(b => b.totalValueUsd >= 10)
             .map(b => b.chainId),
         );
+        // If any chain has enough to bridge, all configured chains are reachable
+        const totalCrossChainValue = state.evmChainBalances.reduce((s, b) => s + b.totalValueUsd, 0);
+        const bridgeReachable = totalCrossChainValue >= 20 && env.lifiEnabled;
+        const deployableChainIds = bridgeReachable
+          ? new Set([...fundedChainIds, ...Object.keys(env.evmRpcUrls).map(Number)])
+          : fundedChainIds;
 
         const eligible = pools.filter(p =>
           p.tvlUsd >= env.krystalLpMinTvlUsd &&
           p.apr7d >= learnedMinApr &&
           (env.evmRpcUrls[p.chainNumericId] || p.chainNumericId === 42161) &&
-          fundedChainIds.has(p.chainNumericId), // only deploy on chains where we have balance
+          deployableChainIds.has(p.chainNumericId), // deploy on funded chains OR bridge-reachable chains
         );
 
         // Check: not already in the same pool
@@ -2301,13 +2309,20 @@ export async function generateDecisions(
             continue;
           }
 
-          // Cap deploy to available value on the target chain (USDC + native token value)
+          // Cap deploy to available value: target chain local value + bridgeable value from other chains
           const targetChainBal = state.evmChainBalances.find(b => b.chainId === best.chainNumericId);
-          const targetChainValue = (targetChainBal?.usdcBalance ?? 0) + (targetChainBal?.nativeValueUsd ?? 0);
-          const deployUsd = Math.min(perTierMaxUsd, env.krystalLpMaxUsd, evmUsdcCap, targetChainValue * 0.9);
+          const targetChainLocalValue = targetChainBal?.totalValueUsd ?? 0;
+          // If target chain is underfunded, consider bridgeable funds from other chains (minus ~3% for bridge fees)
+          const otherChainsValue = bridgeReachable
+            ? state.evmChainBalances
+                .filter(b => b.chainId !== best.chainNumericId && b.totalValueUsd >= 5)
+                .reduce((s, b) => s + b.totalValueUsd, 0) * 0.97
+            : 0;
+          const effectiveValue = targetChainLocalValue + otherChainsValue;
+          const deployUsd = Math.min(perTierMaxUsd, env.krystalLpMaxUsd, evmUsdcCap, effectiveValue * 0.9);
 
           if (deployUsd < 15) {
-            krystalSkip(`${tier} tier: deploy amount too small ($${deployUsd.toFixed(0)})`);
+            krystalSkip(`${tier} tier: deploy amount too small ($${deployUsd.toFixed(0)}, local=$${targetChainLocalValue.toFixed(0)}, bridgeable=$${otherChainsValue.toFixed(0)})`);
             continue;
           }
 
@@ -2344,11 +2359,11 @@ export async function generateDecisions(
               riskTier: tier,
               chainName: best.chainName,
               pair: `${best.token0.symbol}/${best.token1.symbol}`,
-              // Bridge funding: pick the chain with the most stablecoin balance (if not same chain)
+              // Bridge funding: pick the chain with the most total value (stables + native + WETH)
               bridgeFunding: (() => {
                 const bestBal = state.evmChainBalances
-                  .filter(b => b.chainId !== best.chainNumericId && b.totalStableUsd >= deployUsd * 0.5)
-                  .sort((a, b) => b.totalStableUsd - a.totalStableUsd)[0];
+                  .filter(b => b.chainId !== best.chainNumericId && b.totalValueUsd >= deployUsd * 0.5)
+                  .sort((a, b) => b.totalValueUsd - a.totalValueUsd)[0];
                 if (bestBal && env.evmPrivateKey) {
                   return { sourceChainId: bestBal.chainId, walletAddress: '' };
                 }
@@ -3551,7 +3566,7 @@ export function formatDecisionReport(
     if (chainsWithValue.length > 0) {
       const chainParts = chainsWithValue.map(b => {
         const parts: string[] = [];
-        if (b.totalStableUsd > 0.5) parts.push(`$${b.totalStableUsd.toFixed(0)} USDC`);
+        if (b.totalStableUsd > 0.5) parts.push(`$${b.totalStableUsd.toFixed(0)} stables`);
         if (b.wethValueUsd > 0.5) parts.push(`$${b.wethValueUsd.toFixed(0)} W${b.nativeSymbol}`);
         if (b.nativeValueUsd > 0.5) parts.push(`$${b.nativeValueUsd.toFixed(0)} ${b.nativeSymbol}`);
         return `${b.chainName}: ${parts.join(' + ')} ($${b.totalValueUsd.toFixed(0)})`;
