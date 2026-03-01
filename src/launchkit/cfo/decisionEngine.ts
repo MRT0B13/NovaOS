@@ -880,7 +880,9 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
       // Conservative estimate: 15% if in-range, 0% if out-of-range
       const inRangePositions = positions.filter(p => p.inRange).length;
       orcaLpFeeApy = positions.length > 0 ? (inRangePositions / positions.length) * 0.15 : 0;
-    } catch { /* 0 */ }
+    } catch (orcaErr) {
+      logger.warn('[CFO] Orca position fetch failed:', orcaErr instanceof Error ? orcaErr.message : orcaErr);
+    }
   }
 
   // ── EVM Arb state ─────────────────────────────────────────────────────────

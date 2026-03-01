@@ -610,6 +610,8 @@ export async function getPositions(): Promise<OrcaPosition[]> {
         // PoolUtil.getTokenAmountsFromLiquidity returns the underlying token
         // amounts for the position's liquidity at the current pool price.
         let liquidityUsd = 0;
+        let unclaimedFeesSol = 0;
+        let unclaimedFeesUsdc = 0;
         try {
           const lowerSqrtPrice = PriceMath.tickIndexToSqrtPriceX64(data.tickLowerIndex);
           const upperSqrtPrice = PriceMath.tickIndexToSqrtPriceX64(data.tickUpperIndex);
@@ -629,18 +631,21 @@ export async function getPositions(): Promise<OrcaPosition[]> {
           const tokenAPriceUsd = tokenAIsStable ? 1 : (currentPrice > 0 ? solPriceUsd : 1);
           const tokenBPriceUsd = tokenBIsStable ? 1 : solPriceUsd;
           liquidityUsd = tokenAUi * tokenAPriceUsd + tokenBUi * tokenBPriceUsd;
-        } catch {
-          // Fallback: look up cost basis from DB
+        } catch (liqErr) {
+          logger.debug('[Orca] liquidityUsd calc failed, defaulting to 0:', liqErr);
           liquidityUsd = 0;
         }
 
         // ── Unclaimed fees from on-chain position data ──
-        // position.feeOwedA/B are the accumulated fees in raw token amounts
-        const feeOwedAUi = Number(data.feeOwedA.toString()) / (10 ** tokenADec);
-        const feeOwedBUi = Number(data.feeOwedB.toString()) / (10 ** tokenBDec);
-        // Convert to SOL/USDC denomination
-        const unclaimedFeesSol = feeOwedAUi;    // tokenA fees (in tokenA units, typically SOL)
-        const unclaimedFeesUsdc = feeOwedBUi;   // tokenB fees (in tokenB units, typically USDC)
+        // Wrapped in try/catch so fee-read failures don't kill the position scan
+        try {
+          const feeOwedAUi = Number(data.feeOwedA?.toString?.() ?? '0') / (10 ** tokenADec);
+          const feeOwedBUi = Number(data.feeOwedB?.toString?.() ?? '0') / (10 ** tokenBDec);
+          unclaimedFeesSol = feeOwedAUi;    // tokenA fees (in tokenA units, typically SOL)
+          unclaimedFeesUsdc = feeOwedBUi;   // tokenB fees (in tokenB units, typically USDC)
+        } catch (feeErr) {
+          logger.debug('[Orca] fee calc failed, defaulting to 0:', feeErr);
+        }
 
         result.push({
           positionMint: parsed.mint,
@@ -654,15 +659,19 @@ export async function getPositions(): Promise<OrcaPosition[]> {
           inRange,
           rangeUtilisationPct,
         });
-      } catch {
-        // Not a Whirlpool position or pool not found — skip
+      } catch (posErr) {
+        // Not a Whirlpool position or pool not found — skip silently
+        // Only log if it looks like a real position that failed
+        if (posErr instanceof Error && !posErr.message?.includes('Account does not exist')) {
+          logger.warn(`[Orca] getPositions: position error for mint=${parsed?.mint?.slice?.(0, 8)}: ${posErr.message}`);
+        }
         continue;
       }
     }
 
     return result;
   } catch (err) {
-    logger.debug('[Orca] getPositions error:', err);
+    logger.warn('[Orca] getPositions top-level error (returning []):', err);
     return [];
   }
 }
