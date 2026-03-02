@@ -3641,7 +3641,20 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
         // Reuse openEvmLpPosition with existingTokenId → calls increaseLiquidity instead of mint
         const result = await krystal.openEvmLpPosition(pool, deployUsd, 0, undefined, existingPosId);
-        if (result.success) markDecision('KRYSTAL_LP_INCREASE');
+        if (result.success) {
+          markDecision('KRYSTAL_LP_INCREASE');
+        } else {
+          const err = String(result.error ?? '').toLowerCase();
+          // Deterministic failures (ownership/metadata/revert preflight) should not be retried every cycle.
+          if (
+            err.includes('cannot increase #') ||
+            err.includes('would revert') ||
+            err.includes('position has zero liquidity') ||
+            err.includes('owner')
+          ) {
+            markDecision('KRYSTAL_LP_INCREASE');
+          }
+        }
         return {
           ...base,
           executed: true,

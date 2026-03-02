@@ -147,6 +147,7 @@ const NFPM_ABI = [
   'function mint((address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, address recipient, uint256 deadline)) returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
   'function increaseLiquidity((uint256 tokenId, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint128 liquidity, uint256 amount0, uint256 amount1)',
   'function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
+  'function ownerOf(uint256 tokenId) view returns (address)',
   'function decreaseLiquidity((uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint256 amount0, uint256 amount1)',
   'function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)',
   'function burn(uint256 tokenId)',
@@ -162,6 +163,7 @@ const AERODROME_NFPM_ABI = [
   'function mint((address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, address recipient, uint256 deadline, uint160 sqrtPriceX96)) returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
   'function increaseLiquidity((uint256 tokenId, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint128 liquidity, uint256 amount0, uint256 amount1)',
   'function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
+  'function ownerOf(uint256 tokenId) view returns (address)',
   'function decreaseLiquidity((uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint256 amount0, uint256 amount1)',
   'function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)',
   'function burn(uint256 tokenId)',
@@ -849,7 +851,24 @@ export async function fetchKrystalPositions(
           if (!nfpmAddr) continue; // no NFPM on this chain — skip on-chain reads
           const nfpmAbi = protoResolved ? getNfpmAbiForProtocol(protoResolved.def.abi) : NFPM_ABI;
           const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, provider);
-          const posData = await nfpm.positions(posId);
+          const [posData, ownerOnChain] = await Promise.all([
+            nfpm.positions(posId),
+            nfpm.ownerOf(posId),
+          ]);
+
+          // Guard: Krystal/API can occasionally return stale/non-owned entries.
+          // Skip anything not owned by the CFO wallet to avoid repeated increase reverts.
+          if (String(ownerOnChain).toLowerCase() !== ownerAddress.toLowerCase()) {
+            logger.debug(`[Krystal] Skip position ${posId} on ${name}: owner mismatch (${ownerOnChain})`);
+            continue;
+          }
+
+          const liquidity = BigInt(posData.liquidity ?? posData[7] ?? 0);
+          if (liquidity === 0n) {
+            logger.debug(`[Krystal] Skip position ${posId} on ${name}: on-chain liquidity is zero`);
+            continue;
+          }
+
           tickLower = Number(posData.tickLower ?? posData[5] ?? 0);
           tickUpper = Number(posData.tickUpper ?? posData[6] ?? 0);
           feeTier = Number(posData.fee ?? posData[4] ?? 0);
@@ -941,7 +960,17 @@ export async function fetchKrystalPositions(
           const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, provider);
 
           // Read position data from NFPM
-          const posData = await nfpm.positions(dbRec.posId);
+          const [posData, ownerOnChain] = await Promise.all([
+            nfpm.positions(dbRec.posId),
+            nfpm.ownerOf(dbRec.posId),
+          ]);
+
+          // Guard stale DB rows: only keep positions still owned by this wallet.
+          if (String(ownerOnChain).toLowerCase() !== ownerAddress.toLowerCase()) {
+            logger.info(`[Krystal] Skipping DB position ${dbRec.posId}: owner is ${ownerOnChain}, not ${ownerAddress}`);
+            continue;
+          }
+
           const liquidity = BigInt(posData.liquidity ?? posData[7] ?? 0);
 
           // If liquidity is 0, position has been closed on-chain
@@ -1782,6 +1811,46 @@ export async function openEvmLpPosition(
     let receipt: any;
 
     if (existingTokenId) {
+      // Validate existing position ownership + metadata to avoid opaque reverts.
+      try {
+        const [posData, ownerOnChain] = await Promise.all([
+          nfpmContract.positions(existingTokenId),
+          nfpmContract.ownerOf(existingTokenId),
+        ]);
+
+        if (String(ownerOnChain).toLowerCase() !== wallet.address.toLowerCase()) {
+          return {
+            success: false,
+            error: `Cannot increase #${existingTokenId}: wallet ${wallet.address} is not owner (${ownerOnChain})`,
+          };
+        }
+
+        const posLiquidity = BigInt(posData.liquidity ?? posData[7] ?? 0);
+        if (posLiquidity === 0n) {
+          return {
+            success: false,
+            error: `Cannot increase #${existingTokenId}: position has zero liquidity (already closed)`,
+          };
+        }
+
+        const posToken0 = String(posData.token0 ?? posData[2] ?? '').toLowerCase();
+        const posToken1 = String(posData.token1 ?? posData[3] ?? '').toLowerCase();
+        if (
+          posToken0 && posToken1 &&
+          (posToken0 !== sorted0Addr.toLowerCase() || posToken1 !== sorted1Addr.toLowerCase())
+        ) {
+          return {
+            success: false,
+            error:
+              `Cannot increase #${existingTokenId}: position tokens (${posToken0}/${posToken1}) ` +
+              `do not match target pool (${sorted0Addr.toLowerCase()}/${sorted1Addr.toLowerCase()})`,
+          };
+        }
+      } catch (preErr) {
+        const reason = (preErr as any)?.reason ?? (preErr as Error).message;
+        return { success: false, error: `Cannot increase #${existingTokenId}: on-chain preflight failed: ${reason}` };
+      }
+
       // ── increaseLiquidity: add funds to existing position NFT ──
       const increaseParams = {
         tokenId: BigInt(existingTokenId),
