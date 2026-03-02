@@ -3417,28 +3417,64 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       case 'KAMINO_BORROW_LP': {
         // Step 1: Borrow USDC from Kamino
         const kamino = await import('./kaminoService.ts');
-        const { borrowUsd, usdcAmount, solAmount, rangeWidthPct } = decision.params;
+        const {
+          borrowUsd, usdcAmount, solAmount, rangeWidthPct,
+          tokenA, tokenAMint, tokenB, tokenBMint,
+          whirlpoolAddress, tokenADecimals, tokenBDecimals, tickSpacing: poolTickSpacing,
+          pair,
+        } = decision.params;
         const borrowResult = await kamino.borrow('USDC', borrowUsd);
         if (!borrowResult.success) {
           return { ...base, executed: true, success: false, error: `Borrow failed: ${borrowResult.error}` };
         }
         logger.info(`[CFO] KAMINO_BORROW_LP step 1: borrowed $${borrowUsd.toFixed(0)} USDC | tx: ${borrowResult.txSignature}`);
 
-        // Step 2: Swap half of USDC to SOL for the LP's A-side
-        const jupMod = await import('./jupiterService.ts');
-        const swapResult = await jupMod.swapUsdcToSol(usdcAmount, 100); // 1% slippage for safety
-        if (!swapResult.success) {
-          // Borrow succeeded but swap failed — repay the USDC to unwind
-          logger.warn(`[CFO] KAMINO_BORROW_LP swap failed — repaying borrowed USDC`);
-          await kamino.repay('USDC', borrowUsd * 0.995).catch(() => {});
-          return { ...base, executed: true, success: false, error: `Swap USDC→SOL failed: ${swapResult.error}` };
+        // Register decimals + symbols for this pool so orcaService can read positions correctly
+        if (whirlpoolAddress && tokenADecimals != null && tokenBDecimals != null) {
+          const orcaSvc = await import('./orcaService.ts');
+          orcaSvc.registerPoolDecimals(whirlpoolAddress, tokenADecimals, tokenBDecimals, tokenA, tokenB);
         }
-        const solReceived = swapResult.outputAmount || solAmount;
-        logger.info(`[CFO] KAMINO_BORROW_LP step 2: swapped $${usdcAmount.toFixed(0)} USDC → ${solReceived.toFixed(4)} SOL`);
 
-        // Step 3: Open Orca concentrated LP with both sides
+        // Step 2: Swap half of USDC → tokenA for the LP's A-side.
+        // tokenA might be SOL, KMNO, BONK, WIF, etc. — use the correct swap path.
+        const jupMod = await import('./jupiterService.ts');
+        const isTokenASol = !tokenAMint || tokenA === 'SOL' || tokenAMint === jupMod.MINTS.SOL;
+        let tokenAReceived: number;
+
+        if (isTokenASol) {
+          // Classic path: USDC → SOL
+          const swapResult = await jupMod.swapUsdcToSol(usdcAmount, 100);
+          if (!swapResult.success) {
+            logger.warn(`[CFO] KAMINO_BORROW_LP swap USDC→SOL failed — repaying borrowed USDC`);
+            await kamino.repay('USDC', borrowUsd * 0.995).catch(() => {});
+            return { ...base, executed: true, success: false, error: `Swap USDC→SOL failed: ${swapResult.error}` };
+          }
+          tokenAReceived = swapResult.outputAmount || solAmount;
+          logger.info(`[CFO] KAMINO_BORROW_LP step 2: swapped $${usdcAmount.toFixed(0)} USDC → ${tokenAReceived.toFixed(4)} SOL`);
+        } else {
+          // Non-SOL tokenA (KMNO, BONK, WIF, etc.) — swap USDC → tokenA via Jupiter generic route
+          const quote = await jupMod.getQuote(jupMod.MINTS.USDC, tokenAMint, usdcAmount, 100);
+          if (!quote) {
+            logger.warn(`[CFO] KAMINO_BORROW_LP swap USDC→${tokenA} quote failed — repaying borrowed USDC`);
+            await kamino.repay('USDC', borrowUsd * 0.995).catch(() => {});
+            return { ...base, executed: true, success: false, error: `Swap USDC→${tokenA} quote failed` };
+          }
+          const swapResult = await jupMod.executeSwap(quote, { maxPriceImpactPct: 3 });
+          if (!swapResult.success) {
+            logger.warn(`[CFO] KAMINO_BORROW_LP swap USDC→${tokenA} failed — repaying borrowed USDC`);
+            await kamino.repay('USDC', borrowUsd * 0.995).catch(() => {});
+            return { ...base, executed: true, success: false, error: `Swap USDC→${tokenA} failed: ${swapResult.error}` };
+          }
+          tokenAReceived = swapResult.outputAmount;
+          logger.info(`[CFO] KAMINO_BORROW_LP step 2: swapped $${usdcAmount.toFixed(0)} USDC → ${tokenAReceived.toFixed(4)} ${tokenA}`);
+        }
+
+        // Step 3: Open Orca concentrated LP on the target pool (not hardcoded SOL/USDC)
         const orca = await import('./orcaService.ts');
-        const lpResult = await orca.openPosition(usdcAmount, solReceived, rangeWidthPct);
+        const lpResult = await orca.openPosition(
+          usdcAmount, tokenAReceived, rangeWidthPct,
+          whirlpoolAddress, tokenADecimals ?? 9, tokenBDecimals ?? 6, poolTickSpacing,
+        );
         if (!lpResult.success) {
           // Swap succeeded but LP failed — we have SOL + USDC sitting in wallet.
           // Mark cooldown immediately so the next cycle doesn't borrow again on top.
@@ -3447,7 +3483,14 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           // Attempt to unwind: swap the SOL we received back to USDC, then repay Kamino.
           let unwindNote = 'Unwind not attempted';
           try {
-            const jupUnwind = await jupMod.swapSolToUsdc(solReceived * 0.99, 100); // 1% buffer for gas
+            // Unwind: swap tokenA back to USDC (SOL or arbitrary token)
+            const jupUnwind = isTokenASol
+              ? await jupMod.swapSolToUsdc(tokenAReceived * 0.99, 100)
+              : await (async () => {
+                  const q = await jupMod.getQuote(tokenAMint!, jupMod.MINTS.USDC, tokenAReceived * 0.99, 100);
+                  if (!q) return { success: false, inputMint: tokenAMint!, outputMint: jupMod.MINTS.USDC, inputAmount: tokenAReceived, outputAmount: 0, priceImpactPct: 0, error: 'No unwind quote' } as typeof jupMod extends { swapSolToUsdc: (...a: any[]) => Promise<infer R> } ? R : never;
+                  return jupMod.executeSwap(q);
+                })();
             if (jupUnwind.success) {
               const usdcRecovered = jupUnwind.outputAmount ?? 0;
               const repayAmt = Math.min(usdcRecovered + usdcAmount, borrowUsd);
