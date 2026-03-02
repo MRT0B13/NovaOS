@@ -325,15 +325,21 @@ async function executeLifiEvmRoute(quote: BridgeQuote, fromPrivateKey: string): 
 
     lifi.createConfig({ integrator: 'nova-cfo' });
 
-    const execution = await lifi.executeRoute(quote.rawRoute as any, {
+    // LI.FI /quote returns a single Step, but executeRoute expects a Route
+    // with steps[]. Wrap the raw quote in a route structure if needed.
+    const rawRoute = quote.rawRoute as any;
+    const route = rawRoute.steps ? rawRoute : { ...rawRoute, steps: [rawRoute] };
+
+    const execution = await lifi.executeRoute(route, {
       updateRouteHook: (updatedRoute: any) => {
-        const step = updatedRoute.steps?.[0];
+        const step = updatedRoute?.steps?.[0];
         logger.debug(`[Bridge] Step status: ${step?.execution?.status}`);
       },
     });
 
-    const lastStep = (execution as any).steps?.at(-1);
-    const txHash = lastStep?.execution?.process?.at(-1)?.txHash;
+    const lastStep = (execution as any)?.steps?.at(-1);
+    const txHash = lastStep?.execution?.process?.at(-1)?.txHash
+      ?? (execution as any)?.execution?.process?.at(-1)?.txHash;
 
     logger.info(`[Bridge] Bridge tx submitted: ${txHash}`);
 

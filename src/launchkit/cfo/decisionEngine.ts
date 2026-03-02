@@ -2459,6 +2459,7 @@ export async function generateDecisions(
   // Safety: tiny capacity fraction (20%), strict LTV cap, large spread requirement,
   //         APPROVAL tier. The CFO should never go crazy with borrowed money.
   //
+  let _borrowLpLastSkip = '';
   if (
     env.kaminoBorrowLpEnabled &&
     env.orcaLpEnabled &&
@@ -2466,8 +2467,10 @@ export async function generateDecisions(
     intel.marketCondition !== 'bearish' &&
     intel.marketCondition !== 'danger'
   ) {
-    const borrowLpSkip = (reason: string) =>
+    const borrowLpSkip = (reason: string) => {
+      _borrowLpLastSkip = reason;
       logger.debug(`[CFO:Decision] Section K skip: ${reason}`);
+    };
 
     const anyLoopActive = state.kaminoJitoLoopActive || !!state.kaminoActiveLstLoop;
     if (!anyLoopActive && state.kaminoDepositValueUsd < 10) {
@@ -2800,26 +2803,9 @@ export async function generateDecisions(
       if (decisions.some(d => d.type === 'KAMINO_BORROW_LP')) diag.push('BorrowLP:✓');
       else if (!env.orcaLpEnabled) diag.push('BorrowLP:orca-off');
       else if (!env.kaminoBorrowEnabled) diag.push('BorrowLP:borrow-off');
-      else if (state.kaminoDepositValueUsd < 10 && !state.kaminoJitoLoopActive && !state.kaminoActiveLstLoop) diag.push('BorrowLP:no-collateral');
-      else if (state.kaminoHealthFactor < 2.0) diag.push(`BorrowLP:HF=${state.kaminoHealthFactor.toFixed(2)}`);
-      else if (state.orcaPositions.length >= env.orcaLpMaxPositions) diag.push(`BorrowLP:max-pos`);
-      else if (!checkCooldown('KAMINO_BORROW_LP', 4 * 3600_000)) {
-        const lastTs = lastDecisionAt['KAMINO_BORROW_LP'] ?? 0;
-        const minsLeft = lastTs ? Math.ceil((lastTs + 4 * 3600_000 - Date.now()) / 60_000) : 0;
-        diag.push(`BorrowLP:cooldown(${minsLeft}m left)`);
-      } else if (state.kaminoLtv >= (env.kaminoBorrowLpMaxLtvPct / 100) * 0.90) {
-        diag.push(`BorrowLP:LTV-cap(${(state.kaminoLtv * 100).toFixed(1)}%≥${(env.kaminoBorrowLpMaxLtvPct * 0.90).toFixed(0)}%)`);
-      } else {
-        // Spread check diagnostic
-        const borrowCostD = state.kaminoBorrowApy > 0 ? state.kaminoBorrowApy : 0.08;
-        const spreadD = (0.15 - borrowCostD) * 100;
-        const minSpread = env.kaminoBorrowLpMinSpreadPct ?? 5;
-        if (spreadD < minSpread) {
-          diag.push(`BorrowLP:spread(${spreadD.toFixed(1)}%<${minSpread}%)`);
-        } else {
-          diag.push(`BorrowLP:no-pools`);
-        }
-      }
+      else if (intel.marketCondition === 'bearish' || intel.marketCondition === 'danger') diag.push(`BorrowLP:market-${intel.marketCondition}`);
+      else if (_borrowLpLastSkip) diag.push(`BorrowLP:${_borrowLpLastSkip}`);
+      else diag.push('BorrowLP:skip(unknown)');
     }
 
     // Add active decisions to summary
