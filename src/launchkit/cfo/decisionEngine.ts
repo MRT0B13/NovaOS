@@ -3441,9 +3441,28 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const lpResult = await orca.openPosition(usdcAmount, solReceived, rangeWidthPct);
         if (!lpResult.success) {
           // Swap succeeded but LP failed — we have SOL + USDC sitting in wallet.
-          // Don't auto-repay; admin can decide. Log prominently.
-          logger.error(`[CFO] KAMINO_BORROW_LP LP open failed after borrow+swap — manual intervention needed`);
-          return { ...base, executed: true, success: false, error: `LP open failed: ${lpResult.error}. Borrowed USDC is in wallet.` };
+          // Mark cooldown immediately so the next cycle doesn't borrow again on top.
+          markDecision('KAMINO_BORROW_LP');
+          logger.error(`[CFO] KAMINO_BORROW_LP LP open failed after borrow+swap — attempting auto-unwind`);
+          // Attempt to unwind: swap the SOL we received back to USDC, then repay Kamino.
+          let unwindNote = 'Unwind not attempted';
+          try {
+            const jupUnwind = await jupMod.swapSolToUsdc(solReceived * 0.99, 100); // 1% buffer for gas
+            if (jupUnwind.success) {
+              const usdcRecovered = jupUnwind.outputAmount ?? 0;
+              const repayAmt = Math.min(usdcRecovered + usdcAmount, borrowUsd);
+              const repay = await kamino.repay('USDC', repayAmt * 0.995); // tiny fee buffer
+              unwindNote = repay.success
+                ? `Auto-unwind OK: repaid $${repayAmt.toFixed(2)} USDC`
+                : `Swap OK but repay failed: ${repay.error} — manual repay needed`;
+            } else {
+              unwindNote = `Unwind swap failed: ${jupUnwind.error} — SOL+USDC remain in wallet, manual repay needed`;
+            }
+          } catch (unwindErr) {
+            unwindNote = `Unwind error: ${(unwindErr as Error).message} — manual repay needed`;
+          }
+          logger.error(`[CFO] KAMINO_BORROW_LP ${unwindNote}`);
+          return { ...base, executed: true, success: false, error: `LP open failed: ${lpResult.error}. ${unwindNote}` };
         }
 
         markDecision('KAMINO_BORROW_LP');

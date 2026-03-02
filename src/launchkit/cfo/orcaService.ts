@@ -262,9 +262,13 @@ export async function openPosition(
       effectiveTickSpacing,
     );
 
-    // Build liquidity quote — pick the token with the larger USD value as input
-    const tokenAInputBN = new BN(Math.floor(tokenAAmount * (10 ** tokenADecimals)));
-    const usdcInputBN = new BN(Math.floor(usdcAmount * (10 ** tokenBDecimals)));
+    // Build liquidity quote — pick the token with the larger USD value as input.
+    // Apply a 1.5% safety haircut so that tokenMax (estimate × 1.01 slippage) stays
+    // comfortably below the actual wallet balance. We only ever use ~98.5% of each
+    // side; the tiny dust remainder stays in the wallet.
+    const LP_INPUT_SAFETY = 0.985;
+    const tokenAInputBN = new BN(Math.floor(tokenAAmount * LP_INPUT_SAFETY * (10 ** tokenADecimals)));
+    const usdcInputBN = new BN(Math.floor(usdcAmount * LP_INPUT_SAFETY * (10 ** tokenBDecimals)));
 
     // Use whichever side the user provided more of (by USD-equivalent)
     const tokenAValueUsd = tokenAAmount * currentPrice;
@@ -610,9 +614,48 @@ export async function rebalancePosition(
     return { success: true, txSignature: closeResult.txSignature, valueRecoveredUsd: 0, usdcReceived, solReceived };
   }
 
-  // Step 2: Reopen centred on current price using the tokens we got back
-  logger.info(`[Orca] Rebalance: reopening with ${solReceived.toFixed(6)} SOL + ${usdcReceived.toFixed(4)} USDC (≈$${valueRecoveredUsd.toFixed(2)})`);
-  const openResult = await openPosition(usdcReceived, solReceived, width, whirlpoolAddress);
+  // Step 2: Pre-swap to rebalance proceeds — openPosition needs BOTH sides.
+  // If the old position was fully out-of-range it closes with only one token.
+  // We swap ~half back here so openPosition only deposits what came FROM this
+  // position and never inadvertently draws extra SOL/USDC from the wallet.
+  let finalUsdc = usdcReceived;
+  let finalSol  = solReceived;
+  const MIN_SOL_SIDE  = 0.001;   // less than this → swap half USDC→SOL
+  const MIN_USDC_SIDE = 0.50;    // less than this → swap half SOL→USDC
+  try {
+    const jup = await import('./jupiterService.ts');
+    if (finalSol < MIN_SOL_SIDE && finalUsdc > MIN_USDC_SIDE) {
+      // Position closed all-USDC (price went above range) — swap half to SOL
+      const swapAmt = finalUsdc * 0.49; // 49% → SOL, leave 51% as USDC for other side
+      logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(4)} USDC → SOL (position was all-USDC)`);
+      const swapRes = await jup.swapUsdcToSol(swapAmt, 100);
+      if (swapRes.success && (swapRes.outputAmount ?? 0) > 0) {
+        finalSol  = swapRes.outputAmount ?? 0;
+        finalUsdc = finalUsdc - swapAmt;
+        logger.info(`[Orca] Rebalance pre-swap done: ${finalSol.toFixed(6)} SOL | ${finalUsdc.toFixed(4)} USDC`);
+      } else {
+        logger.warn(`[Orca] Rebalance pre-swap failed (${swapRes.error}) — proceeding with USDC-only open`);
+      }
+    } else if (finalUsdc < MIN_USDC_SIDE && finalSol > 0.002) {
+      // Position closed all-SOL (price fell below range) — swap half to USDC
+      const swapAmt = finalSol * 0.49;
+      logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(6)} SOL → USDC (position was all-SOL)`);
+      const swapRes = await jup.swapSolToUsdc(swapAmt, 100);
+      if (swapRes.success && (swapRes.outputAmount ?? 0) > 0) {
+        finalUsdc = swapRes.outputAmount ?? 0;
+        finalSol  = finalSol - swapAmt;
+        logger.info(`[Orca] Rebalance pre-swap done: ${finalSol.toFixed(6)} SOL | ${finalUsdc.toFixed(4)} USDC`);
+      } else {
+        logger.warn(`[Orca] Rebalance pre-swap failed (${swapRes.error}) — proceeding with SOL-only open`);
+      }
+    }
+  } catch (swapErr) {
+    logger.warn(`[Orca] Rebalance pre-swap error: ${(swapErr as Error).message} — continuing with close proceeds as-is`);
+  }
+
+  // Step 3: Reopen centred on current price using only the proceeds from the closed position
+  logger.info(`[Orca] Rebalance: reopening with ${finalSol.toFixed(6)} SOL + ${finalUsdc.toFixed(4)} USDC (≈$${valueRecoveredUsd.toFixed(2)})`);
+  const openResult = await openPosition(finalUsdc, finalSol, width, whirlpoolAddress);
   if (!openResult.success) {
     return { success: false, error: `Reopen failed: ${openResult.error} (closed OK, funds in wallet)`, valueRecoveredUsd, usdcReceived, solReceived };
   }
