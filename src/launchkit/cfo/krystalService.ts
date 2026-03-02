@@ -779,7 +779,13 @@ export async function fetchKrystalPositions(
       rawPositions = Array.isArray(data) ? data : (data?.positions ?? []);
       if (!Array.isArray(rawPositions)) rawPositions = [];
     } catch (apiErr) {
-      logger.warn('[Krystal] Positions API failed, will try on-chain fallback:', apiErr);
+      // Expected timeout — on-chain fallback handles it fine
+      const errName = (apiErr as any)?.name ?? '';
+      if (errName === 'TimeoutError' || errName === 'AbortError') {
+        logger.debug(`[Krystal] Positions API timed out, using on-chain fallback`);
+      } else {
+        logger.warn('[Krystal] Positions API failed, will try on-chain fallback:', apiErr);
+      }
     }
 
     // Build lookup from DB records for openedAt timestamps
