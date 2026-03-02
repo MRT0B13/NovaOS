@@ -2543,8 +2543,8 @@ export async function generateDecisions(
       const borrowCost = state.kaminoBorrowApy > 0 ? state.kaminoBorrowApy : 0.08;
       const spreadPct = (estimatedLpFeeApy - borrowCost) * 100;
 
-      if (totalBorrowBudget < 20) {
-        borrowLpSkip(`borrow amount $${totalBorrowBudget.toFixed(0)} too small (need ≥$20)`);
+      if (totalBorrowBudget < 10) {
+        borrowLpSkip(`borrow amount $${totalBorrowBudget.toFixed(0)} too small (need ≥$10)`);
       } else if (spreadPct < (env.kaminoBorrowLpMinSpreadPct ?? 5)) {
         borrowLpSkip(`spread ${spreadPct.toFixed(1)}% < min ${env.kaminoBorrowLpMinSpreadPct ?? 5}% (LP ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow ~${(borrowCost * 100).toFixed(0)}%)`);
       } else {
@@ -2577,6 +2577,7 @@ export async function generateDecisions(
         const slotsAvailable = env.orcaLpMaxPositions - state.orcaPositions.length;
         const perTierBudget = totalBorrowBudget / Math.max(enabledTiers.length, 1);
         let tiersOpened = 0;
+        let budgetUsed = 0;   // track actual spend, not pre-allocated slots
 
         for (const tier of enabledTiers) {
           if (tiersOpened >= slotsAvailable) break;
@@ -2601,8 +2602,10 @@ export async function generateDecisions(
 
           const tierRangeMult = ORCA_TIER_RANGE_MULT_K[tier] ?? 1.0;
           const learnedTierMult = learned.lpTierRangeMultipliers?.[tier] ?? 1.0;
-          const borrowUsd = Math.min(perTierBudget, totalBorrowBudget - tiersOpened * perTierBudget);
-          if (borrowUsd < 15) {
+          // Budget: use per-tier share OR all remaining budget (rolls over from skipped tiers)
+          const remainingBudget = totalBorrowBudget - budgetUsed;
+          const borrowUsd = Math.min(perTierBudget, remainingBudget);
+          if (borrowUsd < 10) {
             borrowLpSkip(`${tier} tier: borrow amount $${borrowUsd.toFixed(0)} too small`);
             continue;
           }
@@ -2656,6 +2659,7 @@ export async function generateDecisions(
             tier: 'APPROVAL',   // ALWAYS require admin approval for borrowed money
           });
           tiersOpened++;
+          budgetUsed += borrowUsd;
 
           logger.info(
             `[CFO:Decision] Section K: KAMINO_BORROW_LP [${tier}] — borrow $${borrowUsd.toFixed(0)} → ${pair} LP ` +

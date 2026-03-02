@@ -305,7 +305,16 @@ async function executeLifiEvmRoute(quote: BridgeQuote, fromPrivateKey: string): 
 
   try {
     const lifi = await import('@lifi/sdk');
-    const ethers = await import('ethers');
+    const { createWalletClient, http } = await import('viem');
+    const { privateKeyToAccount } = await import('viem/accounts');
+    const { mainnet, optimism, bsc, polygon, arbitrum, avalanche, base, zksync, linea, scroll, mantle, blast } = await import('viem/chains');
+
+    // Map numeric chain IDs to viem chain objects
+    const viemChains: Record<number, any> = {
+      1: mainnet, 10: optimism, 56: bsc, 137: polygon,
+      42161: arbitrum, 43114: avalanche, 8453: base, 324: zksync,
+      59144: linea, 534352: scroll, 5000: mantle, 81457: blast,
+    };
 
     // Use dynamic provider from krystalService (covers all configured chains)
     const fromChainId = WELL_KNOWN_CHAIN_IDS[quote.fromChain] ?? 137;
@@ -320,10 +329,36 @@ async function executeLifiEvmRoute(quote: BridgeQuote, fromPrivateKey: string): 
         ? getCFOEnv().polygonRpcUrl
         : getCFOEnv().arbitrumRpcUrl;
     }
-    const provider = new ethers.JsonRpcProvider(rpcUrl);
-    const signer = new ethers.Wallet(fromPrivateKey, provider);
 
-    lifi.createConfig({ integrator: 'nova-cfo' });
+    const account = privateKeyToAccount(fromPrivateKey.startsWith('0x') ? fromPrivateKey as `0x${string}` : `0x${fromPrivateKey}`);
+
+    // Helper: build a viem WalletClient for a given chain ID
+    const buildWalletClient = (chainId: number, transportUrl?: string) => {
+      const chain = viemChains[chainId] ?? { ...mainnet, id: chainId };
+      // Resolve RPC: explicit env, fallback to known, or chain default
+      let url = transportUrl;
+      if (!url) {
+        try { url = getCFOEnv().evmRpcUrls[chainId]; } catch { /* ignore */ }
+      }
+      return createWalletClient({
+        account,
+        chain,
+        transport: http(url),
+      });
+    };
+
+    const walletClient = buildWalletClient(fromChainId, rpcUrl);
+
+    // Register the EVM execution provider with LI.FI so it can sign txs
+    lifi.createConfig({
+      integrator: 'nova-cfo',
+      providers: [
+        lifi.EVM({
+          getWalletClient: async () => walletClient,
+          switchChain: async (chainId: number) => buildWalletClient(chainId),
+        }),
+      ],
+    });
 
     // LI.FI /quote returns a single Step, but executeRoute expects a Route
     // with steps[]. Wrap the raw quote in a route structure if needed.
