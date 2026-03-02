@@ -3706,9 +3706,9 @@ function _humanAction(d: Decision, state: PortfolioState): string {
       return `<b>Close Orca LP</b> — withdrawing ${p.pair ?? 'LP'} position`;
     case 'KAMINO_BORROW_LP':
       if (p.blocked) {
-        return `⏸ <b>Borrow→LP waiting</b> — ${p.blockReason === 'no_collateral' ? 'needs Jito loop collateral first' : 'blocked'}. Would borrow $${p.borrowUsd?.toFixed(0) ?? '?'} → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
+        return `⏸ <b>Borrow→LP waiting</b> — ${p.blockReason === 'no_collateral' ? 'needs Jito loop collateral first' : 'blocked'}. Would borrow $${p.borrowUsd?.toFixed(0) ?? '?'} → ${p.pair ?? 'SOL/USDC'} LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
       }
-      return `<b>Borrow → LP</b> — $${p.borrowUsd?.toFixed(0) ?? '?'} from Kamino → SOL/USDC LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
+      return `<b>Borrow → LP</b> — $${p.borrowUsd?.toFixed(0) ?? '?'} from Kamino → ${p.pair ?? 'SOL/USDC'} LP (${p.spreadPct?.toFixed(0) ?? '?'}% spread)`;
     case 'EVM_FLASH_ARB': {
       const pair = p.opportunity?.displayPair ?? p.displayPair ?? '?/?';
       const buyDex = (p.opportunity?.buyPool?.dex ?? p.buyDex ?? '?').replace('_v3', ' V3').replace('_', ' ');

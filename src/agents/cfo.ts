@@ -1518,13 +1518,20 @@ export class CFOAgent extends BaseAgent {
         if (r.pendingApproval && r.decision.tier === 'APPROVAL') {
           const d = r.decision;
 
-          // Dedup: skip if we already have a pending approval for this decision type
+          // Dedup: skip if we already have a pending approval for this exact decision
+          // For multi-tier decisions (KAMINO_BORROW_LP), allow one per risk tier
+          const dedupKey = d.params?.riskTier ? `${d.type}_${d.params.riskTier}` : d.type;
           const alreadyPending = [...this.pendingApprovals.values()].find(
-            (a) => a.decisionJson?.type === d.type
+            (a) => {
+              const aKey = a.decisionJson?.params?.riskTier
+                ? `${a.decisionJson.type}_${a.decisionJson.params.riskTier}`
+                : a.decisionJson?.type;
+              return aKey === dedupKey;
+            }
           );
           if (alreadyPending) {
-            logger.debug(`[CFO] Skipping duplicate approval for ${d.type} — ${alreadyPending.id} already pending`);
-            approvalIds.set(`${d.type}-${r.decision.urgency}`, alreadyPending.id);
+            logger.debug(`[CFO] Skipping duplicate approval for ${dedupKey} — ${alreadyPending.id} already pending`);
+            approvalIds.set(dedupKey, alreadyPending.id);
             continue;
           }
 
@@ -1579,7 +1586,7 @@ export class CFOAgent extends BaseAgent {
             d,                      // full Decision object (JSON-safe)
             'decision_engine',
           );
-          approvalIds.set(`${d.type}-${r.decision.urgency}`, approvalId);
+          approvalIds.set(dedupKey, approvalId);
         }
       }
 
@@ -1913,6 +1920,38 @@ export class CFOAgent extends BaseAgent {
         try {
           const hs = await (await hl()).getAccountSummary();
           lines.push(`*Hyperliquid:* $${hs.equity.toFixed(2)} equity | ${hs.positions.length} pos | PnL ${hs.totalPnl >= 0 ? '+' : ''}$${hs.totalPnl.toFixed(2)}`);
+        } catch { /* non-fatal */ }
+      }
+
+      if (env.orcaLpEnabled) {
+        try {
+          const orcaMod = await import('../launchkit/cfo/orcaService.ts');
+          const positions = await orcaMod.getPositions();
+          const active = positions.filter((p: any) => p.inRange || p.liquidityUsd > 0);
+          if (active.length > 0) {
+            const totalUsd = active.reduce((s: number, p: any) => s + (p.liquidityUsd ?? 0), 0);
+            const feesUsd = active.reduce((s: number, p: any) => s + (p.feesOwedUsd ?? 0), 0);
+            const inRange = active.filter((p: any) => p.inRange).length;
+            const pairList = active.map((p: any) => p.pair ?? `${p.tokenASymbol}/${p.tokenBSymbol}`).join(', ');
+            lines.push(`*Orca LP:* ${active.length} pos $${totalUsd.toFixed(2)} | ${inRange}/${active.length} in-range | fees $${feesUsd.toFixed(2)} | ${pairList}`);
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      if (env.krystalLpEnabled && env.evmPrivateKey) {
+        try {
+          const krystalMod = await import('../launchkit/cfo/krystalService.ts');
+          const ethers = await import('ethers' as string);
+          const walletAddr = ethers.computeAddress(env.evmPrivateKey);
+          const evmPositions = await krystalMod.fetchKrystalPositions(walletAddr, ((globalThis as any).__cfo_evm_lp_records ?? []));
+          const active = evmPositions.filter((p: any) => p.valueUsd > 0);
+          if (active.length > 0) {
+            const totalUsd = active.reduce((s: number, p: any) => s + (p.valueUsd ?? 0), 0);
+            const feesUsd = active.reduce((s: number, p: any) => s + (p.feesOwedUsd ?? 0), 0);
+            const inRange = active.filter((p: any) => p.inRange).length;
+            const pairList = active.map((p: any) => `${p.token0Symbol}/${p.token1Symbol}`).join(', ');
+            lines.push(`*EVM LP:* ${active.length} pos $${totalUsd.toFixed(2)} | ${inRange}/${active.length} in-range | fees $${feesUsd.toFixed(2)} | ${pairList}`);
+          }
         } catch { /* non-fatal */ }
       }
 
