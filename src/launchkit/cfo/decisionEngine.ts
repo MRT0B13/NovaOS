@@ -89,6 +89,7 @@ export type DecisionType =
   | 'ORCA_LP_OPEN'           // open a new concentrated LP position
   | 'ORCA_LP_REBALANCE'      // close out-of-range position and reopen centred on new price
   | 'ORCA_LP_CLOSE'          // close Orca LP position without reopening (capital withdrawal)
+  | 'ORCA_LP_CLAIM_FEES'     // collect accumulated fees from Orca LP positions (without closing)
   | 'KAMINO_BORROW_LP'       // borrow from Kamino → swap → open Orca LP, fees repay loan
   | 'EVM_FLASH_ARB'          // Arbitrum: atomic flash loan arb via Aave v3 + DEX spread
   | 'KRYSTAL_LP_OPEN'        // open EVM concentrated LP via Krystal-discovered pool
@@ -436,6 +437,21 @@ export function restoreCooldownState(saved: Record<string, number>): void {
   for (const [type, ts] of Object.entries(saved)) {
     if (typeof ts === 'number' && now - ts < maxCooldownMs) {
       lastDecisionAt[type] = ts;
+    }
+  }
+}
+
+/** Export LP pair recency state so CFO can persist across restarts */
+export function getLpRecencyState(): Record<string, number> {
+  return { ..._lpPairLastSelected };
+}
+
+/** Restore LP pair recency state from DB on restart — skip entries older than recency window */
+export function restoreLpRecencyState(saved: Record<string, number>): void {
+  const now = Date.now();
+  for (const [addr, ts] of Object.entries(saved)) {
+    if (typeof ts === 'number' && now - ts < RECENCY_WINDOW_MS) {
+      _lpPairLastSelected[addr] = ts;
     }
   }
 }
@@ -1135,6 +1151,7 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
   tokenBMint: string;
   tokenADecimals: number;
   tokenBDecimals: number;
+  tickSpacing?: number;
   score: number;
   reasoning: string;
   apyBase7d: number;
@@ -2049,6 +2066,31 @@ export async function generateDecisions(
           });
         }
       }
+    // H-bis: Proactive repay — if wallet has USDC from LP fees/closes and Kamino has
+    // an active borrow, repay some to reduce interest drag and free borrow capacity.
+    // This is separate from the emergency LTV-breach repay above.
+    } else if (
+      state.kaminoBorrowValueUsd > 5 &&
+      state.solanaUsdcBalance > 10 &&
+      !ltvBreached && !healthDanger &&
+      checkCooldown('KAMINO_REPAY_PROACTIVE', 6 * 3600_000)
+    ) {
+      // Repay up to 80% of wallet USDC (keep some for gas/fees)
+      const repayUsd = Math.min(state.solanaUsdcBalance * 0.8, state.kaminoBorrowValueUsd);
+      if (repayUsd > 5) {
+        decisions.push({
+          type: 'KAMINO_REPAY',
+          reasoning:
+            `Proactive repay — $${repayUsd.toFixed(0)} USDC in wallet from LP fees. ` +
+            `Active borrow: $${state.kaminoBorrowValueUsd.toFixed(0)}. ` +
+            `Repaying to reduce interest drag and free capacity for more BorrowLP.`,
+          params: { repayUsd, repayAsset: 'USDC', proactive: true },
+          urgency: 'low',
+          estimatedImpactUsd: repayUsd * (state.kaminoBorrowApy ?? 0.08),
+          intelUsed: [],
+          tier: 'AUTO',  // small amounts, proactive = safe to auto-execute
+        });
+      }
     } else if (loopUnprofitable && checkCooldown('KAMINO_JITO_UNWIND', 12 * 3600_000)) {
       const activeLst = state.kaminoActiveLstLoop ?? 'JitoSOL';
       const unwindType = state.kaminoJitoLoopActive ? 'KAMINO_JITO_UNWIND' : 'KAMINO_LST_UNWIND';
@@ -2123,6 +2165,32 @@ export async function generateDecisions(
           estimatedImpactUsd: 0,
           intelUsed: [],
           tier: 'NOTIFY',
+        });
+      }
+    }
+
+    // I3: Claim accumulated fees from existing Orca positions
+    // Fees sit uncollected on-chain until position is closed/rebalanced.
+    // Claiming proactively liberates USDC (→ repay Kamino borrow) and SOL (→ Jito stake).
+    for (const pos of state.orcaPositions) {
+      const feesUsd = pos.feesUsd ?? 0;
+      if (feesUsd >= 2 && checkCooldown(`ORCA_LP_CLAIM_${pos.positionMint}`, 4 * 3600_000)) {
+        decisions.push({
+          type: 'ORCA_LP_CLAIM_FEES',
+          reasoning:
+            `Collecting $${feesUsd.toFixed(2)} unclaimed fees from ` +
+            `${pos.tokenA ?? 'SOL'}/${pos.tokenB ?? 'USDC'} Orca LP — ` +
+            `USDC proceeds → Kamino repay, SOL → Jito stake.`,
+          params: {
+            positionMint: pos.positionMint,
+            tokenA: pos.tokenA,
+            tokenB: pos.tokenB,
+            feesUsd,
+          },
+          urgency: 'low',
+          estimatedImpactUsd: feesUsd,
+          intelUsed: [],
+          tier: 'AUTO',
         });
       }
     }
@@ -2660,10 +2728,23 @@ export async function generateDecisions(
         for (const tier of enabledTiers) {
           if (tiersOpened >= slotsAvailable) break;
 
-          const tierPools = tieredPools.filter(p => p.riskTier === tier).sort((a, b) => b.score - a.score);
+          // Apply diversity recency penalty so we rotate through different pools
+          const tierPools = tieredPools
+            .filter(p => p.riskTier === tier)
+            .map(p => {
+              const recency = getLpRecencyPenalty(p.whirlpoolAddress);
+              return { ...p, effectiveScore: p.score - recency, _recency: recency };
+            })
+            .sort((a, b) => b.effectiveScore - a.effectiveScore);
 
           // Fallback: if no discovered pools for this tier, use selectBestOrcaPairDynamic for medium tier
           let selectedPool: any = tierPools[0];
+          if (selectedPool?._recency > 0) {
+            logger.info(
+              `[CFO:Decision] Section K diversity: ${selectedPool.pair} penalized -${selectedPool._recency} (recently used). ` +
+              `Effective score ${selectedPool.effectiveScore} (base ${selectedPool.score}). ${tierPools.length} ${tier}-tier pools available.`,
+            );
+          }
           if (!selectedPool && tier === 'medium') {
             try {
               const dynamicPick = await selectBestOrcaPairDynamic(intel);
@@ -2739,6 +2820,11 @@ export async function generateDecisions(
           tiersOpened++;
           budgetUsed += borrowUsd;
 
+          // Mark this pool as recently selected so diversity rotation works next cycle
+          if (selectedPool.whirlpoolAddress) {
+            markLpPairSelected(selectedPool.whirlpoolAddress);
+          }
+
           logger.info(
             `[CFO:Decision] Section K: KAMINO_BORROW_LP [${tier}] — borrow $${borrowUsd.toFixed(0)} → ${pair} LP ` +
             `(spread ${spreadPct.toFixed(1)}%, post-LTV ${((state.kaminoLtv + borrowUsd / state.kaminoDepositValueUsd) * 100).toFixed(0)}%)`,
@@ -2781,6 +2867,15 @@ export async function generateDecisions(
             ].filter(Boolean),
             tier: 'APPROVAL',
           });
+          tiersOpened = 1;
+        }
+
+        // Mark cooldown at generation time so the same KAMINO_BORROW_LP decision
+        // doesn't regenerate every cycle while waiting for admin approval.
+        // If the admin approves and execution succeeds, markDecision is called again 
+        // in the execution handler (updating the timestamp).
+        if (tiersOpened > 0) {
+          markDecision('KAMINO_BORROW_LP');
         }
       }
     }
@@ -3278,6 +3373,26 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           solReceived: result.solReceived,
           error: result.error,
         } as DecisionResult & { txHash?: string; valueRecoveredUsd?: number; newPositionMint?: string; usdcReceived?: number; solReceived?: number };
+      }
+
+      case 'ORCA_LP_CLAIM_FEES': {
+        const orca = await import('./orcaService.ts');
+        const { positionMint } = decision.params;
+        const claimResult = await orca.claimFees(positionMint);
+        if (claimResult.success) markDecision(`ORCA_LP_CLAIM_${positionMint}`);
+        let solPriceForClaim = 85;
+        try { const pyth = await import('./pythOracleService.ts'); solPriceForClaim = await pyth.getSolPrice(); } catch { /* fallback */ }
+        const claimedUsd = (claimResult.solClaimed * solPriceForClaim) + claimResult.usdcClaimed;
+        return {
+          ...base,
+          executed: true,
+          success: claimResult.success,
+          txId: claimResult.txSignature,
+          solClaimed: claimResult.solClaimed,
+          usdcClaimed: claimResult.usdcClaimed,
+          claimedUsd,
+          error: claimResult.error,
+        } as DecisionResult & { solClaimed?: number; usdcClaimed?: number; claimedUsd?: number };
       }
 
       case 'ORCA_LP_CLOSE': {
@@ -3801,6 +3916,8 @@ function _humanAction(d: Decision, state: PortfolioState): string {
       return `<b>Open LP</b> — $${((p.usdcAmount ?? 0) * 2).toFixed(0)} in ${p.pair ?? 'SOL/USDC'} (±${(p.rangeWidthPct ?? 20) / 2}% range)${p.needsSwap ? ' (auto-swap)' : ''}`;
     case 'ORCA_LP_REBALANCE':
       return `<b>Rebalance LP</b> — price moved out of range, re-centering`;
+    case 'ORCA_LP_CLAIM_FEES':
+      return `<b>Claim Orca LP fees</b> — $${p.feesUsd?.toFixed(2) ?? '?'} from ${p.tokenA ?? 'SOL'}/${p.tokenB ?? 'USDC'}`;
     case 'ORCA_LP_CLOSE':
       return `<b>Close Orca LP</b> — withdrawing ${p.pair ?? 'LP'} position`;
     case 'KAMINO_BORROW_LP':

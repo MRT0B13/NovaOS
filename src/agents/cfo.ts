@@ -22,7 +22,7 @@ import { BaseAgent } from './types.ts';
 import { getCFOEnv } from '../launchkit/cfo/cfoEnv.ts';
 import { PostgresCFORepository } from '../launchkit/cfo/postgresCFORepository.ts';
 import { PositionManager } from '../launchkit/cfo/positionManager.ts';
-import { getDecisionConfig, runDecisionCycle, classifyTier, getCooldownState, restoreCooldownState } from '../launchkit/cfo/decisionEngine.ts';
+import { getDecisionConfig, runDecisionCycle, classifyTier, getCooldownState, restoreCooldownState, getLpRecencyState, restoreLpRecencyState } from '../launchkit/cfo/decisionEngine.ts';
 import type { DecisionResult } from '../launchkit/cfo/decisionEngine.ts';
 import type { PlacedOrder, MarketOpportunity } from '../launchkit/cfo/polymarketService.ts';
 import type { TransactionType, PositionStrategy, CFOPosition } from '../launchkit/cfo/postgresCFORepository.ts';
@@ -814,6 +814,40 @@ export class CFOAgent extends BaseAgent {
                 });
               } catch { /* best effort */ }
             }
+            break;
+          }
+
+          // ── Orca LP Fee Claim ──────────────────────────────────
+          case 'ORCA_LP_CLAIM_FEES': {
+            const feeResult = r as any;
+            const claimedUsd = feeResult.claimedUsd ?? (p.feesUsd ?? 0);
+            const solClaimed = feeResult.solClaimed ?? 0;
+            const usdcClaimed = feeResult.usdcClaimed ?? 0;
+            await this.repo.insertTransaction({
+              id: `tx-orca-claim-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'solana', strategyTag: 'orca_lp', txType: 'fee_claim' as TransactionType,
+              tokenIn: 'fees', amountIn: 0,
+              tokenOut: 'SOL+USDC', amountOut: claimedUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: {
+                positionMint: p.positionMint,
+                tokenA: p.tokenA, tokenB: p.tokenB,
+                solClaimed, usdcClaimed, claimedUsd,
+                reasoning: d.reasoning,
+              },
+            });
+            logger.info(`[CFO] Persisted ORCA_LP_CLAIM_FEES: ${p.positionMint?.slice(0, 8)} | $${claimedUsd.toFixed(2)} (${solClaimed.toFixed(4)} SOL + ${usdcClaimed.toFixed(2)} USDC)`);
+            // Update cfo_positions with realized fee income
+            try {
+              const feePos = await this.repo.getPositionByExternalId(p.positionMint as string);
+              if (feePos) {
+                await this.repo.upsertPosition({
+                  ...feePos,
+                  realizedPnlUsd: feePos.realizedPnlUsd + claimedUsd,
+                  updatedAt: new Date().toISOString(),
+                });
+              }
+            } catch { /* best effort */ }
             break;
           }
 
@@ -2727,6 +2761,7 @@ export class CFOAgent extends BaseAgent {
       approvalCounter: this.approvalCounter,
       pendingApprovals: serializedApprovals,
       cooldowns: getCooldownState(),
+      lpRecency: getLpRecencyState(),
       emergencyPausedUntil: this.emergencyPausedUntil,
       scoutIntel: this.scoutIntel,
     });
@@ -2739,6 +2774,7 @@ export class CFOAgent extends BaseAgent {
       approvalCounter?: number;
       pendingApprovals?: SerializableApproval[];
       cooldowns?: Record<string, number>;
+      lpRecency?: Record<string, number>;
       emergencyPausedUntil?: number | null;
       scoutIntel?: ScoutIntel | null;
     }>();
@@ -2778,6 +2814,13 @@ export class CFOAgent extends BaseAgent {
       restoreCooldownState(s.cooldowns);
       const restored = Object.keys(s.cooldowns).length;
       if (restored > 0) logger.info(`[CFO] Restored ${restored} decision cooldown(s)`);
+    }
+
+    // Restore LP pair recency so diversity rotation survives restarts
+    if (s.lpRecency) {
+      restoreLpRecencyState(s.lpRecency);
+      const restored = Object.keys(s.lpRecency).length;
+      if (restored > 0) logger.info(`[CFO] Restored ${restored} LP pair recency entries`);
     }
 
     // Restore pending approvals — rebuild action closures, skip already-expired

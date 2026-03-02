@@ -110,6 +110,10 @@ export interface AdaptiveParams {
   kaminoLtvMultiplier: number;     // tighten/loosen LTV target
   kaminoSpreadFloorMultiplier: number; // raise spread floor if actual yield < projected
 
+  // BorrowLP pipeline (Kamino borrow → Orca LP → fees → repay)
+  borrowLpNetYield: number;         // net annualized yield (LP fees - borrow cost) from BorrowLP positions
+  borrowLpCycleCount: number;       // completed borrow→LP→repay cycles (confidence gate)
+
   // EVM Arb
   evmArbMinProfitMultiplier: number; // raise if slippage consistently eats profit
 
@@ -787,6 +791,27 @@ function computeAdaptiveParams(
   let kaminoSpreadMult = 1.0;
   const kaminoSt = stats['kamino'];
 
+  // ── BorrowLP pipeline yield ─────────────────────────────────────
+  // Measure net yield of the combined borrow → LP → fee → repay cycle.
+  // Uses orca_lp positions that were opened via KAMINO_BORROW_LP (metadata.borrowLp=true)
+  // Falls back to comparing LP PnL rate vs kamino borrow costs if no metadata tag.
+  let borrowLpNetYieldComputed = 0;
+  let borrowLpCycles = 0;
+  const orcaLpForBorrow = lpStats['orca_lp'];
+  if (orcaLpForBorrow && orcaLpForBorrow.totalPositions >= 1 && kaminoSt) {
+    // LP daily yield minus annualized borrow cost
+    // LP daily → annualized
+    const lpAnnualYieldPct = orcaLpForBorrow.avgPnlPerDayUsd > 0
+      ? (orcaLpForBorrow.avgPnlPerDayUsd * 365) / Math.max(1, orcaLpForBorrow.totalPositions * 50) // rough per-position annual yield
+      : 0;
+    // Kamino borrow cost approximation from trade data
+    const borrowCostPct = kaminoSt.avgPnlUsd < 0
+      ? Math.abs(kaminoSt.avgPnlUsd) * 365 / Math.max(1, kaminoSt.avgHoldHours / 24 * kaminoSt.totalTrades * 50)
+      : 0.08; // default 8% if no loss data
+    borrowLpNetYieldComputed = lpAnnualYieldPct - borrowCostPct;
+    borrowLpCycles = orcaLpForBorrow.totalPositions;
+  }
+
   if (kaminoSt && kaminoSt.totalTrades >= 3) {
     if (kaminoSt.maxDrawdownUsd < -20) {
       kaminoLtvMult = 0.8;
@@ -892,6 +917,8 @@ function computeAdaptiveParams(
     lpTotalPositions: lpTotalPos,
     kaminoLtvMultiplier: blend(kaminoLtvMult, prior?.kaminoLtvMultiplier),
     kaminoSpreadFloorMultiplier: blend(kaminoSpreadMult, prior?.kaminoSpreadFloorMultiplier),
+    borrowLpNetYield: blend(borrowLpNetYieldComputed, prior?.borrowLpNetYield),
+    borrowLpCycleCount: borrowLpCycles,
     evmArbMinProfitMultiplier: blend(evmArbMinProfitMult, prior?.evmArbMinProfitMultiplier),
     feeDragPct: feeStats.feeDragPct,
     executionFailRates,
@@ -1107,8 +1134,12 @@ export function getDefaultParams(): AdaptiveParams {
     lpRebalanceTriggerMultiplier: 1.0,
     lpTierRangeMultipliers: { low: 1.0, medium: 1.0, high: 1.0 },
     lpTierMinAprAdjustments: { low: 0, medium: 0, high: 0 },
+    lpBestPairs: [],
+    lpTotalPositions: 0,
     kaminoLtvMultiplier: 1.0,
     kaminoSpreadFloorMultiplier: 1.0,
+    borrowLpNetYield: 0,
+    borrowLpCycleCount: 0,
     evmArbMinProfitMultiplier: 1.0,
     feeDragPct: 0,
     executionFailRates: {},

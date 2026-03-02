@@ -364,6 +364,103 @@ export async function openPosition(
 }
 
 // ============================================================================
+// Claim Fees (without closing the position)
+// ============================================================================
+
+export interface OrcaFeeClaimResult {
+  success: boolean;
+  solClaimed: number;
+  usdcClaimed: number;
+  txSignature?: string;
+  error?: string;
+}
+
+/**
+ * Collect accumulated fees from an existing LP position WITHOUT removing liquidity.
+ * Uses: decreaseLiquidity(0) is a no-op, then collectFees harvests the owed tokens.
+ *
+ * The Orca SDK's Position object exposes collectFees/collectRewards builders.
+ * Fees go directly to the wallet's ATAs for tokenA / tokenB.
+ */
+export async function claimFees(positionMint: string): Promise<OrcaFeeClaimResult> {
+  const env = getCFOEnv();
+
+  if (env.dryRun) {
+    logger.info(`[Orca] DRY RUN — would claim fees from position ${positionMint.slice(0, 8)}`);
+    return { success: true, solClaimed: 0, usdcClaimed: 0 };
+  }
+
+  try {
+    const { WhirlpoolContext, buildWhirlpoolClient, PDAUtil, ORCA_WHIRLPOOL_PROGRAM_ID } = await loadOrcaSdk();
+    const { AnchorProvider, Wallet } = await loadAnchor();
+
+    const walletKeypair = loadWallet();
+    const connection = new Connection(getRpcUrl(), 'confirmed');
+    const provider = new AnchorProvider(connection, new Wallet(walletKeypair), {});
+    const ctx = WhirlpoolContext.withProvider(provider);
+    const client = buildWhirlpoolClient(ctx);
+
+    const mintPubkey = new PublicKey(positionMint);
+    const positionPda = PDAUtil.getPosition(ORCA_WHIRLPOOL_PROGRAM_ID, mintPubkey);
+
+    // Snapshot wallet balances BEFORE claiming
+    const solBefore = await connection.getBalance(walletKeypair.publicKey);
+    const { getAssociatedTokenAddress } = await import('@solana/spl-token' as string);
+    const USDC_MINT = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+    const usdcAta = await getAssociatedTokenAddress(USDC_MINT, walletKeypair.publicKey);
+    let usdcBefore = 0;
+    try {
+      const usdcAcct = await connection.getTokenAccountBalance(usdcAta);
+      usdcBefore = Number(usdcAcct.value.uiAmount ?? 0);
+    } catch { /* ATA may not exist */ }
+
+    // Load the position and build a collectFees + collectRewards tx
+    const position = await client.getPosition(positionPda.publicKey);
+
+    // collectFeesAndRewardsInstructions bundles:
+    //  1. updateFeesAndRewards (sync on-chain owed amounts)
+    //  2. collectFees (transfer owed token0/token1 to wallet ATAs)
+    //  3. collectReward (for each reward index)
+    const collectTx = await position.collectFeesAndRewardsInstructions(
+      walletKeypair.publicKey,   // funder / wallet
+      undefined,                 // token program — auto-detected
+      false,                     // refresh = false (updateFeesAndRewards is included)
+    );
+
+    // collectTx is a TransactionBuilder (or array) — send it
+    const txBuilders = Array.isArray(collectTx) ? collectTx : [collectTx];
+    let lastSig = '';
+    for (const txBuilder of txBuilders) {
+      lastSig = await buildSendAndConfirm(txBuilder, connection, walletKeypair);
+    }
+
+    // Wait for balance finality then snapshot AFTER
+    await new Promise(r => setTimeout(r, 2000));
+    const solAfter = await connection.getBalance(walletKeypair.publicKey);
+    let usdcAfter = 0;
+    try {
+      const usdcAcct = await connection.getTokenAccountBalance(usdcAta);
+      usdcAfter = Number(usdcAcct.value.uiAmount ?? 0);
+    } catch { /* ATA may not exist */ }
+
+    const solClaimed = Math.max(0, (solAfter - solBefore) / 1e9);
+    const usdcClaimed = Math.max(0, usdcAfter - usdcBefore);
+
+    logger.info(`[Orca] Claimed fees from LP ${positionMint.slice(0, 8)}: ${lastSig} | ` +
+      `${solClaimed.toFixed(6)} SOL + ${usdcClaimed.toFixed(4)} USDC`);
+    return {
+      success: true,
+      txSignature: lastSig,
+      solClaimed,
+      usdcClaimed,
+    };
+  } catch (err) {
+    logger.error('[Orca] claimFees error:', err);
+    return { success: false, solClaimed: 0, usdcClaimed: 0, error: (err as Error).message };
+  }
+}
+
+// ============================================================================
 // Close Position
 // ============================================================================
 
