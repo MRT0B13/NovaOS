@@ -145,6 +145,7 @@ const NFPM_ADDRESS = '0xC36442b4a4522E871399CD717aBDD847Ab11FE88';
 // Uniswap V3 / PancakeSwap V3 NFPM ABI (identical interface)
 const NFPM_ABI = [
   'function mint((address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, address recipient, uint256 deadline)) returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'function increaseLiquidity((uint256 tokenId, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint128 liquidity, uint256 amount0, uint256 amount1)',
   'function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
   'function decreaseLiquidity((uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint256 amount0, uint256 amount1)',
   'function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)',
@@ -159,6 +160,7 @@ const NFPM_ABI = [
 // Aerodrome CL (Slipstream) NFPM ABI — uses tickSpacing instead of fee, extra sqrtPriceX96 in mint
 const AERODROME_NFPM_ABI = [
   'function mint((address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, address recipient, uint256 deadline, uint160 sqrtPriceX96)) returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'function increaseLiquidity((uint256 tokenId, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint128 liquidity, uint256 amount0, uint256 amount1)',
   'function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
   'function decreaseLiquidity((uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint256 amount0, uint256 amount1)',
   'function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)',
@@ -1094,6 +1096,8 @@ export async function openEvmLpPosition(
     sourceChainId: number;    // chain with available USDC
     walletAddress: string;    // EVM wallet address
   },
+  /** Optional: if provided, adds liquidity to an existing position instead of minting a new one */
+  existingTokenId?: string,
 ): Promise<EvmLpOpenResult> {
   const env = getCFOEnv();
   const { numericId: chainNumericId } = pool.chainNumericId
@@ -1101,8 +1105,9 @@ export async function openEvmLpPosition(
     : parseKrystalChainId(pool.chainId);
 
   if (env.dryRun) {
-    logger.info(`[Krystal] DRY RUN — would open LP: $${deployUsd} on ${pool.token0.symbol}/${pool.token1.symbol} (chain ${chainNumericId})`);
-    return { success: true, tokenId: `dry-evm-lp-${Date.now()}` };
+    const verb = existingTokenId ? `increase LP #${existingTokenId}` : 'open LP';
+    logger.info(`[Krystal] DRY RUN — would ${verb}: $${deployUsd} on ${pool.token0.symbol}/${pool.token1.symbol} (chain ${chainNumericId})`);
+    return { success: true, tokenId: existingTokenId ?? `dry-evm-lp-${Date.now()}` };
   }
 
   try {
@@ -1772,33 +1777,68 @@ export async function openEvmLpPosition(
 
     const protoLabel = protoResolved?.def.label ?? 'Uniswap V3';
 
-    logger.info(
-      `[Krystal] Minting LP via ${protoLabel}: ${sortedToken0.symbol}/${sortedToken1.symbol} on chain ${chainNumericId}, ` +
-      `ticks [${tickLower}, ${tickUpper}], ${isAerodromeCl ? 'tickSpacing' : 'fee'} ${isAerodromeCl ? tickSpacing : pool.feeTier}, ` +
-      `amt0=${ethers.formatUnits(amount0Desired, sortedDec0)}, amt1=${ethers.formatUnits(amount1Desired, sortedDec1)}`,
-    );
+    // ── 9. Mint NEW position OR increase existing one ──────────────────
+    let tx: any;
+    let receipt: any;
 
-    // Pre-flight: estimateGas to catch reverts before burning gas on-chain
-    try {
-      await nfpmContract.mint.estimateGas(mintParams);
-    } catch (estErr) {
-      const reason = (estErr as any)?.reason ?? (estErr as Error).message;
-      logger.warn(`[Krystal] Mint estimateGas failed: ${reason}`);
-      return { success: false, error: `Mint would revert: ${reason}` };
+    if (existingTokenId) {
+      // ── increaseLiquidity: add funds to existing position NFT ──
+      const increaseParams = {
+        tokenId: BigInt(existingTokenId),
+        amount0Desired,
+        amount1Desired,
+        amount0Min: BigInt(0),
+        amount1Min: BigInt(0),
+        deadline: Math.floor(Date.now() / 1000) + 600,
+      };
+
+      logger.info(
+        `[Krystal] Increasing liquidity on #${existingTokenId} via ${protoLabel}: ` +
+        `${sortedToken0.symbol}/${sortedToken1.symbol} on chain ${chainNumericId}, ` +
+        `amt0=${ethers.formatUnits(amount0Desired, sortedDec0)}, amt1=${ethers.formatUnits(amount1Desired, sortedDec1)}`,
+      );
+
+      // Pre-flight
+      try {
+        await nfpmContract.increaseLiquidity.estimateGas(increaseParams);
+      } catch (estErr) {
+        const reason = (estErr as any)?.reason ?? (estErr as Error).message;
+        logger.warn(`[Krystal] increaseLiquidity estimateGas failed: ${reason}`);
+        return { success: false, error: `IncreaseLiquidity would revert: ${reason}` };
+      }
+
+      tx = await nfpmContract.increaseLiquidity(increaseParams);
+      receipt = await tx.wait();
+    } else {
+      // ── mint: create new position NFT ──
+      logger.info(
+        `[Krystal] Minting LP via ${protoLabel}: ${sortedToken0.symbol}/${sortedToken1.symbol} on chain ${chainNumericId}, ` +
+        `ticks [${tickLower}, ${tickUpper}], ${isAerodromeCl ? 'tickSpacing' : 'fee'} ${isAerodromeCl ? tickSpacing : pool.feeTier}, ` +
+        `amt0=${ethers.formatUnits(amount0Desired, sortedDec0)}, amt1=${ethers.formatUnits(amount1Desired, sortedDec1)}`,
+      );
+
+      // Pre-flight: estimateGas to catch reverts before burning gas on-chain
+      try {
+        await nfpmContract.mint.estimateGas(mintParams);
+      } catch (estErr) {
+        const reason = (estErr as any)?.reason ?? (estErr as Error).message;
+        logger.warn(`[Krystal] Mint estimateGas failed: ${reason}`);
+        return { success: false, error: `Mint would revert: ${reason}` };
+      }
+
+      tx = await nfpmContract.mint(mintParams);
+      receipt = await tx.wait();
     }
 
-    const tx = await nfpmContract.mint(mintParams);
-    const receipt = await tx.wait();
-
     // Parse tokenId AND actual amounts from IncreaseLiquidity event
-    let tokenId: string | undefined;
+    let tokenId: string | undefined = existingTokenId; // already known for increase
     let mintedAmount0 = BigInt(0);
     let mintedAmount1 = BigInt(0);
     for (const log of receipt.logs) {
       try {
         const parsed = nfpmContract.interface.parseLog({ topics: log.topics as string[], data: log.data });
         if (parsed?.name === 'IncreaseLiquidity') {
-          tokenId = parsed.args?.tokenId?.toString();
+          if (!tokenId) tokenId = parsed.args?.tokenId?.toString();
           mintedAmount0 = BigInt(parsed.args?.amount0?.toString() ?? '0');
           mintedAmount1 = BigInt(parsed.args?.amount1?.toString() ?? '0');
           if (tokenId) break;
@@ -1846,7 +1886,8 @@ export async function openEvmLpPosition(
       logger.info(`[Krystal] Mint actual amounts: ${sortedToken0.symbol}=${minted0Ui.toFixed(6)} ($${(minted0Ui * usdPerSorted0).toFixed(2)}), ${sortedToken1.symbol}=${minted1Ui.toFixed(6)} ($${(minted1Ui * usdPerSorted1).toFixed(2)}) → real=$${realDeployUsd.toFixed(2)} (pre-mint estimate was $${actualDeployUsd.toFixed(2)})`);
     }
 
-    logger.info(`[Krystal] LP minted: tokenId=${tokenId} tx=${receipt.hash} actual=$${realDeployUsd.toFixed(2)}`);
+    const verb = existingTokenId ? 'LP increased' : 'LP minted';
+    logger.info(`[Krystal] ${verb}: tokenId=${tokenId} tx=${receipt.hash} actual=$${realDeployUsd.toFixed(2)}`);
     return { success: true, tokenId, txHash: receipt.hash, actualDeployUsd: realDeployUsd };
   } catch (err) {
     logger.error('[Krystal] openEvmLpPosition error:', err);

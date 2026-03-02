@@ -92,6 +92,7 @@ export type DecisionType =
   | 'KAMINO_BORROW_LP'       // borrow from Kamino → swap → open Orca LP, fees repay loan
   | 'EVM_FLASH_ARB'          // Arbitrum: atomic flash loan arb via Aave v3 + DEX spread
   | 'KRYSTAL_LP_OPEN'        // open EVM concentrated LP via Krystal-discovered pool
+  | 'KRYSTAL_LP_INCREASE'    // add liquidity to an existing EVM LP position (avoid duplicate mints)
   | 'KRYSTAL_LP_REBALANCE'   // close + reopen out-of-range EVM LP (closeOnly=true → just close)
   | 'KRYSTAL_LP_CLAIM_FEES'  // collect accumulated fees from EVM LP positions
   | 'EVM_BRIDGE'             // bridge tokens between EVM chains (via LI.FI)
@@ -2259,15 +2260,30 @@ export async function generateDecisions(
           deployableChainIds.has(p.chainNumericId), // deploy on funded chains OR bridge-reachable chains
         );
 
-        // Check: not already in the same pool
-        const existingPoolAddrs = new Set(state.evmLpPositions.map(p => {
-          return `${p.chainNumericId}_${p.token0Symbol}_${p.token1Symbol}`;
-        }));
-        const deduped = eligible.filter(p => {
-          const key = `${p.chainNumericId}_${p.token0.symbol}_${p.token1.symbol}`;
-          const keyRev = `${p.chainNumericId}_${p.token1.symbol}_${p.token0.symbol}`;
-          return !existingPoolAddrs.has(key) && !existingPoolAddrs.has(keyRev);
-        });
+        // Build a map from normalised pair key → existing position (for increase-liquidity)
+        // Case-insensitive symbol comparison prevents duplicates from mismatched casing (cbBTC vs CBBTC)
+        const existingPairMap = new Map<string, { posId: string; inRange: boolean; valueUsd: number }>();
+        for (const p of state.evmLpPositions) {
+          const k = `${p.chainNumericId}_${p.token0Symbol.toUpperCase()}_${p.token1Symbol.toUpperCase()}`;
+          const kRev = `${p.chainNumericId}_${p.token1Symbol.toUpperCase()}_${p.token0Symbol.toUpperCase()}`;
+          const val = { posId: p.posId, inRange: p.inRange, valueUsd: p.valueUsd };
+          existingPairMap.set(k, val);
+          existingPairMap.set(kRev, val);
+        }
+
+        // Separate eligible pools into new vs existing-pair
+        const newPools: typeof eligible = [];
+        const increasePools: Array<{ pool: typeof eligible[0]; existing: { posId: string; inRange: boolean; valueUsd: number } }> = [];
+        for (const p of eligible) {
+          const key = `${p.chainNumericId}_${p.token0.symbol.toUpperCase()}_${p.token1.symbol.toUpperCase()}`;
+          const existing = existingPairMap.get(key);
+          if (existing) {
+            // Only add to in-range positions (out-of-range → let rebalance handle it)
+            if (existing.inRange) increasePools.push({ pool: p, existing });
+          } else {
+            newPools.push(p);
+          }
+        }
 
         // ── Tier-based range width multipliers ──
         const TIER_RANGE_MULT: Record<string, number> = {
@@ -2295,9 +2311,9 @@ export async function generateDecisions(
           // Respect max positions (could have filled up from another tier)
           if (state.evmLpPositions.length + tiersOpened >= env.krystalLpMaxPositions) break;
 
-          const tierPools = deduped.filter(p => p.riskTier === tier);
+          const tierPools = newPools.filter(p => p.riskTier === tier);
           if (tierPools.length === 0) {
-            krystalSkip(`no ${tier}-risk pools pass filters (${deduped.length} total deduped)`);
+            krystalSkip(`no ${tier}-risk NEW pools pass filters (${newPools.length} new, ${increasePools.length} increase-eligible)`);
             continue;
           }
 
@@ -2381,8 +2397,70 @@ export async function generateDecisions(
           tiersOpened++;
         }
 
-        if (tiersOpened === 0 && deduped.length === 0) {
-          krystalSkip(`no eligible pools (${pools.length} total, 0 pass TVL/APR/RPC/dedup filters)`);
+        // ── KRYSTAL_LP_INCREASE: add liquidity to existing in-range positions ──
+        // Instead of opening duplicate positions, route funds to existing ones.
+        // Gated by: cooldown, learning engine pair performance, and minimum APR.
+        // Doesn't count toward tiersOpened or max positions.
+        if (checkCooldown('KRYSTAL_LP_INCREASE', 6 * 3600_000)) {
+          // Only increase positions whose pair is in the learning engine's "bestPairs"
+          // or has too few data points to judge (benefit of the doubt).
+          const learnedBestPairs = new Set(
+            (learned.lpBestPairs ?? []).map((p: string) => p.toUpperCase()),
+          );
+          const hasEnoughLearningData = (learned.lpTotalPositions ?? 0) >= 3;
+
+          for (const { pool: incPool, existing } of increasePools) {
+            const pairKey = `${incPool.token0.symbol}/${incPool.token1.symbol}`.toUpperCase();
+            const pairKeyRev = `${incPool.token1.symbol}/${incPool.token0.symbol}`.toUpperCase();
+
+            // Learning gate: skip pairs that are performing badly (known, not in bestPairs)
+            if (hasEnoughLearningData && learnedBestPairs.size > 0 &&
+                !learnedBestPairs.has(pairKey) && !learnedBestPairs.has(pairKeyRev)) {
+              krystalSkip(`increase: ${pairKey} not in learned bestPairs — waiting for more data`);
+              continue;
+            }
+
+            // Cap deploy per increase to per-tier budget
+            const targetChainBal = state.evmChainBalances.find(b => b.chainId === incPool.chainNumericId);
+            const localValue = targetChainBal?.totalValueUsd ?? 0;
+            const deployUsd = Math.min(perTierMaxUsd, env.krystalLpMaxUsd, evmUsdcCap, localValue * 0.9);
+            if (deployUsd < 10) continue; // too small to bother
+
+            decisions.push({
+              type: 'KRYSTAL_LP_INCREASE',
+              reasoning:
+                `Adding $${deployUsd.toFixed(0)} to existing ${incPool.token0.symbol}/${incPool.token1.symbol} LP #${existing.posId} on ${incPool.chainName} ` +
+                `(current $${existing.valueUsd.toFixed(0)}, in-range). APR7d ${incPool.apr7d.toFixed(1)}%.`,
+              params: {
+                pool: {
+                  chainId: incPool.chainId,
+                  chainNumericId: incPool.chainNumericId,
+                  poolAddress: incPool.poolAddress,
+                  token0: incPool.token0,
+                  token1: incPool.token1,
+                  protocol: incPool.protocol,
+                  feeTier: incPool.feeTier,
+                },
+                deployUsd,
+                rangeWidthTicks: 0, // not used for increase — uses existing range
+                riskTier: incPool.riskTier ?? 'medium',
+                chainName: incPool.chainName,
+                pair: `${incPool.token0.symbol}/${incPool.token1.symbol}`,
+                existingPosId: existing.posId,
+              },
+              urgency: 'low',
+              estimatedImpactUsd: deployUsd * (incPool.apr7d / 100 / 52),
+              intelUsed: [
+                intel.analystEvmLpAt ? 'analyst' : '',
+                intel.guardianReceivedAt ? 'guardian' : '',
+              ].filter(Boolean),
+              tier: classifyTier('KRYSTAL_LP_INCREASE', 'low', deployUsd, config, intel.marketCondition),
+            });
+          }
+        }
+
+        if (tiersOpened === 0 && newPools.length === 0 && increasePools.length === 0) {
+          krystalSkip(`no eligible pools (${pools.length} total, 0 pass TVL/APR/RPC filters)`);
         }
       } catch (err) {
         logger.debug('[CFO:Decision] Krystal pool discovery failed:', err);
@@ -3438,6 +3516,27 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         } as DecisionResult & { txHash?: string };
       }
 
+      case 'KRYSTAL_LP_INCREASE': {
+        const krystal = await import('./krystalService.ts');
+        const { pool, deployUsd, existingPosId } = decision.params;
+
+        if (!existingPosId) {
+          return { ...base, executed: false, error: 'KRYSTAL_LP_INCREASE missing existingPosId' };
+        }
+
+        // Reuse openEvmLpPosition with existingTokenId → calls increaseLiquidity instead of mint
+        const result = await krystal.openEvmLpPosition(pool, deployUsd, 0, undefined, existingPosId);
+        if (result.success) markDecision('KRYSTAL_LP_INCREASE');
+        return {
+          ...base,
+          executed: true,
+          success: result.success,
+          txId: existingPosId,                     // keep same posId for record updates
+          txHash: result.txHash,
+          error: result.error,
+        } as DecisionResult & { txHash?: string };
+      }
+
       case 'KRYSTAL_LP_REBALANCE': {
         const krystal = await import('./krystalService.ts');
         const { posId, chainNumericId, closeOnly, rangeWidthTicks, protocol: rebalProto } = decision.params;
@@ -3721,6 +3820,8 @@ function _humanAction(d: Decision, state: PortfolioState): string {
     }
     case 'KRYSTAL_LP_OPEN':
       return `<b>Open EVM LP</b> — $${p.deployUsd?.toFixed(0) ?? '?'} in ${p.pair ?? '?/?'} on ${p.chainName ?? 'EVM'} (${p.rangeWidthTicks ?? 400} tick range)`;
+    case 'KRYSTAL_LP_INCREASE':
+      return `<b>Add to EVM LP</b> — $${p.deployUsd?.toFixed(0) ?? '?'} → ${p.pair ?? '?/?'} #${p.existingPosId ?? '?'} on ${p.chainName ?? 'EVM'}`;
     case 'KRYSTAL_LP_REBALANCE':
       return p.closeOnly
         ? `<b>Close EVM LP</b> — ${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'} on ${p.chainName ?? 'EVM'}`

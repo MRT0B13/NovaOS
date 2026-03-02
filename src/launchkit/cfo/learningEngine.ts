@@ -102,6 +102,10 @@ export interface AdaptiveParams {
   lpTierRangeMultipliers: Record<string, number>;   // { low: 1.0, medium: 1.0, high: 1.3 }
   lpTierMinAprAdjustments: Record<string, number>;  // per-tier APR floor nudges
 
+  // LP pair intelligence (used for increase / remove gating)
+  lpBestPairs: string[];           // top-performing LP pairs by daily PnL (combined Orca + Krystal)
+  lpTotalPositions: number;        // total historical LP positions (confidence gate)
+
   // Kamino
   kaminoLtvMultiplier: number;     // tighten/loosen LTV target
   kaminoSpreadFloorMultiplier: number; // raise spread floor if actual yield < projected
@@ -725,6 +729,24 @@ function computeAdaptiveParams(
     }
   }
 
+  // ── LP pair intelligence (combined Orca + Krystal) ──────────────
+  // Merge bestPairs from both providers, deduplicate, rank by appearance
+  const combinedBestPairs = new Map<string, number>(); // pair → priority (lower = better)
+  let lpTotalPos = 0;
+  for (const lp of allLp) {
+    if (!lp) continue;
+    lpTotalPos += lp.totalPositions;
+    for (let i = 0; i < lp.bestPairs.length; i++) {
+      const pair = lp.bestPairs[i].toUpperCase();
+      const existing = combinedBestPairs.get(pair) ?? Infinity;
+      combinedBestPairs.set(pair, Math.min(existing, i)); // keep best rank
+    }
+  }
+  const lpBestPairsComputed = [...combinedBestPairs.entries()]
+    .sort((a, b) => a[1] - b[1])
+    .slice(0, 10)
+    .map(([pair]) => pair);
+
   // ── Per-tier LP adaptations (both Orca and Krystal risk tiers) ─────────
   // Each tier learns independently: high-risk OOR doesn't widen low-risk ranges
   const lpTierRangeMultipliers: Record<string, number> = { low: 1.0, medium: 1.0, high: 1.0 };
@@ -866,6 +888,8 @@ function computeAdaptiveParams(
       medium: blend(lpTierMinAprAdjustments.medium, prior?.lpTierMinAprAdjustments?.medium),
       high: blend(lpTierMinAprAdjustments.high, prior?.lpTierMinAprAdjustments?.high),
     },
+    lpBestPairs: lpBestPairsComputed,
+    lpTotalPositions: lpTotalPos,
     kaminoLtvMultiplier: blend(kaminoLtvMult, prior?.kaminoLtvMultiplier),
     kaminoSpreadFloorMultiplier: blend(kaminoSpreadMult, prior?.kaminoSpreadFloorMultiplier),
     evmArbMinProfitMultiplier: blend(evmArbMinProfitMult, prior?.evmArbMinProfitMultiplier),

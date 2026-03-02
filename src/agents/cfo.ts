@@ -997,6 +997,51 @@ export class CFOAgent extends BaseAgent {
             break;
           }
 
+          // ── Krystal EVM LP Increase (add to existing position) ──
+          case 'KRYSTAL_LP_INCREASE': {
+            const pool = p.pool ?? {};
+            const resultAny = r as any;
+            const actualUsd = resultAny.actualDeployUsd ?? p.deployUsd ?? 0;
+            await this.repo.insertTransaction({
+              id: `tx-krystal-lp-increase-${Date.now()}`, timestamp: now,
+              chain: p.chainName ?? 'evm', strategyTag: 'krystal_lp', txType: 'liquidity_add' as TransactionType,
+              tokenIn: pool.token0?.symbol ?? '?', amountIn: actualUsd,
+              tokenOut: `${pool.token0?.symbol ?? '?'}/${pool.token1?.symbol ?? '?'}-LP`, amountOut: actualUsd,
+              feeUsd: 0, txHash: resultAny.txHash ?? '', walletAddress: '', status: 'confirmed',
+              metadata: {
+                pair: p.pair, chainName: p.chainName, chainNumericId: pool.chainNumericId,
+                existingPosId: p.existingPosId, poolAddress: pool.poolAddress,
+                reasoning: d.reasoning, action: 'increase_liquidity',
+              },
+            });
+            // Update existing kv_store record with new entryUsd (additive)
+            const existingRecords = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('../launchkit/cfo/krystalService.ts').EvmLpRecord[];
+            const existingRec = existingRecords.find(
+              (pos) => String(pos.posId) === String(p.existingPosId),
+            );
+            if (existingRec) {
+              await this.persistEvmLpPosition({
+                ...existingRec,
+                entryUsd: (existingRec.entryUsd ?? 0) + actualUsd,
+              });
+            }
+            logger.info(`[CFO] Persisted KRYSTAL_LP_INCREASE: +$${actualUsd.toFixed(2)} → #${p.existingPosId} on ${p.chainName}`);
+            // Also update cfo_positions cost basis so learning engine PnL stays accurate
+            try {
+              const incPos = await this.repo.getPositionByExternalId(String(p.existingPosId));
+              if (incPos) {
+                await this.repo.upsertPosition({
+                  ...incPos,
+                  costBasisUsd: incPos.costBasisUsd + actualUsd,
+                  sizeUnits: incPos.sizeUnits + actualUsd,
+                  currentValueUsd: incPos.currentValueUsd + actualUsd,
+                  updatedAt: new Date().toISOString(),
+                });
+              }
+            } catch { /* best effort — learning will self-correct */ }
+            break;
+          }
+
           // ── Krystal EVM LP Rebalance ─────────────────────────
           case 'KRYSTAL_LP_REBALANCE': {
             const resultAny = r as any;
