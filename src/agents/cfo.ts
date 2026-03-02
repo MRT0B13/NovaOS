@@ -1655,7 +1655,15 @@ export class CFOAgent extends BaseAgent {
             } else {
               logger.error(`[CFO] Approved decision ${d.type} failed: ${execResult.error}`);
               const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
-              await notifyAdminForce(`❌ ${d.type} failed: ${execResult.error}`);
+              const err = String(execResult.error ?? 'unknown error');
+              if (d.type === 'KRYSTAL_LP_INCREASE') {
+                const p: any = d.params ?? {};
+                await notifyAdminForce(
+                  `⚠️ KRYSTAL_LP_INCREASE skipped — #${p.existingPosId ?? 'n/a'} ${p.pair ?? '?/?'} on ${p.chainName ?? 'evm'}: ${err}`,
+                );
+              } else {
+                await notifyAdminForce(`❌ ${d.type} failed: ${err}`);
+              }
             }
           };
           const approvalId = await this.queueForApproval(
@@ -1683,6 +1691,32 @@ export class CFOAgent extends BaseAgent {
           msg += '\n⏰ Expires in 15 min.';
         }
         await notifyAdminForce(msg);
+      }
+
+      // ── Explicit skip alerts: KRYSTAL_LP_INCREASE preflight/revert reasons ──
+      // One-line, actionable alerts so admin can immediately see why an add-liquidity
+      // attempt was skipped (owner mismatch, zero liquidity, token mismatch, etc.).
+      const increaseSkipResults = results.filter((r) => {
+        if (r.decision.type !== 'KRYSTAL_LP_INCREASE' || !r.executed || r.success) return false;
+        const err = String(r.error ?? '').toLowerCase();
+        return (
+          err.includes('cannot increase #') ||
+          err.includes('would revert') ||
+          err.includes('position has zero liquidity') ||
+          err.includes('owner') ||
+          err.includes('do not match target pool') ||
+          err.includes('on-chain preflight failed')
+        );
+      });
+
+      if (increaseSkipResults.length > 0) {
+        const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+        for (const r of increaseSkipResults) {
+          const p: any = r.decision.params ?? {};
+          await notifyAdminForce(
+            `⚠️ KRYSTAL_LP_INCREASE skipped — #${p.existingPosId ?? 'n/a'} ${p.pair ?? '?/?'} on ${p.chainName ?? 'evm'}: ${String(r.error ?? 'unknown error')}`,
+          );
+        }
       }
 
       // ── Persist ALL successful decisions to DB ────────────────────
