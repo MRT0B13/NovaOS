@@ -274,7 +274,7 @@ export function getCFOEnv(bust = false): CFOEnv {
     orcaLpMaxUsd: Number(process.env.CFO_ORCA_LP_MAX_USD ?? 500),
     orcaLpRebalanceTriggerPct: Number(process.env.CFO_ORCA_LP_REBALANCE_TRIGGER_PCT ?? 5),
     orcaLpMaxPositions: Number(process.env.CFO_ORCA_LP_MAX_POSITIONS ?? 3),
-    orcaLpRiskTiers: (process.env.CFO_ORCA_LP_RISK_TIERS ?? 'low,medium')
+    orcaLpRiskTiers: (process.env.CFO_ORCA_LP_RISK_TIERS ?? 'low,medium,high')
       .split(',').map(t => t.trim().toLowerCase()).filter(t => ['low', 'medium', 'high'].includes(t)),
 
     krystalLpEnabled: process.env.CFO_KRYSTAL_LP_ENABLE === 'true',
@@ -285,7 +285,7 @@ export function getCFOEnv(bust = false): CFOEnv {
     krystalLpMaxPositions: Number(process.env.CFO_KRYSTAL_LP_MAX_POSITIONS ?? 3),
     krystalLpRangeWidthTicks: Number(process.env.CFO_KRYSTAL_LP_RANGE_WIDTH_TICKS ?? 400),
     krystalLpRebalanceTriggerPct: Number(process.env.CFO_KRYSTAL_LP_REBALANCE_TRIGGER_PCT ?? 10),
-    krystalLpRiskTiers: (process.env.CFO_KRYSTAL_LP_RISK_TIERS ?? 'low,medium')
+    krystalLpRiskTiers: (process.env.CFO_KRYSTAL_LP_RISK_TIERS ?? 'low,medium,high')
       .split(',').map(t => t.trim().toLowerCase()).filter(t => ['low', 'medium', 'high'].includes(t)),
     evmRpcUrls: parseEvmRpcUrls(),
 

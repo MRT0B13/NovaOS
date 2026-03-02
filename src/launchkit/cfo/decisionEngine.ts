@@ -2519,8 +2519,8 @@ export async function generateDecisions(
       borrowLpSkip(`LTV ${(state.kaminoLtv * 100).toFixed(1)}% too close to cap ${env.kaminoBorrowLpMaxLtvPct}%`);
     } else if (state.orcaPositions.length >= env.orcaLpMaxPositions) {
       borrowLpSkip(`already at max Orca LP positions (${state.orcaPositions.length}/${env.orcaLpMaxPositions})`);
-    } else if (!checkCooldown('KAMINO_BORROW_LP', 24 * 3600_000)) {
-      borrowLpSkip('cooldown (24h)');
+    } else if (!checkCooldown('KAMINO_BORROW_LP', 4 * 3600_000)) {
+      borrowLpSkip('cooldown (4h)');
     } else {
       // Calculate safe borrow amount: X% of remaining headroom, capped by config
       const maxBorrowLtv = (env.kaminoBorrowLpMaxLtvPct) / 100;
@@ -2803,7 +2803,23 @@ export async function generateDecisions(
       else if (state.kaminoDepositValueUsd < 10 && !state.kaminoJitoLoopActive && !state.kaminoActiveLstLoop) diag.push('BorrowLP:no-collateral');
       else if (state.kaminoHealthFactor < 2.0) diag.push(`BorrowLP:HF=${state.kaminoHealthFactor.toFixed(2)}`);
       else if (state.orcaPositions.length >= env.orcaLpMaxPositions) diag.push(`BorrowLP:max-pos`);
-      else diag.push('BorrowLP:cooldown/spread');
+      else if (!checkCooldown('KAMINO_BORROW_LP', 4 * 3600_000)) {
+        const lastTs = lastDecisionAt['KAMINO_BORROW_LP'] ?? 0;
+        const minsLeft = lastTs ? Math.ceil((lastTs + 4 * 3600_000 - Date.now()) / 60_000) : 0;
+        diag.push(`BorrowLP:cooldown(${minsLeft}m left)`);
+      } else if (state.kaminoLtv >= (env.kaminoBorrowLpMaxLtvPct / 100) * 0.90) {
+        diag.push(`BorrowLP:LTV-cap(${(state.kaminoLtv * 100).toFixed(1)}%≥${(env.kaminoBorrowLpMaxLtvPct * 0.90).toFixed(0)}%)`);
+      } else {
+        // Spread check diagnostic
+        const borrowCostD = state.kaminoBorrowApy > 0 ? state.kaminoBorrowApy : 0.08;
+        const spreadD = (0.15 - borrowCostD) * 100;
+        const minSpread = env.kaminoBorrowLpMinSpreadPct ?? 5;
+        if (spreadD < minSpread) {
+          diag.push(`BorrowLP:spread(${spreadD.toFixed(1)}%<${minSpread}%)`);
+        } else {
+          diag.push(`BorrowLP:no-pools`);
+        }
+      }
     }
 
     // Add active decisions to summary

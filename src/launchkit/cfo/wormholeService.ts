@@ -669,9 +669,12 @@ export async function bridgeEvmToEvm(
     const feeCostUsd = Number(data.estimate?.feeCosts?.[0]?.amountUSD ?? 0);
     const totalFee = gasCostUsd + feeCostUsd;
 
-    // Fee gate: skip if fee > 3% of amount
-    if (amountHuman > 0 && totalFee > amountHuman * 0.03) {
-      return fail(`Bridge fee $${totalFee.toFixed(2)} exceeds 3% of $${amountHuman}`);
+    // Fee gate: skip if fee > 3% of amount (always compare in USD terms)
+    // For non-stablecoin bridges, amountHuman is in token units (e.g. 0.01 ETH),
+    // so we use LI.FI's fromAmountUSD to get the true USD value for comparison.
+    const fromAmountUsd = Number(data.estimate?.fromAmountUSD ?? amountHuman);
+    if (fromAmountUsd > 0 && totalFee > fromAmountUsd * 0.03) {
+      return fail(`Bridge fee $${totalFee.toFixed(2)} exceeds 3% of $${fromAmountUsd.toFixed(2)}`);
     }
 
     const quote: BridgeQuote = {
