@@ -1352,6 +1352,20 @@ export async function openEvmLpPosition(
       }
     }
 
+    // Gas guard: abort LP deployment if the target chain has no native gas for transactions.
+    // This prevents the cascade of failed swaps that happen after a cross-chain bridge
+    // delivers tokens but doesn't include gas (e.g. bridging to BSC without BNB).
+    {
+      const gasCheckBal = await provider.getBalance(wallet.address);
+      const gasCheckHuman = Number(ethers.formatEther(gasCheckBal));
+      const minGasNative = 0.002; // covers ~2-3 swap txs on any EVM chain
+      if (gasCheckHuman < minGasNative) {
+        const nativeSym = CHAIN_NATIVE_SYMBOL[chainNumericId] ?? 'ETH';
+        logger.error(`[Krystal] Aborting LP on chain ${chainNumericId}: only ${gasCheckHuman.toFixed(6)} ${nativeSym} — need ≥${minGasNative} for gas`);
+        return { success: false, error: `No ${nativeSym} gas on chain ${chainNumericId} (bal ${gasCheckHuman.toFixed(6)})` };
+      }
+    }
+
     // Phase 2: Swap USDC into pool tokens if we have USDC but are missing/underfunded on one side
     // This runs ALWAYS (not just after bridge) — handles cases where wallet has USDC
     // on the target chain already, or where one pool token is USDC and we need the other.
@@ -1506,6 +1520,7 @@ export async function openEvmLpPosition(
       const WRAPPED_NATIVE: Record<number, { symbol: string; address: string }> = {
         1:     { symbol: 'WETH',   address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' },
         10:    { symbol: 'WETH',   address: '0x4200000000000000000000000000000000000006' },
+        56:    { symbol: 'WBNB',   address: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c' },
         137:   { symbol: 'WMATIC', address: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270' },
         8453:  { symbol: 'WETH',   address: '0x4200000000000000000000000000000000000006' },
         42161: { symbol: 'WETH',   address: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1' },
@@ -2253,6 +2268,7 @@ const WELL_KNOWN_USDT: Record<number, string> = {
 const WRAPPED_NATIVE_ADDR: Record<number, string> = {
   1:     '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', // WETH
   10:    '0x4200000000000000000000000000000000000006', // WETH (Optimism)
+  56:    '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', // WBNB (BSC)
   137:   '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270', // WMATIC
   8453:  '0x4200000000000000000000000000000000000006', // WETH (Base)
   42161: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', // WETH (Arbitrum)
