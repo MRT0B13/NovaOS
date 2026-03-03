@@ -968,6 +968,38 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
           if (walletAddr) {
             const dbRecords = (globalThis as any).__cfo_evm_lp_records as import('./krystalService.ts').EvmLpRecord[] | undefined;
             const positions = await krystal.fetchKrystalPositions(walletAddr, dbRecords);
+
+            // Clean up positions confirmed closed on-chain (0 liquidity)
+            if (positions.closedOnChainPosIds?.length) {
+              for (const closedPosId of positions.closedOnChainPosIds) {
+                const existing = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('./krystalService.ts').EvmLpRecord[];
+                (globalThis as any).__cfo_evm_lp_records = existing.filter(r => r.posId !== closedPosId);
+              }
+              // Clean kv_store so they don't rehydrate on restart
+              try {
+                const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+                if (dbUrl) {
+                  const { Pool: PgPool } = await import('pg');
+                  const kvPool = new PgPool({ connectionString: dbUrl, max: 1 });
+                  try {
+                    for (const closedPosId of positions.closedOnChainPosIds) {
+                      await kvPool.query(`DELETE FROM kv_store WHERE key = $1`, [`cfo_evm_lp_${closedPosId}`]);
+                      // Also close the cfo_positions row if it exists (metadata.nfpmTokenId matches posId)
+                      await kvPool.query(
+                        `UPDATE cfo_positions SET status = 'CLOSED', realized_pnl_usd = 0,
+                         unrealized_pnl_usd = 0, current_value_usd = 0,
+                         exit_tx_hash = 'closed-on-chain', closed_at = NOW(), updated_at = NOW()
+                         WHERE strategy = 'krystal_lp' AND status = 'OPEN'
+                         AND metadata->>'nfpmTokenId' = $1`,
+                        [closedPosId],
+                      );
+                    }
+                    logger.info(`[CFO:Decision] Cleaned ${positions.closedOnChainPosIds.length} closed-on-chain EVM LP position(s) from kv_store + cfo_positions`);
+                  } finally { kvPool.end().catch(() => {}); }
+                }
+              } catch { /* non-fatal */ }
+            }
+
             evmLpPositions = positions.map(p => ({
               posId: p.posId,
               chainName: p.chainName,

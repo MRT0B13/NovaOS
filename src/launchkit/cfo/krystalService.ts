@@ -853,12 +853,19 @@ function classifyKrystalPoolRisk(pool: ScoredKrystalPool): 'low' | 'medium' | 'h
 const _slot0Cache = new Map<string, { tick: number; ts: number }>();
 const SLOT0_CACHE_TTL = 60_000;
 
+/** Extended return: array of live positions + closedOnChainPosIds for DB cleanup */
+export type KrystalPositionResult = KrystalPosition[] & { closedOnChainPosIds: string[] };
+
 export async function fetchKrystalPositions(
   ownerAddress: string,
   dbRecords?: EvmLpRecord[],
-): Promise<KrystalPosition[]> {
+): Promise<KrystalPositionResult> {
   const env = getCFOEnv();
-  if (!env.krystalLpEnabled) return [];
+  if (!env.krystalLpEnabled) {
+    const empty = [] as unknown as KrystalPositionResult;
+    empty.closedOnChainPosIds = [];
+    return empty;
+  }
 
   try {
     let rawPositions: any[] = [];
@@ -1028,6 +1035,7 @@ export async function fetchKrystalPositions(
     // ── On-chain NFPM fallback for DB positions missing from API ────────
     // Positions minted directly via NFPM (not through Krystal) won't appear
     // in the Krystal API. Read them on-chain using the NFPM contract.
+    const closedOnChainPosIds: string[] = [];
     if (dbRecords && dbRecords.length > 0) {
       const apiPosIds = new Set(positions.map(p => `${p.posId}_${p.chainNumericId}`));
       const missingRecords = dbRecords.filter(r => !apiPosIds.has(`${r.posId}_${r.chainNumericId}`));
@@ -1067,6 +1075,7 @@ export async function fetchKrystalPositions(
           // If liquidity is 0, position has been closed on-chain
           if (liquidity === 0n) {
             logger.info(`[Krystal] On-chain position ${dbRec.posId} has 0 liquidity — closed externally`);
+            closedOnChainPosIds.push(dbRec.posId);
             continue;
           }
 
@@ -1200,10 +1209,15 @@ export async function fetchKrystalPositions(
       }
     }
 
-    return positions;
+    // Attach closed posIds for caller-side DB cleanup
+    const result = positions as KrystalPositionResult;
+    result.closedOnChainPosIds = closedOnChainPosIds;
+    return result;
   } catch (err) {
     logger.warn('[Krystal] fetchKrystalPositions failed:', err);
-    return [];
+    const empty = [] as unknown as KrystalPositionResult;
+    empty.closedOnChainPosIds = [];
+    return empty;
   }
 }
 

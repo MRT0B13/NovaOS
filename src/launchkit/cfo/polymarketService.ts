@@ -1696,6 +1696,11 @@ export async function fetchPositions(): Promise<PolyPosition[]> {
     if (!resp.ok) {
       const text = await resp.text();
       logger.warn(`[Polymarket] Data API /positions returned ${resp.status}: ${text.slice(0, 200)}`);
+      // Throw on transient errors (429 rate-limit, 5xx) so callers know the
+      // result is unreliable and don't treat an empty array as "no positions".
+      if (resp.status === 429 || resp.status >= 500) {
+        throw new Error(`[Polymarket] Data API transient error ${resp.status}`);
+      }
       return [];
     }
 
