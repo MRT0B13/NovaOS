@@ -573,11 +573,17 @@ function detectDriftAlerts(
   }
 
   // Strategy degradation alerts
+  const GATE_THRESHOLD = 15; // matches MIN_STRATEGY_SCORE in decisionEngine
   for (const [name, st] of Object.entries(strategyStats)) {
     if (st.totalTrades < MIN_TRADES_FOR_CONFIDENCE) continue;
 
     const score = current.strategyScores[name] ?? 50;
     if (score < 25) {
+      const isGated = score < GATE_THRESHOLD && st.totalTrades >= 5;
+      if (isGated) {
+        // Strategy is already blocked by the decision engine gate — no need to alert
+        continue;
+      }
       alerts.push(
         `⚠️ ${name} degraded: score=${score.toFixed(0)}, ` +
         `WR=${(st.winRate * 100).toFixed(0)}%, Sharpe=${st.sharpeApprox.toFixed(2)}, ` +
