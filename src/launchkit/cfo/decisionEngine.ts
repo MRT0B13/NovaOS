@@ -983,7 +983,8 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
                   const kvPool = new PgPool({ connectionString: dbUrl, max: 1 });
                   try {
                     for (const closedPosId of positions.closedOnChainPosIds) {
-                      await kvPool.query(`DELETE FROM kv_store WHERE key = $1`, [`cfo_evm_lp_${closedPosId}`]);
+                      // Key format is cfo_evm_lp_<posId>_<chainNumericId> — use LIKE wildcard
+                      await kvPool.query(`DELETE FROM kv_store WHERE key LIKE $1`, [`cfo_evm_lp_${closedPosId}_%`]);
                       // Also close the cfo_positions row if it exists (metadata.nfpmTokenId matches posId)
                       await kvPool.query(
                         `UPDATE cfo_positions SET status = 'CLOSED', realized_pnl_usd = 0,

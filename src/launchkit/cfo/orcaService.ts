@@ -805,14 +805,36 @@ export async function getPositions(): Promise<OrcaPosition[]> {
         }
 
         // ── Unclaimed fees from on-chain position data ──
-        // Wrapped in try/catch so fee-read failures don't kill the position scan
+        // Use SDK's collectFeesQuote for accurate fee computation.
+        // Raw feeOwedA/B are only updated after updateFeesAndRewards instruction,
+        // so they read as 0 unless recently called. collectFeesQuote computes
+        // the true owed fees from fee growth checkpoints vs pool/tick globals.
         try {
-          const feeOwedAUi = Number(data.feeOwedA?.toString?.() ?? '0') / (10 ** tokenADec);
-          const feeOwedBUi = Number(data.feeOwedB?.toString?.() ?? '0') / (10 ** tokenBDec);
-          unclaimedFeesSol = feeOwedAUi;    // tokenA fees (in tokenA units, typically SOL)
-          unclaimedFeesUsdc = feeOwedBUi;   // tokenB fees (in tokenB units, typically USDC)
+          const [tickLowerData, tickUpperData] = await Promise.all([
+            position.getLowerTickData(),
+            position.getUpperTickData(),
+          ]);
+          const { collectFeesQuote, NO_TOKEN_EXTENSION_CONTEXT } = await loadOrcaSdk();
+          const feeQuote = collectFeesQuote({
+            whirlpool: poolData,
+            position: data,
+            tickLower: tickLowerData,
+            tickUpper: tickUpperData,
+            tokenExtensionCtx: NO_TOKEN_EXTENSION_CONTEXT,
+          });
+          const feeOwedAUi = Number(feeQuote.feeOwedA.toString()) / (10 ** tokenADec);
+          const feeOwedBUi = Number(feeQuote.feeOwedB.toString()) / (10 ** tokenBDec);
+          unclaimedFeesSol = feeOwedAUi;
+          unclaimedFeesUsdc = feeOwedBUi;
         } catch (feeErr) {
-          logger.debug('[Orca] fee calc failed, defaulting to 0:', feeErr);
+          // Fallback to raw on-chain feeOwedA/B (may be stale but better than 0)
+          try {
+            const feeOwedAUi = Number(data.feeOwedA?.toString?.() ?? '0') / (10 ** tokenADec);
+            const feeOwedBUi = Number(data.feeOwedB?.toString?.() ?? '0') / (10 ** tokenBDec);
+            unclaimedFeesSol = feeOwedAUi;
+            unclaimedFeesUsdc = feeOwedBUi;
+          } catch { /* leave at 0 */ }
+          logger.debug('[Orca] collectFeesQuote failed, fell back to raw feeOwed:', feeErr);
         }
 
         // Derive risk tier from token composition (same logic as orcaPoolDiscovery)
