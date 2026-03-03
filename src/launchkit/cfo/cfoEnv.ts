@@ -75,7 +75,7 @@ export interface CFOEnv {
   orcaLpMaxUsd: number;                           // max USD deployed into Orca LP (default 500)
   orcaLpRebalanceTriggerPct: number;              // rebalance when price within X% of range edge (default 5%)
   orcaLpMaxPositions: number;                     // max concurrent Orca LP positions (default 3)
-  orcaLpRiskTiers: string[];                      // enabled risk tiers: low,medium,high (default: low,medium)
+  orcaLpRiskTiers: Set<string>;                    // enabled risk tiers: low,medium,high (default: low,medium)
 
   // ── Krystal EVM Concentrated LP ──────────────────────────────────
   krystalLpEnabled: boolean;                      // enable Krystal EVM LP (default false)
@@ -86,7 +86,8 @@ export interface CFOEnv {
   krystalLpMaxPositions: number;                  // max concurrent EVM LP positions (default 3)
   krystalLpRangeWidthTicks: number;               // range width in ticks (default 400)
   krystalLpRebalanceTriggerPct: number;           // rebalance when utilisation drops below X% (default 10)
-  krystalLpRiskTiers: string[];                   // enabled risk tiers: low,medium,high (default: low,medium)
+  krystalLpRiskTiers: Set<string>;                 // enabled risk tiers: low,medium,high (default: low,medium)
+  krystalLpOpenCooldownMs: number;                // cooldown between KRYSTAL_LP_OPEN decisions (default 4h)
   evmRpcUrls: Record<number, string>;             // chainId → RPC URL mapping
 
   // ── Kamino-funded LP (borrow → LP → fees repay loan) ─────────────
@@ -274,8 +275,10 @@ export function getCFOEnv(bust = false): CFOEnv {
     orcaLpMaxUsd: Number(process.env.CFO_ORCA_LP_MAX_USD ?? 500),
     orcaLpRebalanceTriggerPct: Number(process.env.CFO_ORCA_LP_REBALANCE_TRIGGER_PCT ?? 5),
     orcaLpMaxPositions: Number(process.env.CFO_ORCA_LP_MAX_POSITIONS ?? 3),
-    orcaLpRiskTiers: (process.env.CFO_ORCA_LP_RISK_TIERS ?? 'low,medium,high')
-      .split(',').map(t => t.trim().toLowerCase()).filter(t => ['low', 'medium', 'high'].includes(t)),
+    orcaLpRiskTiers: new Set(
+      (process.env.CFO_ORCA_LP_RISK_TIERS ?? 'low,medium,high')
+        .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+    ),
 
     krystalLpEnabled: process.env.CFO_KRYSTAL_LP_ENABLE === 'true',
     krystalApiKey: process.env.CFO_KRYSTAL_API_KEY,
@@ -285,8 +288,11 @@ export function getCFOEnv(bust = false): CFOEnv {
     krystalLpMaxPositions: Number(process.env.CFO_KRYSTAL_LP_MAX_POSITIONS ?? 3),
     krystalLpRangeWidthTicks: Number(process.env.CFO_KRYSTAL_LP_RANGE_WIDTH_TICKS ?? 400),
     krystalLpRebalanceTriggerPct: Number(process.env.CFO_KRYSTAL_LP_REBALANCE_TRIGGER_PCT ?? 10),
-    krystalLpRiskTiers: (process.env.CFO_KRYSTAL_LP_RISK_TIERS ?? 'low,medium,high')
-      .split(',').map(t => t.trim().toLowerCase()).filter(t => ['low', 'medium', 'high'].includes(t)),
+    krystalLpRiskTiers: new Set(
+      (process.env.CFO_KRYSTAL_LP_RISK_TIERS ?? 'low,medium,high')
+        .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+    ),
+    krystalLpOpenCooldownMs: Number(process.env.CFO_KRYSTAL_LP_OPEN_COOLDOWN_HOURS ?? 4) * 3600_000,
     evmRpcUrls: parseEvmRpcUrls(),
 
     kaminoBorrowLpEnabled: process.env.CFO_KAMINO_BORROW_LP_ENABLE === 'true',

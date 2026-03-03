@@ -216,6 +216,20 @@ export async function openPosition(
   const halfRange = (rangeWidthPct ?? env.orcaLpRangeWidthPct ?? 20) / 2 / 100;
   const poolAddress = whirlpoolAddress ?? SOL_USDC_WHIRLPOOL;
 
+  // Guard: if this is a non-default pool, check the decimal registry.
+  // Using wrong decimals (e.g. 9/6 for a USDC/USDT pair) causes incorrect tick
+  // calculations. Fall back to on-chain reads if not registered.
+  if (poolAddress !== SOL_USDC_WHIRLPOOL) {
+    const reg = _poolDecimalRegistry[poolAddress];
+    if (!reg) {
+      logger.warn(`[Orca] Pool ${poolAddress.slice(0, 8)}… not in decimal registry — using caller-provided decimals (A=${tokenADecimals}, B=${tokenBDecimals}). Register via registerPoolDecimals() for safety.`);
+    } else {
+      // Override caller-provided decimals with verified registry values
+      tokenADecimals = reg.tokenADecimals;
+      tokenBDecimals = reg.tokenBDecimals;
+    }
+  }
+
   if (env.dryRun) {
     logger.info(`[Orca] DRY RUN — would open LP: $${usdcAmount} USDC + ${tokenAAmount} tokenA, range ±${halfRange * 100}%`);
     return { success: true, positionMint: `dry-position-${Date.now()}`, lowerPrice: 0, upperPrice: 0 };

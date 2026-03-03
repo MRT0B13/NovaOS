@@ -164,8 +164,8 @@ export interface OrcaPoolCandidate {
   scoreBreakdown: Record<string, number>;
   reasoning: string[];
 
-  // Risk tier (inferred from token composition)
-  riskTier?: 'low' | 'medium' | 'high';
+  // Risk tier (classified by classifyOrcaPoolRisk)
+  riskTier: 'low' | 'medium' | 'high';
 }
 
 /** The result of pool selection — what decisionEngine needs */
@@ -299,11 +299,7 @@ export async function discoverOrcaPools(forceRefresh = false): Promise<OrcaPoolC
         score: 0,
         scoreBreakdown: {},
         reasoning: [],
-        riskTier: (() => {
-          const _stables = new Set(['USDC', 'USDT', 'DAI', 'USDH', 'UXD', 'PYUSD']);
-          const sA = _stables.has(symbolA.toUpperCase()), sB = _stables.has(symbolB.toUpperCase());
-          return sA && sB ? 'low' as const : (sA || sB) ? 'medium' as const : 'high' as const;
-        })(),
+        riskTier: 'high' as const, // overwritten by scorePool → classifyOrcaPoolRisk
       });
     }
 
@@ -322,7 +318,7 @@ export async function discoverOrcaPools(forceRefresh = false): Promise<OrcaPoolC
 
     // Log top 10 for observability
     const top10 = candidates.slice(0, 10).map((c, i) =>
-      `${i + 1}. ${c.pair} score=${c.score.toFixed(0)} APY7d=${c.apyBase7d.toFixed(1)}% TVL=$${(c.tvlUsd / 1e6).toFixed(1)}M vol=$${(c.volumeUsd1d / 1e6).toFixed(1)}M pred=${c.predictedClass}`
+      `${i + 1}. ${c.pair} score=${c.score.toFixed(0)} APY7d=${c.apyBase7d.toFixed(1)}% TVL=$${(c.tvlUsd / 1e6).toFixed(1)}M vol=$${(c.volumeUsd1d / 1e6).toFixed(1)}M pred=${c.predictedClass} risk=${c.riskTier}`
     ).join('\n');
     logger.info(`[OrcaDiscovery] Top 10 pools:\n${top10}`);
 
@@ -512,6 +508,43 @@ function scorePool(pool: OrcaPoolCandidate): void {
   pool.score = score;
   pool.scoreBreakdown = breakdown;
   pool.reasoning = reasons;
+  pool.riskTier = classifyOrcaPoolRisk(pool);
+}
+
+/**
+ * Classify Orca pool risk using only DeFiLlama structural fields and
+ * computed scoreBreakdown.ilSafety. No token symbol hardcoding.
+ *
+ * LOW    = stablecoin pair with no IL risk (stablecoin=true, ilRisk=false), OR
+ *          correlated pair with no IL risk and stable fee stream (sigma <= 0.15)
+ *
+ * MEDIUM = IL risk present but ilSafety >= 5 (scorer found recognised/liquid token)
+ *          AND sigma <= 0.5 (fee income moderately predictable)
+ *
+ * HIGH   = IL risk + ilSafety < 5 (unknown/new token, scorer couldn't verify)
+ *          OR sigma > 1.0 (boom-bust fee cycles regardless of token type)
+ *          OR DeFiLlama ML predicts APY decline with >= 70% confidence
+ */
+function classifyOrcaPoolRisk(pool: OrcaPoolCandidate): 'low' | 'medium' | 'high' {
+  const ilSafety = pool.scoreBreakdown?.ilSafety ?? 1;
+  const sigma    = pool.sigma ?? 0;
+
+  // Boom-bust fee cycles — not worth LP regardless of token quality
+  if (sigma > 1.0) return 'high';
+
+  // ML strongly predicts APY decline — fees won't persist
+  if (pool.predictedClass === 'Down' && pool.predictedProb >= 70) return 'high';
+
+  if (!pool.ilRisk) {
+    // Both stable / correlated pair — minimal price risk
+    if (pool.stablecoin) return 'low';
+    if (sigma <= 0.15) return 'low';  // correlated pair, fee income very stable
+    return 'medium';
+  }
+
+  // Has IL risk — quality determined by ilSafety score
+  if (ilSafety >= 5 && sigma <= 0.5) return 'medium';
+  return 'high';
 }
 
 // ============================================================================
@@ -541,6 +574,7 @@ export async function selectBestPool(opts: {
   analystPrices?: Record<string, { usd: number; change24h: number }>;
   analystTrending?: string[];
   maxResults?: number;
+  orcaLpRiskTiers?: Set<string>;
 }): Promise<PoolSelection | null> {
   const pools = await discoverOrcaPools();
   if (pools.length === 0) {
@@ -548,10 +582,21 @@ export async function selectBestPool(opts: {
     return null;
   }
 
+  const allowedTiers = opts.orcaLpRiskTiers;
+  const tierFiltered = (allowedTiers && allowedTiers.size > 0 && allowedTiers.size < 3)
+    ? pools.filter(p => allowedTiers.has(p.riskTier))
+    : pools;
+
+  if (tierFiltered.length === 0) {
+    logger.warn('[OrcaDiscovery] No pools match risk tiers: ' +
+      (allowedTiers ? [...allowedTiers].join(',') : 'all'));
+    return null;
+  }
+
   const maxResults = opts.maxResults ?? 5;
 
   // ── Apply market condition adjustments ──────────────────────────────
-  const scored = pools.map(p => {
+  const scored = tierFiltered.map(p => {
     let adjustedScore = p.score;
     const adjustReasons: string[] = [...p.reasoning];
 

@@ -373,9 +373,12 @@ export class Supervisor extends BaseAgent {
         logger.info(`[supervisor] High safety alert posted for ${tokenName || tokenAddress}`);
 
         // Keep keyword filter as a sanity check, but ALSO require CFO exposure
+        // Also check payload.type directly so structured alerts aren't missed by keyword gaps
         const alertTypes = (alerts || []).map((a: string) => a.toLowerCase());
-        const hasLpDrain = alertTypes.some((a: string) => a.includes('lp') || a.includes('liquidity') || a.includes('drain'));
-        const hasCrash   = alertTypes.some((a: string) => a.includes('crash') || a.includes('dump') || a.includes('plunge'));
+        const hasLpDrain = alertTypes.some((a: string) => a.includes('lp') || a.includes('liquidity') || a.includes('drain'))
+          || msg.payload.type === 'lp_drain';
+        const hasCrash   = alertTypes.some((a: string) => a.includes('crash') || a.includes('dump') || a.includes('plunge'))
+          || msg.payload.type === 'price_crash';
         const isCfoTokenHigh = !!msg.payload.isCfoExposure;
 
         if ((hasLpDrain || hasCrash) && isCfoTokenHigh) {

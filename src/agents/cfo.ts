@@ -405,7 +405,7 @@ export class CFOAgent extends BaseAgent {
               tokenOut: p.tokenId, amountOut: p.sizeUsd / (p.pricePerShare || 0.01),
               feeUsd: 0, txHash: r.txId, walletAddress: '', positionId: pos.id,
               status: 'confirmed',
-              metadata: { conditionId: p.conditionId, outcome: p.side, reasoning: d.reasoning },
+              metadata: { conditionId: p.conditionId, outcome: p.side, reasoning: d.reasoning, estimatedProbability: p.pricePerShare },
             });
             logger.info(`[CFO] Persisted POLY_BET: ${pos.id} — ${p.side} "${(p.marketQuestion ?? '').slice(0, 50)}" $${p.sizeUsd}`);
             break;
@@ -780,7 +780,7 @@ export class CFOAgent extends BaseAgent {
                   closedAt: new Date().toISOString(),
                   updatedAt: new Date().toISOString(),
                   exitTxHash: resultAny.txHash ?? r.txId,
-                  metadata: { ...oldPos.metadata, rebalanced: true, rebalancedTo: newPosMint },
+                  metadata: { ...oldPos.metadata, rebalanced: true, rebalancedTo: newPosMint, outOfRange: !(oldPos.metadata as any)?.inRange },
                 });
               }
             } catch { /* best effort */ }
@@ -1123,6 +1123,7 @@ export class CFOAgent extends BaseAgent {
                   closedAt: new Date().toISOString(),
                   updatedAt: new Date().toISOString(),
                   exitTxHash: closeResult.txHash ?? r.txId,
+                  metadata: { ...oldKPos.metadata, rebalanced: true, outOfRange: !p.inRange },
                 });
               }
             } catch { /* best effort */ }
@@ -1142,7 +1143,7 @@ export class CFOAgent extends BaseAgent {
                 currentValueUsd: p.deployUsd ?? 0,
                 realizedPnlUsd: 0, unrealizedPnlUsd: 0,
                 entryTxHash: r.txId, externalId: r.txId,
-                metadata: { chainName: p.chainName, chainNumericId: p.chainNumericId, nfpmTokenId: r.txId },
+                metadata: { chainName: p.chainName, chainNumericId: p.chainNumericId, nfpmTokenId: r.txId, riskTier: p.riskTier ?? 'medium' },
                 openedAt: new Date().toISOString(),
                 updatedAt: new Date().toISOString(),
               });
@@ -2076,6 +2077,16 @@ export class CFOAgent extends BaseAgent {
       }
 
       lines.push(`\n_Cycles: ${this.cycleCount} | Paused: ${this.paused}_`);
+
+      // Append learning engine summary (shows adaptive parameter adjustments)
+      try {
+        const { getAdaptiveParams, formatLearningSummary } = await import('../launchkit/cfo/learningEngine.ts');
+        const learnedParams = getAdaptiveParams();
+        if (learnedParams.lastComputed > 0) {
+          lines.push('');
+          lines.push(formatLearningSummary(learnedParams));
+        }
+      } catch { /* non-fatal */ }
     } catch (err) {
       lines.push(`\n_Error: ${(err as Error).message}_`);
     }
@@ -2450,6 +2461,24 @@ export class CFOAgent extends BaseAgent {
         break;
       }
 
+      case 'token_graduated': {
+        const mint = payload.mint;
+        const ticker = payload.tokenSymbol ?? payload.tokenName ?? mint?.slice(0, 8);
+        logger.info(`[CFO] Token graduated: ${ticker} (${mint}) from ${msg.from_agent}`);
+        // Check if CFO holds this token and trigger yield assessment
+        if (mint && this.positionManager && this.repo) {
+          try {
+            const pos = await this.repo.getPositionByExternalId(mint);
+            if (pos && pos.status === 'OPEN') {
+              logger.info(`[CFO] Graduated token ${ticker} is in portfolio — scheduling yield check`);
+              const { notifyAdmin } = await import('../launchkit/services/adminNotify.ts');
+              await notifyAdmin(`🎓 Token *${ticker}* graduated to Raydium. Checking LP opportunities.`, 'system');
+            }
+          } catch { /* best effort */ }
+        }
+        break;
+      }
+
       default:
         if (cmd) logger.debug(`[CFO] Unhandled message command: ${cmd} from ${msg.from_agent}`);
         break;
@@ -2556,6 +2585,16 @@ export class CFOAgent extends BaseAgent {
         lines.push(`    /cfo approve ${id} — ${a.description.split(':')[0]}`);
       }
     }
+
+    // ── Learning summary ──
+    try {
+      const { getAdaptiveParams, formatLearningSummary } = await import('../launchkit/cfo/learningEngine.ts');
+      const learnedParams = getAdaptiveParams();
+      if (learnedParams.lastComputed > 0) {
+        lines.push('');
+        lines.push(formatLearningSummary(learnedParams));
+      }
+    } catch { /* non-fatal */ }
 
     const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
     await notifyAdminForce(lines.join('\n'));

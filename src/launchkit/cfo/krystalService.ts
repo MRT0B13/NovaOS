@@ -470,7 +470,26 @@ async function getEvmWallet(numericChainId: number): Promise<any> {
 // Krystal API helpers
 // ============================================================================
 
+// ── Circuit breaker for Krystal Cloud API ───────────────────────────────────
+// After KRYSTAL_CB_THRESHOLD consecutive failures the breaker opens and all
+// subsequent calls fail immediately (no network I/O) for KRYSTAL_CB_COOLDOWN_MS.
+// This prevents burning 15 s per request when the API is completely down.
+const KRYSTAL_CB_THRESHOLD   = 3;            // consecutive failures to trip
+const KRYSTAL_CB_COOLDOWN_MS = 5 * 60_000;   // 5 min cooldown once tripped
+let _krystalCbFails   = 0;
+let _krystalCbOpenAt  = 0;                   // timestamp when breaker opened
+
 async function krystalFetch(path: string, params?: Record<string, string>): Promise<any> {
+  // ── Circuit breaker check ──
+  if (_krystalCbFails >= KRYSTAL_CB_THRESHOLD) {
+    const elapsed = Date.now() - _krystalCbOpenAt;
+    if (elapsed < KRYSTAL_CB_COOLDOWN_MS) {
+      throw new Error(`[Krystal] Circuit breaker OPEN — skipping API call (${((KRYSTAL_CB_COOLDOWN_MS - elapsed) / 1000).toFixed(0)}s remaining)`);
+    }
+    // Cooldown expired — half-open: allow one probe request through
+    logger.info('[Krystal] Circuit breaker half-open — probing API');
+  }
+
   const env = getCFOEnv();
   const apiKey = env.krystalApiKey;
 
@@ -482,17 +501,33 @@ async function krystalFetch(path: string, params?: Record<string, string>): Prom
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (apiKey) headers['KC-APIKey'] = apiKey;
 
-  const resp = await fetch(url.toString(), {
-    headers,
-    signal: AbortSignal.timeout(15_000),
-  });
+  try {
+    const resp = await fetch(url.toString(), {
+      headers,
+      signal: AbortSignal.timeout(15_000),
+    });
 
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => '');
-    throw new Error(`[Krystal] API ${resp.status}: ${body.slice(0, 200)}`);
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      throw new Error(`[Krystal] API ${resp.status}: ${body.slice(0, 200)}`);
+    }
+
+    // Success — reset breaker
+    if (_krystalCbFails > 0) {
+      logger.info(`[Krystal] Circuit breaker CLOSED — API recovered after ${_krystalCbFails} failure(s)`);
+    }
+    _krystalCbFails = 0;
+    _krystalCbOpenAt = 0;
+
+    return resp.json();
+  } catch (err) {
+    _krystalCbFails++;
+    if (_krystalCbFails >= KRYSTAL_CB_THRESHOLD && _krystalCbOpenAt === 0) {
+      _krystalCbOpenAt = Date.now();
+      logger.warn(`[Krystal] Circuit breaker OPEN after ${_krystalCbFails} consecutive failures — cooling down ${KRYSTAL_CB_COOLDOWN_MS / 1000}s`);
+    }
+    throw err;
   }
-
-  return resp.json();
 }
 
 // ============================================================================
@@ -655,8 +690,13 @@ export async function discoverKrystalPools(forceRefresh = false): Promise<Scored
       });
     }
 
-    // Score all candidates
-    for (const c of candidates) scoreKrystalPool(c);
+    // Score all candidates (pass learned best pairs for bonus)
+    let lpBestPairs: string[] = [];
+    try {
+      const { getAdaptiveParams } = await import('./learningEngine.ts');
+      lpBestPairs = getAdaptiveParams().lpBestPairs ?? [];
+    } catch { /* learning engine may not be initialized */ }
+    for (const c of candidates) scoreKrystalPool(c, lpBestPairs);
 
     // Sort by score descending
     candidates.sort((a, b) => b.score - a.score);
@@ -689,7 +729,7 @@ export async function discoverKrystalPools(forceRefresh = false): Promise<Scored
  *   4. Protocol (10%): V3-compatible protocol bonus
  *   5. Range Safety (5%): stablecoin pairs less IL
  */
-function scoreKrystalPool(pool: ScoredKrystalPool): void {
+function scoreKrystalPool(pool: ScoredKrystalPool, lpBestPairs: string[] = []): void {
   const breakdown: Record<string, number> = {};
   const reasons: string[] = [];
 
@@ -743,22 +783,66 @@ function scoreKrystalPool(pool: ScoredKrystalPool): void {
   const is1Stable = stableSymbols.includes(pool.token1.symbol.toUpperCase());
 
   if (is0Stable && is1Stable) {
-    pool.riskTier = 'low';
     breakdown.range = 5;
-    reasons.push('LOW risk — stablecoin pair, minimal IL');
+    reasons.push('stablecoin pair, minimal IL');
   } else if (is0Stable || is1Stable) {
-    pool.riskTier = 'medium';
     breakdown.range = 3;
-    reasons.push('MEDIUM risk — one volatile side');
+    reasons.push('one volatile side');
   } else {
-    pool.riskTier = 'high';
-    breakdown.range = 2; // don't penalise volatile pairs heavily — APR compensates
-    reasons.push('HIGH risk — volatile pair, higher IL but higher APR');
+    breakdown.range = 1;
+    reasons.push('volatile pair, higher IL but higher APR');
   }
 
   pool.score = Object.values(breakdown).reduce((s, v) => s + v, 0);
+
+  // ── 6. Learning bonus — historically profitable pairs get a boost ──
+  if (lpBestPairs.length > 0) {
+    const pairKey = `${pool.token0.symbol}/${pool.token1.symbol}`.toUpperCase();
+    const pairKeyReverse = `${pool.token1.symbol}/${pool.token0.symbol}`.toUpperCase();
+    if (lpBestPairs.includes(pairKey) || lpBestPairs.includes(pairKeyReverse)) {
+      breakdown.learning = 5;
+      pool.score += 5;
+      reasons.push('historically profitable pair');
+    }
+  }
+
   pool.scoreBreakdown = breakdown;
   pool.reasoning = reasons;
+  pool.riskTier = classifyKrystalPoolRisk(pool);
+}
+
+/**
+ * Classify Krystal pool risk using only scoreBreakdown numeric signals.
+ * No token symbol hardcoding — signals derive from price/volume behavior.
+ *
+ * LOW    = both tokens price-stable (range=5), OR
+ *          one stable side (range=3) with deep TVL (score>=20 = $5M+),
+ *          consistent APR (score>=12), and reputable protocol (score>=8).
+ *
+ * HIGH   = both tokens volatile (range=1) AND either thin TVL
+ *          (score<=10 = <$500k) or spiked/collapsing APR (score<=5).
+ *
+ * MEDIUM = everything else.
+ */
+function classifyKrystalPoolRisk(pool: ScoredKrystalPool): 'low' | 'medium' | 'high' {
+  const range = pool.scoreBreakdown.range       ?? 1;
+  const cons  = pool.scoreBreakdown.consistency ?? 0;
+  const tvl   = pool.scoreBreakdown.tvl         ?? 0;
+  const prot  = pool.scoreBreakdown.protocol    ?? 0;
+
+  // LOW: both tokens price-stable — no meaningful IL
+  if (range === 5) return 'low';
+
+  // LOW: one stable side, well-cushioned by depth + consistent APR + reputable protocol
+  if (range === 3 && tvl >= 20 && cons >= 12 && prot >= 8) return 'low';
+
+  // HIGH: both volatile with thin TVL (illiquid, position has outsized impact)
+  if (range === 1 && tvl <= 10) return 'high';
+
+  // HIGH: both volatile with spiked or collapsing APR (unsustainable income)
+  if (range === 1 && cons <= 5) return 'high';
+
+  return 'medium';
 }
 
 // ============================================================================
@@ -800,9 +884,16 @@ export async function fetchKrystalPositions(
 
     const positions: KrystalPosition[] = [];
 
+    // Track CLOSED positions from API for ghost reconciliation
+    const closedPosIds: string[] = [];
+
     for (const pos of rawPositions) {
-      // Skip closed positions
-      if (pos.status === 'CLOSED') continue;
+      // Skip closed positions — but track them for reconciliation with DB
+      if (pos.status === 'CLOSED') {
+        const closedId = String(pos.tokenId ?? pos.posId ?? '');
+        if (closedId) closedPosIds.push(closedId);
+        continue;
+      }
 
       // ── Normalise Krystal positions API shape ──
       // chain: { name, id } → chainId string
@@ -1093,6 +1184,18 @@ export async function fetchKrystalPositions(
           logger.info(`[Krystal] On-chain fallback: position ${dbRec.posId} (${sym0}/${sym1} on ${chainName}) — $${valueUsd.toFixed(0)}, ${inRange ? 'in-range' : 'out-of-range'}`);
         } catch (err) {
           logger.warn(`[Krystal] On-chain read failed for position ${dbRec.posId}:`, err);
+        }
+      }
+    }
+
+    // ── Ghost position reconciliation ────────────────────────────────
+    // If the API reports a position as CLOSED but we still have it in DB as open,
+    // log it so the CFO can clean up stale records.
+    if (closedPosIds.length > 0 && dbRecords && dbRecords.length > 0) {
+      for (const closedId of closedPosIds) {
+        const dbKey = dbRecords.find(r => String(r.posId) === closedId);
+        if (dbKey) {
+          logger.warn(`[Krystal] Ghost position detected: posId=${closedId} is CLOSED on API but still in DB. Should be reconciled.`);
         }
       }
     }

@@ -933,64 +933,79 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     }
   }
 
-  // ── EVM Arb state ─────────────────────────────────────────────────────────
+  // ── EVM sections (Arb + Krystal LP + Multi-chain balances) ─────────────
+  // These three are independent of each other — run in parallel to cut
+  // wall-clock time (especially when Krystal API is slow / circuit-broken).
   let evmArbProfit24h = 0, evmArbPoolCount = 0, evmArbUsdcBalance = 0;
-  if (env.evmArbEnabled) {
-    try {
-      const arbMod = await import('./evmArbService.ts');
-      evmArbProfit24h    = arbMod.getProfit24h();
-      evmArbPoolCount    = arbMod.getCandidatePoolCount();
-      evmArbUsdcBalance  = await arbMod.getArbUsdcBalance();
-    } catch { /* 0 */ }
-  }
-
-  // ── Krystal EVM LP state ─────────────────────────────────────────────────
   let evmLpPositions: PortfolioState['evmLpPositions'] = [];
   let evmLpTotalValueUsd = 0, evmLpTotalFeesUsd = 0;
-  if (env.krystalLpEnabled) {
-    try {
-      const krystal = await import('./krystalService.ts');
-      const walletAddr = env.evmPrivateKey
-        ? (await import('ethers' as string)).computeAddress(env.evmPrivateKey)
-        : undefined;
-      if (walletAddr) {
-        // Pass DB records for openedAt enrichment (hydrated from kv_store by CFO agent)
-        const dbRecords = (globalThis as any).__cfo_evm_lp_records as import('./krystalService.ts').EvmLpRecord[] | undefined;
-        const positions = await krystal.fetchKrystalPositions(walletAddr, dbRecords);
-        evmLpPositions = positions.map(p => ({
-          posId: p.posId,
-          chainName: p.chainName,
-          chainNumericId: p.chainNumericId,
-          protocol: p.protocol,
-          token0Symbol: p.token0.symbol,
-          token1Symbol: p.token1.symbol,
-          token0Address: p.token0.address,
-          token1Address: p.token1.address,
-          token0Decimals: p.token0.decimals,
-          token1Decimals: p.token1.decimals,
-          valueUsd: p.valueUsd,
-          inRange: p.inRange,
-          rangeUtilisationPct: p.rangeUtilisationPct,
-          feesOwedUsd: p.feesOwedUsd,
-          openedAt: p.openedAt,
-        }));
-        evmLpTotalValueUsd = evmLpPositions.reduce((s, p) => s + p.valueUsd, 0);
-        evmLpTotalFeesUsd = evmLpPositions.reduce((s, p) => s + p.feesOwedUsd, 0);
-      }
-    } catch { /* 0 */ }
-  }
-
-  // ── Multi-chain EVM balance scan ──────────────────────────────────────────
   let evmChainBalances: PortfolioState['evmChainBalances'] = [];
   let evmTotalUsdcAllChains = 0, evmTotalNativeAllChains = 0;
-  if (env.krystalLpEnabled || env.lifiEnabled) {
-    try {
-      const krystal = await import('./krystalService.ts');
-      const balances = await krystal.getMultiChainEvmBalances();
-      evmChainBalances = balances;
-      evmTotalUsdcAllChains = balances.reduce((s, b) => s + b.totalStableUsd, 0);
-      evmTotalNativeAllChains = balances.reduce((s, b) => s + b.nativeValueUsd + b.wethValueUsd, 0);
-    } catch { /* 0 */ }
+
+  {
+    const evmJobs: Promise<void>[] = [];
+
+    // Job 1: EVM Arb state
+    if (env.evmArbEnabled) {
+      evmJobs.push((async () => {
+        try {
+          const arbMod = await import('./evmArbService.ts');
+          evmArbProfit24h   = arbMod.getProfit24h();
+          evmArbPoolCount   = arbMod.getCandidatePoolCount();
+          evmArbUsdcBalance = await arbMod.getArbUsdcBalance();
+        } catch { /* 0 */ }
+      })());
+    }
+
+    // Job 2: Krystal EVM LP positions
+    if (env.krystalLpEnabled) {
+      evmJobs.push((async () => {
+        try {
+          const krystal = await import('./krystalService.ts');
+          const walletAddr = env.evmPrivateKey
+            ? (await import('ethers' as string)).computeAddress(env.evmPrivateKey)
+            : undefined;
+          if (walletAddr) {
+            const dbRecords = (globalThis as any).__cfo_evm_lp_records as import('./krystalService.ts').EvmLpRecord[] | undefined;
+            const positions = await krystal.fetchKrystalPositions(walletAddr, dbRecords);
+            evmLpPositions = positions.map(p => ({
+              posId: p.posId,
+              chainName: p.chainName,
+              chainNumericId: p.chainNumericId,
+              protocol: p.protocol,
+              token0Symbol: p.token0.symbol,
+              token1Symbol: p.token1.symbol,
+              token0Address: p.token0.address,
+              token1Address: p.token1.address,
+              token0Decimals: p.token0.decimals,
+              token1Decimals: p.token1.decimals,
+              valueUsd: p.valueUsd,
+              inRange: p.inRange,
+              rangeUtilisationPct: p.rangeUtilisationPct,
+              feesOwedUsd: p.feesOwedUsd,
+              openedAt: p.openedAt,
+            }));
+            evmLpTotalValueUsd = evmLpPositions.reduce((s, p) => s + p.valueUsd, 0);
+            evmLpTotalFeesUsd  = evmLpPositions.reduce((s, p) => s + p.feesOwedUsd, 0);
+          }
+        } catch { /* 0 */ }
+      })());
+    }
+
+    // Job 3: Multi-chain EVM balance scan
+    if (env.krystalLpEnabled || env.lifiEnabled) {
+      evmJobs.push((async () => {
+        try {
+          const krystal = await import('./krystalService.ts');
+          const balances = await krystal.getMultiChainEvmBalances();
+          evmChainBalances        = balances;
+          evmTotalUsdcAllChains   = balances.reduce((s, b) => s + b.totalStableUsd, 0);
+          evmTotalNativeAllChains = balances.reduce((s, b) => s + b.nativeValueUsd + b.wethValueUsd, 0);
+        } catch { /* 0 */ }
+      })());
+    }
+
+    await Promise.all(evmJobs);
   }
 
   // Patch totalPortfolioUsd with Kamino + Orca + EVM LP values gathered above
@@ -1142,7 +1157,10 @@ function adaptiveLpRangeWidthTicks(
  *
  * Fallback: if discovery fails, returns a SOL/USDC hardcoded entry.
  */
-async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
+async function selectBestOrcaPairDynamic(
+  intel: SwarmIntel,
+  orcaLpRiskTiers?: Set<string>,
+): Promise<{
   pair: string;
   whirlpoolAddress: string;
   tokenA: string;
@@ -1156,6 +1174,7 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
   reasoning: string;
   apyBase7d: number;
   tvlUsd: number;
+  riskTier: 'low' | 'medium' | 'high';
 }> {
   const fallback = {
     pair: 'SOL/USDC',
@@ -1171,6 +1190,7 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
     reasoning: 'Fallback SOL/USDC — pool discovery unavailable',
     apyBase7d: 0,
     tvlUsd: 0,
+    riskTier: 'medium' as const,
   };
 
   try {
@@ -1193,6 +1213,7 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
       guardianTokens: intel.guardianTokens,
       analystPrices: intel.analystPrices,
       analystTrending: intel.analystTrending,
+      orcaLpRiskTiers,
     });
 
     if (!selection) {
@@ -1238,6 +1259,7 @@ async function selectBestOrcaPairDynamic(intel: SwarmIntel): Promise<{
       reasoning: `${p.reasoning.slice(0, 6).join(', ')}${pick.recency > 0 ? ' (diversity rotation)' : ''} (${ranked.length} pools evaluated)`,
       apyBase7d: p.apyBase7d,
       tvlUsd: p.tvlUsd,
+      riskTier: p.riskTier,
     };
   } catch (err) {
     logger.warn('[CFO:Decision] Dynamic pool selection failed:', err);
@@ -1343,6 +1365,17 @@ export async function generateDecisions(
 ): Promise<Decision[]> {
   const decisions: Decision[] = [];
   const conf = learned.confidenceLevel;
+
+  // ── Strategy score gate — skip capital-deploying sections for poorly performing strategies ──
+  // MIN_SAMPLES prevents gating strategies that haven't been tried enough.
+  // Risk-management sections (stop-loss, repay, emergency unstake) are NEVER gated.
+  const MIN_STRATEGY_SCORE = 15;
+  const MIN_SAMPLES_FOR_GATE = 5;
+  const isStrategyGated = (key: string): boolean => {
+    const score = learned.strategyScores[key];
+    const samples = learned.sampleSizes[key] ?? 0;
+    return samples >= MIN_SAMPLES_FOR_GATE && score !== undefined && score < MIN_STRATEGY_SCORE;
+  };
 
   // ── Global risk from learning (regime detection) ──────────────────
   const globalRisk = applyAdaptive(1.0, learned.globalRiskMultiplier, conf);
@@ -1558,7 +1591,9 @@ export async function generateDecisions(
   }
 
   // ── E) Polymarket prediction bets (using scout intel) ─────────────
-  if (config.autoPolymarket && env.polymarketEnabled && state.polyHeadroomUsd >= 2) {
+  if (isStrategyGated('polymarket')) {
+    logger.info(`[CFO:Decision] Section E skip: polymarket strategy score below ${MIN_STRATEGY_SCORE} (${learned.strategyScores['polymarket']?.toFixed(0) ?? '?'}/100, ${learned.sampleSizes['polymarket'] ?? 0} trades)`);
+  } else if (config.autoPolymarket && env.polymarketEnabled && state.polyHeadroomUsd >= 2) {
     // Apply learned cooldown multiplier (slower if poorly calibrated, faster if well-calibrated)
     const effectiveCooldown = config.polyBetCooldownMs * applyAdaptive(1.0, learned.polyCooldownMultiplier, conf);
     if (checkCooldown('POLY_BET', effectiveCooldown)) {
@@ -2298,7 +2333,7 @@ export async function generateDecisions(
       state.evmTotalUsdcAllChains >= 20 &&
       state.evmLpPositions.length < env.krystalLpMaxPositions &&
       intel.marketCondition !== 'bearish' &&
-      checkCooldown('KRYSTAL_LP_OPEN', 4 * 3600_000)
+      checkCooldown('KRYSTAL_LP_OPEN', env.krystalLpOpenCooldownMs)
     ) {
       try {
         const krystal = await import('./krystalService.ts');
@@ -2325,7 +2360,8 @@ export async function generateDecisions(
           p.tvlUsd >= env.krystalLpMinTvlUsd &&
           p.apr7d >= learnedMinApr &&
           (env.evmRpcUrls[p.chainNumericId] || p.chainNumericId === 42161) &&
-          deployableChainIds.has(p.chainNumericId), // deploy on funded chains OR bridge-reachable chains
+          deployableChainIds.has(p.chainNumericId) && // deploy on funded chains OR bridge-reachable chains
+          env.krystalLpRiskTiers.has(p.riskTier),
         );
 
         // Build a map from normalised pair key → existing position (for increase-liquidity)
@@ -2369,7 +2405,7 @@ export async function generateDecisions(
 
         // Split headroom across enabled tiers (equal share)
         const enabledTiers = env.krystalLpRiskTiers;
-        const perTierMaxUsd = evmLpHeadroomUsd / Math.max(enabledTiers.length, 1);
+        const perTierMaxUsd = evmLpHeadroomUsd / Math.max(enabledTiers.size, 1);
 
         // Group eligible pools by tier and pick the best from each
         const bestSolanaApr = state.orcaLpFeeApy ?? 0;
@@ -2424,7 +2460,7 @@ export async function generateDecisions(
             type: 'KRYSTAL_LP_OPEN',
             reasoning:
               `Opening [${tier.toUpperCase()} risk] EVM LP: ${best.token0.symbol}/${best.token1.symbol} on ${best.chainName} ` +
-              `($${deployUsd.toFixed(0)}). Pool score: ${best.score.toFixed(0)}/100 — ` +
+              `($${deployUsd.toFixed(0)}) [risk: ${best.riskTier}]. Pool score: ${best.score.toFixed(0)}/100 — ` +
               `APR7d ${best.apr7d.toFixed(1)}%, TVL $${(best.tvlUsd / 1e6).toFixed(1)}M, ` +
               `range ${rangeWidthTicks} ticks. ` +
               `${best.reasoning.join(', ')}.`,
@@ -2528,7 +2564,8 @@ export async function generateDecisions(
         }
 
         if (tiersOpened === 0 && newPools.length === 0 && increasePools.length === 0) {
-          krystalSkip(`no eligible pools (${pools.length} total, 0 pass TVL/APR/RPC filters)`);
+          krystalSkip('no eligible pools (' + pools.length + ' total, 0 pass filters' +
+            ' — allowed tiers: ' + [...env.krystalLpRiskTiers].join(',') + ')');
         }
       } catch (err) {
         logger.debug('[CFO:Decision] Krystal pool discovery failed:', err);
@@ -2543,7 +2580,9 @@ export async function generateDecisions(
   // ── J) EVM Flash Arbitrage (Arbitrum) ─────────────────────────────────────
   // Uses dynamic pool list from DeFiLlama. On-chain quotes only — no API latency.
   // AUTO tier: worst case is a reverted tx (~$0.05 gas). No capital at risk.
-  if (!env.evmArbEnabled) {
+  if (isStrategyGated('evm_flash_arb')) {
+    logger.info(`[CFO:Decision] Section J skip: evm_flash_arb strategy score below ${MIN_STRATEGY_SCORE} (${learned.strategyScores['evm_flash_arb']?.toFixed(0) ?? '?'}/100)`);
+  } else if (!env.evmArbEnabled) {
     logger.info('[CFO:Decision] Section J skip: evmArbEnabled=false');
   } else if (!env.evmArbReceiverAddress) {
     logger.debug('[CFO:Decision] Section J skip: no receiver contract address (CFO_EVM_ARB_RECEIVER_ADDRESS)');
@@ -2606,7 +2645,9 @@ export async function generateDecisions(
   //         APPROVAL tier. The CFO should never go crazy with borrowed money.
   //
   let _borrowLpLastSkip = '';
-  if (
+  if (isStrategyGated('orca_lp')) {
+    logger.info(`[CFO:Decision] Section K skip: orca_lp strategy score below ${MIN_STRATEGY_SCORE} (${learned.strategyScores['orca_lp']?.toFixed(0) ?? '?'}/100, ${learned.sampleSizes['orca_lp'] ?? 0} trades)`);
+  } else if (
     env.kaminoBorrowLpEnabled &&
     env.orcaLpEnabled &&
     env.kaminoBorrowEnabled &&
@@ -2664,6 +2705,8 @@ export async function generateDecisions(
       }
     } else if (state.kaminoHealthFactor < 2.0) {
       borrowLpSkip(`health factor ${state.kaminoHealthFactor.toFixed(2)} < 2.0 — too risky to borrow more`);
+    } else if ((learned.borrowLpCycleCount ?? 0) >= 3 && (learned.borrowLpNetYield ?? 0) < -5) {
+      borrowLpSkip(`learning: borrowLpNetYield=${(learned.borrowLpNetYield ?? 0).toFixed(1)}% after ${learned.borrowLpCycleCount} cycles — pausing until profitable`);
     } else if (state.kaminoLtv >= (env.kaminoBorrowLpMaxLtvPct / 100) * 0.90) {
       borrowLpSkip(`LTV ${(state.kaminoLtv * 100).toFixed(1)}% too close to cap ${env.kaminoBorrowLpMaxLtvPct}%`);
     } else if (state.orcaPositions.length >= env.orcaLpMaxPositions) {
@@ -2694,15 +2737,11 @@ export async function generateDecisions(
       } else if (spreadPct < (env.kaminoBorrowLpMinSpreadPct ?? 5)) {
         borrowLpSkip(`spread ${spreadPct.toFixed(1)}% < min ${env.kaminoBorrowLpMinSpreadPct ?? 5}% (LP ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow ~${(borrowCost * 100).toFixed(0)}%)`);
       } else {
-        // ── 3-tier risk system: discover pools, infer tiers, open one per enabled tier ──
+        // ── 3-tier risk system: discover pools, use classifier tiers, open one per enabled tier ──
         const ORCA_TIER_RANGE_MULT_K: Record<string, number> = { low: 0.4, medium: 1.0, high: 2.0 };
-        const _stableSetOrca = new Set(['USDC', 'USDT', 'DAI', 'USDH', 'UXD', 'PYUSD']);
-        const _inferOrcaTier = (tA: string, tB: string): 'low' | 'medium' | 'high' => {
-          const sA = _stableSetOrca.has(tA.toUpperCase()), sB = _stableSetOrca.has(tB.toUpperCase());
-          return sA && sB ? 'low' : (sA || sB) ? 'medium' : 'high';
-        };
 
         // Get discovered pools (cached — refreshes every 2h)
+        // Pools already carry riskTier from classifyOrcaPoolRisk() in orcaPoolDiscovery.ts
         let discoveredPools: any[] = [];
         try {
           discoveredPools = await discoverOrcaPools();
@@ -2711,17 +2750,13 @@ export async function generateDecisions(
         // Build set of existing Orca LP pool addresses to avoid duplicates
         const existingOrcaPools = new Set(state.orcaPositions.map(p => p.whirlpoolAddress).filter(Boolean));
 
-        // Annotate with risk tier
+        // Filter duplicates — riskTier is already set by the pool discovery classifier
         const tieredPools = discoveredPools
-          .filter(p => !existingOrcaPools.has(p.whirlpoolAddress))
-          .map(p => ({
-            ...p,
-            riskTier: _inferOrcaTier(p.tokenA.symbol, p.tokenB.symbol),
-          }));
+          .filter(p => !existingOrcaPools.has(p.whirlpoolAddress));
 
         const enabledTiers = env.orcaLpRiskTiers;
         const slotsAvailable = env.orcaLpMaxPositions - state.orcaPositions.length;
-        const perTierBudget = totalBorrowBudget / Math.max(enabledTiers.length, 1);
+        const perTierBudget = totalBorrowBudget / Math.max(enabledTiers.size, 1);
         let tiersOpened = 0;
         let budgetUsed = 0;   // track actual spend, not pre-allocated slots
 
@@ -2747,7 +2782,7 @@ export async function generateDecisions(
           }
           if (!selectedPool && tier === 'medium') {
             try {
-              const dynamicPick = await selectBestOrcaPairDynamic(intel);
+              const dynamicPick = await selectBestOrcaPairDynamic(intel, env.orcaLpRiskTiers);
               if (dynamicPick && !existingOrcaPools.has(dynamicPick.whirlpoolAddress)) {
                 selectedPool = dynamicPick;
               }
@@ -2785,7 +2820,7 @@ export async function generateDecisions(
             type: 'KAMINO_BORROW_LP',
             reasoning:
               `[${tier.toUpperCase()} risk] Borrow $${borrowUsd.toFixed(0)} USDC from Kamino (${(fractionToUse * 100).toFixed(0)}% of headroom) → ` +
-              `deploy into ${pair} concentrated LP (range ±${adaptiveRange / 2}%). ` +
+              `deploy into ${pair} concentrated LP [risk: ${selectedPool.riskTier ?? tier}] (range ±${adaptiveRange / 2}%). ` +
               `Est. LP fee yield ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow cost ~${(borrowCost * 100).toFixed(0)}% ` +
               `= ${spreadPct.toFixed(1)}% spread. Post-borrow LTV: ~${((state.kaminoLtv + borrowUsd / state.kaminoDepositValueUsd) * 100).toFixed(0)}%. ` +
               `LP fees accrue → close LP → repay borrow → keep profit.`,
@@ -2889,6 +2924,75 @@ export async function generateDecisions(
     }
   }
 
+  // ── K-bis) Standalone Orca LP — use wallet USDC when Kamino borrow is unavailable ──
+  // Fallback path: if Kamino borrow is not possible (no collateral, disabled, etc.)
+  // but the wallet has USDC and Orca LP is enabled, open a position with own funds.
+  if (
+    env.orcaLpEnabled &&
+    !isStrategyGated('orca_lp') &&
+    (!env.kaminoBorrowLpEnabled || state.kaminoDepositValueUsd < 10) &&
+    state.orcaPositions.length < env.orcaLpMaxPositions &&
+    state.solanaUsdcBalance >= 20 &&
+    intel.marketCondition !== 'danger' &&
+    checkCooldown('ORCA_LP_OPEN', 4 * 3600_000)
+  ) {
+    const deployUsd = Math.min(
+      state.solanaUsdcBalance * 0.3,  // deploy up to 30% of wallet USDC
+      env.orcaLpMaxUsd - state.orcaLpValueUsd,
+    );
+    if (deployUsd >= 20) {
+      const usdcSide = deployUsd / 2;
+      const solSide = deployUsd / 2 / state.solPriceUsd;
+      const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct, learned);
+
+      // Try to use discovered pools
+      let selectedPool: any = null;
+      try {
+        const pools = await discoverOrcaPools();
+        const existingPools = new Set(state.orcaPositions.map(p => p.whirlpoolAddress).filter(Boolean));
+        const candidates = pools
+          .filter(p => !existingPools.has(p.whirlpoolAddress) && p.riskTier === 'medium')
+          .sort((a, b) => b.score - a.score);
+        selectedPool = candidates[0];
+      } catch { /* fallback to SOL/USDC */ }
+
+      const pair = selectedPool?.pair ?? 'SOL/USDC';
+      const tokenA = selectedPool?.tokenA?.symbol ?? 'SOL';
+      const tokenB = selectedPool?.tokenB?.symbol ?? 'USDC';
+
+      decisions.push({
+        type: 'ORCA_LP_OPEN',
+        reasoning:
+          `Standalone LP (no Kamino borrow): deploy $${deployUsd.toFixed(0)} wallet USDC into ${pair} ` +
+          `concentrated LP (range ±${adaptiveRange / 2}%). No borrow cost — pure fee yield.`,
+        params: {
+          usdcAmount: usdcSide,
+          solAmount: solSide,
+          tokenAAmount: solSide,
+          rangeWidthPct: adaptiveRange,
+          riskTier: 'medium',
+          pair,
+          tokenA,
+          tokenB,
+          whirlpoolAddress: selectedPool?.whirlpoolAddress,
+          tokenADecimals: selectedPool?.tokenA?.decimals ?? 9,
+          tokenBDecimals: selectedPool?.tokenB?.decimals ?? 6,
+          tickSpacing: selectedPool?.tickSpacing,
+          needsSwapForUsdc: true,
+          solToSwapForUsdc: usdcSide / state.solPriceUsd,
+          needsSwapForTokenA: tokenA !== 'SOL',
+          solToSwapForTokenA: tokenA !== 'SOL' ? solSide : 0,
+          tokenAMint: selectedPool?.tokenA?.mint,
+        },
+        urgency: 'low',
+        estimatedImpactUsd: deployUsd * 0.15, // ~15% APY estimate
+        intelUsed: intel.scoutReceivedAt ? ['scout'] : [],
+        tier: 'APPROVAL',
+      });
+      logger.info(`[CFO:Decision] Section K-bis: standalone ORCA_LP_OPEN $${deployUsd.toFixed(0)} into ${pair} (no Kamino borrow)`);
+    }
+  }
+
   // Log tier breakdown
   const tierCounts = { AUTO: 0, NOTIFY: 0, APPROVAL: 0 };
   for (const d of decisions) tierCounts[d.tier]++;
@@ -2951,7 +3055,7 @@ export async function generateDecisions(
 
     // I: Orca LP (new positions via Section K / Kamino borrow; this tracks rebalance only)
     if (env.orcaLpEnabled) {
-      const orcaTierTag = env.orcaLpRiskTiers.join('/');
+      const orcaTierTag = [...env.orcaLpRiskTiers].join('/');
       if (state.orcaPositions.length > 0) diag.push(`OrcaLP:active(${state.orcaPositions.length})[${orcaTierTag}]`);
       else if (env.kaminoBorrowLpEnabled) diag.push(`OrcaLP:via-kamino-borrow(K)[${orcaTierTag}]`);
       else diag.push('OrcaLP:needs-borrow-enable');
@@ -2959,13 +3063,13 @@ export async function generateDecisions(
 
     // I-bis: Krystal EVM LP (3-tier risk system)
     if (env.krystalLpEnabled) {
-      const tierTag = env.krystalLpRiskTiers.join('/');
+      const tierTag = [...env.krystalLpRiskTiers].join('/');
       if (state.evmLpPositions.length > 0) diag.push(`KrystalLP:active(${state.evmLpPositions.length})[${tierTag}]`);
       else if (intel.marketCondition === 'danger') diag.push('KrystalLP:danger');
       else if (state.evmTotalUsdcAllChains < 20) diag.push(`KrystalLP:low-usdc($${state.evmTotalUsdcAllChains.toFixed(0)})`);
       else if (state.evmLpPositions.length >= env.krystalLpMaxPositions) diag.push(`KrystalLP:max-pos(${state.evmLpPositions.length})`);
       else if (intel.marketCondition === 'bearish') diag.push('KrystalLP:bearish');
-      else if (!checkCooldown('KRYSTAL_LP_OPEN', 4 * 3600_000)) diag.push('KrystalLP:cooldown');
+      else if (!checkCooldown('KRYSTAL_LP_OPEN', env.krystalLpOpenCooldownMs)) diag.push('KrystalLP:cooldown');
       else diag.push(`KrystalLP:seeking[${tierTag}]`);
     }
 

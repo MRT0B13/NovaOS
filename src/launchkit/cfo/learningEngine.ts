@@ -1081,6 +1081,12 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
       for (const alert of params.alerts) {
         logger.warn(`[Learning]   ${alert}`);
       }
+      // Forward critical alerts to admin Telegram so they're visible outside logs
+      try {
+        const { notifyAdmin } = await import('../services/adminNotify.ts');
+        const alertMsg = `🧠 *Learning Alerts (${params.alerts.length}):*\n${params.alerts.map(a => `  • ${a}`).join('\n')}`;
+        await notifyAdmin(alertMsg, 'system');
+      } catch { /* non-fatal — admin notify may not be configured */ }
     }
 
     // Log per-strategy detail at debug level

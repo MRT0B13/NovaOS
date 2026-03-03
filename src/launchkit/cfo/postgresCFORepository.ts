@@ -385,7 +385,29 @@ export class PostgresCFORepository {
 
   // ── Transactions ──────────────────────────────────────────────────
 
+  /**
+   * Estimate gas fee in USD when not explicitly provided.
+   * Uses conservative per-chain averages. The learning engine uses feeUsd
+   * to compute feeDragPct — having rough estimates is far better than 0.
+   */
+  private static estimateGasUsd(chain: string): number {
+    const estimates: Record<string, number> = {
+      solana: 0.005,     // ~5000 lamport priority fee + base
+      polygon: 0.02,     // cheap L2
+      arbitrum: 0.10,    // L2 rollup
+      base: 0.03,        // cheap L2
+      optimism: 0.05,    // L2 rollup
+      avalanche: 0.08,
+      ethereum: 3.00,    // L1 — expensive
+      evm: 0.10,         // unknown EVM chain default
+    };
+    return estimates[chain.toLowerCase()] ?? 0.05;
+  }
+
   async insertTransaction(tx: CFOTransaction): Promise<void> {
+    // Auto-estimate gas fee when callers pass 0 — provides learning engine
+    // with rough fee drag data instead of a blind spot.
+    const feeUsd = tx.feeUsd > 0 ? tx.feeUsd : PostgresCFORepository.estimateGasUsd(tx.chain);
     try {
       await this.pool.query(
         `INSERT INTO cfo_transactions (
@@ -397,7 +419,7 @@ export class PostgresCFORepository {
         [
           tx.id, tx.timestamp, tx.chain, tx.strategyTag, tx.txType,
           tx.tokenIn ?? null, tx.amountIn ?? null, tx.tokenOut ?? null, tx.amountOut ?? null,
-          tx.feeUsd, tx.txHash ?? null, tx.walletAddress,
+          feeUsd, tx.txHash ?? null, tx.walletAddress,
           tx.positionId ?? null, tx.status, tx.errorMessage ?? null,
           JSON.stringify(tx.metadata),
         ],
