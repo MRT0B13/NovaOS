@@ -758,7 +758,7 @@ async function getStaleTopics(): Promise<ResearchTopic[]> {
 /**
  * Research a single topic: Tavily search → GPT fact extraction → store in PG
  */
-async function researchTopic(topic: ResearchTopic): Promise<void> {
+async function researchTopic(topic: ResearchTopic, depthOverride?: 'basic' | 'advanced'): Promise<void> {
   const tavilyKey = process.env.TAVILY_API_KEY;
   const openaiKey = process.env.OPENAI_API_KEY;
   if (!tavilyKey || !openaiKey) return;
@@ -767,13 +767,15 @@ async function researchTopic(topic: ResearchTopic): Promise<void> {
   if (!repo) return;
 
   // Step 1: Search via Tavily
+  // depthOverride lets the caller control credit spend (basic=1 credit, advanced=2)
+  const searchDepth = depthOverride ?? 'basic';
   const searchRes = await fetch('https://api.tavily.com/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       api_key: tavilyKey,
       query: topic.query,
-      search_depth: topic.priority >= 8 ? 'advanced' : 'basic',
+      search_depth: searchDepth,
       include_answer: true,
       max_results: 5,
     }),
@@ -1283,11 +1285,18 @@ export async function runResearchCycle(): Promise<void> {
   if (tavilyKey) {
     const staleTopics = await getStaleTopics();
     if (staleTopics.length > 0) {
-      const batch = staleTopics.sort((a, b) => b.priority - a.priority).slice(0, 5);
-      logger.info(`[NovaResearch] Phase 1: Researching ${batch.length} topics: ${batch.map(t => t.id).join(', ')}`);
-      for (const topic of batch) {
+      // SCOUT_RESEARCH_MAX_TOPICS: max topics per research cycle (default 3, was 5)
+      // Credit budget: topic[0] = basic (1 credit), topics[1..N] = advanced (2 credits each)
+      // Default 3 topics = 1 + 2 + 2 = 5 Tavily credits per research cycle
+      const maxTopics = Number(process.env.SCOUT_RESEARCH_MAX_TOPICS) || 3;
+      const batch = staleTopics.sort((a, b) => b.priority - a.priority).slice(0, maxTopics);
+      logger.info(`[NovaResearch] Phase 1: Researching ${batch.length}/${staleTopics.length} stale topics (1 basic + ${Math.max(0, batch.length - 1)} advanced): ${batch.map(t => t.id).join(', ')}`);
+      for (let idx = 0; idx < batch.length; idx++) {
+        const topic = batch[idx];
         try {
-          await researchTopic(topic);
+          // First topic = basic (cheaper), rest = advanced (deeper)
+          const depth: 'basic' | 'advanced' = idx === 0 ? 'basic' : 'advanced';
+          await researchTopic(topic, depth);
           await new Promise(r => setTimeout(r, 5000));
         } catch (err) {
           logger.warn(`[NovaResearch] Failed to research ${topic.id}: ${err}`);
@@ -1419,9 +1428,11 @@ export async function quickSearch(query: string): Promise<string | null> {
   const repo = await getRepo();
   if (repo) {
     try {
+      // SCOUT_CACHE_TTL_HOURS: how long quickSearch results stay fresh (default 12, was 6)
+      const cacheTtlH = Number(process.env.SCOUT_CACHE_TTL_HOURS) || 12;
       const cached = await repo.query(
         `SELECT summary, facts FROM nova_knowledge 
-         WHERE search_query = $1 AND fetched_at > NOW() - INTERVAL '6 hours'
+         WHERE search_query = $1 AND fetched_at > NOW() - INTERVAL '${cacheTtlH} hours'
          LIMIT 1`,
         [query]
       );

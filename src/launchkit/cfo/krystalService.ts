@@ -536,7 +536,8 @@ async function krystalFetch(path: string, params?: Record<string, string>): Prom
 
 let _cachedPools: ScoredKrystalPool[] = [];
 let _cacheTimestamp = 0;
-const CACHE_TTL_MS = 60 * 60_000; // 1 hour
+// CFO_KRYSTAL_DISCOVERY_TTL_HOURS: how long discovery cache stays fresh (default 4, was 1)
+const CACHE_TTL_MS = (Number(process.env.CFO_KRYSTAL_DISCOVERY_TTL_HOURS) || 4) * 60 * 60_000;
 
 export async function discoverKrystalPools(forceRefresh = false): Promise<ScoredKrystalPool[]> {
   if (!forceRefresh && _cachedPools.length > 0 && Date.now() - _cacheTimestamp < CACHE_TTL_MS) {
@@ -546,48 +547,105 @@ export async function discoverKrystalPools(forceRefresh = false): Promise<Scored
   const env = getCFOEnv();
   if (!env.krystalLpEnabled) return _cachedPools;
 
-  // Query per-chain with pagination for full coverage
-  const targetChains = Array.from(KRYSTAL_LP_CHAINS);
-  const PAGES_PER_CHAIN = 5;
+  // ── Two-phase dynamic chain discovery ──────────────────────────────
+  // Phase 1: Probe page 1 from ALL Krystal chains (10 API calls)
+  // Phase 2: Rank chains by aggregate TVL, fetch pages 2-3 ONLY from active chains
+  // This drops dead chains automatically and saves ~60% of API calls vs fetching
+  // 3 pages from all 10 chains every time.
+  const allChains = Array.from(KRYSTAL_LP_CHAINS);
+  const EXTRA_PAGES = 2;  // pages 2-3 for active chains (3 total per active chain)
   const PER_PAGE = 200;
-  logger.info(`[KrystalDiscovery] Refreshing pool list across ${targetChains.length} chains (${PAGES_PER_CHAIN} pages each)…`);
+  // CFO_KRYSTAL_CHAIN_MIN_TVL: minimum aggregate TVL ($) on page 1 to qualify for extra pages (default 5M)
+  const chainMinTvl = Number(process.env.CFO_KRYSTAL_CHAIN_MIN_TVL) || 5_000_000;
+
+  logger.info(`[KrystalDiscovery] Phase 1: Probing ${allChains.length} chains (1 page each, TTL ${CACHE_TTL_MS / 3600_000}h)…`);
 
   try {
-    // Build fetch tasks: each chain × each page (offset-based — Krystal ignores 'page')
-    const fetchTasks: Array<{ chainId: number; offset: number }> = [];
-    for (const chainId of targetChains) {
-      for (let p = 0; p < PAGES_PER_CHAIN; p++) {
-        fetchTasks.push({ chainId, offset: p * PER_PAGE });
-      }
-    }
-
-    const perChainResults = await Promise.allSettled(
-      fetchTasks.map(({ chainId, offset }) =>
+    // ── Phase 1: Probe page 1 from all chains ──
+    const probeResults = await Promise.allSettled(
+      allChains.map(chainId =>
         krystalFetch('/v1/pools', {
           sortBy: '0',
           limit: String(PER_PAGE),
           chainId: String(chainId),
-          offset: String(offset),
-        }),
+          offset: '0',
+        }).then(data => ({ chainId, data })),
       ),
     );
 
-    const rawPools: any[] = [];
-    let failCount = 0;
-    for (const result of perChainResults) {
-      if (result.status !== 'fulfilled') { failCount++; continue; }
-      const data = result.value;
+    // Collect page-1 pools per chain + compute aggregate TVL
+    const chainPools: Map<number, any[]> = new Map();
+    const chainTvl: Map<number, number> = new Map();
+    let probeFailCount = 0;
+
+    for (const result of probeResults) {
+      if (result.status !== 'fulfilled') { probeFailCount++; continue; }
+      const { chainId, data } = result.value;
       const arr = data?.pools ?? (Array.isArray(data) ? data : []);
-      if (Array.isArray(arr)) rawPools.push(...arr);
+      if (!Array.isArray(arr) || arr.length === 0) continue;
+      chainPools.set(chainId, arr);
+      const totalTvl = arr.reduce((sum: number, p: any) => sum + Number(p.tvl ?? 0), 0);
+      chainTvl.set(chainId, totalTvl);
     }
-    if (failCount > 0) logger.warn(`[KrystalDiscovery] ${failCount}/${fetchTasks.length} fetch tasks failed`);
+    if (probeFailCount > 0) logger.warn(`[KrystalDiscovery] Phase 1: ${probeFailCount}/${allChains.length} chain probes failed`);
+
+    // Rank chains by TVL, keep only those above minimum
+    const rankedChains = [...chainTvl.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .filter(([, tvl]) => tvl >= chainMinTvl);
+
+    const activeChainIds = rankedChains.map(([id]) => id);
+    const droppedCount = chainTvl.size - activeChainIds.length;
+
+    logger.info(
+      `[KrystalDiscovery] Phase 1 complete: ${chainTvl.size} chains responded, ` +
+      `${activeChainIds.length} active (TVL≥$${(chainMinTvl / 1e6).toFixed(0)}M), ${droppedCount} dropped. ` +
+      `Ranking: ${rankedChains.map(([id, tvl]) => `${id}=$${(tvl / 1e6).toFixed(1)}M`).join(', ')}`
+    );
+
+    // ── Phase 2: Fetch extra pages only for active chains ──
+    const rawPools: any[] = [];
+    // Add all page-1 results first
+    for (const [, pools] of chainPools) rawPools.push(...pools);
+
+    if (activeChainIds.length > 0 && EXTRA_PAGES > 0) {
+      const extraTasks: Array<{ chainId: number; offset: number }> = [];
+      for (const chainId of activeChainIds) {
+        for (let p = 1; p <= EXTRA_PAGES; p++) {
+          extraTasks.push({ chainId, offset: p * PER_PAGE });
+        }
+      }
+
+      logger.info(`[KrystalDiscovery] Phase 2: Fetching ${extraTasks.length} extra pages for ${activeChainIds.length} active chains…`);
+
+      const extraResults = await Promise.allSettled(
+        extraTasks.map(({ chainId, offset }) =>
+          krystalFetch('/v1/pools', {
+            sortBy: '0',
+            limit: String(PER_PAGE),
+            chainId: String(chainId),
+            offset: String(offset),
+          }),
+        ),
+      );
+
+      let extraFailCount = 0;
+      for (const result of extraResults) {
+        if (result.status !== 'fulfilled') { extraFailCount++; continue; }
+        const data = result.value;
+        const arr = data?.pools ?? (Array.isArray(data) ? data : []);
+        if (Array.isArray(arr)) rawPools.push(...arr);
+      }
+      if (extraFailCount > 0) logger.warn(`[KrystalDiscovery] Phase 2: ${extraFailCount}/${extraTasks.length} extra fetches failed`);
+    }
 
     if (rawPools.length === 0) {
       logger.warn('[KrystalDiscovery] No pools returned from any chain');
       return _cachedPools;
     }
 
-    logger.info(`[KrystalDiscovery] Fetched ${rawPools.length} raw pools across ${targetChains.length} chains`);
+    const totalApiCalls = allChains.length + (activeChainIds.length * EXTRA_PAGES);
+    logger.info(`[KrystalDiscovery] Fetched ${rawPools.length} raw pools (${totalApiCalls} API calls — was ${allChains.length * 5} before optimisation)`);
 
     // Deduplicate by chainId + poolAddress
     const seenPools = new Set<string>();

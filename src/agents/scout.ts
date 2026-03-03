@@ -62,6 +62,7 @@ export class ScoutAgent extends BaseAgent {
   private researchIntervalMs: number;
   private scanIntervalMs: number;
   private digestIntervalMs: number;
+  private topicsPerScan: number;
   private lastResearchAt = 0;
   private lastScanAt = 0;
   private lastDigestAt = 0;
@@ -118,9 +119,15 @@ export class ScoutAgent extends BaseAgent {
       agentType: 'scout',
       pool,
     });
+    // ── API credit conservation (env-configurable) ──
+    // SCOUT_SCAN_INTERVAL_MIN: minutes between scans (default 60, was 30)
+    // SCOUT_TOPICS_PER_SCAN:  topics searched per scan (default 4, was 7)
+    const scanMinutes = Number(process.env.SCOUT_SCAN_INTERVAL_MIN) || 60;
+    const topicsPerScan = Number(process.env.SCOUT_TOPICS_PER_SCAN) || 4;
     this.researchIntervalMs = opts?.researchIntervalMs ?? 8 * 60 * 60 * 1000;  // 8 hours
-    this.scanIntervalMs     = opts?.scanIntervalMs     ?? 30 * 60 * 1000;      // 30 minutes
+    this.scanIntervalMs     = opts?.scanIntervalMs     ?? scanMinutes * 60 * 1000;
     this.digestIntervalMs   = opts?.digestIntervalMs   ?? 2 * 60 * 60 * 1000;  // 2 hours
+    this.topicsPerScan      = Math.max(1, Math.min(topicsPerScan, ScoutAgent.TOPIC_POOL.length));
   }
 
   protected async onStart(): Promise<void> {
@@ -194,10 +201,11 @@ export class ScoutAgent extends BaseAgent {
       await loadTrendData();
       await this.updateStatus('scanning');
 
-      // Pick 7 topics: rotate through the pool so each scan covers different ground
-      const offset = (this.scanCount * 7) % ScoutAgent.TOPIC_POOL.length;
+      // Pick N topics: rotate through the pool so each scan covers different ground
+      const n = this.topicsPerScan;
+      const offset = (this.scanCount * n) % ScoutAgent.TOPIC_POOL.length;
       const topics: string[] = [];
-      for (let i = 0; i < 7 && topics.length < 7; i++) {
+      for (let i = 0; i < n && topics.length < n; i++) {
         topics.push(ScoutAgent.TOPIC_POOL[(offset + i) % ScoutAgent.TOPIC_POOL.length]);
       }
 
