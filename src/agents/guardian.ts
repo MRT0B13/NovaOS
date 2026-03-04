@@ -113,36 +113,16 @@ async function fetchDexScreenerLiquidity(mints: string[]): Promise<Map<string, L
 }
 
 // ============================================================================
-// Known protocol / infrastructure tokens — NEVER flag as rugged
-// These are established DeFi protocol tokens whose RugCheck scores are high
-// due to normal vault/index/LP complexity, NOT actual rug risk.
-// Add any CFO-deployed pool tokens here to prevent false-positive emergency pauses.
+// Confirmed-non-rug seed — absolute minimum that will never be scanned
+// (native SOL and the two main stablecoins).  Everything else is learned
+// dynamically by the Guardian as it scans tokens and sees data.rugged=false.
 // ============================================================================
 
-const KNOWN_PROTOCOL_MINTS = new Set<string>([
-  // Jupiter
-  'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',   // JUP
-  '27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4',   // JLP (Jupiter LP Index)
-  // Jito
-  'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',   // JitoSOL
-  'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL',    // JTO
-  // Orca
-  'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE',    // ORCA
-  // Raydium
-  '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R',   // RAY
-  // Kamino
-  'KMNo3nJsBXfcpJTVhZcXLW7RmTwTt4GVFE7suUBo9sS',    // KMNO
-  // Drift
-  'DriFtupJYLTosbwoN8koMbEYSx54aFAVLddWsbksjwg7',   // DRIFT
-  // Marinade
-  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',   // mSOL
-  // Pyth
-  'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3',   // PYTH
-  // SOL/stablecoins
-  'So11111111111111111111111111111111111111112',       // WSOL
+const CONFIRMED_NON_RUG_SEED: readonly string[] = [
+  'So11111111111111111111111111111111111111112',       // WSOL  — native SOL
   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',   // USDC
   'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',   // USDT
-]);
+];
 
 // ============================================================================
 // Core Solana tokens — always watched as a baseline
@@ -192,6 +172,11 @@ export class GuardianAgent extends BaseAgent {
   // every rescan cycle (e.g. Guardian rescans every 15 min, CFO pause resets each time)
   private lastCriticalAlertAt: Map<string, number> = new Map();
   private static readonly CRITICAL_ALERT_COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours
+  // Dynamically-learned set of mints confirmed NOT rugged by the RugCheck API.
+  // Seeded with WSOL/USDC/USDT at startup; every scan that returns data.rugged=false
+  // adds the mint here so subsequent scans never fire false-positive rug alerts.
+  // Persisted to DB so knowledge survives restarts.
+  private confirmedNonRug: Set<string> = new Set(CONFIRMED_NON_RUG_SEED);
 
   // ── Security Modules ──────────────────────────────────────────
   private walletSentinel: WalletSentinel;
@@ -440,6 +425,17 @@ export class GuardianAgent extends BaseAgent {
     this.scanCount++;
     const safe = _isSafe!(report);
 
+    // Learn: if RugCheck confirms this token is NOT rugged, remember it permanently.
+    // This prevents protocol tokens (JLP, JitoSOL, etc.) from ever triggering false
+    // rug alerts — Guardian learns from its own scan results rather than a static list.
+    if (!report.isRugged) {
+      if (!this.confirmedNonRug.has(mint)) {
+        this.confirmedNonRug.add(mint);
+        const label = this.watchList.get(mint)?.ticker ?? mint.slice(0, 8);
+        logger.info(`[guardian] ✅ Learned confirmed-non-rug: ${label} (score=${report.score}) — will never trigger false rug alert`);
+      }
+    }
+
     // Persist counters after each scan (survive restarts)
     this.persistState();
     // Update watch list if we're tracking this token
@@ -463,12 +459,13 @@ export class GuardianAgent extends BaseAgent {
 
     // Critical alerts for dangerous findings.
     // Skip for:
-    //   - core tokens (established protocol tokens always score high)
-    //   - KNOWN_PROTOCOL_MINTS (DeFi infrastructure, JLP, JitoSOL, etc.)
-    // For genuine tokens, only fire critical ONCE per 4 hours per mint to prevent
+    //   - core tokens (always tracked baseline tokens)
+    //   - confirmedNonRug (any mint the Guardian has seen data.rugged=false for)
+    // For genuinely-rugged tokens, only fire ONCE per 4 hours per mint to prevent
     // the Guardian re-scan loop from repeatedly extending the CFO emergency pause.
     const isCore = watched?.source === 'core';
-    const isKnownProtocol = KNOWN_PROTOCOL_MINTS.has(mint);
+    // Use dynamically-learned confirmed-non-rug set (grown by scan results)
+    const isKnownProtocol = this.confirmedNonRug.has(mint);
 
     if (!isCore && !isKnownProtocol && report.isRugged) {
       // isRugged is now only true when RugCheck API explicitly confirms it (data.rugged=true)
@@ -919,6 +916,7 @@ export class GuardianAgent extends BaseAgent {
       securityInitialized: this.securityInitialized,
       xQuotaExhausted: this.xQuotaExhausted,
       scoutTokens,
+      confirmedNonRug: [...this.confirmedNonRug],
     });
   }
 
@@ -928,6 +926,7 @@ export class GuardianAgent extends BaseAgent {
       liquidityAlertCount?: number;
       xQuotaExhausted?: boolean;
       scoutTokens?: Array<{ mint: string; ticker?: string; source: string; addedAt: number }>;
+      confirmedNonRug?: string[];
     }>();
     if (!s) return;
     if (s.scanCount)           this.scanCount = s.scanCount;
@@ -940,6 +939,10 @@ export class GuardianAgent extends BaseAgent {
         pauseReplyEngine('restored from persisted state — quota was exhausted before restart');
       } catch { /* reply engine not init yet — checkXQuota interval will catch it */ }
     }
+    // Restore dynamically-learned confirmed-non-rug set
+    if (s.confirmedNonRug && Array.isArray(s.confirmedNonRug)) {
+      for (const mint of s.confirmedNonRug) this.confirmedNonRug.add(mint);
+    }
     // Re-add persisted scout/manual tokens to watchList
     if (s.scoutTokens) {
       for (const t of s.scoutTokens) {
@@ -948,7 +951,8 @@ export class GuardianAgent extends BaseAgent {
         }
       }
     }
-    logger.info(`[guardian] Restored: ${this.scanCount} scans, ${this.liquidityAlertCount} LP alerts, ${s.scoutTokens?.length || 0} persisted tokens${s.xQuotaExhausted ? ', X quota PAUSED' : ''}`);
+    const learnedCount = this.confirmedNonRug.size - CONFIRMED_NON_RUG_SEED.length;
+    logger.info(`[guardian] Restored: ${this.scanCount} scans, ${this.liquidityAlertCount} LP alerts, ${s.scoutTokens?.length || 0} persisted tokens, ${learnedCount} learned non-rug mints${s.xQuotaExhausted ? ', X quota PAUSED' : ''}`);
   }
 
   // ── Public API ───────────────────────────────────────────────────
