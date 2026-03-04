@@ -239,7 +239,11 @@ async function quoteViaLifi(
       signal: AbortSignal.timeout(10_000),
     });
 
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      logger.debug(`[EvmSwap] LI.FI quote ${resp.status} on chain ${chainId}: ${body.slice(0, 200)}`);
+      return null;
+    }
 
     const data = await resp.json() as any;
     const outToken = new ethers.Contract(tokenOutAddr, ERC20_ABI, provider);
@@ -256,7 +260,7 @@ async function quoteViaLifi(
       route: 'lifi',
     };
   } catch (err) {
-    logger.debug('[EvmSwap] LI.FI quote failed:', err);
+    logger.debug(`[EvmSwap] LI.FI quote failed on chain ${chainId} (${tokenInAddr.slice(0,10)}→${tokenOutAddr.slice(0,10)}, $${amountInHuman.toFixed(2)}):`, err);
     return null;
   }
 }

@@ -1577,12 +1577,12 @@ export async function openEvmLpPosition(
           const swapPortion1 = neededUsd1 * scale;
           logger.info(`[Krystal] Auto-swap: USDC bal=$${usdcBal.toFixed(2)}, need0=$${neededUsd0.toFixed(2)}, need1=$${neededUsd1.toFixed(2)} (scale=${scale.toFixed(2)})`);
 
-          if (needSwap0 && swapPortion0 > 0.5) {
+          if (needSwap0 && swapPortion0 > 2) {
             const quote0 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token0.address, swapPortion0, pool.feeTier);
             if (quote0 && quote0.priceImpactPct > 3) {
               logger.warn(`[Krystal] Swap USDC→${pool.token0.symbol} price impact ${quote0.priceImpactPct.toFixed(1)}% > 3% — skipping`);
             } else if (!quote0) {
-              logger.warn(`[Krystal] Swap USDC→${pool.token0.symbol}: no quote available`);
+              logger.warn(`[Krystal] Swap $${swapPortion0.toFixed(2)} USDC→${pool.token0.symbol}: no quote available (chain ${chainNumericId})`);
             } else {
               const swapResult = await swap.executeEvmSwap(
                 chainNumericId, usdcAddr, pool.token0.address, swapPortion0, pool.feeTier,
@@ -1592,12 +1592,12 @@ export async function openEvmLpPosition(
             }
           }
 
-          if (needSwap1 && swapPortion1 > 0.5) {
+          if (needSwap1 && swapPortion1 > 2) {
             const quote1 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token1.address, swapPortion1, pool.feeTier);
             if (quote1 && quote1.priceImpactPct > 3) {
               logger.warn(`[Krystal] Swap USDC→${pool.token1.symbol} price impact ${quote1.priceImpactPct.toFixed(1)}% > 3% — skipping`);
             } else if (!quote1) {
-              logger.warn(`[Krystal] Swap USDC→${pool.token1.symbol}: no quote available`);
+              logger.warn(`[Krystal] Swap $${swapPortion1.toFixed(2)} USDC→${pool.token1.symbol}: no quote available (chain ${chainNumericId})`);
             } else {
               const swapResult = await swap.executeEvmSwap(
                 chainNumericId, usdcAddr, pool.token1.address, swapPortion1, pool.feeTier,
