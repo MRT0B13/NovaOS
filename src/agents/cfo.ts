@@ -1336,6 +1336,46 @@ export class CFOAgent extends BaseAgent {
       }
     } catch (err) { logger.debug('[CFO] HL price refresh error:', err); }
 
+    // ── Refresh Orca LP position values ──
+    if (env.orcaLpEnabled && this.positionManager) {
+      try {
+        const orcaMod = await import('../launchkit/cfo/orcaService.ts');
+        const livePositions = await orcaMod.getPositions();
+        const dbPositions = await this.repo?.getOpenPositions('orca_lp') ?? [];
+        for (const dbPos of dbPositions) {
+          const meta = dbPos.metadata as { positionMint?: string; nftMint?: string };
+          const mint = meta.positionMint ?? meta.nftMint;
+          const live = mint
+            ? livePositions.find((p: any) => p.positionMint === mint || p.nftMint === mint)
+            : null;
+          if (live && live.liquidityUsd > 0) {
+            await this.repo?.updatePositionPrice(dbPos.id, live.currentPrice ?? dbPos.currentPrice, live.liquidityUsd);
+          }
+        }
+      } catch (err) { logger.debug('[CFO] Orca LP price refresh error:', err); }
+    }
+
+    // ── Refresh Krystal EVM LP position values ──
+    if (env.krystalLpEnabled && env.evmPrivateKey && this.positionManager) {
+      try {
+        const krystalMod = await import('../launchkit/cfo/krystalService.ts');
+        const ethers = await import('ethers' as string);
+        const walletAddr = ethers.computeAddress(env.evmPrivateKey);
+        const livePositions = await krystalMod.fetchKrystalPositions(walletAddr, ((globalThis as any).__cfo_evm_lp_records ?? []));
+        const dbPositions = await this.repo?.getOpenPositions('krystal_lp') ?? [];
+        for (const dbPos of dbPositions) {
+          const meta = dbPos.metadata as { tokenId?: string; nftTokenId?: string };
+          const tokenId = meta.tokenId ?? meta.nftTokenId;
+          const live = tokenId
+            ? livePositions.find((p: any) => String(p.tokenId) === String(tokenId) || String(p.nftTokenId) === String(tokenId))
+            : null;
+          if (live && live.valueUsd > 0) {
+            await this.repo?.updatePositionPrice(dbPos.id, dbPos.currentPrice, live.valueUsd);
+          }
+        }
+      } catch (err) { logger.debug('[CFO] Krystal LP price refresh error:', err); }
+    }
+
     // ── Refresh Polymarket position prices ──
     if (!env.polymarketEnabled) return;
 
@@ -1626,7 +1666,7 @@ export class CFOAgent extends BaseAgent {
           );
         }
       }
-    } catch (err) { logger.error('[CFO] monitorPositions error:', err); }
+    } catch (err) { logger.debug('[CFO] Poly price refresh error:', err); }
   }
 
   // ── Yield management ──────────────────────────────────────────────
@@ -2227,8 +2267,81 @@ export class CFOAgent extends BaseAgent {
       try {
         const m = await this.positionManager.getPortfolioMetrics();
         const solPrice = (await (await pyth()).getPrice('SOL/USD'))?.price ?? 0;
+
+        // ── Comprehensive portfolio value (not just cfo_positions) ──
+        let totalPortfolioUsd = m.totalValueUsd; // tracked positions
+
+        // Add Jito staked SOL value (not tracked as cfo_position)
+        if (env.jitoEnabled) {
+          try {
+            const sp = await (await jito()).getStakePosition(solPrice);
+            if (sp.jitoSolBalance > 0) totalPortfolioUsd += sp.jitoSolValueUsd;
+          } catch { /* non-fatal */ }
+        }
+
+        // Add HL equity beyond what's tracked in cfo_positions
+        if (env.hyperliquidEnabled) {
+          try {
+            const hs = await (await hl()).getAccountSummary();
+            // cfo_positions tracks each open HL position's sizeUsd.
+            // HL equity includes unused margin + unrealized P&L.
+            // Avoid double-counting: hlPositionsTracked = m.byStrategy value for HL
+            const hlTracked = (m.byStrategy['hyperliquid']?.totalValueUsd ?? 0)
+                            + (m.byStrategy['hl_perp']?.totalValueUsd ?? 0);
+            const hlUntracked = Math.max(0, hs.equity - hlTracked);
+            if (hlUntracked > 0.01) totalPortfolioUsd += hlUntracked;
+          } catch { /* non-fatal */ }
+        }
+
+        // Add Kamino net value (deposits - borrows)
+        if (env.kaminoEnabled) {
+          try {
+            const pos = await (await kamino()).getPosition();
+            if (pos.deposits.length) {
+              totalPortfolioUsd += pos.netValueUsd;
+            }
+          } catch { /* non-fatal */ }
+        }
+
+        // Add live Orca LP values (cfo_positions may be stale at deploy-time values)
+        if (env.orcaLpEnabled) {
+          try {
+            const orcaMod = await import('../launchkit/cfo/orcaService.ts');
+            const positions = await orcaMod.getPositions();
+            const liveOrcaUsd = positions
+              .filter((p: any) => p.inRange || p.liquidityUsd > 0)
+              .reduce((s: number, p: any) => s + (p.liquidityUsd ?? 0), 0);
+            const trackedOrcaUsd = m.byStrategy['orca_lp']?.totalValueUsd ?? 0;
+            // Replace tracked value with live value
+            totalPortfolioUsd += (liveOrcaUsd - trackedOrcaUsd);
+          } catch { /* non-fatal */ }
+        }
+
+        // Add live EVM LP values
+        if (env.krystalLpEnabled && env.evmPrivateKey) {
+          try {
+            const krystalMod = await import('../launchkit/cfo/krystalService.ts');
+            const ethers = await import('ethers' as string);
+            const walletAddr = ethers.computeAddress(env.evmPrivateKey);
+            const evmPositions = await krystalMod.fetchKrystalPositions(walletAddr, ((globalThis as any).__cfo_evm_lp_records ?? []));
+            const liveEvmUsd = evmPositions
+              .filter((p: any) => p.valueUsd > 0)
+              .reduce((s: number, p: any) => s + (p.valueUsd ?? 0), 0);
+            const trackedEvmUsd = m.byStrategy['krystal_lp']?.totalValueUsd ?? 0;
+            totalPortfolioUsd += (liveEvmUsd - trackedEvmUsd);
+          } catch { /* non-fatal */ }
+        }
+
+        // Add EVM USDC balance (not tracked as position)
+        if (env.polymarketEnabled) {
+          try {
+            const ws = await (await evm()).getWalletStatus();
+            totalPortfolioUsd += ws.usdcBalance;
+          } catch { /* non-fatal */ }
+        }
+
         await this.repo.upsertDailySnapshot({
-          date, totalPortfolioUsd: m.totalValueUsd, solPriceUsd: solPrice,
+          date, totalPortfolioUsd, solPriceUsd: solPrice,
           byStrategy: Object.fromEntries(Object.entries(m.byStrategy).map(([k, v]: any) => [k, { valueUsd: v.totalValueUsd, pnl24h: v.unrealizedPnlUsd }])),
           realizedPnl24h: 0, unrealizedPnl: m.totalUnrealizedPnlUsd,
           yieldEarned24h: 0, x402Revenue24h: 0,

@@ -36,8 +36,8 @@ interface StrategyBreakdown {
   unrealizedPnl: number;    // USD
   feesCollected: number;    // USD (LP fee_collect revenue)
   feesPaid: number;         // USD (gas + execution costs)
-  bestTrade: { asset: string; pnl: number } | null;
-  worstTrade: { asset: string; pnl: number } | null;
+  bestTrade: { asset: string; description: string; pnl: number } | null;
+  worstTrade: { asset: string; description: string; pnl: number } | null;
 }
 
 interface DebtSnapshot {
@@ -58,6 +58,11 @@ interface PeriodReport {
   endPortfolioUsd: number;
   portfolioChangePct: number; // (end - start) / start
 
+  // Capital flows
+  depositsUsd: number;        // SOL deposited in period (converted to USD)
+  withdrawalsUsd: number;     // SOL withdrawn in period (converted to USD)
+  organicChangePct: number;   // portfolio change minus deposits/withdrawals
+
   // P&L
   totalRealizedPnl: number;
   totalUnrealizedPnl: number;
@@ -69,8 +74,8 @@ interface PeriodReport {
   strategies: StrategyBreakdown[];
 
   // Top trades
-  bestTrades: Array<{ asset: string; strategy: string; pnl: number }>;
-  worstTrades: Array<{ asset: string; strategy: string; pnl: number }>;
+  bestTrades: Array<{ asset: string; description: string; strategy: string; pnl: number }>;
+  worstTrades: Array<{ asset: string; description: string; strategy: string; pnl: number }>;
 
   // Snapshots
   portfolioHistory: Array<{ date: string; value: number }>;
@@ -235,6 +240,37 @@ async function getSnapshotsInRange(
 }
 
 /**
+ * Get SOL deposits/withdrawals in a period from pnl_sol_flows table.
+ */
+async function getCapitalFlows(
+  pool: Pool,
+  start: string,
+  end: string,
+): Promise<{ deposited: number; withdrawn: number }> {
+  try {
+    const startMs = new Date(`${start}T00:00:00Z`).getTime();
+    const endMs = new Date(`${end}T23:59:59Z`).getTime();
+    const res = await pool.query(
+      `SELECT type,
+              COALESCE(SUM(amount), 0) AS total
+       FROM pnl_sol_flows
+       WHERE timestamp >= $1 AND timestamp <= $2
+       GROUP BY type`,
+      [startMs, endMs],
+    );
+    let deposited = 0;
+    let withdrawn = 0;
+    for (const row of res.rows) {
+      if (row.type === 'deposit') deposited = Number(row.total);
+      else if (row.type === 'withdrawal') withdrawn = Number(row.total);
+    }
+    return { deposited, withdrawn };
+  } catch {
+    return { deposited: 0, withdrawn: 0 };
+  }
+}
+
+/**
  * Load learning params from kv_store.
  */
 async function getLearnedParams(pool: Pool): Promise<any | null> {
@@ -264,7 +300,7 @@ export async function generateReport(
   periodEnd: string,
 ): Promise<PeriodReport> {
   // Parallel data queries
-  const [closedPositions, openedPositions, openPositions, txSummary, snapshots, learnedParams] =
+  const [closedPositions, openedPositions, openPositions, txSummary, snapshots, learnedParams, capitalFlows] =
     await Promise.all([
       getClosedPositionsInPeriod(pool, periodStart, periodEnd),
       getOpenedPositionsInPeriod(pool, periodStart, periodEnd),
@@ -272,6 +308,7 @@ export async function generateReport(
       getTransactionSummary(pool, periodStart, periodEnd),
       getSnapshotsInRange(pool, periodStart, periodEnd),
       getLearnedParams(pool),
+      getCapitalFlows(pool, periodStart, periodEnd),
     ]);
 
   // ── Portfolio change ──
@@ -280,6 +317,19 @@ export async function generateReport(
   const startValue = startSnap?.totalPortfolioUsd ?? 0;
   const endValue = endSnap?.totalPortfolioUsd ?? 0;
   const changePct = startValue > 0 ? (endValue - startValue) / startValue : 0;
+
+  // ── Capital flows (deposits/withdrawals) ──
+  // Use average SOL price from snapshots to convert SOL flows to USD
+  const avgSolPrice = snapshots.length > 0
+    ? snapshots.reduce((s, snap) => s + snap.solPriceUsd, 0) / snapshots.length
+    : 0;
+  const depositsUsd = capitalFlows.deposited * avgSolPrice;
+  const withdrawalsUsd = capitalFlows.withdrawn * avgSolPrice;
+  const netCapitalFlowUsd = depositsUsd - withdrawalsUsd;
+  // Organic change = portfolio change minus capital injections
+  const organicChangePct = startValue > 0
+    ? ((endValue - netCapitalFlowUsd) - startValue) / startValue
+    : 0;
 
   // ── Per-strategy breakdown ──
   const stratMap = new Map<string, StrategyBreakdown>();
@@ -303,8 +353,8 @@ export async function generateReport(
     sb.realizedPnl += pnl;
     if (pnl > 0) sb.wins++;
     else sb.losses++;
-    if (!sb.bestTrade || pnl > sb.bestTrade.pnl) sb.bestTrade = { asset: pos.asset, pnl };
-    if (!sb.worstTrade || pnl < sb.worstTrade.pnl) sb.worstTrade = { asset: pos.asset, pnl };
+    if (!sb.bestTrade || pnl > sb.bestTrade.pnl) sb.bestTrade = { asset: pos.asset, description: pos.description, pnl };
+    if (!sb.worstTrade || pnl < sb.worstTrade.pnl) sb.worstTrade = { asset: pos.asset, description: pos.description, pnl };
   }
 
   // Add unrealized PnL from open positions
@@ -335,9 +385,9 @@ export async function generateReport(
   // ── Top trades ──
   const allClosedSorted = [...closedPositions].sort((a, b) => b.realizedPnlUsd - a.realizedPnlUsd);
   const bestTrades = allClosedSorted.slice(0, 3).filter(t => t.realizedPnlUsd > 0)
-    .map(t => ({ asset: t.asset, strategy: t.strategy, pnl: t.realizedPnlUsd }));
+    .map(t => ({ asset: t.asset, description: t.description ?? t.asset, strategy: t.strategy, pnl: t.realizedPnlUsd }));
   const worstTrades = allClosedSorted.slice(-3).filter(t => t.realizedPnlUsd < 0).reverse()
-    .map(t => ({ asset: t.asset, strategy: t.strategy, pnl: t.realizedPnlUsd }));
+    .map(t => ({ asset: t.asset, description: t.description ?? t.asset, strategy: t.strategy, pnl: t.realizedPnlUsd }));
 
   // ── Debt snapshot (Kamino) ──
   let currentDebt: DebtSnapshot | null = null;
@@ -395,6 +445,9 @@ export async function generateReport(
     startPortfolioUsd: startValue,
     endPortfolioUsd: endValue,
     portfolioChangePct: changePct,
+    depositsUsd,
+    withdrawalsUsd,
+    organicChangePct,
     totalRealizedPnl: totalRealizedPnl,
     totalUnrealizedPnl,
     totalFeesCollected: txSummary.feesCollected,
@@ -426,6 +479,21 @@ function pnlSign(n: number): string {
   return n >= 0 ? `+$${n.toFixed(2)}` : `-$${Math.abs(n).toFixed(2)}`;
 }
 
+/**
+ * Human-readable label for a trade. For Polymarket positions, `description`
+ * holds "Yes | Will Trump win?" while `asset` is a raw hex token ID.
+ */
+function tradeLabel(asset: string, description: string, strategy: string): string {
+  if (strategy === 'polymarket' && description && description !== asset) {
+    // Poly description is "Outcome | Question". Truncate question part.
+    const parts = description.split(' | ');
+    const question = parts.length > 1 ? parts.slice(1).join(' | ') : parts[0];
+    const truncated = question.length > 50 ? question.slice(0, 47) + '…' : question;
+    return parts.length > 1 ? `${parts[0]}: ${truncated}` : truncated;
+  }
+  return asset;
+}
+
 function pctSign(n: number): string {
   const pct = (n * 100).toFixed(1);
   return n >= 0 ? `+${pct}%` : `${pct}%`;
@@ -454,9 +522,15 @@ export function formatReportHTML(report: PeriodReport): string {
   L.push('');
 
   // ── Portfolio Overview ──
-  const changeEmoji = report.portfolioChangePct >= 0 ? '🟢' : '🔴';
+  const changeEmoji = report.organicChangePct >= 0 ? '🟢' : '🔴';
   L.push(`━━━ <b>Portfolio</b> ━━━`);
-  L.push(`   ${changeEmoji} $${report.startPortfolioUsd.toFixed(2)} → $${report.endPortfolioUsd.toFixed(2)} (${pctSign(report.portfolioChangePct)})`);
+  L.push(`   ${changeEmoji} $${report.startPortfolioUsd.toFixed(2)} → $${report.endPortfolioUsd.toFixed(2)} (${pctSign(report.organicChangePct)})`);
+  if (report.depositsUsd > 0.01 || report.withdrawalsUsd > 0.01) {
+    const parts: string[] = [];
+    if (report.depositsUsd > 0.01) parts.push(`+$${report.depositsUsd.toFixed(2)} deposited`);
+    if (report.withdrawalsUsd > 0.01) parts.push(`-$${report.withdrawalsUsd.toFixed(2)} withdrawn`);
+    L.push(`   <i>${parts.join(', ')} (excluded from %)</i>`);
+  }
   if (report.portfolioHistory.length > 2) {
     L.push(`   ${sparkline(report.portfolioHistory.map(h => h.value))}`);
   }
@@ -504,10 +578,12 @@ export function formatReportHTML(report: PeriodReport): string {
   if (report.bestTrades.length > 0 || report.worstTrades.length > 0) {
     L.push(`━━━ <b>Notable Trades</b> ━━━`);
     for (const t of report.bestTrades) {
-      L.push(`   🏆 ${t.asset} (${stratName(t.strategy)}): ${pnlSign(t.pnl)}`);
+      const label = tradeLabel(t.asset, t.description, t.strategy);
+      L.push(`   🏆 ${label} (${stratName(t.strategy)}): ${pnlSign(t.pnl)}`);
     }
     for (const t of report.worstTrades) {
-      L.push(`   💀 ${t.asset} (${stratName(t.strategy)}): ${pnlSign(t.pnl)}`);
+      const label = tradeLabel(t.asset, t.description, t.strategy);
+      L.push(`   💀 ${label} (${stratName(t.strategy)}): ${pnlSign(t.pnl)}`);
     }
     L.push('');
   }
