@@ -1308,16 +1308,17 @@ export class CFOAgent extends BaseAgent {
           // Position gone from exchange — close the DB record so we stop alerting.
           try {
             const dbPos = await this.repo?.getPosition(action.positionId);
+            if (!dbPos || dbPos.status === 'CLOSED') continue; // already closed — skip
             const unrealizedPnl = dbPos?.unrealizedPnlUsd ?? 0;
             await this.positionManager.closePosition(
               action.positionId, 0, 'external-close', dbPos?.currentValueUsd ?? 0,
             );
             logger.warn(`[CFO] Auto-closed stale DB position ${action.positionId} (PnL ~$${unrealizedPnl.toFixed(2)})`);
+            const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+            await notifyAdminForce(`⚠️ CFO HL: ${action.reason} — DB record closed`);
           } catch (closeErr) {
             logger.error(`[CFO] Failed to auto-close stale position ${action.positionId}:`, closeErr);
           }
-          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
-          await notifyAdminForce(`⚠️ CFO HL: ${action.reason} — DB record closed`);
         } else if (action.urgency === 'critical') {
           const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
           await notifyAdminForce(`⚠️ CFO HL: ${action.reason}`);
