@@ -2200,8 +2200,10 @@ export async function generateDecisions(
   // NOTE: New LP positions are opened via Section K (KAMINO_BORROW_LP) which
   // borrows USDC from Kamino rather than spending wallet SOL. Wallet SOL is
   // reserved for staking (Section C) and the Kamino leverage loop (Section G).
-  // Section I only handles rebalancing existing positions.
-  if (env.orcaLpEnabled && intel.marketCondition !== 'bearish' && intel.marketCondition !== 'danger') {
+  // Section I only handles rebalancing existing positions + fee claims.
+  // Gate on 'danger' only (not 'bearish') — existing positions still need
+  // rebalancing in bearish markets to avoid drifting out of range.
+  if (env.orcaLpEnabled && intel.marketCondition !== 'danger') {
 
     // ── Tier-based range width multipliers (mirrored from Krystal) ──
     const ORCA_TIER_RANGE_MULT: Record<string, number> = {
