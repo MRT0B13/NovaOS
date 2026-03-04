@@ -40,6 +40,7 @@
 import { logger } from '@elizaos/core';
 import { getCFOEnv, type CFOEnv } from './cfoEnv.ts';
 import { refreshLearning, getAdaptiveParams, applyAdaptive, formatLearningSummary, setLearningPool, type AdaptiveParams } from './learningEngine.ts';
+import * as swapSvc from './evmSwapService.ts';
 
 // ============================================================================
 // Constants
@@ -2394,7 +2395,10 @@ export async function generateDecisions(
           p.apr7d >= learnedMinApr &&
           (env.evmRpcUrls[p.chainNumericId] || p.chainNumericId === 42161) &&
           deployableChainIds.has(p.chainNumericId) && // deploy on funded chains OR bridge-reachable chains
-          env.krystalLpRiskTiers.has(p.riskTier),
+          env.krystalLpRiskTiers.has(p.riskTier) &&
+          // Skip pools with known-unswappable tokens (populated by pre-flight failures, TTL 2h)
+          !swapSvc.hasSwapFailure(p.chainNumericId, p.token0.address) &&
+          !swapSvc.hasSwapFailure(p.chainNumericId, p.token1.address),
         );
 
         // Build a map from normalised pair key → existing position (for increase-liquidity)
@@ -2783,9 +2787,30 @@ export async function generateDecisions(
         // Build set of existing Orca LP pool addresses to avoid duplicates
         const existingOrcaPools = new Set(state.orcaPositions.map(p => p.whirlpoolAddress).filter(Boolean));
 
-        // Filter duplicates — riskTier is already set by the pool discovery classifier
+        // KAMINO_BORROW_LP execution flow: borrow USDC → swap half to tokenA → openPosition(usdcRemaining, tokenAReceived).
+        // This means tokenB of the pool MUST be fundable from the USDC we hold (i.e. tokenB = USDC).
+        // Pools where neither token is USDC (e.g. jitoSOL/SOL, BONK/SOL) require tokenB that we don't
+        // have in the wallet — they would fail at LP open with insufficient SPL token balance.
+        const KAMINO_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+        const KAMINO_USDC_SYMS = new Set(['USDC', 'USDC.E', 'USDCE']);
         const tieredPools = discoveredPools
-          .filter(p => !existingOrcaPools.has(p.whirlpoolAddress));
+          .filter(p => !existingOrcaPools.has(p.whirlpoolAddress))
+          .filter(p => {
+            const symA = String(p.tokenA?.symbol ?? p.tokenA ?? '').toUpperCase();
+            const symB = String(p.tokenB?.symbol ?? p.tokenB ?? '').toUpperCase();
+            const mintA = String(p.tokenA?.mint ?? p.tokenAMint ?? '');
+            const mintB = String(p.tokenB?.mint ?? p.tokenBMint ?? '');
+            const hasUsdc = KAMINO_USDC_SYMS.has(symA) || KAMINO_USDC_SYMS.has(symB)
+                          || mintA === KAMINO_USDC_MINT || mintB === KAMINO_USDC_MINT;
+            if (!hasUsdc) {
+              logger.debug(
+                `[CFO:Decision] Section K: skipping pool ${
+                  p.pair ?? (p.whirlpoolAddress ?? '').slice(0, 8)
+                } — neither token is USDC (${symA}/${symB}), not fundable from USDC borrow flow`,
+              );
+            }
+            return hasUsdc;
+          });
 
         const enabledTiers = env.orcaLpRiskTiers;
         const slotsAvailable = env.orcaLpMaxPositions - state.orcaPositions.length;
@@ -3606,10 +3631,58 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           logger.info(`[CFO] KAMINO_BORROW_LP step 2: swapped $${usdcAmount.toFixed(0)} USDC → ${tokenAReceived.toFixed(4)} ${tokenA}`);
         }
 
+        // Step 2b: If tokenB is not USDC, also swap USDC → tokenB to fund that side.
+        // e.g. SOL/jitoSOL pools — both tokens must be obtained from the borrowed USDC.
+        const USDC_MINT_KBLP = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+        const isTokenBUsdc = !tokenBMint || tokenBMint === USDC_MINT_KBLP;
+        const isTokenBSol = tokenB === 'SOL' || tokenBMint === jupMod.MINTS.SOL;
+        let tokenBDepositAmount = usdcAmount; // default: remaining borrowed USDC funds tokenB directly
+
+        if (!isTokenBUsdc) {
+          logger.info(`[CFO] KAMINO_BORROW_LP step 2b: tokenB=${tokenB} ≠ USDC — swapping $${usdcAmount.toFixed(2)} USDC → ${tokenB}`);
+          let swapBSuccess = false;
+          let swapBOutput = 0;
+          let swapBError = 'unknown';
+          if (isTokenBSol) {
+            const swapB = await jupMod.swapUsdcToSol(usdcAmount, 100);
+            swapBSuccess = swapB.success; swapBOutput = swapB.outputAmount ?? 0; swapBError = swapB.error ?? '';
+          } else {
+            const quoteB = await jupMod.getQuote(jupMod.MINTS.USDC, tokenBMint!, usdcAmount, 100);
+            if (!quoteB) {
+              swapBError = `no Jupiter quote for USDC→${tokenB}`;
+            } else {
+              const swapB = await jupMod.executeSwap(quoteB, { maxPriceImpactPct: 3 });
+              swapBSuccess = swapB.success; swapBOutput = swapB.outputAmount ?? 0; swapBError = swapB.error ?? '';
+            }
+          }
+          if (!swapBSuccess) {
+            markDecision('KAMINO_BORROW_LP');
+            logger.warn(`[CFO] KAMINO_BORROW_LP step 2b: USDC→${tokenB} failed — unwinding tokenA, repaying`);
+            let unwindNote = 'Unwind not attempted';
+            try {
+              const jupUnwindA = isTokenASol
+                ? await jupMod.swapSolToUsdc(tokenAReceived * 0.99, 100)
+                : await (async () => {
+                    const q = await jupMod.getQuote(tokenAMint!, jupMod.MINTS.USDC, tokenAReceived * 0.99, 100);
+                    if (!q) return { success: false as const, outputAmount: 0 };
+                    return jupMod.executeSwap(q);
+                  })();
+              // tokenB swap failed so the second USDC half is still in wallet
+              const totalUsdc = (jupUnwindA.success ? jupUnwindA.outputAmount ?? 0 : 0) + usdcAmount;
+              const repay = await kamino.repay('USDC', Math.min(totalUsdc, borrowUsd) * 0.995).catch(() => ({ success: false, error: 'threw' }));
+              unwindNote = (repay as any).success ? `Unwind OK` : `Repay failed: ${(repay as any).error}`;
+            } catch (e) { unwindNote = `Unwind error: ${(e as Error).message}`; }
+            logger.error(`[CFO] KAMINO_BORROW_LP step2b ${unwindNote}`);
+            return { ...base, executed: true, success: false, error: `USDC→${tokenB} swap failed: ${swapBError}. ${unwindNote}` };
+          }
+          tokenBDepositAmount = swapBOutput;
+          logger.info(`[CFO] KAMINO_BORROW_LP step 2b: swapped $${usdcAmount.toFixed(2)} USDC → ${tokenBDepositAmount.toFixed(4)} ${tokenB}`);
+        }
+
         // Step 3: Open Orca concentrated LP on the target pool (not hardcoded SOL/USDC)
         const orca = await import('./orcaService.ts');
         const lpResult = await orca.openPosition(
-          usdcAmount, tokenAReceived, rangeWidthPct,
+          tokenBDepositAmount, tokenAReceived, rangeWidthPct,
           whirlpoolAddress, tokenADecimals ?? 9, tokenBDecimals ?? 6, poolTickSpacing,
         );
         if (!lpResult.success) {
@@ -3629,14 +3702,29 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
                   return jupMod.executeSwap(q);
                 })();
             if (jupUnwind.success) {
-              const usdcRecovered = jupUnwind.outputAmount ?? 0;
-              const repayAmt = Math.min(usdcRecovered + usdcAmount, borrowUsd);
+              let usdcRecovered = jupUnwind.outputAmount ?? 0;
+              // If tokenB was swapped from USDC (non-USDC pool), also unwind tokenB → USDC
+              if (!isTokenBUsdc && tokenBDepositAmount > 0) {
+                try {
+                  const unwindB = isTokenBSol
+                    ? await jupMod.swapSolToUsdc(tokenBDepositAmount * 0.99, 100)
+                    : await (async () => {
+                        const q = await jupMod.getQuote(tokenBMint!, jupMod.MINTS.USDC, tokenBDepositAmount * 0.99, 100);
+                        if (!q) return { success: false as const, outputAmount: 0 };
+                        return jupMod.executeSwap(q);
+                      })();
+                  usdcRecovered += unwindB.success ? (unwindB.outputAmount ?? 0) : 0;
+                } catch { /* best-effort tokenB unwind */ }
+              } else {
+                usdcRecovered += usdcAmount; // tokenB side was USDC, still in wallet
+              }
+              const repayAmt = Math.min(usdcRecovered, borrowUsd);
               const repay = await kamino.repay('USDC', repayAmt * 0.995); // tiny fee buffer
               unwindNote = repay.success
                 ? `Auto-unwind OK: repaid $${repayAmt.toFixed(2)} USDC`
                 : `Swap OK but repay failed: ${repay.error} — manual repay needed`;
             } else {
-              unwindNote = `Unwind swap failed: ${jupUnwind.error} — SOL+USDC remain in wallet, manual repay needed`;
+              unwindNote = `Unwind swap failed: ${jupUnwind.error} — tokens remain in wallet, manual repay needed`;
             }
           } catch (unwindErr) {
             unwindNote = `Unwind error: ${(unwindErr as Error).message} — manual repay needed`;
