@@ -113,6 +113,38 @@ async function fetchDexScreenerLiquidity(mints: string[]): Promise<Map<string, L
 }
 
 // ============================================================================
+// Known protocol / infrastructure tokens — NEVER flag as rugged
+// These are established DeFi protocol tokens whose RugCheck scores are high
+// due to normal vault/index/LP complexity, NOT actual rug risk.
+// Add any CFO-deployed pool tokens here to prevent false-positive emergency pauses.
+// ============================================================================
+
+const KNOWN_PROTOCOL_MINTS = new Set<string>([
+  // Jupiter
+  'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',   // JUP
+  '27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4',   // JLP (Jupiter LP Index)
+  // Jito
+  'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',   // JitoSOL
+  'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL',    // JTO
+  // Orca
+  'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE',    // ORCA
+  // Raydium
+  '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R',   // RAY
+  // Kamino
+  'KMNo3nJsBXfcpJTVhZcXLW7RmTwTt4GVFE7suUBo9sS',    // KMNO
+  // Drift
+  'DriFtupJYLTosbwoN8koMbEYSx54aFAVLddWsbksjwg7',   // DRIFT
+  // Marinade
+  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',   // mSOL
+  // Pyth
+  'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3',   // PYTH
+  // SOL/stablecoins
+  'So11111111111111111111111111111111111111112',       // WSOL
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',   // USDC
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',   // USDT
+]);
+
+// ============================================================================
 // Core Solana tokens — always watched as a baseline
 // ============================================================================
 
@@ -156,6 +188,10 @@ export class GuardianAgent extends BaseAgent {
   private liquidityCheckIntervalMs: number;
   private scanCount = 0;
   private liquidityAlertCount = 0;
+  // Deduplication: track last critical alert time per mint to avoid re-triggering
+  // every rescan cycle (e.g. Guardian rescans every 15 min, CFO pause resets each time)
+  private lastCriticalAlertAt: Map<string, number> = new Map();
+  private static readonly CRITICAL_ALERT_COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours
 
   // ── Security Modules ──────────────────────────────────────────
   private walletSentinel: WalletSentinel;
@@ -425,27 +461,50 @@ export class GuardianAgent extends BaseAgent {
       }
     }
 
-    // Critical alerts for dangerous findings
-    // SKIP for core tokens — established protocol tokens (JitoSOL, PYTH, JTO, etc.)
-    // naturally have high RugCheck scores due to mint/freeze authorities.
-    // For core tokens we only track score degradation (handled above).
+    // Critical alerts for dangerous findings.
+    // Skip for:
+    //   - core tokens (established protocol tokens always score high)
+    //   - KNOWN_PROTOCOL_MINTS (DeFi infrastructure, JLP, JitoSOL, etc.)
+    // For genuine tokens, only fire critical ONCE per 4 hours per mint to prevent
+    // the Guardian re-scan loop from repeatedly extending the CFO emergency pause.
     const isCore = watched?.source === 'core';
+    const isKnownProtocol = KNOWN_PROTOCOL_MINTS.has(mint);
 
-    if (!isCore && (report.isRugged || report.mintAuthority || report.freezeAuthority)) {
+    if (!isCore && !isKnownProtocol && report.isRugged) {
+      // isRugged is now only true when RugCheck API explicitly confirms it (data.rugged=true)
+      const lastAlert = this.lastCriticalAlertAt.get(mint) ?? 0;
+      const cooldownPassed = Date.now() - lastAlert > GuardianAgent.CRITICAL_ALERT_COOLDOWN_MS;
+      if (cooldownPassed) {
+        this.lastCriticalAlertAt.set(mint, Date.now());
+        await this.reportAlert('critical', mint, {
+          tokenName: watched?.ticker,
+          score: report.score,
+          riskLevel: report.riskLevel,
+          alerts: ['TOKEN IS RUGGED'],
+          isRugged: true,
+        });
+      } else {
+        logger.debug(`[guardian] Suppressed duplicate rug alert for ${watched?.ticker ?? mint.slice(0, 8)} (cooldown: ${Math.round((GuardianAgent.CRITICAL_ALERT_COOLDOWN_MS - (Date.now() - lastAlert)) / 60000)}m remaining)`);
+      }
+    } else if (!isCore && !isKnownProtocol && (report.mintAuthority || report.freezeAuthority)) {
+      // Mint/freeze authority warnings — fire as high, not critical (these are flags, not ruins)
       const alerts: string[] = [];
-      if (report.isRugged) alerts.push('TOKEN IS RUGGED');
       if (report.mintAuthority) alerts.push('Mint authority still active');
       if (report.freezeAuthority) alerts.push('Freeze authority still active');
-
-      await this.reportAlert('critical', mint, {
-        tokenName: watched?.ticker,
-        score: report.score,
-        riskLevel: report.riskLevel,
-        alerts,
-        isRugged: report.isRugged,
-      });
-    } else if (!isCore && !safe) {
-      // Non-critical but unsafe (skip core tokens — they always score high)
+      const lastAlert = this.lastCriticalAlertAt.get(`${mint}:authority`) ?? 0;
+      const cooldownPassed = Date.now() - lastAlert > GuardianAgent.CRITICAL_ALERT_COOLDOWN_MS;
+      if (cooldownPassed) {
+        this.lastCriticalAlertAt.set(`${mint}:authority`, Date.now());
+        await this.reportAlert('high', mint, {
+          tokenName: watched?.ticker,
+          score: report.score,
+          riskLevel: report.riskLevel,
+          alerts,
+          isRugged: false,
+        });
+      }
+    } else if (!isCore && !isKnownProtocol && !safe) {
+      // Non-critical but unsafe
       const alerts = report.risks?.map((r: any) => `${r.level}: ${r.name}`) || [];
       await this.reportAlert('high', mint, {
         tokenName: watched?.ticker,

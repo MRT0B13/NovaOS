@@ -228,12 +228,17 @@ function parseReport(mint: string, data: any): RugCheckReport {
     }
   }
 
-  // Determine risk level from score
+  // Determine risk level from score.
+  // RugCheck scores are cumulative risk points — meme coins with rug risks score in the
+  // hundreds; established protocol infrastructure tokens (JLP, JitoSOL, etc.) can score
+  // in the tens-of-thousands simply due to complexity/holder concentration flags that
+  // are normal for vault/index tokens. Thresholds are intentionally high to avoid
+  // false positives on DeFi infrastructure tokens.
   const score = data.score ?? data.riskScore ?? 0;
   let riskLevel: RugCheckReport['riskLevel'] = 'Unknown';
-  if (score <= 300) riskLevel = 'Good';
-  else if (score <= 700) riskLevel = 'Warning';
-  else riskLevel = 'Danger';
+  if (score <= 1_000) riskLevel = 'Good';
+  else if (score <= 5_000) riskLevel = 'Warning';
+  else riskLevel = 'Danger';  // >5000 = genuinely dangerous for typical tokens
 
   // Parse token authorities
   const mintAuthority = data.tokenMeta?.mintAuthority != null && data.tokenMeta?.mintAuthority !== '';
@@ -255,6 +260,13 @@ function parseReport(mint: string, data: any): RugCheckReport {
   const lpLocked = data.markets?.[0]?.lp?.lpLocked === true;
   const lpLockedPct = data.markets?.[0]?.lp?.lpLockedPct || 0;
 
+  // isRugged: only true if the API explicitly confirms it (data.rugged === true).
+  // Previously this was inferred from riskLevel === 'Danger', which caused major
+  // protocol tokens (JLP score=93967) to be treated as rugged — triggering emergency
+  // CFO pauses every 15 minutes. The RugCheck API sets data.rugged=true only when
+  // there is confirmed on-chain evidence the token was rugged (LP removed, etc.).
+  const isRugged = data.rugged === true;
+
   return {
     mint,
     score,
@@ -265,7 +277,7 @@ function parseReport(mint: string, data: any): RugCheckReport {
     top10HolderPct,
     lpLocked,
     lpLockedPct,
-    isRugged: riskLevel === 'Danger',
+    isRugged,
     risks,
     scannedAt: new Date().toISOString(),
     rawData: data,
