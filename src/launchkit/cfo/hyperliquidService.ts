@@ -345,8 +345,13 @@ export async function hedgeTreasury(params: HedgeParams): Promise<HLOrderResult>
 
     return { success: true, orderId, avgPrice };
   } catch (err) {
+    const msg = String((err as Error)?.message ?? err ?? '');
+    if (msg.includes('Insufficient margin')) {
+      logger.warn(`[Hyperliquid] ${coin} hedge skipped — insufficient margin`);
+      return { success: false, error: 'Insufficient margin' };
+    }
     logger.error('[Hyperliquid] hedgeTreasury error:', err);
-    return { success: false, error: (err as Error).message };
+    return { success: false, error: msg };
   }
 }
 
@@ -423,6 +428,20 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
       return { success: false, error: `Notional $${(sizeFmt * coinPrice).toFixed(2)} below HL minimum $10` };
     }
 
+    // Pre-check available margin to avoid noisy "Insufficient margin" errors
+    const marginNeeded = sizeUsd / leverage;
+    const acctState = await withRetry(
+      () => info.clearinghouseState({ user: wallet.address }),
+      'openPerpTrade:marginCheck',
+    );
+    const availableMargin = Number((acctState as any).withdrawable ?? 0);
+    if (availableMargin < marginNeeded * 1.05) { // 5% buffer for fees
+      logger.warn(
+        `[Hyperliquid] ${side} ${coin}-PERP skipped — need $${marginNeeded.toFixed(2)} margin, only $${availableMargin.toFixed(2)} available`,
+      );
+      return { success: false, error: 'Insufficient margin' };
+    }
+
     await exchange.updateLeverage({
       asset: assetIdx,
       isCross: false,
@@ -477,6 +496,10 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
       _haltedCoins.set(coin, Date.now());
       logger.warn(`[Hyperliquid] ${coin}-PERP trading is halted on HL — skipping for 30min`);
       return { success: false, error: `${coin} trading is halted` };
+    }
+    if (msg.includes('Insufficient margin')) {
+      logger.warn(`[Hyperliquid] ${side} ${coin}-PERP skipped — insufficient margin`);
+      return { success: false, error: 'Insufficient margin' };
     }
     logger.error(`[Hyperliquid] openPerpTrade(${side} ${coin}) error:`, err);
     return { success: false, error: msg };
