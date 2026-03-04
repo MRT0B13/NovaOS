@@ -1424,6 +1424,34 @@ export async function openEvmLpPosition(
 
     logger.info(`[Krystal] Pre-funding: held $${totalHeldUsd.toFixed(2)} (${pool.token0.symbol}=$${heldUsd0.toFixed(2)}, ${pool.token1.symbol}=$${heldUsd1.toFixed(2)}), target $${deployUsd.toFixed(2)}, gap $${fundingGapUsd.toFixed(2)}`);
 
+    // ── Pre-flight: verify both tokens are swappable from USDC before bridging ──
+    // Prevents wasting bridge fees on pools where a token has no DEX liquidity
+    // (e.g. VIRTUAL only trades on Aerodrome, not Uniswap V3; exotic BSC tokens etc.)
+    if (fundingGapUsd > 1) {
+      try {
+        const swapSvc = await import('./evmSwapService.ts');
+        const bridgeSvc = await import('./wormholeService.ts');
+        const usdcAddr = bridgeSvc.resolveTokenAddress(chainNumericId, 'USDC');
+        if (usdcAddr) {
+          const stableSyms = ['USDC', 'USDT', 'DAI', 'BUSD', 'USDCE', 'USDC.E', 'USDT0', 'USD\u20AE0'];
+          const tok0IsStable = stableSyms.includes(pool.token0.symbol.toUpperCase());
+          const tok1IsStable = stableSyms.includes(pool.token1.symbol.toUpperCase());
+          const [ok0, ok1] = await Promise.all([
+            tok0IsStable ? Promise.resolve(true) : swapSvc.canSwapFromUsdc(chainNumericId, usdcAddr, pool.token0.address),
+            tok1IsStable ? Promise.resolve(true) : swapSvc.canSwapFromUsdc(chainNumericId, usdcAddr, pool.token1.address),
+          ]);
+          if (!ok0 || !ok1) {
+            const bad = [!ok0 && pool.token0.symbol, !ok1 && pool.token1.symbol].filter(Boolean).join(', ');
+            logger.warn(`[Krystal] Pre-flight failed: no swap route for ${bad} on chain ${chainNumericId} — skipping pool (recorded 2h)`);
+            return { success: false, error: `No swap route for ${bad} on chain ${chainNumericId}` };
+          }
+          logger.info(`[Krystal] Pre-flight OK: ${pool.token0.symbol}+${pool.token1.symbol} swappable on chain ${chainNumericId}`);
+        }
+      } catch (err) {
+        logger.warn('[Krystal] Pre-flight swap check failed (non-fatal, continuing):', err);
+      }
+    }
+
     // ── Bridge + Swap Funding Flow ──────────────────────────────────
     // Phase 1: Bridge — if held value < 50% of deploy target and bridge funding is available
     if (totalHeldUsd < deployUsd * 0.5 && bridgeFunding) {
