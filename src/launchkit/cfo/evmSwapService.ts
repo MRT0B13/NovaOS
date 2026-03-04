@@ -105,10 +105,21 @@ export async function quoteEvmSwap(
   amountInHuman: number,
   feeTier = 3000,
 ): Promise<SwapQuote | null> {
-  // Try Uniswap V3 on supported chains
+  // Standard Uniswap V3 fee tiers — try the requested tier first, then fall back
+  // to common tiers. Aerodrome/Slipstream pools pass non-standard fee tiers (e.g. 668, 471)
+  // which don't correspond to any Uniswap V3 pool → quote silently fails.
+  const STANDARD_TIERS = [500, 3000, 10000, 100];
+  const isStandardTier = STANDARD_TIERS.includes(feeTier);
+  const tiersToTry = isStandardTier
+    ? [feeTier, ...STANDARD_TIERS.filter(t => t !== feeTier)]
+    : STANDARD_TIERS; // Non-standard tier (Aerodrome etc.) — skip it, only try standard
+
+  // Try Uniswap V3 on supported chains (multiple fee tiers)
   if (UNISWAP_V3_CHAINS.has(chainId)) {
-    const uniQuote = await quoteViaUniswap(chainId, tokenInAddr, tokenOutAddr, amountInHuman, feeTier);
-    if (uniQuote) return uniQuote;
+    for (const tier of tiersToTry) {
+      const uniQuote = await quoteViaUniswap(chainId, tokenInAddr, tokenOutAddr, amountInHuman, tier);
+      if (uniQuote) return uniQuote;
+    }
   }
 
   // Fallback to LI.FI swap API (works on any chain)
@@ -283,7 +294,9 @@ export async function executeEvmSwap(
   }
 
   if (quote.route === 'uniswap_v3') {
-    return executeViaUniswap(chainId, tokenInAddr, tokenOutAddr, amountInHuman, feeTier, slippagePct, quote.amountOut);
+    // Use quote.fee (the tier that actually got a quote) — may differ from the
+    // requested feeTier if we fell back to a standard tier during quoting.
+    return executeViaUniswap(chainId, tokenInAddr, tokenOutAddr, amountInHuman, quote.fee, slippagePct, quote.amountOut);
   } else {
     return executeViaLifiSwap(chainId, tokenInAddr, tokenOutAddr, amountInHuman);
   }
