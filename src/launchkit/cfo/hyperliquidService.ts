@@ -307,7 +307,9 @@ export async function hedgeTreasury(params: HedgeParams): Promise<HLOrderResult>
       leverage,
     });
 
-    const limitPrice = (coinPrice * 0.9995).toFixed(2);
+    // Use aggressive slippage (0.5%) with IoC so we fill immediately or cancel.
+    // Gtc limit orders linger as open orders if not filled, causing DB/monitor desync.
+    const limitPrice = (coinPrice * 0.995).toFixed(2);
 
     const order = await exchange.order({
       orders: [{
@@ -316,7 +318,7 @@ export async function hedgeTreasury(params: HedgeParams): Promise<HLOrderResult>
         p: limitPrice,
         s: sizeFmt.toString(),
         r: false,
-        t: { limit: { tif: 'Gtc' as const } },
+        t: { limit: { tif: 'Ioc' as const } },
         c: `0x${Buffer.from(`cfo-hedge-${Date.now()}`).toString('hex').padEnd(32, '0').slice(0, 32)}`,
       }],
       grouping: 'na',
@@ -327,7 +329,13 @@ export async function hedgeTreasury(params: HedgeParams): Promise<HLOrderResult>
       return { success: false, error: (result as any)?.error ?? 'Order rejected' };
     }
 
-    const orderId = (result as any).resting?.oid ?? (result as any).filled?.oid;
+    // IoC: if order rested instead of filling, it was auto-cancelled — treat as failure
+    if ((result as any).resting) {
+      logger.warn(`[Hyperliquid] Hedge ${coin} order rested (not filled) — IoC auto-cancelled`);
+      return { success: false, error: 'Order did not fill (IoC)' };
+    }
+
+    const orderId = (result as any).filled?.oid;
     const avgPrice = Number((result as any).filled?.avgPx ?? limitPrice);
 
     logger.info(
@@ -421,10 +429,11 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
       leverage,
     });
 
-    // For LONG: buy slightly above mid to get filled. For SHORT: sell slightly below.
+    // Use IoC (Immediate-or-Cancel) with 0.5% slippage to ensure immediate fill.
+    // Gtc would leave unfilled limit orders on the book, causing DB/monitor desync loops.
     const limitPrice = isLong
-      ? (coinPrice * 1.0005).toFixed(2)
-      : (coinPrice * 0.9995).toFixed(2);
+      ? (coinPrice * 1.005).toFixed(2)
+      : (coinPrice * 0.995).toFixed(2);
 
     const order = await exchange.order({
       orders: [{
@@ -433,7 +442,7 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
         p: limitPrice,
         s: sizeFmt.toString(),
         r: false,
-        t: { limit: { tif: 'Gtc' as const } },
+        t: { limit: { tif: 'Ioc' as const } },
         c: `0x${Buffer.from(`cfo-perp-${side.toLowerCase()}-${Date.now()}`).toString('hex').padEnd(32, '0').slice(0, 32)}`,
       }],
       grouping: 'na',
@@ -444,7 +453,13 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
       return { success: false, error: (result as any)?.error ?? 'Order rejected' };
     }
 
-    const orderId = (result as any).resting?.oid ?? (result as any).filled?.oid;
+    // IoC: if order rested instead of filling, it was auto-cancelled — treat as failure
+    if ((result as any).resting) {
+      logger.warn(`[Hyperliquid] ${side} ${coin}-PERP order rested (not filled) — IoC auto-cancelled`);
+      return { success: false, error: 'Order did not fill (IoC)' };
+    }
+
+    const orderId = (result as any).filled?.oid;
     const avgPrice = Number((result as any).filled?.avgPx ?? limitPrice);
 
     logger.info(
@@ -558,6 +573,46 @@ export async function closePosition(coin: string, sizeInCoin: number, isBuy: boo
 }
 
 /**
+ * Cancel all open (resting) orders. Cleans up stale Gtc orders that never filled.
+ */
+export async function cancelAllOpenOrders(): Promise<{ cancelled: number; errors: string[] }> {
+  let cancelled = 0;
+  const errors: string[] = [];
+  try {
+    const { exchange, info, wallet } = await loadHL();
+    const openOrders = await info.openOrders({ user: wallet.address });
+    if (!openOrders || openOrders.length === 0) return { cancelled: 0, errors: [] };
+
+    // Map coin name → asset index for the cancel API
+    const meta = await info.meta();
+    const universe = (meta as any).universe ?? [];
+    const coinToAsset = new Map<string, number>();
+    for (let i = 0; i < universe.length; i++) {
+      coinToAsset.set(universe[i].name, i);
+    }
+
+    for (const o of openOrders) {
+      try {
+        const assetIdx = coinToAsset.get(o.coin);
+        if (assetIdx === undefined) {
+          errors.push(`${o.coin}: unknown asset`);
+          continue;
+        }
+        await exchange.cancel({ cancels: [{ a: assetIdx, o: o.oid }] });
+        cancelled++;
+        logger.info(`[Hyperliquid] Cancelled stale order ${o.oid} (${o.coin} ${o.side === 'B' ? 'BUY' : 'SELL'})`);
+      } catch (e) {
+        errors.push(`${o.coin}/${o.oid}: ${(e as Error).message}`);
+      }
+    }
+  } catch (err) {
+    errors.push(`cancelAllOpenOrders: ${(err as Error).message}`);
+  }
+  if (cancelled > 0) logger.info(`[Hyperliquid] Cancelled ${cancelled} stale open orders`);
+  return { cancelled, errors };
+}
+
+/**
  * Emergency close ALL open positions. Used by kill switch and Guardian alerts.
  */
 export async function closeAllPositions(): Promise<{ closed: number; errors: string[] }> {
@@ -565,6 +620,9 @@ export async function closeAllPositions(): Promise<{ closed: number; errors: str
   const errors: string[] = [];
 
   try {
+    // Cancel any open (resting) orders first — they use margin and could interfere
+    await cancelAllOpenOrders().catch(e => errors.push(`cancelOrders: ${(e as Error).message}`));
+
     const summary = await getAccountSummary();
     for (const pos of summary.positions) {
       const isBuy = pos.side === 'SHORT'; // to close a short, we buy
