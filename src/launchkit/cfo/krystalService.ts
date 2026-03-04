@@ -2237,6 +2237,66 @@ export async function closeEvmLpPosition(params: {
     const provider = await getEvmProvider(chainNumericId);
     let nextNonce = await provider.getTransactionCount(wallet.address, 'latest');
 
+    // 2a. Aerodrome gauge-staking check —————————————————————————————————
+    //     Aerodrome CL positions can be staked in a gauge for AERO rewards.
+    //     When staked, the gauge contract becomes the ERC-721 owner of the NFT.
+    //     Calling decreaseLiquidity/collect directly then reverts with "NG" (Not Gauge).
+    //     Fix: detect staking by checking ownerOf, derive the gauge via the pool,
+    //     call gauge.withdraw(tokenId) to return the NFT to our wallet, then proceed.
+    try {
+      const actualOwner: string = await nfpm.ownerOf(posId);
+      if (actualOwner.toLowerCase() !== wallet.address.toLowerCase()) {
+        logger.warn(`[Krystal] Position ${posId} owned by ${actualOwner} (not our wallet) — attempting Aerodrome gauge unstake`);
+
+        // Aerodrome Slipstream CL factory addresses by chain
+        const AERODROME_CL_FACTORY: Record<number, string> = {
+          8453:   '0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A', // Base
+          34443:  '0x31832f2a97Fd20664D76Cc421207669b55CE4BC0', // Mode
+          10:     '0x31832f2a97Fd20664D76Cc421207669b55CE4BC0', // Optimism (Velodrome Slipstream)
+        };
+        const factoryAddr = AERODROME_CL_FACTORY[chainNumericId];
+        if (!factoryAddr) {
+          throw new Error(`No Aerodrome CL factory known for chain ${chainNumericId} — cannot unstake tokenId ${posId}`);
+        }
+
+        // Read pool identity from position data.
+        // Aerodrome CL NFPM stores tickSpacing at index 4 (same slot Uniswap V3 uses for fee).
+        const posToken0: string  = posData.token0 ?? posData[2];
+        const posToken1: string  = posData.token1 ?? posData[3];
+        const posTickSpacing      = posData.tickSpacing ?? posData.fee ?? posData[4];
+
+        const clFactoryAbi = ['function getPool(address,address,int24) view returns (address)'];
+        const clFactory = new ethers.Contract(factoryAddr, clFactoryAbi, wallet);
+        const poolAddr: string = await clFactory.getPool(posToken0, posToken1, posTickSpacing);
+        if (!poolAddr || poolAddr === ethers.ZeroAddress) {
+          throw new Error(`Aerodrome CL pool not found for ${posToken0}/${posToken1} tickSpacing=${posTickSpacing} on chain ${chainNumericId}`);
+        }
+
+        const clPoolAbi = ['function gauge() view returns (address)'];
+        const clPool = new ethers.Contract(poolAddr, clPoolAbi, wallet);
+        const gaugeAddr: string = await clPool.gauge();
+        if (!gaugeAddr || gaugeAddr === ethers.ZeroAddress) {
+          throw new Error(`Aerodrome pool ${poolAddr} has no gauge — cannot unstake tokenId ${posId}`);
+        }
+
+        if (gaugeAddr.toLowerCase() !== actualOwner.toLowerCase()) {
+          throw new Error(`Position ${posId} owned by ${actualOwner} but pool gauge is ${gaugeAddr} — unexpected owner, cannot unstake`);
+        }
+
+        const gaugeAbi = ['function withdraw(uint256 tokenId) external'];
+        const gaugeContract = new ethers.Contract(gaugeAddr, gaugeAbi, wallet);
+        const unstakeTx = await gaugeContract.withdraw(BigInt(posId), { nonce: nextNonce });
+        await unstakeTx.wait();
+        nextNonce++;
+        logger.info(`[Krystal] Unstaked position ${posId} from gauge ${gaugeAddr} on chain ${chainNumericId}`);
+      }
+    } catch (gaugeErr) {
+      // If the revert reason is "NG" we know it's a gauge issue — re-throw to surface it.
+      // Other errors (ownerOf call failed for expired position, etc.) are also surfaced.
+      logger.error(`[Krystal] Gauge ownership check/unstake failed for ${posId}:`, gaugeErr);
+      throw gaugeErr;
+    }
+
     if (liquidity > BigInt(0)) {
       const deadline = Math.floor(Date.now() / 1000) + 600;
       const decreaseTx = await nfpm.decreaseLiquidity({
