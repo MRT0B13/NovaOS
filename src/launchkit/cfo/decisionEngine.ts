@@ -3065,40 +3065,46 @@ export async function generateDecisions(
     //   2. Listed on Hyperliquid (tradeable as perp)
     // This means if the analyst starts tracking DOGE and HL lists DOGE-PERP,
     // the CFO will automatically score and potentially trade it — no config change needed.
-    const baseCoins = new Set(env.hlPerpTradingCoins);
 
-    // Expand with analyst-tracked coins that are HL-listed
+    // Fetch the canonical HL listing — single source of truth for tradeable coins
+    const hl = await import('./hyperliquidService.ts');
+    const hlListedCoins = new Set(await hl.getHLListedCoins());
+
+    const baseCoins = new Set<string>();
+
+    // 1. Configured base coins (only if HL-listed)
+    for (const c of env.hlPerpTradingCoins) {
+      if (hlListedCoins.has(c)) baseCoins.add(c);
+    }
+
+    // 2. Analyst-tracked coins that are HL-listed
     if (intel.analystPrices) {
-      // Get HL-listed coins from treasury enrichment (already fetched this cycle)
-      const hlListedSet = new Set(
-        state.treasuryExposures
-          .filter(e => e.hlListed)
-          .map(e => e.symbol),
-      );
-      // Also check existing HL positions — those coins are definitely listed
-      for (const pos of state.hlPositions) hlListedSet.add(pos.coin);
-
       for (const sym of Object.keys(intel.analystPrices)) {
         const upper = sym.toUpperCase();
-        // Skip stablecoins — not tradeable for directional plays
         if (['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) continue;
-        if (hlListedSet.has(upper)) baseCoins.add(upper);
+        if (hlListedCoins.has(upper)) baseCoins.add(upper);
       }
     }
 
-    // Also include analyst top movers — if they're big movers, we want to score them
+    // 3. Analyst top movers — only if HL-listed
     if (intel.analystMovers) {
       for (const m of intel.analystMovers) {
         const upper = m.symbol.toUpperCase();
         if (['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) continue;
-        baseCoins.add(upper); // availability checked later when placing the order
+        if (hlListedCoins.has(upper)) baseCoins.add(upper);
       }
     }
 
-    // Trending tokens from CoinGecko — social heat may precede price moves
+    // 4. CoinGecko trending — only if HL-listed
     if (intel.analystTrending) {
-      for (const t of intel.analystTrending) baseCoins.add(t.toUpperCase());
+      for (const t of intel.analystTrending) {
+        const upper = t.toUpperCase();
+        if (hlListedCoins.has(upper)) baseCoins.add(upper);
+      }
     }
+
+    // Also ensure existing HL positions are scored (they're definitely listed)
+    for (const pos of state.hlPositions) baseCoins.add(pos.coin);
 
     const perpCoins = [...baseCoins];
     if (perpCoins.length > env.hlPerpTradingCoins.length) {
