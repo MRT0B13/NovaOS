@@ -341,6 +341,17 @@ export async function openPosition(
       `tokenMaxA=${quote.tokenMaxA.toString()}, tokenMaxB=${quote.tokenMaxB.toString()}, ` +
       `liquidity=${quote.liquidityAmount?.toString() ?? 'n/a'}, solBalance=${solBalance}`);
 
+    // Helper: get SPL token balance for a given mint (returns BN base units)
+    const getSplBalance = async (mintPubkey: typeof whirlpoolData.tokenMintA): Promise<typeof quote.tokenMaxA> => {
+      const accounts = await connection.getParsedTokenAccountsByOwner(walletKeypair.publicKey, { mint: mintPubkey });
+      let total = new BN(0);
+      for (const { account } of accounts.value) {
+        const amt = (account.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0';
+        total = total.add(new BN(amt));
+      }
+      return total;
+    };
+
     if (mintAStr === SOL_NATIVE_MINT && quote.tokenMaxA.gtn(0)) {
       const maxAllowed = new BN(Math.max(0, solBalance - SOL_FEE_RESERVE_LAMPORTS));
       if (quote.tokenMaxA.gt(maxAllowed)) {
@@ -348,6 +359,15 @@ export async function openPosition(
           success: false,
           error: `Insufficient SOL for LP (tokenA): need ${(quote.tokenMaxA.toNumber() / 1e9).toFixed(4)} SOL, ` +
             `have ${(solBalance / 1e9).toFixed(4)} SOL (reserving 0.05 for fees)`,
+        };
+      }
+    } else if (mintAStr !== SOL_NATIVE_MINT && quote.tokenMaxA.gtn(0)) {
+      const splBal = await getSplBalance(whirlpoolData.tokenMintA);
+      logger.info(`[Orca] SPL balance tokenA (${mintAStr.slice(0, 8)}): have=${splBal.toString()}, need=${quote.tokenMaxA.toString()}`);
+      if (quote.tokenMaxA.gt(splBal)) {
+        return {
+          success: false,
+          error: `Insufficient tokenA (${mintAStr.slice(0, 8)}): need ${quote.tokenMaxA.toString()} base units, have ${splBal.toString()}`,
         };
       }
     }
@@ -358,6 +378,15 @@ export async function openPosition(
           success: false,
           error: `Insufficient SOL for LP (tokenB): need ${(quote.tokenMaxB.toNumber() / 1e9).toFixed(4)} SOL, ` +
             `have ${(solBalance / 1e9).toFixed(4)} SOL (reserving 0.05 for fees)`,
+        };
+      }
+    } else if (mintBStr !== SOL_NATIVE_MINT && quote.tokenMaxB.gtn(0)) {
+      const splBal = await getSplBalance(whirlpoolData.tokenMintB);
+      logger.info(`[Orca] SPL balance tokenB (${mintBStr.slice(0, 8)}): have=${splBal.toString()}, need=${quote.tokenMaxB.toString()}`);
+      if (quote.tokenMaxB.gt(splBal)) {
+        return {
+          success: false,
+          error: `Insufficient tokenB (${mintBStr.slice(0, 8)}): need ${quote.tokenMaxB.toString()} base units, have ${splBal.toString()}`,
         };
       }
     }
@@ -693,14 +722,19 @@ export async function rebalancePosition(
   // position and never inadvertently draws extra SOL/USDC from the wallet.
   let finalUsdc = usdcReceived;
   let finalSol  = solReceived;
-  const MIN_SOL_SIDE  = 0.001;   // less than this → swap half USDC→SOL
-  const MIN_USDC_SIDE = 0.50;    // less than this → swap half SOL→USDC
+  // Use value-based thresholds — absolute amounts like "< 0.001 SOL" miss the case
+  // where position came back 98% USDC (e.g. 0.010 SOL + 54 USDC after price moved above range).
+  const solValueUsd  = finalSol  * solPriceUsd;
+  const usdcValueUsd = finalUsdc;                  // USDC is 1:1 USD
+  const totalValueUsd = solValueUsd + usdcValueUsd;
+  // Imbalance threshold: if either side is below 10% of total value, rebalance before reopening
+  const IMBALANCE_THRESHOLD = 0.10;
   try {
     const jup = await import('./jupiterService.ts');
-    if (finalSol < MIN_SOL_SIDE && finalUsdc > MIN_USDC_SIDE) {
-      // Position closed all-USDC (price went above range) — swap half to SOL
-      const swapAmt = finalUsdc * 0.49; // 49% → SOL, leave 51% as USDC for other side
-      logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(4)} USDC → SOL (position was all-USDC)`);
+    if (solValueUsd < totalValueUsd * IMBALANCE_THRESHOLD && finalUsdc > 1) {
+      // Position closed mostly/all USDC (price went above range) — swap ~half to SOL
+      const swapAmt = finalUsdc * 0.49; // 49% → SOL, leave 51% as USDC for the other side
+      logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(4)} USDC → SOL (SOL only ${(solValueUsd / totalValueUsd * 100).toFixed(1)}% of value, need ≥${IMBALANCE_THRESHOLD * 100}%)`);
       const swapRes = await jup.swapUsdcToSol(swapAmt, 100);
       if (swapRes.success && (swapRes.outputAmount ?? 0) > 0) {
         finalSol  = swapRes.outputAmount ?? 0;
@@ -709,10 +743,10 @@ export async function rebalancePosition(
       } else {
         logger.warn(`[Orca] Rebalance pre-swap failed (${swapRes.error}) — proceeding with USDC-only open`);
       }
-    } else if (finalUsdc < MIN_USDC_SIDE && finalSol > 0.002) {
-      // Position closed all-SOL (price fell below range) — swap half to USDC
+    } else if (usdcValueUsd < totalValueUsd * IMBALANCE_THRESHOLD && finalSol > 0.002) {
+      // Position closed mostly/all SOL (price fell below range) — swap ~half to USDC
       const swapAmt = finalSol * 0.49;
-      logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(6)} SOL → USDC (position was all-SOL)`);
+      logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(6)} SOL → USDC (USDC only ${(usdcValueUsd / totalValueUsd * 100).toFixed(1)}% of value, need ≥${IMBALANCE_THRESHOLD * 100}%)`);
       const swapRes = await jup.swapSolToUsdc(swapAmt, 100);
       if (swapRes.success && (swapRes.outputAmount ?? 0) > 0) {
         finalUsdc = swapRes.outputAmount ?? 0;

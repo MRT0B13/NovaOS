@@ -2787,30 +2787,11 @@ export async function generateDecisions(
         // Build set of existing Orca LP pool addresses to avoid duplicates
         const existingOrcaPools = new Set(state.orcaPositions.map(p => p.whirlpoolAddress).filter(Boolean));
 
-        // KAMINO_BORROW_LP execution flow: borrow USDC → swap half to tokenA → openPosition(usdcRemaining, tokenAReceived).
-        // This means tokenB of the pool MUST be fundable from the USDC we hold (i.e. tokenB = USDC).
-        // Pools where neither token is USDC (e.g. jitoSOL/SOL, BONK/SOL) require tokenB that we don't
-        // have in the wallet — they would fail at LP open with insufficient SPL token balance.
-        const KAMINO_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-        const KAMINO_USDC_SYMS = new Set(['USDC', 'USDC.E', 'USDCE']);
+        // Filter duplicates only — riskTier is already set by the pool discovery classifier.
+        // Non-USDC pools (e.g. SOL/jitoSOL, BONK/SOL) are allowed: the execution handler
+        // now swaps USDC→tokenB in step 2b when tokenB ≠ USDC.
         const tieredPools = discoveredPools
-          .filter(p => !existingOrcaPools.has(p.whirlpoolAddress))
-          .filter(p => {
-            const symA = String(p.tokenA?.symbol ?? p.tokenA ?? '').toUpperCase();
-            const symB = String(p.tokenB?.symbol ?? p.tokenB ?? '').toUpperCase();
-            const mintA = String(p.tokenA?.mint ?? p.tokenAMint ?? '');
-            const mintB = String(p.tokenB?.mint ?? p.tokenBMint ?? '');
-            const hasUsdc = KAMINO_USDC_SYMS.has(symA) || KAMINO_USDC_SYMS.has(symB)
-                          || mintA === KAMINO_USDC_MINT || mintB === KAMINO_USDC_MINT;
-            if (!hasUsdc) {
-              logger.debug(
-                `[CFO:Decision] Section K: skipping pool ${
-                  p.pair ?? (p.whirlpoolAddress ?? '').slice(0, 8)
-                } — neither token is USDC (${symA}/${symB}), not fundable from USDC borrow flow`,
-              );
-            }
-            return hasUsdc;
-          });
+          .filter(p => !existingOrcaPools.has(p.whirlpoolAddress));
 
         const enabledTiers = env.orcaLpRiskTiers;
         const slotsAvailable = env.orcaLpMaxPositions - state.orcaPositions.length;
