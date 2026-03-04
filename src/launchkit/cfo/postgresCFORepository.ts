@@ -192,6 +192,9 @@ async function ensureCFOSchema(pool: Pool): Promise<void> {
 export class PostgresCFORepository {
   private constructor(private pool: Pool) {}
 
+  /** Expose the underlying pg Pool for services that need raw SQL (e.g. financialReport). */
+  getPool(): Pool { return this.pool; }
+
   static async create(databaseUrl: string): Promise<PostgresCFORepository> {
     const sslNeeded = databaseUrl.includes('sslmode=require') || process.env.PGSSLMODE === 'require';
     const config: PoolConfig = {

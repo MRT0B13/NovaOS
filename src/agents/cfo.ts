@@ -210,6 +210,16 @@ export class CFOAgent extends BaseAgent {
       `kamino:${env.kaminoEnabled} jito:${env.jitoEnabled} ` +
       `x402:${env.x402Enabled} helius:${env.heliusEnabled} dryRun:${env.dryRun}`,
     );
+
+    // ── Financial Report Scheduler ──────────────────────────────────
+    if (this.repo) {
+      try {
+        const { startFinancialReportScheduler } = await import('../launchkit/cfo/financialReport.ts');
+        startFinancialReportScheduler(this.repo.getPool());
+      } catch (err) {
+        logger.warn('[CFO] Financial report scheduler failed to start:', err);
+      }
+    }
   }
 
   private async initServices(env: ReturnType<typeof getCFOEnv>): Promise<void> {
@@ -2305,6 +2315,19 @@ export class CFOAgent extends BaseAgent {
       case 'cfo_status': await this.sendStatusReport(); break;
       case 'cfo_scan': setTimeout(() => this.runOpportunityScan(), 100); break;
       case 'cfo_decide': setTimeout(() => this.runAutonomousDecisionCycle(), 100); break;
+
+      case 'cfo_report': {
+        const reportType = (payload.type === 'monthly' ? 'monthly' : 'weekly') as 'weekly' | 'monthly';
+        if (!this.repo) { await notify('⚠️ Database not available — cannot generate report'); break; }
+        try {
+          await notify(`⏳ Generating ${reportType} financial report...`);
+          const { triggerReport } = await import('../launchkit/cfo/financialReport.ts');
+          await triggerReport(this.repo.getPool(), reportType);
+        } catch (err) {
+          await notify(`❌ Report generation failed: ${(err as Error).message}`);
+        }
+        break;
+      }
 
       case 'cfo_approve': {
         const a = this.pendingApprovals.get(payload.approvalId);

@@ -375,6 +375,16 @@ export async function registerFactoryCommands(
             }
             break;
           }
+          case 'report': {
+            const reportType = (parts[1] || 'weekly').toLowerCase();
+            if (reportType !== 'weekly' && reportType !== 'monthly') {
+              await ctx.reply('Usage: /cfo report <weekly|monthly>');
+              break;
+            }
+            await sendToCFO('cfo_report', { type: reportType });
+            await ctx.reply(`📊 Generating ${reportType} financial report...`);
+            break;
+          }
           default:
             await ctx.reply(
               `🏦 *CFO Commands:*\n` +
@@ -389,7 +399,8 @@ export async function registerFactoryCommands(
               `/cfo borrow <USD> — Borrow USDC from Kamino\n` +
               `/cfo repay <USD|all> — Repay Kamino borrow\n` +
               `/cfo lp open|close|status — Orca LP\n` +
-              `/cfo loop start|stop|status — JitoSOL loop`,
+              `/cfo loop start|stop|status — JitoSOL loop\n` +
+              `/cfo report weekly|monthly — Financial report`,
               { parse_mode: 'Markdown' }
             );
         }
