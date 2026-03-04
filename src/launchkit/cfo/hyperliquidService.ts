@@ -158,17 +158,24 @@ let _listedCoinsCacheTs = 0;
 const LISTED_COINS_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 // ── Price formatting ────────────────────────────────────────────────────────
-// HL accepts up to 5 significant figures for prices. We need enough decimal
-// places so that slippage (e.g. 2%) is actually represented in the price
-// string. For cheap coins like W at $0.02, .toFixed(2) rounds 0.0196 → 0.02
-// which gives zero effective slippage and IoC orders won't match.
-function formatLimitPrice(price: number): string {
+// HL perp price validation (from @nktkas/hyperliquid/utils.formatPrice):
+//   1. Max decimal places = 6 - szDecimals
+//   2. Max 5 significant figures
+//   3. Truncate (floor) toward zero, don't round
+// Without this, cheap coins like W at $0.02 get too many decimals and HL
+// rejects with "Order has invalid price".
+function formatLimitPrice(price: number, szDecimals: number): string {
   if (price <= 0) return '0';
-  // Use 5 significant figures — covers everything from $0.0001 to $90,000
-  const sigFigs = 5;
+  // Rule 1: HL perp max decimals = 6 - szDecimals
+  const maxDecimals = Math.max(6 - szDecimals, 0);
+  // Rule 2: 5 significant figures
   const magnitude = Math.floor(Math.log10(Math.abs(price)));
-  const decimals = Math.max(0, sigFigs - 1 - magnitude);
-  return price.toFixed(decimals);
+  const sigFigDecimals = Math.max(0, 5 - 1 - magnitude);
+  // Take the stricter of the two limits
+  const decimals = Math.min(maxDecimals, sigFigDecimals);
+  // Truncate toward zero (like HL's formatPrice) rather than rounding
+  const factor = Math.pow(10, decimals);
+  return (Math.trunc(price * factor) / factor).toFixed(decimals);
 }
 
 // ── Halted coins cache ──────────────────────────────────────────────────────
@@ -324,7 +331,7 @@ export async function hedgeTreasury(params: HedgeParams): Promise<HLOrderResult>
     // Use aggressive slippage (2%) with IoC so we fill immediately or cancel.
     // Gtc limit orders linger as open orders if not filled, causing DB/monitor desync.
     // formatLimitPrice keeps enough decimals so slippage survives on cheap coins.
-    const limitPrice = formatLimitPrice(coinPrice * 0.98);
+    const limitPrice = formatLimitPrice(coinPrice * 0.98, szDecimals);
 
     const order = await exchange.order({
       orders: [{
@@ -467,8 +474,8 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
     // Gtc would leave unfilled limit orders on the book, causing DB/monitor desync loops.
     // formatLimitPrice keeps enough decimals so slippage survives on cheap coins.
     const limitPrice = isLong
-      ? formatLimitPrice(coinPrice * 1.02)
-      : formatLimitPrice(coinPrice * 0.98);
+      ? formatLimitPrice(coinPrice * 1.02, szDecimals)
+      : formatLimitPrice(coinPrice * 0.98, szDecimals);
 
     const order = await exchange.order({
       orders: [{
@@ -585,8 +592,8 @@ export async function closePosition(coin: string, sizeInCoin: number, isBuy: boo
     // Close at slightly worse price to guarantee fill
     // Use 1% slippage with formatLimitPrice for proper precision on cheap coins
     const limitPx = isBuy
-      ? formatLimitPrice(markPrice * 1.01)  // buying back short: above mid
-      : formatLimitPrice(markPrice * 0.99); // selling long: below mid
+      ? formatLimitPrice(markPrice * 1.01, szDecimals)  // buying back short: above mid
+      : formatLimitPrice(markPrice * 0.99, szDecimals); // selling long: below mid
 
     const order = await exchange.order({
       orders: [{
