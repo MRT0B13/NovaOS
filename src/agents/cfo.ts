@@ -500,7 +500,9 @@ export class CFOAgent extends BaseAgent {
           // ── Hyperliquid CLOSE losing position ──────────────────
           case 'CLOSE_LOSING': {
             const openHL = await this.repo.getOpenPositions('hyperliquid' as PositionStrategy);
-            const match = openHL.find(pos =>
+            const openPerp = await this.repo.getOpenPositions('hl_perp' as PositionStrategy);
+            const allHL = [...openHL, ...openPerp];
+            const match = allHL.find(pos =>
               (pos.metadata as any)?.coin === p.coin && (pos.metadata as any)?.side === p.side,
             );
             // Use actual receivedUsd from executor (includes unrealized PnL),
@@ -519,6 +521,88 @@ export class CFOAgent extends BaseAgent {
               feeUsd: 0, txHash: r.txId, walletAddress: '',
               positionId: match?.id, status: 'confirmed',
               metadata: { reason: 'stop_loss', reasoning: d.reasoning },
+            });
+            break;
+          }
+
+          // ── Signal-driven HL Perp OPEN ─────────────────────────
+          case 'HL_PERP_OPEN':
+          case 'HL_PERP_NEWS': {
+            const coin = p.coin;
+            const side = p.side as 'LONG' | 'SHORT';
+            const sizeUsd = p.sizeUsd ?? d.estimatedImpactUsd;
+            const leverage = p.leverage ?? 2;
+            // Fetch entry price from HL account summary
+            let entryPrice = 0;
+            try {
+              const hlMod = await import('../launchkit/cfo/hyperliquidService.ts');
+              const summary = await hlMod.getAccountSummary();
+              const pos = summary.positions.find((pp: any) => pp.coin === coin);
+              if (pos) entryPrice = pos.markPrice;
+            } catch { /* non-fatal */ }
+            const perpPos: CFOPosition = {
+              id: `hl-perp-${coin.toLowerCase()}-${Date.now()}`,
+              strategy: 'hl_perp' as PositionStrategy,
+              asset: `${coin}-PERP`,
+              description: `${side} ${coin} ${leverage}x (${d.type === 'HL_PERP_NEWS' ? 'news' : 'signal'})`,
+              chain: 'arbitrum',
+              status: 'OPEN',
+              entryPrice,
+              currentPrice: entryPrice,
+              sizeUnits: entryPrice > 0 ? sizeUsd / entryPrice : 0,
+              costBasisUsd: sizeUsd / leverage, // margin used
+              currentValueUsd: sizeUsd,
+              realizedPnlUsd: 0,
+              unrealizedPnlUsd: 0,
+              entryTxHash: r.txId,
+              externalId: r.txId,
+              metadata: {
+                coin, side, leverage,
+                signal: p.signal,
+                conviction: p.conviction,
+                stopLossPct: p.stopLossPct,
+                takeProfitPct: p.takeProfitPct,
+                decisionType: d.type,
+              },
+              openedAt: now,
+              updatedAt: now,
+            };
+            await this.repo.upsertPosition(perpPos);
+            await this.repo.insertTransaction({
+              id: `tx-hl-perp-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'arbitrum', strategyTag: 'hl_perp', txType: 'swap',
+              tokenIn: 'USDC', amountIn: sizeUsd / leverage,
+              tokenOut: `${coin}-PERP-${side}`, amountOut: sizeUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { coin, side, leverage, signal: p.signal, conviction: p.conviction, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted ${d.type}: ${side} ${coin} $${sizeUsd} @ ${leverage}x (conviction=${p.conviction})`);
+            break;
+          }
+
+          // ── Signal-driven HL Perp CLOSE ────────────────────────
+          case 'HL_PERP_CLOSE': {
+            const coin = p.coin;
+            const side = p.side as 'LONG' | 'SHORT';
+            const receivedUsd = r.receivedUsd ?? d.estimatedImpactUsd ?? 0;
+            // Find matching open perp position
+            const openPerps = await this.repo.getOpenPositions('hl_perp' as PositionStrategy);
+            const perpMatch = openPerps.find(pos =>
+              (pos.metadata as any)?.coin === coin && (pos.metadata as any)?.side === side,
+            );
+            if (perpMatch) {
+              await this.positionManager.closePosition(perpMatch.id, 0, r.txId ?? '', receivedUsd);
+              const pnl = receivedUsd - perpMatch.costBasisUsd;
+              logger.info(`[CFO] Persisted HL_PERP_CLOSE: closed ${perpMatch.id} (${side} ${coin}) PnL $${pnl.toFixed(2)}`);
+            }
+            await this.repo.insertTransaction({
+              id: `tx-hl-perp-close-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'arbitrum', strategyTag: 'hl_perp', txType: 'swap',
+              tokenIn: `${coin}-PERP-${side}`, amountIn: d.estimatedImpactUsd,
+              tokenOut: 'USDC', amountOut: receivedUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '',
+              positionId: perpMatch?.id, status: 'confirmed',
+              metadata: { coin, side, reason: d.reasoning },
             });
             break;
           }

@@ -87,11 +87,17 @@ export interface AdaptiveParams {
   polyBetSizeMultiplier: number; // scale bet sizing
   polyCooldownMultiplier: number; // >1 = slower betting (poor calibration), <1 = faster
 
-  // Hyperliquid
+  // Hyperliquid (hedge)
   hlStopLossMultiplier: number; // tighter/wider stop loss (< 1 = tighter)
   hlLeverageBias: number;       // -1 to +1 adjustment on max leverage
   hlHedgeTargetMultiplier: number; // scale hedge target ratio based on hedge performance
   hlRebalanceThresholdMultiplier: number; // wider if frequent rebalance = churn losses
+
+  // Hyperliquid (signal-driven perps)
+  hlPerpConvictionFloor: number;    // raise if too many losing trades at low conviction
+  hlPerpSizeMultiplier: number;     // scale position size based on trade outcomes
+  hlPerpStopLossMultiplier: number; // tighter/wider SL for perps specifically
+  hlPerpMaxPositionsAdj: number;    // -N to +N adjustment on max simultaneous positions
 
   // LP (Orca + Krystal) — global
   lpRangeWidthMultiplier: number;  // wider/narrower ranges based on rebalance frequency
@@ -560,6 +566,8 @@ function detectDriftAlerts(
       ['LP Range', current.lpRangeWidthMultiplier, prior.lpRangeWidthMultiplier],
       ['Bet Size', current.polyBetSizeMultiplier, prior.polyBetSizeMultiplier],
       ['Hedge Target', current.hlHedgeTargetMultiplier, prior.hlHedgeTargetMultiplier],
+      ['Perp Size', current.hlPerpSizeMultiplier, prior.hlPerpSizeMultiplier],
+      ['Perp SL', current.hlPerpStopLossMultiplier, prior.hlPerpStopLossMultiplier],
     ];
 
     for (const [name, curr, prev] of drifts) {
@@ -710,6 +718,47 @@ function computeAdaptiveParams(
     // Rebalance threshold: if lots of churn (many open/close with losses), widen
     if (hlSt.avgHoldHours < 4 && hlSt.avgPnlUsd < 0) {
       hlRebalThreshMult = 1.3; // widen threshold to reduce churn
+    }
+  }
+
+  // ── HL Perp (signal-driven) adaptations ─────────────────────────
+  let perpConvFloor = 0;       // 0 = use env default, >0 = raise minimum conviction
+  let perpSizeMult = 1.0;     // scale position sizes
+  let perpStopMult = 1.0;     // tighter/wider SL
+  let perpMaxPosAdj = 0;      // -N to +N on max positions
+  const perpSt = stats['hl_perp'];
+
+  if (perpSt && perpSt.totalTrades >= MIN_TRADES_FOR_CONFIDENCE) {
+    // If win rate is poor, raise conviction floor to filter out weak signals
+    if (perpSt.winRate < 0.35 && perpSt.totalPnlUsd < 0) {
+      perpConvFloor = Math.min(0.7, 0.3 + (0.35 - perpSt.winRate)); // e.g. 30% WR → floor 0.35
+    }
+
+    // If avg PnL is strongly negative, cut position sizes
+    if (perpSt.avgPnlUsd < -3) {
+      perpSizeMult = 0.6;
+    } else if (perpSt.avgPnlUsd > 3 && perpSt.sharpeApprox > 0.5) {
+      perpSizeMult = 1.3; // perps are working → lean in
+    }
+
+    // If max drawdown is severe, tighten stops
+    if (perpSt.maxDrawdownUsd < -20 && Math.abs(perpSt.maxDrawdownUsd) > perpSt.avgPnlUsd * 3) {
+      perpStopMult = 0.7; // tighter SL
+    } else if (perpSt.winRate > 0.55 && perpSt.sharpeApprox > 0.3) {
+      perpStopMult = 1.15; // let winners run slightly more
+    }
+
+    // If many losing trades, reduce max concurrent positions
+    if (perpSt.recentWinRate < 0.3 && perpSt.recentAvgPnlUsd < 0) {
+      perpMaxPosAdj = -1; // scale down from 3 → 2
+    } else if (perpSt.recentWinRate > 0.6 && perpSt.recentAvgPnlUsd > 0) {
+      perpMaxPosAdj = 1; // expand if printing
+    }
+
+    // Recent regime shift: perps suddenly deteriorating
+    if (perpSt.recentAvgPnlUsd < -2 && perpSt.avgPnlUsd > 0) {
+      perpSizeMult *= 0.7; // reduce exposure during regime shift
+      perpStopMult *= 0.85;
     }
   }
 
@@ -906,6 +955,10 @@ function computeAdaptiveParams(
     hlLeverageBias: blend(hlLevBias, prior?.hlLeverageBias),
     hlHedgeTargetMultiplier: blend(hlHedgeTargetMult, prior?.hlHedgeTargetMultiplier),
     hlRebalanceThresholdMultiplier: blend(hlRebalThreshMult, prior?.hlRebalanceThresholdMultiplier),
+    hlPerpConvictionFloor: blend(perpConvFloor, prior?.hlPerpConvictionFloor),
+    hlPerpSizeMultiplier: blend(perpSizeMult, prior?.hlPerpSizeMultiplier),
+    hlPerpStopLossMultiplier: blend(perpStopMult, prior?.hlPerpStopLossMultiplier),
+    hlPerpMaxPositionsAdj: blend(perpMaxPosAdj, prior?.hlPerpMaxPositionsAdj),
     lpRangeWidthMultiplier: blend(lpRangeMult, prior?.lpRangeWidthMultiplier),
     lpMinAprAdjustment: blend(lpMinAprAdj, prior?.lpMinAprAdjustment),
     lpRebalanceTriggerMultiplier: blend(lpRebalTriggerMult, prior?.lpRebalanceTriggerMultiplier),
@@ -1014,7 +1067,7 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
     const prior = await loadPrior(dbPool);
 
     // 2. Compute stats for each strategy
-    const strategies = ['polymarket', 'hyperliquid', 'kamino', 'jito', 'orca_lp', 'krystal_lp', 'evm_flash_arb'];
+    const strategies = ['polymarket', 'hyperliquid', 'hl_perp', 'kamino', 'jito', 'orca_lp', 'krystal_lp', 'evm_flash_arb'];
     const statsEntries = await Promise.all(
       strategies.map(async s => [s, await computeStrategyStats(dbPool, s)] as const),
     );
@@ -1073,6 +1126,8 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
       `kelly×${params.kellyMultiplier.toFixed(2)} | ` +
       `hlStop×${params.hlStopLossMultiplier.toFixed(2)} | ` +
       `hedge×${params.hlHedgeTargetMultiplier.toFixed(2)} | ` +
+      `perpSize×${params.hlPerpSizeMultiplier.toFixed(2)} | ` +
+      `perpSL×${params.hlPerpStopLossMultiplier.toFixed(2)} | ` +
       `lpRange×${params.lpRangeWidthMultiplier.toFixed(2)} | ` +
       `lpTiers: L×${params.lpTierRangeMultipliers.low?.toFixed(2) ?? '1'} M×${params.lpTierRangeMultipliers.medium?.toFixed(2) ?? '1'} H×${params.lpTierRangeMultipliers.high?.toFixed(2) ?? '1'} | ` +
       `arbMin×${params.evmArbMinProfitMultiplier.toFixed(2)} | ` +
@@ -1141,6 +1196,10 @@ export function getDefaultParams(): AdaptiveParams {
     hlLeverageBias: 0,
     hlHedgeTargetMultiplier: 1.0,
     hlRebalanceThresholdMultiplier: 1.0,
+    hlPerpConvictionFloor: 0,
+    hlPerpSizeMultiplier: 1.0,
+    hlPerpStopLossMultiplier: 1.0,
+    hlPerpMaxPositionsAdj: 0,
     lpRangeWidthMultiplier: 1.0,
     lpMinAprAdjustment: 0,
     lpRebalanceTriggerMultiplier: 1.0,
@@ -1202,7 +1261,7 @@ export function formatLearningSummary(params: AdaptiveParams): string {
 
   // Best/worst strategies with names expanded
   const stratNameMap: Record<string, string> = {
-    hyperliquid: 'Hyperliquid', kamino: 'Kamino', jito: 'Jito Staking',
+    hyperliquid: 'HL Hedge', hl_perp: 'HL Perps', kamino: 'Kamino', jito: 'Jito Staking',
     orca_lp: 'Orca LP', krystal_lp: 'EVM LP', evm_flash_arb: 'Arb Scanner',
     polymarket: 'Polymarket',
   };

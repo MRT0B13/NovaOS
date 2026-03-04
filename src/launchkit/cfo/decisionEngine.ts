@@ -3113,10 +3113,15 @@ export async function generateDecisions(
         `(base: ${env.hlPerpTradingCoins.join(',')} + ${perpCoins.length - env.hlPerpTradingCoins.length} discovered)`,
       );
     }
-    const maxPosUsd = env.hlPerpMaxPositionUsd;
-    const maxTotalUsd = env.hlPerpMaxTotalUsd;
-    const maxPositions = env.hlPerpMaxPositions;
-    const minConviction = config.hlPerpMinConviction;
+    const maxPosUsd = applyAdaptive(env.hlPerpMaxPositionUsd, learned.hlPerpSizeMultiplier, conf);
+    const maxTotalUsd = applyAdaptive(env.hlPerpMaxTotalUsd, learned.hlPerpSizeMultiplier, conf);
+    const maxPositions = Math.max(1, env.hlPerpMaxPositions + Math.round(learned.hlPerpMaxPositionsAdj * conf));
+    const minConviction = Math.max(
+      config.hlPerpMinConviction,
+      learned.hlPerpConvictionFloor * conf, // learning can raise floor but never lower it
+    );
+    const learnedPerpSL = applyAdaptive(env.hlPerpStopLossPct, learned.hlPerpStopLossMultiplier, conf);
+    const learnedPerpTP = env.hlPerpTakeProfitPct; // TP not yet adapted
 
     // Current perp positions (excluding hedge shorts)
     // Hedge positions are tagged by the OPEN_HEDGE cooldown key convention;
@@ -3143,6 +3148,9 @@ export async function generateDecisions(
     const signals: CoinSignal[] = [];
 
     for (const coin of perpCoins) {
+      // Skip coins with trading halted on HL (remembered for 30 min after a halt error)
+      if (hl.isHalted(coin)) continue;
+
       let bullScore = 0;
       let bearScore = 0;
       const reasons: string[] = [];
@@ -3293,8 +3301,8 @@ export async function generateDecisions(
           side: sig.side,
           sizeUsd,
           leverage: env.hlPerpDefaultLeverage,
-          stopLossPct: env.hlPerpStopLossPct,
-          takeProfitPct: env.hlPerpTakeProfitPct,
+          stopLossPct: learnedPerpSL,
+          takeProfitPct: learnedPerpTP,
           signal: sig.sources.join('+'),
           conviction: sig.conviction,
         },
@@ -3318,9 +3326,9 @@ export async function generateDecisions(
       const signalReversed = currentSignal && currentSignal.side !== pos.side && currentSignal.conviction >= minConviction;
       // Also close if P&L stop-loss breached (check unrealized PnL vs margin)
       const marginPct = pos.marginUsed > 0 ? (pos.unrealizedPnlUsd / pos.marginUsed) * 100 : 0;
-      const stopHit = marginPct < -env.hlPerpStopLossPct;
+      const stopHit = marginPct < -learnedPerpSL;
       // Take profit
-      const tpHit = marginPct > env.hlPerpTakeProfitPct;
+      const tpHit = marginPct > learnedPerpTP;
 
       if (signalReversed || stopHit || tpHit) {
         const reason = stopHit

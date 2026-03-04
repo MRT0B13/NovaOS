@@ -157,6 +157,22 @@ let _listedCoinsCache: string[] = [];
 let _listedCoinsCacheTs = 0;
 const LISTED_COINS_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
+// ── Halted coins cache ──────────────────────────────────────────────────────
+// When HL returns "Trading is halted" for a coin, remember it for 30 minutes
+// so the signal engine doesn't keep trying every cycle.
+const _haltedCoins = new Map<string, number>(); // coin → timestamp
+const HALTED_COIN_TTL_MS = 30 * 60 * 1000; // 30 min
+
+export function isHalted(coin: string): boolean {
+  const ts = _haltedCoins.get(coin);
+  if (!ts) return false;
+  if (Date.now() - ts > HALTED_COIN_TTL_MS) {
+    _haltedCoins.delete(coin);
+    return false;
+  }
+  return true;
+}
+
 // ============================================================================
 // Account info
 // ============================================================================
@@ -349,6 +365,12 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
     return { success: false, error: 'sizeUsd must be positive' };
   }
 
+  // Skip coins that HL has halted (cached for 30 min)
+  if (isHalted(coin)) {
+    logger.info(`[Hyperliquid] Skipping ${side} ${coin}-PERP — trading halted (cached)`);
+    return { success: false, error: `${coin} trading is halted` };
+  }
+
   const leverage = Math.min(params.leverage ?? 2, env.maxHyperliquidLeverage);
   const stopLossPct = params.stopLossPct ?? 5;
   const takeProfitPct = params.takeProfitPct ?? 10;
@@ -432,9 +454,17 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
     );
 
     return { success: true, orderId, avgPrice };
-  } catch (err) {
+  } catch (err: any) {
+    const msg = String(err?.message ?? err ?? '');
+    // "Trading is halted" is a known HL-side halt (e.g. during rugs/delistings).
+    // Cache it so we don't retry every cycle and pollute logs with stack traces.
+    if (msg.includes('Trading is halted') || msg.includes('trading is halted')) {
+      _haltedCoins.set(coin, Date.now());
+      logger.warn(`[Hyperliquid] ${coin}-PERP trading is halted on HL — skipping for 30min`);
+      return { success: false, error: `${coin} trading is halted` };
+    }
     logger.error(`[Hyperliquid] openPerpTrade(${side} ${coin}) error:`, err);
-    return { success: false, error: (err as Error).message };
+    return { success: false, error: msg };
   }
 }
 
