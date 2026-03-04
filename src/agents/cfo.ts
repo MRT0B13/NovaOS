@@ -1270,6 +1270,26 @@ export class CFOAgent extends BaseAgent {
     }
   }
 
+  /**
+   * Close all open HL positions in the DB (both hedge and hl_perp).
+   * Called after exchange-side closeAllPositions() so DB stays in sync.
+   */
+  private async closeAllHLPositionsInDB(reason: string): Promise<number> {
+    if (!this.positionManager || !this.repo) return 0;
+    const openHedge = await this.repo.getOpenPositions('hyperliquid');
+    const openPerp = await this.repo.getOpenPositions('hl_perp');
+    const all = [...openHedge, ...openPerp];
+    let closed = 0;
+    for (const pos of all) {
+      try {
+        await this.positionManager.closePosition(pos.id, 0, reason, pos.currentValueUsd ?? 0);
+        closed++;
+      } catch (e) { logger.error(`[CFO] Failed to close DB position ${pos.id}:`, e); }
+    }
+    if (closed > 0) logger.warn(`[CFO] Closed ${closed} HL DB positions (${reason})`);
+    return closed;
+  }
+
   // ── Position monitor ──────────────────────────────────────────────
 
   private async monitorPositions(): Promise<void> {
@@ -1280,13 +1300,27 @@ export class CFOAgent extends BaseAgent {
     try {
       const hl = await import('../launchkit/cfo/hyperliquidService.ts');
       const summary = await hl.getAccountSummary();
-      if (summary.positions.length > 0) {
-        const actions = await this.positionManager.updateHyperliquidPrices(summary.positions);
-        for (const action of actions) {
-          if (action.urgency === 'critical') {
-            const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
-            await notifyAdminForce(`⚠️ CFO HL: ${action.reason}`);
+      // Always run — even with 0 live positions — so EXPIRE can fire for DB records
+      // whose exchange side was closed externally (e.g. Guardian emergency close).
+      const actions = await this.positionManager.updateHyperliquidPrices(summary.positions);
+      for (const action of actions) {
+        if (action.action === 'EXPIRE') {
+          // Position gone from exchange — close the DB record so we stop alerting.
+          try {
+            const dbPos = await this.repo?.getPosition(action.positionId);
+            const unrealizedPnl = dbPos?.unrealizedPnlUsd ?? 0;
+            await this.positionManager.closePosition(
+              action.positionId, 0, 'external-close', dbPos?.currentValueUsd ?? 0,
+            );
+            logger.warn(`[CFO] Auto-closed stale DB position ${action.positionId} (PnL ~$${unrealizedPnl.toFixed(2)})`);
+          } catch (closeErr) {
+            logger.error(`[CFO] Failed to auto-close stale position ${action.positionId}:`, closeErr);
           }
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(`⚠️ CFO HL: ${action.reason} — DB record closed`);
+        } else if (action.urgency === 'critical') {
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(`⚠️ CFO HL: ${action.reason}`);
         }
       }
     } catch (err) { logger.debug('[CFO] HL price refresh error:', err); }
@@ -2252,6 +2286,7 @@ export class CFOAgent extends BaseAgent {
       case 'cfo_close_hl': {
         logger.warn('[CFO] Emergency: closing all Hyperliquid positions');
         await (await hl()).closeAllPositions();
+        await this.closeAllHLPositionsInDB('cfo_close_hl');
         break;
       }
 
@@ -2262,6 +2297,7 @@ export class CFOAgent extends BaseAgent {
         const hlMod = await hl();
         await Promise.allSettled([polyMod.cancelAllOrders(), hlMod.closeAllPositions()]);
         for (const p of await polyMod.fetchPositions()) await polyMod.exitPosition(p, 1.0);
+        await this.closeAllHLPositionsInDB('cfo_close_all');
         break;
       }
 
@@ -2516,7 +2552,8 @@ export class CFOAgent extends BaseAgent {
         if (cfoEnv.hyperliquidEnabled) {
           try {
             await (await hl()).closeAllPositions();
-            closeResults.push('HL: closed all positions');
+            const dbClosed = await this.closeAllHLPositionsInDB('emergency_exit');
+            closeResults.push(`HL: closed all positions (${dbClosed} DB records)`);
           } catch (e: any) { closeResults.push(`HL close failed: ${e.message ?? e}`); }
         }
 
