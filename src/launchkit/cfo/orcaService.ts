@@ -281,12 +281,38 @@ export async function openPosition(
     // comfortably below the actual wallet balance. We only ever use ~98.5% of each
     // side; the tiny dust remainder stays in the wallet.
     const LP_INPUT_SAFETY = 0.985;
-    const tokenAInputBN = new BN(Math.floor(tokenAAmount * LP_INPUT_SAFETY * (10 ** tokenADecimals)));
-    const usdcInputBN = new BN(Math.floor(usdcAmount * LP_INPUT_SAFETY * (10 ** tokenBDecimals)));
+    const USDC_MINT_LP = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+    const USDC_DECIMALS_LP = 6; // USDC always has 6 decimals — never use tokenBDecimals for USDC scaling
 
-    // Use whichever side the user provided more of (by USD-equivalent)
-    const tokenAValueUsd = tokenAAmount * currentPrice;
-    const useUsdc = usdcAmount > 0 && usdcAmount >= tokenAValueUsd;
+    const tokenAInputBN = new BN(Math.floor(tokenAAmount * LP_INPUT_SAFETY * (10 ** tokenADecimals)));
+    // Always scale USDC with 6 decimals regardless of tokenBDecimals.
+    // Bug: when tokenB=SOL (9 dec), using tokenBDecimals turns $10 into 9.85 SOL worth of input → massive/wrong quote.
+    const usdcInputBN = new BN(Math.floor(usdcAmount * LP_INPUT_SAFETY * (10 ** USDC_DECIMALS_LP)));
+
+    // Determine which pool token is USDC so we pick the correct input side
+    const mintAStr = whirlpoolData.tokenMintA.toBase58();
+    const mintBStr = whirlpoolData.tokenMintB.toBase58();
+    const usdcIsTokenB = mintBStr === USDC_MINT_LP;
+    const usdcIsTokenA = mintAStr === USDC_MINT_LP;
+
+    // Use whichever side the user provided more of (by USD-equivalent).
+    // currentPrice from PriceMath is tokenB-per-tokenA (decimal-adjusted), which equals
+    // USD only when tokenB = USDC(6 dec). For non-USDC pools a direct dollar comparison
+    // is meaningless, so always use tokenA as input in that case.
+    let useUsdc: boolean;
+    if (usdcIsTokenB) {
+      // Standard case: tokenB=USDC → currentPrice ≈ USD per tokenA
+      const tokenAValueUsd = tokenAAmount * currentPrice;
+      useUsdc = usdcAmount > 0 && usdcAmount >= tokenAValueUsd;
+    } else if (usdcIsTokenA) {
+      // Unusual: USDC is tokenA — always use the non-USDC side (tokenB) as input
+      useUsdc = false;
+    } else {
+      // Neither token is USDC (e.g. BONK/SOL, jitoSOL/SOL) — use tokenA as input
+      logger.warn(`[Orca] Pool ${poolAddress.slice(0, 8)} has no USDC — using tokenA (${mintAStr.slice(0, 8)}) as LP input. usdcAmount=$${usdcAmount} will not be deposited directly.`);
+      useUsdc = false;
+    }
+
     const inputTokenMint = useUsdc ? whirlpoolData.tokenMintB : whirlpoolData.tokenMintA;
     const inputTokenAmount = useUsdc ? usdcInputBN : tokenAInputBN;
 
@@ -303,6 +329,39 @@ export async function openPosition(
       slippageTolerance,
       tokenExtensionCtx: NO_TOKEN_EXTENSION_CONTEXT,
     });
+
+    // ── Wallet balance preflight ────────────────────────────────────────────
+    // Check actual on-chain balances BEFORE submitting so we get a clean error
+    // (and trigger auto-unwind) rather than an on-chain "insufficient lamports" failure.
+    const SOL_NATIVE_MINT = 'So11111111111111111111111111111111111111112';
+    const SOL_FEE_RESERVE_LAMPORTS = 50_000_000; // keep 0.05 SOL for tx fees
+    const solBalance = await connection.getBalance(walletKeypair.publicKey);
+
+    logger.info(`[Orca] Quote: input=${inputTokenAmount.toString()} (${useUsdc ? 'USDC' : 'tokenA'}), ` +
+      `tokenMaxA=${quote.tokenMaxA.toString()}, tokenMaxB=${quote.tokenMaxB.toString()}, ` +
+      `liquidity=${quote.liquidityAmount?.toString() ?? 'n/a'}, solBalance=${solBalance}`);
+
+    if (mintAStr === SOL_NATIVE_MINT && quote.tokenMaxA.gtn(0)) {
+      const maxAllowed = new BN(Math.max(0, solBalance - SOL_FEE_RESERVE_LAMPORTS));
+      if (quote.tokenMaxA.gt(maxAllowed)) {
+        return {
+          success: false,
+          error: `Insufficient SOL for LP (tokenA): need ${(quote.tokenMaxA.toNumber() / 1e9).toFixed(4)} SOL, ` +
+            `have ${(solBalance / 1e9).toFixed(4)} SOL (reserving 0.05 for fees)`,
+        };
+      }
+    }
+    if (mintBStr === SOL_NATIVE_MINT && quote.tokenMaxB.gtn(0)) {
+      const maxAllowed = new BN(Math.max(0, solBalance - SOL_FEE_RESERVE_LAMPORTS));
+      if (quote.tokenMaxB.gt(maxAllowed)) {
+        return {
+          success: false,
+          error: `Insufficient SOL for LP (tokenB): need ${(quote.tokenMaxB.toNumber() / 1e9).toFixed(4)} SOL, ` +
+            `have ${(solBalance / 1e9).toFixed(4)} SOL (reserving 0.05 for fees)`,
+        };
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────────
 
     // The quote doesn't include minSqrtPrice/maxSqrtPrice, but ByTokenAmountsParams
     // requires them—otherwise the program errors with PriceSlippageOutOfBounds (6069).
