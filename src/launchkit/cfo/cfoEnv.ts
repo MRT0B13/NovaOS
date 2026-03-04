@@ -164,11 +164,16 @@ const ALCHEMY_CHAINS: Record<string, number> = {
   'linea-mainnet':   59144,
 };
 
-/** Free public RPCs for chains Alchemy doesn't support */
+/** Free public RPCs for chains Alchemy doesn't support (or as fallback) */
 const PUBLIC_FALLBACK_RPCS: Record<number, string> = {
   56:    'https://bsc-dataseed1.binance.org',                // BSC
   43114: 'https://avalanche-c-chain-rpc.publicnode.com',     // Avalanche
   250:   'https://rpc.ankr.com/fantom',                      // Fantom
+  8453:  'https://mainnet.base.org',                         // Base
+  1:     'https://eth.drpc.org',                             // Ethereum
+  42161: 'https://arb1.arbitrum.io/rpc',                     // Arbitrum
+  10:    'https://mainnet.optimism.io',                      // Optimism
+  137:   'https://polygon-rpc.com',                          // Polygon
 };
 
 /** Build EVM RPC URL map. Priority (highest first):

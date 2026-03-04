@@ -458,6 +458,47 @@ export async function getEvmProvider(numericChainId: number): Promise<any> {
   return provider;
 }
 
+/** Evict cached provider so next call creates a fresh one (e.g. after RPC failures). */
+function evictProvider(numericChainId: number): void {
+  _providerCache.delete(numericChainId);
+}
+
+// ============================================================================
+// RPC retry helper — exponential backoff for transient errors (503, 429, timeout)
+// ============================================================================
+const TRANSIENT_RPC_CODES = ['SERVER_ERROR', 'TIMEOUT', 'NETWORK_ERROR'];
+
+async function withRpcRetry<T>(
+  fn: () => Promise<T>,
+  label: string,
+  maxAttempts = 3,
+): Promise<T> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      const code  = err?.code ?? '';
+      const msg   = String(err?.message ?? err ?? '');
+      const isTransient =
+        TRANSIENT_RPC_CODES.includes(code) ||
+        msg.includes('503')  ||
+        msg.includes('429')  ||
+        msg.includes('overloaded') ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('ETIMEDOUT');
+
+      if (isTransient && attempt < maxAttempts) {
+        const delayMs = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s
+        logger.debug(`[Krystal] ${label} transient error — retry ${attempt}/${maxAttempts} in ${delayMs}ms`);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error(`[Krystal] ${label} unreachable`);
+}
+
 async function getEvmWallet(numericChainId: number): Promise<any> {
   const env = getCFOEnv();
   if (!env.evmPrivateKey) throw new Error('[Krystal] CFO_EVM_PRIVATE_KEY not set');
@@ -1007,10 +1048,13 @@ export async function fetchKrystalPositions(
           if (!nfpmAddr) continue; // no NFPM on this chain — skip on-chain reads
           const nfpmAbi = protoResolved ? getNfpmAbiForProtocol(protoResolved.def.abi) : NFPM_ABI;
           const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, provider);
-          const [posData, ownerOnChain] = await Promise.all([
-            nfpm.positions(posId),
-            nfpm.ownerOf(posId),
-          ]);
+          const [posData, ownerOnChain] = await withRpcRetry(
+            () => Promise.all([
+              nfpm.positions(posId),
+              nfpm.ownerOf(posId),
+            ]),
+            `positions+ownerOf(${posId})`,
+          );
 
           // Guard: Krystal/API can occasionally return stale/non-owned entries.
           // Skip anything not owned by the CFO wallet to avoid repeated increase reverts.
@@ -1038,12 +1082,17 @@ export async function fetchKrystalPositions(
             } else {
               const isAero = protoResolved?.def.abi === 'aerodrome-cl';
               const poolContract = new ethers.Contract(poolAddress, getPoolAbi(isAero), provider);
-              const slot0 = await poolContract.slot0();
+              const slot0 = await withRpcRetry(
+                () => poolContract.slot0(),
+                `slot0(${poolAddress})`,
+              );
               currentTick = Number(slot0.tick ?? slot0[1] ?? 0);
               _slot0Cache.set(poolKey, { tick: currentTick, ts: Date.now() });
             }
           }
-        } catch (err) {
+        } catch (err: any) {
+          // On persistent RPC failure, evict cached provider so next cycle retries fresh
+          if (TRANSIENT_RPC_CODES.includes(err?.code)) evictProvider(numericId);
           logger.warn(`[Krystal] Failed to read on-chain data for position ${posId}:`, err);
         }
       }
@@ -1116,11 +1165,14 @@ export async function fetchKrystalPositions(
           const nfpmAbi = dbProtoResolved ? getNfpmAbiForProtocol(dbProtoResolved.def.abi) : NFPM_ABI;
           const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, provider);
 
-          // Read position data from NFPM
-          const [posData, ownerOnChain] = await Promise.all([
-            nfpm.positions(dbRec.posId),
-            nfpm.ownerOf(dbRec.posId),
-          ]);
+          // Read position data from NFPM (with retry for transient RPC errors)
+          const [posData, ownerOnChain] = await withRpcRetry(
+            () => Promise.all([
+              nfpm.positions(dbRec.posId),
+              nfpm.ownerOf(dbRec.posId),
+            ]),
+            `db-positions+ownerOf(${dbRec.posId})`,
+          );
 
           // Guard stale DB rows: only keep positions still owned by this wallet.
           if (String(ownerOnChain).toLowerCase() !== ownerAddress.toLowerCase()) {
@@ -1146,12 +1198,15 @@ export async function fetchKrystalPositions(
           // Read token symbols and decimals
           const token0Contract = new ethers.Contract(token0Addr, ERC20_ABI, provider);
           const token1Contract = new ethers.Contract(token1Addr, ERC20_ABI, provider);
-          const [sym0, dec0, sym1, dec1] = await Promise.all([
-            token0Contract.symbol().catch(() => dbRec.token0Symbol || '?'),
-            token0Contract.decimals().catch(() => 18),
-            token1Contract.symbol().catch(() => dbRec.token1Symbol || '?'),
-            token1Contract.decimals().catch(() => 18),
-          ]);
+          const [sym0, dec0, sym1, dec1] = await withRpcRetry(
+            () => Promise.all([
+              token0Contract.symbol().catch(() => dbRec.token0Symbol || '?'),
+              token0Contract.decimals().catch(() => 18),
+              token1Contract.symbol().catch(() => dbRec.token1Symbol || '?'),
+              token1Contract.decimals().catch(() => 18),
+            ]),
+            `erc20-meta(${dbRec.posId})`,
+          );
 
           // Get current tick from pool via factory
           let currentTick = 0;
@@ -1165,11 +1220,17 @@ export async function fetchKrystalPositions(
                 ? 'function getPool(address, address, int24) view returns (address)'
                 : 'function getPool(address, address, uint24) view returns (address)';
               const factory = new ethers.Contract(factoryAddr, [factoryAbiStr], provider);
-              const discoveredPool = await factory.getPool(token0Addr, token1Addr, feeTier);
+              const discoveredPool = await withRpcRetry(
+                () => factory.getPool(token0Addr, token1Addr, feeTier),
+                `getPool(${dbRec.posId})`,
+              );
               if (discoveredPool && discoveredPool !== ethers.ZeroAddress) {
                 poolAddress = discoveredPool;
                 const poolContract = new ethers.Contract(discoveredPool, getPoolAbi(isAerodrome), provider);
-                const slot0 = await poolContract.slot0();
+                const slot0 = await withRpcRetry(
+                  () => poolContract.slot0(),
+                  `db-slot0(${discoveredPool})`,
+                );
                 currentTick = Number(slot0.tick ?? slot0[1] ?? 0);
               }
             } catch { /* use 0 tick — inRange will fall back to DB state */ }
@@ -1249,7 +1310,8 @@ export async function fetchKrystalPositions(
           });
 
           logger.info(`[Krystal] On-chain fallback: position ${dbRec.posId} (${sym0}/${sym1} on ${chainName}) — $${valueUsd.toFixed(0)}, ${inRange ? 'in-range' : 'out-of-range'}`);
-        } catch (err) {
+        } catch (err: any) {
+          if (TRANSIENT_RPC_CODES.includes(err?.code)) evictProvider(dbRec.chainNumericId);
           logger.warn(`[Krystal] On-chain read failed for position ${dbRec.posId}:`, err);
         }
       }
