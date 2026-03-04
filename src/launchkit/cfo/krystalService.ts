@@ -2347,6 +2347,10 @@ export async function closeEvmLpPosition(params: {
     }
 
     // Estimate USD value from recovered token amounts
+    //   Previous heuristic (stableAmt * 2) broke when positions went out of range
+    //   and all value concentrated in one token — the stable side was $0 → total $0.
+    //   Now: derive per-token USD prices from the pool's sqrtPriceX96 and compute
+    //   value = human0 * usdPerToken0 + human1 * usdPerToken1.
     let valueRecoveredUsd = 0;
     try {
       const stableSymbols = ['USDC', 'USDT', 'DAI', 'BUSD', 'USDCE', 'USDC.E', 'USDT0'];
@@ -2362,15 +2366,65 @@ export async function closeEvmLpPosition(params: {
 
         if (is0Stable && is1Stable) {
           valueRecoveredUsd = human0 + human1;
-        } else if (is0Stable) {
-          // token0 is $1 → token1 value ≈ human0 equivalent (symmetric LP)
-          valueRecoveredUsd = human0 * 2; // approximate: LP is ~50/50
-        } else if (is1Stable) {
-          valueRecoveredUsd = human1 * 2;
         } else {
-          // Neither is stable — use native price heuristic
-          const nPrice = await getNativeTokenPrice(chainNumericId);
-          valueRecoveredUsd = (human0 + human1) * nPrice; // rough
+          // Read pool sqrtPriceX96 for accurate token pricing
+          let priced = false;
+          try {
+            const protoResolved = params.protocol ? resolveProtocol(params.protocol.toLowerCase(), chainNumericId) : undefined;
+            const isAerodromeCl = protoResolved?.def.abi === 'aerodrome-cl';
+            // Derive pool address from factory + position token pair
+            const factoryAddr = protoResolved?.factoryAddress;
+            if (factoryAddr) {
+              const posToken0 = t0.address;
+              const posToken1 = t1.address;
+              const feeOrSpacing = feeTier; // from posData
+              const factoryAbiStr = isAerodromeCl
+                ? 'function getPool(address,address,int24) view returns (address)'
+                : 'function getPool(address,address,uint24) view returns (address)';
+              const factory = new ethers.Contract(factoryAddr, [factoryAbiStr], provider);
+              const poolAddr: string = await factory.getPool(posToken0, posToken1, feeOrSpacing);
+              if (poolAddr && poolAddr !== ethers.ZeroAddress) {
+                const poolContract = new ethers.Contract(poolAddr, getPoolAbi(!!isAerodromeCl), provider);
+                const slot0 = await poolContract.slot0();
+                const sqrtPriceX96 = slot0.sqrtPriceX96 ?? slot0[0];
+                const sqrtP = Number(sqrtPriceX96) / (2 ** 96);
+                const rawPrice = sqrtP * sqrtP;
+                const price0In1 = rawPrice * (10 ** dec0) / (10 ** dec1);
+
+                let usdPer0: number;
+                let usdPer1: number;
+                if (is1Stable) {
+                  usdPer1 = 1;
+                  usdPer0 = price0In1; // token0 priced in stable token1
+                } else if (is0Stable) {
+                  usdPer0 = 1;
+                  usdPer1 = 1 / price0In1;
+                } else {
+                  const nPrice = await getNativeTokenPrice(chainNumericId);
+                  usdPer0 = nPrice; // rough: assume token0 ≈ native
+                  usdPer1 = nPrice / price0In1;
+                }
+                valueRecoveredUsd = human0 * usdPer0 + human1 * usdPer1;
+                priced = true;
+              }
+            }
+          } catch (priceErr) {
+            logger.warn('[Krystal] Pool-based pricing failed (falling back to heuristic):', priceErr);
+          }
+
+          // Fallback: simple heuristic (only used if pool lookup failed)
+          if (!priced) {
+            if (is0Stable) {
+              const nPrice = await getNativeTokenPrice(chainNumericId);
+              valueRecoveredUsd = human0 + human1 * nPrice;
+            } else if (is1Stable) {
+              const nPrice = await getNativeTokenPrice(chainNumericId);
+              valueRecoveredUsd = human1 + human0 * nPrice;
+            } else {
+              const nPrice = await getNativeTokenPrice(chainNumericId);
+              valueRecoveredUsd = (human0 + human1) * nPrice; // rough
+            }
+          }
         }
       }
       if (valueRecoveredUsd > 0) {
@@ -2675,10 +2729,55 @@ export async function rebalanceEvmLpPosition(params: {
   }
 
   const best = eligible[0]; // already sorted by score
-  // Use recovered value if computed, otherwise fallback to 50% of max (conservative)
-  const deployUsd = closeResult.valueRecoveredUsd > 1
+
+  // Compute deployUsd from actual wallet balances for the target pool.
+  // closeResult.valueRecoveredUsd can be $0 when positions go fully out of range
+  // (all value in one token, the stable*2 heuristic returns $0). Reading the actual
+  // wallet holdings against the pool's sqrtPriceX96 gives accurate sizing.
+  let deployUsd = closeResult.valueRecoveredUsd > 1
     ? closeResult.valueRecoveredUsd
     : env.krystalLpMaxUsd * 0.5;
+  try {
+    const ethers = await loadEthers();
+    const wallet = await getEvmWallet(chainNumericId);
+    const provider = await getEvmProvider(chainNumericId);
+    const [walBal0, walBal1] = await Promise.all([
+      new ethers.Contract(best.token0.address, ERC20_ABI, provider).balanceOf(wallet.address).catch(() => BigInt(0)),
+      new ethers.Contract(best.token1.address, ERC20_ABI, provider).balanceOf(wallet.address).catch(() => BigInt(0)),
+    ]);
+    const dec0 = best.token0.decimals ?? 18;
+    const dec1 = best.token1.decimals ?? 18;
+    const human0 = Number(ethers.formatUnits(walBal0, dec0));
+    const human1 = Number(ethers.formatUnits(walBal1, dec1));
+
+    const protoName = typeof best.protocol === 'string' ? best.protocol : best.protocol?.name ?? '';
+    const protoResolved = resolveProtocol(protoName.toLowerCase(), chainNumericId);
+    const isAero = protoResolved?.def.abi === 'aerodrome-cl';
+    const poolContract = new ethers.Contract(best.poolAddress, getPoolAbi(!!isAero), provider);
+    const slot0 = await poolContract.slot0();
+    const sqrtPriceX96 = slot0.sqrtPriceX96 ?? slot0[0];
+    const sqrtP = Number(sqrtPriceX96) / (2 ** 96);
+    const rawPrice = sqrtP * sqrtP;
+    const price0In1 = rawPrice * (10 ** dec0) / (10 ** dec1);
+
+    const stableSymbols = ['USDC', 'USDT', 'DAI', 'BUSD', 'USDCE', 'USDC.E', 'USDT0'];
+    const s0 = stableSymbols.includes(best.token0.symbol.toUpperCase());
+    const s1 = stableSymbols.includes(best.token1.symbol.toUpperCase());
+    let usdPer0: number;
+    let usdPer1: number;
+    if (s1) { usdPer1 = 1; usdPer0 = price0In1; }
+    else if (s0) { usdPer0 = 1; usdPer1 = 1 / price0In1; }
+    else { const np = await getNativeTokenPrice(chainNumericId); usdPer0 = np; usdPer1 = np / price0In1; }
+
+    const walletValueUsd = human0 * usdPer0 + human1 * usdPer1;
+    if (walletValueUsd > 1) {
+      // Cap at krystalLpMaxUsd to avoid over-deploying tokens from other positions
+      deployUsd = Math.min(walletValueUsd, env.krystalLpMaxUsd);
+      logger.info(`[Krystal] Rebalance: wallet holds $${walletValueUsd.toFixed(2)} for ${best.token0.symbol}/${best.token1.symbol} → deployUsd=$${deployUsd.toFixed(2)}`);
+    }
+  } catch (err) {
+    logger.warn('[Krystal] Rebalance: wallet value calc failed (using close estimate):', err);
+  }
 
   const openResult = await openEvmLpPosition(
     {
