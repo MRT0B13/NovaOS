@@ -2,7 +2,10 @@
  * EVM Swap Service
  *
  * Same-chain token swaps on EVM via Uniswap V3 SwapRouter02.
- * Fallback to LI.FI swap API for chains without Uniswap V3.
+ * Fallback 1: LI.FI swap API (all chains, any token).
+ * Fallback 2: Aerodrome/Velodrome Router v2 (Base / Optimism) — handles tokens
+ *             that only trade on Aerodrome (e.g. VIRTUAL, AERO, VELO).
+ *             Routes: direct USDC→TOKEN or 2-hop USDC→WETH→TOKEN.
  *
  * SwapRouter02:  0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45  (universal all chains)
  * QuoterV2:      0x61fFE014bA17989E743c5F6cB21bF9697530B21e  (universal all chains)
@@ -14,6 +17,54 @@
 
 import { logger } from '@elizaos/core';
 import { getCFOEnv } from './cfoEnv.ts';
+
+// ============================================================================
+// Swap Failure Cache
+// ============================================================================
+
+// Tracks token+chain combos where swap quotes have recently failed.
+// Key: `${chainId}_${tokenAddr.toLowerCase()}`, Value: timestamp
+// TTL: 2 hours — prevents the engine from repeatedly bridging then failing on
+// the same unswappable token (e.g. VIRTUAL on Uniswap V3).
+const _swapFailureCache = new Map<string, number>();
+const SWAP_FAILURE_TTL_MS = 2 * 60 * 60 * 1000; // 2h
+
+export function recordSwapFailure(chainId: number, tokenAddr: string): void {
+  _swapFailureCache.set(`${chainId}_${tokenAddr.toLowerCase()}`, Date.now());
+}
+
+export function hasSwapFailure(chainId: number, tokenAddr: string): boolean {
+  const key = `${chainId}_${tokenAddr.toLowerCase()}`;
+  const ts = _swapFailureCache.get(key);
+  if (!ts) return false;
+  if (Date.now() - ts > SWAP_FAILURE_TTL_MS) {
+    _swapFailureCache.delete(key);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Quick pre-flight check: can we swap USDC → tokenAddr on this chain?
+ * Uses QuoterV2 with a $2 probe. Returns true if any standard fee tier quotes.
+ * Also checks LIFI as fallback. Caches failures for 2h.
+ */
+export async function canSwapFromUsdc(
+  chainId: number,
+  usdcAddr: string,
+  tokenAddr: string,
+): Promise<boolean> {
+  // Already known to fail
+  if (hasSwapFailure(chainId, tokenAddr)) return false;
+  // USDC→USDC is trivially true
+  if (tokenAddr.toLowerCase() === usdcAddr.toLowerCase()) return true;
+
+  const quote = await quoteEvmSwap(chainId, usdcAddr, tokenAddr, 2);
+  if (quote) return true;
+  recordSwapFailure(chainId, tokenAddr);
+  logger.warn(`[EvmSwap] Pre-flight: no swap route USDC→${tokenAddr.slice(0, 10)} on chain ${chainId} — recording failure (2h)`);
+  return false;
+}
 
 // ============================================================================
 // Constants
@@ -41,6 +92,35 @@ function getQuoterV2(chainId: number): string {
 }
 
 const LIFI_API_BASE = 'https://li.quest/v1';
+
+// ── Aerodrome / Velodrome Router v2 ─────────────────────────────────────────
+// These are the primary DEX on Base/Optimism — many tokens ONLY exist here
+// (VIRTUAL, AERO, VELO, etc.) and have no Uniswap V3 pools.
+const AERODROME_ROUTER: Record<number, string> = {
+  8453: '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43', // Aerodrome on Base
+  10:   '0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858', // Velodrome on Optimism
+};
+const AERODROME_VOLATILE_FACTORY: Record<number, string> = {
+  8453: '0x420DD381b31aEf6683db6B902084cB0FFECe40Da', // Aerodrome volatile factory
+  10:   '0x25CbdDb98b35ab1FF77413456B31EC81A6B6B746', // Velodrome volatile factory
+};
+// WETH address per chain (needed for 2-hop USDC→WETH→TOKEN routes)
+const WETH_ADDR: Record<number, string> = {
+  1:     '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+  10:    '0x4200000000000000000000000000000000000006',
+  56:    '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', // WBNB
+  137:   '0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619',
+  8453:  '0x4200000000000000000000000000000000000006',
+  42161: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1',
+  43114: '0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7', // WAVAX
+};
+
+const AERODROME_ROUTER_ABI = [
+  // getAmountsOut for quoting (view — no gas)
+  'function getAmountsOut(uint256 amountIn, tuple(address from, address to, bool stable, address factory)[] routes) view returns (uint256[] amounts)',
+  // swap execution
+  'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, tuple(address from, address to, bool stable, address factory)[] routes, address to, uint256 deadline) returns (uint256[] amounts)',
+];
 
 /** Chains where Uniswap V3 SwapRouter02 is deployed */
 const UNISWAP_V3_CHAINS = new Set([1, 10, 137, 8453, 42161, 43114, 324, 534352, 59144]);
@@ -71,7 +151,7 @@ export interface SwapQuote {
   amountOut: number;        // expected output (human readable)
   fee: number;              // Uniswap fee tier (e.g. 3000)
   priceImpactPct: number;   // rough estimate
-  route: 'uniswap_v3' | 'lifi';  // which router used
+  route: 'uniswap_v3' | 'lifi' | 'aerodrome';  // which router used
   gasEstimate?: number;     // gas units
 }
 
@@ -80,7 +160,7 @@ export interface SwapResult {
   txHash?: string;
   amountIn: number;
   amountOut: number;
-  route: 'uniswap_v3' | 'lifi';
+  route: 'uniswap_v3' | 'lifi' | 'aerodrome';
   error?: string;
 }
 
@@ -122,8 +202,19 @@ export async function quoteEvmSwap(
     }
   }
 
-  // Fallback to LI.FI swap API (works on any chain)
-  return quoteViaLifi(chainId, tokenInAddr, tokenOutAddr, amountInHuman);
+  // Fallback 1: LI.FI swap API (works on any chain)
+  const lifiQuote = await quoteViaLifi(chainId, tokenInAddr, tokenOutAddr, amountInHuman);
+  if (lifiQuote) return lifiQuote;
+
+  // Fallback 2: Aerodrome/Velodrome Router v2 (Base / Optimism)
+  // Many tokens (VIRTUAL, AERO, VELO, SONNE etc.) ONLY exist on Aerodrome/Velodrome
+  // and have no Uniswap V3 or LIFI support.
+  if (AERODROME_ROUTER[chainId]) {
+    const aeroQuote = await quoteViaAerodrome(chainId, tokenInAddr, tokenOutAddr, amountInHuman);
+    if (aeroQuote) return aeroQuote;
+  }
+
+  return null;
 }
 
 async function quoteViaUniswap(
@@ -198,7 +289,7 @@ async function quoteViaUniswap(
       gasEstimate,
     };
   } catch (err) {
-    logger.debug(`[EvmSwap] Uniswap V3 quote failed on chain ${chainId}:`, err);
+    logger.warn(`[EvmSwap] Uniswap V3 quote failed (chain ${chainId}, fee ${feeTier}): ${(err as Error).message?.slice(0, 120)}`);
     return null;
   }
 }
@@ -241,7 +332,7 @@ async function quoteViaLifi(
 
     if (!resp.ok) {
       const body = await resp.text().catch(() => '');
-      logger.debug(`[EvmSwap] LI.FI quote ${resp.status} on chain ${chainId}: ${body.slice(0, 200)}`);
+      logger.warn(`[EvmSwap] LI.FI quote ${resp.status} on chain ${chainId} ($${amountInHuman.toFixed(2)} ${tokenInAddr.slice(0,10)}→${tokenOutAddr.slice(0,10)}): ${body.slice(0, 200)}`);
       return null;
     }
 
@@ -260,7 +351,73 @@ async function quoteViaLifi(
       route: 'lifi',
     };
   } catch (err) {
-    logger.debug(`[EvmSwap] LI.FI quote failed on chain ${chainId} (${tokenInAddr.slice(0,10)}→${tokenOutAddr.slice(0,10)}, $${amountInHuman.toFixed(2)}):`, err);
+    logger.warn(`[EvmSwap] LI.FI quote failed on chain ${chainId} (${tokenInAddr.slice(0,10)}→${tokenOutAddr.slice(0,10)}, $${amountInHuman.toFixed(2)}): ${(err as Error).message?.slice(0, 120)}`);
+    return null;
+  }
+}
+
+/**
+ * Quote via Aerodrome (Base) / Velodrome (Optimism) Router v2.
+ * Tries direct route first, then 2-hop via WETH.
+ * Handles tokens with no Uniswap V3 pool (VIRTUAL, AERO, VELO, etc.)
+ */
+async function quoteViaAerodrome(
+  chainId: number,
+  tokenInAddr: string,
+  tokenOutAddr: string,
+  amountInHuman: number,
+): Promise<SwapQuote | null> {
+  const routerAddr = AERODROME_ROUTER[chainId];
+  const factory = AERODROME_VOLATILE_FACTORY[chainId] ?? '0x0000000000000000000000000000000000000000';
+  if (!routerAddr) return null;
+
+  try {
+    const { getEvmProvider } = await import('./krystalService.ts');
+    const ethers = await import('ethers' as string);
+    const provider = await getEvmProvider(chainId);
+
+    const inToken = new ethers.Contract(tokenInAddr, ERC20_ABI, provider);
+    const outToken = new ethers.Contract(tokenOutAddr, ERC20_ABI, provider);
+    const [inDecimals, outDecimals] = await Promise.all([
+      inToken.decimals().then(Number).catch(() => 18),
+      outToken.decimals().then(Number).catch(() => 18),
+    ]);
+    const amountInRaw = ethers.parseUnits(amountInHuman.toFixed(inDecimals), inDecimals);
+
+    const router = new ethers.Contract(routerAddr, AERODROME_ROUTER_ABI, provider);
+
+    // Try direct volatile route: tokenIn → tokenOut
+    const directRoutes = [{ from: tokenInAddr, to: tokenOutAddr, stable: false, factory }];
+    try {
+      const amounts = await router.getAmountsOut(amountInRaw, directRoutes);
+      const amountOut = Number(ethers.formatUnits(amounts[amounts.length - 1], outDecimals));
+      if (amountOut > 0) {
+        logger.debug(`[EvmSwap] Aerodrome direct quote: $${amountInHuman.toFixed(2)} → ${amountOut.toFixed(6)} on chain ${chainId}`);
+        return { tokenIn: tokenInAddr, tokenOut: tokenOutAddr, amountIn: amountInHuman, amountOut, fee: 0, priceImpactPct: 0, route: 'aerodrome' };
+      }
+    } catch { /* no direct pool — try 2-hop */ }
+
+    // Try 2-hop route via WETH: tokenIn → WETH → tokenOut
+    const wethAddr = WETH_ADDR[chainId];
+    if (wethAddr && tokenInAddr.toLowerCase() !== wethAddr.toLowerCase() && tokenOutAddr.toLowerCase() !== wethAddr.toLowerCase()) {
+      const hopRoutes = [
+        { from: tokenInAddr, to: wethAddr,    stable: false, factory },
+        { from: wethAddr,    to: tokenOutAddr, stable: false, factory },
+      ];
+      try {
+        const amounts = await router.getAmountsOut(amountInRaw, hopRoutes);
+        const amountOut = Number(ethers.formatUnits(amounts[amounts.length - 1], outDecimals));
+        if (amountOut > 0) {
+          logger.debug(`[EvmSwap] Aerodrome 2-hop quote (→WETH→): $${amountInHuman.toFixed(2)} → ${amountOut.toFixed(6)} on chain ${chainId}`);
+          return { tokenIn: tokenInAddr, tokenOut: tokenOutAddr, amountIn: amountInHuman, amountOut, fee: 0, priceImpactPct: 0, route: 'aerodrome' };
+        }
+      } catch { /* 2-hop also failed */ }
+    }
+
+    logger.debug(`[EvmSwap] Aerodrome: no route found for ${tokenInAddr.slice(0,10)}→${tokenOutAddr.slice(0,10)} on chain ${chainId}`);
+    return null;
+  } catch (err) {
+    logger.debug(`[EvmSwap] Aerodrome quote failed (chain ${chainId}): ${(err as Error).message?.slice(0, 120)}`);
     return null;
   }
 }
@@ -301,6 +458,8 @@ export async function executeEvmSwap(
     // Use quote.fee (the tier that actually got a quote) — may differ from the
     // requested feeTier if we fell back to a standard tier during quoting.
     return executeViaUniswap(chainId, tokenInAddr, tokenOutAddr, amountInHuman, quote.fee, slippagePct, quote.amountOut);
+  } else if (quote.route === 'aerodrome') {
+    return executeViaAerodrome(chainId, tokenInAddr, tokenOutAddr, amountInHuman, quote.amountOut, slippagePct);
   } else {
     return executeViaLifiSwap(chainId, tokenInAddr, tokenOutAddr, amountInHuman);
   }
@@ -466,5 +625,84 @@ async function executeViaLifiSwap(
     return { success: true, txHash, amountIn: amountInHuman, amountOut, route: 'lifi' };
   } catch (err) {
     return { success: false, amountIn: amountInHuman, amountOut: 0, route: 'lifi', error: (err as Error).message };
+  }
+}
+
+/**
+ * Execute swap via Aerodrome (Base) / Velodrome (Optimism) Router v2.
+ * Mirrors quoteViaAerodrome — tries direct route, then 2-hop USDC→WETH→TOKEN.
+ */
+async function executeViaAerodrome(
+  chainId: number,
+  tokenInAddr: string,
+  tokenOutAddr: string,
+  amountInHuman: number,
+  expectedOut: number,
+  slippagePct = 0.5,
+): Promise<SwapResult> {
+  const routerAddr = AERODROME_ROUTER[chainId];
+  const factory   = AERODROME_VOLATILE_FACTORY[chainId] ?? '0x0000000000000000000000000000000000000000';
+
+  try {
+    const { getEvmProvider } = await import('./krystalService.ts');
+    const ethers = await import('ethers' as string);
+    const env = getCFOEnv();
+    if (!env.evmPrivateKey) throw new Error('CFO_EVM_PRIVATE_KEY not set');
+
+    const provider = await getEvmProvider(chainId);
+    const wallet   = new ethers.Wallet(env.evmPrivateKey, provider);
+
+    const inToken  = new ethers.Contract(tokenInAddr, ERC20_ABI, wallet);
+    const outToken = new ethers.Contract(tokenOutAddr, ERC20_ABI, provider);
+    const [inDecimals, outDecimals] = await Promise.all([
+      inToken.decimals().then(Number).catch(() => 18),
+      outToken.decimals().then(Number).catch(() => 18),
+    ]);
+    const amountInRaw = ethers.parseUnits(amountInHuman.toFixed(inDecimals), inDecimals);
+    const slippage    = 1 - slippagePct / 100;
+    const minOut      = ethers.parseUnits((expectedOut * slippage).toFixed(outDecimals), outDecimals);
+    const deadline    = Math.floor(Date.now() / 1000) + 300;
+
+    // Approve router to spend tokenIn
+    const routerContract = new ethers.Contract(routerAddr, AERODROME_ROUTER_ABI, wallet);
+    const allowance: bigint = await inToken.allowance(wallet.address, routerAddr);
+    if (allowance < amountInRaw) {
+      const approveTx = await inToken.approve(routerAddr, amountInRaw * 10n);
+      await approveTx.wait();
+      logger.debug(`[EvmSwap:Aerodrome] Approved ${amountInHuman.toFixed(4)} tokenIn for router`);
+    }
+
+    // Determine route: direct first, 2-hop as fallback
+    const wethAddr = WETH_ADDR[chainId];
+    let routes: Array<{ from: string; to: string; stable: boolean; factory: string }>;
+
+    // Check if direct route has liquidity
+    let useDirect = false;
+    const directRoutes = [{ from: tokenInAddr, to: tokenOutAddr, stable: false, factory }];
+    try {
+      const amounts = await routerContract.getAmountsOut(amountInRaw, directRoutes);
+      if ((amounts[amounts.length - 1] as bigint) > 0n) useDirect = true;
+    } catch { /* fall through to 2-hop */ }
+
+    if (useDirect) {
+      routes = directRoutes;
+    } else if (wethAddr && tokenInAddr.toLowerCase() !== wethAddr.toLowerCase() && tokenOutAddr.toLowerCase() !== wethAddr.toLowerCase()) {
+      routes = [
+        { from: tokenInAddr, to: wethAddr,    stable: false, factory },
+        { from: wethAddr,    to: tokenOutAddr, stable: false, factory },
+      ];
+    } else {
+      return { success: false, amountIn: amountInHuman, amountOut: 0, route: 'aerodrome', error: 'No Aerodrome route available' };
+    }
+
+    const walletAddr = wallet.address;
+    const tx = await routerContract.swapExactTokensForTokens(amountInRaw, minOut, routes, walletAddr, deadline);
+    const receipt = await tx.wait();
+    const txHash: string = receipt.hash ?? tx.hash;
+
+    logger.info(`[EvmSwap:Aerodrome] Swap completed: $${amountInHuman.toFixed(2)} → ~${expectedOut.toFixed(6)} on chain ${chainId} | tx ${txHash}`);
+    return { success: true, txHash, amountIn: amountInHuman, amountOut: expectedOut, route: 'aerodrome' };
+  } catch (err) {
+    return { success: false, amountIn: amountInHuman, amountOut: 0, route: 'aerodrome', error: (err as Error).message };
   }
 }
