@@ -2,12 +2,14 @@
  * Hyperliquid Perpetuals Service
  *
  * Provides perpetual futures trading via Hyperliquid's DEX.
- * Used by the CFO agent ONLY for hedging — not directional speculation.
+ * Supports:
+ *  1. Treasury hedging — SHORT perps to offset on-chain exposure
+ *  2. Directional perp trading — LONG/SHORT based on signals (sentiment, momentum, news)
  *
  * Architecture doc constraints (enforced in code):
- *  - Max 20% of portfolio
+ *  - Max 20% of portfolio (configurable)
  *  - Max 5x leverage (hard cap)
- *  - Hedging use case only: SHORT SOL when SOL treasury > $X to cap downside risk
+ *  - Perp trading gated behind CFO_HL_PERP_TRADING_ENABLE
  *
  * Hyperliquid auth:
  *  - Uses @nktkas/hyperliquid SDK
@@ -69,6 +71,26 @@ export interface HedgeParams {
   stopLossPct?: number;
   /** Take profit % below entry (default 15%) */
   takeProfitPct?: number;
+}
+
+/** Parameters for a directional perp trade (LONG or SHORT) driven by signals */
+export interface PerpTradeParams {
+  /** Coin to trade (e.g. 'BTC', 'ETH', 'SOL') */
+  coin: string;
+  /** Trade direction */
+  side: 'LONG' | 'SHORT';
+  /** USD notional size */
+  sizeUsd: number;
+  /** Leverage (clamped to env max) */
+  leverage?: number;
+  /** Stop loss % from entry (default 5%) */
+  stopLossPct?: number;
+  /** Take profit % from entry (default 10%) */
+  takeProfitPct?: number;
+  /** Signal source that triggered this trade (for logging) */
+  signal?: string;
+  /** Conviction score 0-1 (for logging / future sizing) */
+  conviction?: number;
 }
 
 // ============================================================================
@@ -307,6 +329,142 @@ export async function hedgeTreasury(params: HedgeParams): Promise<HLOrderResult>
 // Backward-compat alias so nothing else breaks if called externally
 export const hedgeSolTreasury = (p: { solExposureUsd: number; leverage?: number }) =>
   hedgeTreasury({ coin: 'SOL', exposureUsd: p.solExposureUsd, leverage: p.leverage });
+
+// ============================================================================
+// Directional perp trade (signal-driven — LONG or SHORT any listed coin)
+// ============================================================================
+
+/**
+ * Open a directional perp trade on Hyperliquid.
+ * Supports LONG and SHORT. Used by the signal-driven decision engine
+ * (Phase 1: sentiment + momentum, Phase 2: multi-asset, Phase 3: news-reactive).
+ *
+ * NOT a hedge — this is a conviction-based trade with its own TP/SL.
+ */
+export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderResult> {
+  const env = getCFOEnv();
+  const { coin, side, sizeUsd } = params;
+
+  if (sizeUsd <= 0) {
+    return { success: false, error: 'sizeUsd must be positive' };
+  }
+
+  const leverage = Math.min(params.leverage ?? 2, env.maxHyperliquidLeverage);
+  const stopLossPct = params.stopLossPct ?? 5;
+  const takeProfitPct = params.takeProfitPct ?? 10;
+  const isLong = side === 'LONG';
+  const signalTag = params.signal ?? 'manual';
+  const conviction = params.conviction ?? 0;
+
+  if (env.dryRun) {
+    logger.info(
+      `[Hyperliquid] DRY RUN — would ${side} ${coin}-PERP $${sizeUsd.toFixed(0)} ` +
+      `at ${leverage}x (SL: ${stopLossPct}%, TP: ${takeProfitPct}%) ` +
+      `signal=${signalTag} conviction=${(conviction * 100).toFixed(0)}%`,
+    );
+    return { success: true, orderId: 0, cloid: `dry-perp-${Date.now()}` };
+  }
+
+  try {
+    const { exchange, info, wallet } = await loadHL();
+
+    const mids = await withRetry(() => info.allMids(), 'openPerpTrade:allMids');
+    const coinPrice = Number(mids[coin] ?? 0);
+    if (coinPrice <= 0) {
+      return { success: false, error: `${coin} not found in HL allMids — not listed or delisted` };
+    }
+
+    const meta = await withRetry(() => info.meta(), 'openPerpTrade:meta');
+    const universe = (meta as any).universe ?? [];
+    const assetIdx = universe.findIndex((u: any) => u.name === coin);
+    if (assetIdx < 0) {
+      return { success: false, error: `${coin} not found in HL universe` };
+    }
+    const szDecimals: number = universe[assetIdx].szDecimals ?? 1;
+    const szStep = Math.pow(10, szDecimals);
+
+    const sizeInCoin = sizeUsd / coinPrice;
+    const sizeFmt = Math.floor(sizeInCoin * szStep) / szStep;
+
+    if (sizeFmt <= 0) {
+      return { success: false, error: `Position too small after rounding to ${szDecimals} decimals` };
+    }
+    if (sizeFmt * coinPrice < 10) {
+      return { success: false, error: `Notional $${(sizeFmt * coinPrice).toFixed(2)} below HL minimum $10` };
+    }
+
+    await exchange.updateLeverage({
+      asset: assetIdx,
+      isCross: false,
+      leverage,
+    });
+
+    // For LONG: buy slightly above mid to get filled. For SHORT: sell slightly below.
+    const limitPrice = isLong
+      ? (coinPrice * 1.0005).toFixed(2)
+      : (coinPrice * 0.9995).toFixed(2);
+
+    const order = await exchange.order({
+      orders: [{
+        a: assetIdx,
+        b: isLong,          // true = BUY (LONG), false = SELL (SHORT)
+        p: limitPrice,
+        s: sizeFmt.toString(),
+        r: false,
+        t: { limit: { tif: 'Gtc' as const } },
+        c: `0x${Buffer.from(`cfo-perp-${side.toLowerCase()}-${Date.now()}`).toString('hex').padEnd(32, '0').slice(0, 32)}`,
+      }],
+      grouping: 'na',
+    });
+
+    const result = (order as any)?.response?.data?.statuses?.[0];
+    if (!result || (result as any).error) {
+      return { success: false, error: (result as any)?.error ?? 'Order rejected' };
+    }
+
+    const orderId = (result as any).resting?.oid ?? (result as any).filled?.oid;
+    const avgPrice = Number((result as any).filled?.avgPx ?? limitPrice);
+
+    logger.info(
+      `[Hyperliquid] ${side} ${coin}-PERP opened: ${sizeFmt} ${coin} @ ~$${avgPrice} ` +
+      `($${sizeUsd.toFixed(0)}, ${leverage}x) signal=${signalTag} ` +
+      `conviction=${(conviction * 100).toFixed(0)}%: order ${orderId}`,
+    );
+
+    return { success: true, orderId, avgPrice };
+  } catch (err) {
+    logger.error(`[Hyperliquid] openPerpTrade(${side} ${coin}) error:`, err);
+    return { success: false, error: (err as Error).message };
+  }
+}
+
+/**
+ * Get all mid prices from HL (for signal engine price comparison).
+ * Cached briefly to avoid 429s during multi-coin scoring.
+ */
+let _allMidsCache: Record<string, number> = {};
+let _allMidsCacheTs = 0;
+const ALL_MIDS_TTL_MS = 30_000; // 30 seconds
+
+export async function getAllMidPrices(): Promise<Record<string, number>> {
+  if (Object.keys(_allMidsCache).length > 0 && Date.now() - _allMidsCacheTs < ALL_MIDS_TTL_MS) {
+    return _allMidsCache;
+  }
+  try {
+    const { info } = await loadHL();
+    const mids = await withRetry(() => info.allMids(), 'getAllMidPrices');
+    const result: Record<string, number> = {};
+    for (const [coin, price] of Object.entries(mids)) {
+      result[coin] = Number(price);
+    }
+    _allMidsCache = result;
+    _allMidsCacheTs = Date.now();
+    return result;
+  } catch (err) {
+    logger.warn('[Hyperliquid] getAllMidPrices error:', err);
+    return _allMidsCache; // return stale cache if available
+  }
+}
 
 // ============================================================================
 // Close position

@@ -99,6 +99,9 @@ export type DecisionType =
   | 'KRYSTAL_LP_CLAIM_FEES'  // collect accumulated fees from EVM LP positions
   | 'EVM_BRIDGE'             // bridge tokens between EVM chains (via LI.FI)
   | 'EVM_SWAP'               // same-chain token swap on EVM (via Uniswap V3 / LI.FI)
+  | 'HL_PERP_OPEN'           // open a directional perp trade (LONG or SHORT) based on signals
+  | 'HL_PERP_CLOSE'          // close an existing perp trade (TP/SL hit or signal reversed)
+  | 'HL_PERP_NEWS'           // news-reactive perp trade (fast entry, tight stops)
   | 'SKIP';            // no action taken (for logging)
 
 /** Approval tier determines whether CFO executes immediately or waits for admin */
@@ -198,6 +201,7 @@ export interface PortfolioState {
     leverage: number;
     liquidationPrice: number;
     markPrice: number;
+    marginUsed: number;
   }>;
   hlTotalShortUsd: number;        // total SHORT USD across ALL hedged coins on HL
   hlTotalPnl: number;
@@ -346,6 +350,13 @@ export interface DecisionConfig {
   hedgeCooldownMs: number;              // min time between hedge decisions (default: 4h)
   stakeCooldownMs: number;              // min time between stake decisions (default: 6h)
   closeCooldownMs: number;              // min time between close decisions (default: 1h)
+
+  // Perp trading (signal-driven)
+  hlPerpTradingEnabled: boolean;        // master switch for HL perp trading
+  hlPerpMinConviction: number;          // min conviction score to trade (0-1, default: 0.4)
+  hlPerpCooldownMs: number;             // min time between perp trades per coin
+  hlPerpNewsEnabled: boolean;           // enable news-reactive perp trades
+  hlPerpNewsCooldownMs: number;         // cooldown for news-reactive trades
 }
 
 export function getDecisionConfig(): DecisionConfig {
@@ -371,6 +382,13 @@ export function getDecisionConfig(): DecisionConfig {
     hedgeCooldownMs:            Number(process.env.CFO_HEDGE_COOLDOWN_HOURS ?? 4) * 3600_000,
     stakeCooldownMs:            Number(process.env.CFO_STAKE_COOLDOWN_HOURS ?? 6) * 3600_000,
     closeCooldownMs:            Number(process.env.CFO_CLOSE_COOLDOWN_HOURS ?? 1) * 3600_000,
+
+    // Perp trading (reads from env via cfoEnv)
+    hlPerpTradingEnabled:       process.env.CFO_HL_PERP_TRADING_ENABLE === 'true',
+    hlPerpMinConviction:        Math.max(0, Math.min(1, Number(process.env.CFO_HL_PERP_MIN_CONVICTION ?? 0.4))),
+    hlPerpCooldownMs:           Number(process.env.CFO_HL_PERP_COOLDOWN_HOURS ?? 4) * 3600_000,
+    hlPerpNewsEnabled:          process.env.CFO_HL_PERP_NEWS_ENABLE === 'true',
+    hlPerpNewsCooldownMs:       Number(process.env.CFO_HL_PERP_NEWS_COOLDOWN_HOURS ?? 2) * 3600_000,
   };
 }
 
@@ -729,6 +747,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
         leverage: p.leverage,
         liquidationPrice: p.liquidationPrice,
         markPrice: p.markPrice,
+        marginUsed: p.marginUsed,
       }));
     } catch { /* 0 */ }
   }
@@ -3032,6 +3051,349 @@ export async function generateDecisions(
     }
   }
 
+  // ── Section M) Signal-driven HL Perp Trading ─────────────────────────────
+  // Phase 1: Directional trades based on scout sentiment + analyst price momentum.
+  // Phase 2: Multi-asset universe — score each eligible coin by composite signals.
+  // Phase 3: News-reactive fast trades — wired to analyst trending + guardian alerts.
+  //
+  // NOT tied to wallet balances — uses HL equity/margin for sizing.
+  // Completely independent of the hedge logic in Section B.
+  // ──────────────────────────────────────────────────────────────────────────
+  if (config.hlPerpTradingEnabled && env.hyperliquidEnabled) {
+    // Build dynamic coin universe: configured base list + any coin that is:
+    //   1. Tracked by the analyst (has price data)
+    //   2. Listed on Hyperliquid (tradeable as perp)
+    // This means if the analyst starts tracking DOGE and HL lists DOGE-PERP,
+    // the CFO will automatically score and potentially trade it — no config change needed.
+    const baseCoins = new Set(env.hlPerpTradingCoins);
+
+    // Expand with analyst-tracked coins that are HL-listed
+    if (intel.analystPrices) {
+      // Get HL-listed coins from treasury enrichment (already fetched this cycle)
+      const hlListedSet = new Set(
+        state.treasuryExposures
+          .filter(e => e.hlListed)
+          .map(e => e.symbol),
+      );
+      // Also check existing HL positions — those coins are definitely listed
+      for (const pos of state.hlPositions) hlListedSet.add(pos.coin);
+
+      for (const sym of Object.keys(intel.analystPrices)) {
+        const upper = sym.toUpperCase();
+        // Skip stablecoins — not tradeable for directional plays
+        if (['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) continue;
+        if (hlListedSet.has(upper)) baseCoins.add(upper);
+      }
+    }
+
+    // Also include analyst top movers — if they're big movers, we want to score them
+    if (intel.analystMovers) {
+      for (const m of intel.analystMovers) {
+        const upper = m.symbol.toUpperCase();
+        if (['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) continue;
+        baseCoins.add(upper); // availability checked later when placing the order
+      }
+    }
+
+    // Trending tokens from CoinGecko — social heat may precede price moves
+    if (intel.analystTrending) {
+      for (const t of intel.analystTrending) baseCoins.add(t.toUpperCase());
+    }
+
+    const perpCoins = [...baseCoins];
+    if (perpCoins.length > env.hlPerpTradingCoins.length) {
+      logger.debug(
+        `[CFO:Decision] Section M: dynamic perp universe ${perpCoins.length} coins ` +
+        `(base: ${env.hlPerpTradingCoins.join(',')} + ${perpCoins.length - env.hlPerpTradingCoins.length} discovered)`,
+      );
+    }
+    const maxPosUsd = env.hlPerpMaxPositionUsd;
+    const maxTotalUsd = env.hlPerpMaxTotalUsd;
+    const maxPositions = env.hlPerpMaxPositions;
+    const minConviction = config.hlPerpMinConviction;
+
+    // Current perp positions (excluding hedge shorts)
+    // Hedge positions are tagged by the OPEN_HEDGE cooldown key convention;
+    // perp trades use HL_PERP_* keys. Distinguish by checking if it's a hedge coin.
+    const existingPerpPositions = state.hlPositions.filter(p => {
+      // If the coin is in hedge list and position is SHORT, it's likely a hedge
+      const isHedge = p.side === 'SHORT' && state.treasuryExposures.some(e => e.symbol === p.coin);
+      return !isHedge;
+    });
+    const existingPerpCount = existingPerpPositions.length;
+    const existingPerpTotalUsd = existingPerpPositions.reduce((s, p) => s + p.sizeUsd, 0);
+
+    // ── Phase 1 + 2: Score each eligible coin ────────────────────────────────
+    // Conviction = f(sentiment, momentum, risk, market condition)
+    // Range [0, 1] — higher = stronger signal. Side determined by net direction.
+    type CoinSignal = {
+      coin: string;
+      side: 'LONG' | 'SHORT';
+      conviction: number;
+      reasoning: string;
+      sources: string[];
+    };
+
+    const signals: CoinSignal[] = [];
+
+    for (const coin of perpCoins) {
+      let bullScore = 0;
+      let bearScore = 0;
+      const reasons: string[] = [];
+      const sources: string[] = [];
+
+      // ── Signal 1: Scout sentiment (macro market direction) ──────────────
+      const scoutFresh = intel.scoutReceivedAt && (Date.now() - intel.scoutReceivedAt) < 4 * 3600_000;
+      if (scoutFresh) {
+        if (intel.scoutBullish === true) {
+          bullScore += 0.25;
+          reasons.push('scout:bullish');
+        } else if (intel.scoutBullish === false) {
+          bearScore += 0.25;
+          reasons.push('scout:bearish');
+        }
+        const conf = intel.scoutConfidence ?? 0.5;
+        if (conf > 0.7) {
+          // Strong confidence amplifies direction
+          if (intel.scoutBullish) bullScore += 0.10;
+          else bearScore += 0.10;
+          reasons.push(`scout-conf:${(conf * 100).toFixed(0)}%`);
+        }
+        sources.push('scout');
+      }
+
+      // ── Signal 2: Price momentum (analyst 24h change) ──────────────────
+      const priceData = intel.analystPrices?.[coin];
+      const priceFresh = intel.analystPricesAt && (Date.now() - intel.analystPricesAt) < 30 * 60_000;
+      if (priceData && priceFresh) {
+        const change24h = typeof priceData === 'object' ? priceData.change24h : 0;
+        if (change24h > 5) {
+          bullScore += 0.20;
+          reasons.push(`momentum:+${change24h.toFixed(1)}%`);
+        } else if (change24h > 2) {
+          bullScore += 0.10;
+          reasons.push(`momentum:+${change24h.toFixed(1)}%`);
+        } else if (change24h < -5) {
+          bearScore += 0.20;
+          reasons.push(`momentum:${change24h.toFixed(1)}%`);
+        } else if (change24h < -2) {
+          bearScore += 0.10;
+          reasons.push(`momentum:${change24h.toFixed(1)}%`);
+        }
+        sources.push('analyst');
+      }
+
+      // ── Signal 3: CoinGecko trending (social heat) ─────────────────────
+      if (intel.analystTrending?.includes(coin)) {
+        bullScore += 0.10;
+        reasons.push('trending');
+        sources.push('trending');
+      }
+
+      // ── Signal 4: Top mover (strong recent move confirms direction) ────
+      const mover = intel.analystMovers?.find(m => m.symbol === coin);
+      if (mover) {
+        if (mover.change24hPct > 8) {
+          bullScore += 0.15;
+          reasons.push(`top-mover:+${mover.change24hPct.toFixed(0)}%`);
+        } else if (mover.change24hPct < -8) {
+          bearScore += 0.15;
+          reasons.push(`top-mover:${mover.change24hPct.toFixed(0)}%`);
+        }
+        sources.push('mover');
+      }
+
+      // ── Signal 5: Market condition (global risk overlay) ───────────────
+      if (intel.marketCondition === 'bullish') {
+        bullScore += 0.10;
+        reasons.push('market:bullish');
+      } else if (intel.marketCondition === 'bearish') {
+        bearScore += 0.15;
+        reasons.push('market:bearish');
+      } else if (intel.marketCondition === 'danger') {
+        bearScore += 0.30;
+        reasons.push('market:DANGER');
+      }
+
+      // ── Signal 6: Guardian risk (coin-specific safety degradation) ─────
+      const guardianToken = intel.guardianTokens?.find(t => t.ticker === coin);
+      if (guardianToken && !guardianToken.safe) {
+        bearScore += 0.20;
+        reasons.push('guardian:unsafe');
+        sources.push('guardian');
+      }
+
+      // ── Signal 7: Volume spike (macro volatility — directional bias) ───
+      if (intel.analystVolumeSpike) {
+        // Volume spike + bullish = momentum. Volume spike + bearish = capitulation.
+        if (bullScore > bearScore) bullScore += 0.05;
+        else bearScore += 0.05;
+        reasons.push('volume-spike');
+      }
+
+      // ── Compute net conviction ─────────────────────────────────────────
+      const netBull = bullScore - bearScore;
+      const conviction = Math.min(1.0, Math.abs(netBull));
+      const side: 'LONG' | 'SHORT' = netBull >= 0 ? 'LONG' : 'SHORT';
+
+      if (conviction >= minConviction && reasons.length >= 2) {
+        signals.push({
+          coin,
+          side,
+          conviction,
+          reasoning: reasons.join(', '),
+          sources: [...new Set(sources)],
+        });
+      }
+    }
+
+    // Sort by conviction descending — strongest signals first
+    signals.sort((a, b) => b.conviction - a.conviction);
+
+    // ── Generate decisions from top signals ───────────────────────────────
+    for (const sig of signals) {
+      // Check position limits
+      if (existingPerpCount + decisions.filter(d => d.type === 'HL_PERP_OPEN' || d.type === 'HL_PERP_NEWS').length >= maxPositions) break;
+      if (existingPerpTotalUsd + decisions.filter(d => d.type === 'HL_PERP_OPEN' || d.type === 'HL_PERP_NEWS').reduce((s, d) => s + (d.params.sizeUsd ?? 0), 0) >= maxTotalUsd) break;
+
+      // Check margin
+      if (state.hlAvailableMargin < 10) break;
+
+      // Check cooldown per coin
+      if (!checkCooldown(`HL_PERP_${sig.coin}`, config.hlPerpCooldownMs)) continue;
+
+      // Already have a position in this coin? Skip (don't double up)
+      if (existingPerpPositions.some(p => p.coin === sig.coin)) continue;
+
+      // Size = conviction-scaled, capped at max position
+      const sizeUsd = Math.min(
+        maxPosUsd * sig.conviction,  // scale by conviction (0.4-1.0)
+        maxTotalUsd - existingPerpTotalUsd,
+        state.hlAvailableMargin * env.hlPerpDefaultLeverage * 0.8, // 80% of max affordable
+      );
+
+      if (sizeUsd < 10) continue; // below HL minimum
+
+      const d: Decision = {
+        type: 'HL_PERP_OPEN',
+        reasoning:
+          `${sig.side} ${sig.coin}-PERP: conviction ${(sig.conviction * 100).toFixed(0)}% ` +
+          `[${sig.reasoning}]. ` +
+          `Size: $${sizeUsd.toFixed(0)} at ${env.hlPerpDefaultLeverage}x. ` +
+          `HL margin: $${state.hlAvailableMargin.toFixed(0)}. ` +
+          `Perp positions: ${existingPerpCount}/${maxPositions}, total: $${existingPerpTotalUsd.toFixed(0)}/$${maxTotalUsd}.`,
+        params: {
+          coin: sig.coin,
+          side: sig.side,
+          sizeUsd,
+          leverage: env.hlPerpDefaultLeverage,
+          stopLossPct: env.hlPerpStopLossPct,
+          takeProfitPct: env.hlPerpTakeProfitPct,
+          signal: sig.sources.join('+'),
+          conviction: sig.conviction,
+        },
+        urgency: sig.conviction > 0.7 ? 'medium' : 'low',
+        estimatedImpactUsd: sizeUsd,
+        intelUsed: sig.sources,
+        tier: 'AUTO', // will be reclassified by classifyTier
+      };
+      d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
+      decisions.push(d);
+      logger.info(
+        `[CFO:Decision] Section M: ${sig.side} ${sig.coin}-PERP $${sizeUsd.toFixed(0)} ` +
+        `conviction=${(sig.conviction * 100).toFixed(0)}% [${sig.reasoning}]`,
+      );
+    }
+
+    // ── Close existing perp positions if signal reversed ──────────────────
+    for (const pos of existingPerpPositions) {
+      const currentSignal = signals.find(s => s.coin === pos.coin);
+      // Close if: signal reversed to opposite side, or conviction dropped to 0
+      const signalReversed = currentSignal && currentSignal.side !== pos.side && currentSignal.conviction >= minConviction;
+      // Also close if P&L stop-loss breached (check unrealized PnL vs margin)
+      const marginPct = pos.marginUsed > 0 ? (pos.unrealizedPnlUsd / pos.marginUsed) * 100 : 0;
+      const stopHit = marginPct < -env.hlPerpStopLossPct;
+      // Take profit
+      const tpHit = marginPct > env.hlPerpTakeProfitPct;
+
+      if (signalReversed || stopHit || tpHit) {
+        const reason = stopHit
+          ? `stop-loss hit (${marginPct.toFixed(1)}% loss on margin)`
+          : tpHit
+            ? `take-profit hit (${marginPct.toFixed(1)}% gain on margin)`
+            : `signal reversed to ${currentSignal!.side} (conviction: ${(currentSignal!.conviction * 100).toFixed(0)}%)`;
+
+        const d: Decision = {
+          type: 'HL_PERP_CLOSE',
+          reasoning: `Close ${pos.side} ${pos.coin}-PERP ($${pos.sizeUsd.toFixed(0)}): ${reason}`,
+          params: {
+            coin: pos.coin,
+            side: pos.side,
+            sizeUsd: pos.sizeUsd,
+            unrealizedPnl: pos.unrealizedPnlUsd,
+          },
+          urgency: stopHit ? 'high' : 'medium',
+          estimatedImpactUsd: pos.sizeUsd,
+          intelUsed: currentSignal?.sources ?? [],
+          tier: 'AUTO',
+        };
+        d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
+        decisions.push(d);
+        logger.info(`[CFO:Decision] Section M: CLOSE ${pos.side} ${pos.coin}-PERP — ${reason}`);
+      }
+    }
+
+    // ── Phase 3: News-reactive fast trades ──────────────────────────────────
+    // Triggered by analyst trending + large movers — tighter stops, smaller size
+    if (config.hlPerpNewsEnabled && env.hlPerpNewsReactiveEnabled) {
+      const newsMaxUsd = env.hlPerpNewsMaxUsd;
+      const topMovers = (intel.analystMovers ?? [])
+        .filter(m => Math.abs(m.change24hPct) >= 10) // only big moves
+        .filter(m => perpCoins.includes(m.symbol))    // only tradeable coins
+        .filter(m => !existingPerpPositions.some(p => p.coin === m.symbol)) // no existing position
+        .filter(m => !signals.some(s => s.coin === m.symbol && s.conviction >= minConviction)); // not already covered by Phase 1
+
+      for (const mover of topMovers.slice(0, 2)) { // max 2 news trades per cycle
+        if (!checkCooldown(`HL_PERP_NEWS_${mover.symbol}`, config.hlPerpNewsCooldownMs)) continue;
+        if (state.hlAvailableMargin < 10) break;
+
+        // Trend-following: big up → LONG, big down → SHORT
+        const side: 'LONG' | 'SHORT' = mover.change24hPct > 0 ? 'LONG' : 'SHORT';
+        const sizeUsd = Math.min(newsMaxUsd, state.hlAvailableMargin * env.hlPerpDefaultLeverage * 0.5);
+        if (sizeUsd < 10) continue;
+
+        const d: Decision = {
+          type: 'HL_PERP_NEWS',
+          reasoning:
+            `News-reactive ${side} ${mover.symbol}-PERP: ${mover.change24hPct > 0 ? '+' : ''}${mover.change24hPct.toFixed(1)}% 24h move. ` +
+            `Quick entry $${sizeUsd.toFixed(0)} with tight 3% SL. ` +
+            `Source: analyst top mover.`,
+          params: {
+            coin: mover.symbol,
+            side,
+            sizeUsd,
+            leverage: env.hlPerpDefaultLeverage,
+            stopLossPct: 3, // tighter SL for news trades
+            takeProfitPct: 6,
+            signal: 'news-mover',
+            conviction: Math.min(1.0, Math.abs(mover.change24hPct) / 20), // normalize 10-20% → 0.5-1.0
+            change24hPct: mover.change24hPct,
+          },
+          urgency: 'medium',
+          estimatedImpactUsd: sizeUsd,
+          intelUsed: ['analyst', 'mover'],
+          tier: 'AUTO',
+        };
+        d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
+        decisions.push(d);
+        logger.info(
+          `[CFO:Decision] Section M/News: ${side} ${mover.symbol}-PERP $${sizeUsd.toFixed(0)} ` +
+          `(${mover.change24hPct > 0 ? '+' : ''}${mover.change24hPct.toFixed(1)}% move)`,
+        );
+      }
+    }
+  }
+
   // Log tier breakdown
   const tierCounts = { AUTO: 0, NOTIFY: 0, APPROVAL: 0 };
   for (const d of decisions) tierCounts[d.tier]++;
@@ -3128,6 +3490,36 @@ export async function generateDecisions(
       else diag.push('BorrowLP:skip(unknown)');
     }
 
+    // M: HL Perp Trading (signal-driven)
+    if (config.hlPerpTradingEnabled && env.hyperliquidEnabled) {
+      const perpDecisions = decisions.filter(d => d.type === 'HL_PERP_OPEN' || d.type === 'HL_PERP_CLOSE' || d.type === 'HL_PERP_NEWS');
+      // Count dynamic coin universe (base + discovered from analyst/trending)
+      const baseCoinCount = env.hlPerpTradingCoins.length;
+      const dynamicCoinSources: string[] = [];
+      if (intel.analystPrices) dynamicCoinSources.push('analyst');
+      if (intel.analystMovers?.length) dynamicCoinSources.push('movers');
+      if (intel.analystTrending?.length) dynamicCoinSources.push('trending');
+      const coinLabel = dynamicCoinSources.length > 0
+        ? `${baseCoinCount}+${dynamicCoinSources.join('+')}` : `${baseCoinCount}`;
+      if (perpDecisions.length > 0) {
+        diag.push(`Perps(${coinLabel}):${perpDecisions.map(d => `${d.params.side?.[0]}${d.params.coin}`).join(',')}`);
+      } else {
+        const existingPerps = state.hlPositions.filter(p => {
+          const isHedge = p.side === 'SHORT' && state.treasuryExposures.some(e => e.symbol === p.coin);
+          return !isHedge;
+        });
+        if (existingPerps.length > 0) {
+          diag.push(`Perps:hold(${existingPerps.map(p => `${p.side[0]}${p.coin}`).join(',')})`);
+        } else if (state.hlAvailableMargin < 10) {
+          diag.push(`Perps:low-margin($${state.hlAvailableMargin.toFixed(0)})`);
+        } else {
+          diag.push('Perps:no-signal');
+        }
+      }
+    } else if (env.hyperliquidEnabled) {
+      diag.push('Perps:off');
+    }
+
     // Add active decisions to summary
     const activeTypes = decisions.map(d => `${d.type}[${d.tier}]`);
     if (activeTypes.length > 0) diag.push(`→ DECIDED: ${activeTypes.join(', ')}`);
@@ -3171,7 +3563,9 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
     const cooldownKey =
       (decision.type === 'OPEN_HEDGE' || decision.type === 'CLOSE_HEDGE')
         ? `${decision.type}_${decision.params.coin ?? 'SOL'}`
-        : decision.type;
+        : (decision.type === 'HL_PERP_OPEN' || decision.type === 'HL_PERP_CLOSE' || decision.type === 'HL_PERP_NEWS')
+          ? `${decision.type}_${decision.params.coin ?? '?'}`
+          : decision.type;
     _dryRunCooldowns[cooldownKey] = Date.now();
     return { ...base, executed: false, success: true };
   }
@@ -3995,6 +4389,62 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         };
       }
 
+      // ── Signal-driven perp trading ──────────────────────────────────
+      case 'HL_PERP_OPEN':
+      case 'HL_PERP_NEWS': {
+        const hl = await import('./hyperliquidService.ts');
+        const { coin, side, sizeUsd, leverage, stopLossPct, takeProfitPct, signal, conviction } = decision.params;
+        const result = await hl.openPerpTrade({
+          coin,
+          side,
+          sizeUsd,
+          leverage,
+          stopLossPct,
+          takeProfitPct,
+          signal,
+          conviction,
+        });
+        if (result.success) {
+          const cooldownKey = decision.type === 'HL_PERP_NEWS'
+            ? `HL_PERP_NEWS_${coin}`
+            : `HL_PERP_${coin}`;
+          markDecision(cooldownKey);
+        }
+        return {
+          ...base,
+          executed: true,
+          success: result.success,
+          txId: result.orderId?.toString(),
+          error: result.error,
+        };
+      }
+
+      case 'HL_PERP_CLOSE': {
+        const hl = await import('./hyperliquidService.ts');
+        const { coin, side } = decision.params;
+        const summary = await hl.getAccountSummary();
+        const pos = summary.positions.find(
+          (p) => p.coin === coin && p.side === side,
+        );
+        if (!pos) {
+          return { ...base, executed: false, error: `No ${side} ${coin} position found to close` };
+        }
+        const sizeInCoin = pos.sizeUsd / pos.markPrice;
+        const isBuy = side === 'SHORT'; // buy back to close short, sell to close long
+        const closeFraction = 1.0; // full close
+        const closeReceivedUsd = pos.sizeUsd + (pos.unrealizedPnlUsd ?? 0) * closeFraction;
+        const result = await hl.closePosition(coin, sizeInCoin, isBuy);
+        if (result.success) markDecision(`HL_PERP_CLOSE_${coin}`);
+        return {
+          ...base,
+          executed: true,
+          success: result.success,
+          txId: result.orderId?.toString(),
+          receivedUsd: result.success ? Math.max(0, closeReceivedUsd) : undefined,
+          error: result.error,
+        };
+      }
+
       default:
         return { ...base, executed: false, error: `Unknown decision type: ${decision.type}` };
     }
@@ -4226,6 +4676,16 @@ function _humanAction(d: Decision, state: PortfolioState): string {
         : `<b>Rebalance EVM LP</b> — ${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'} on ${p.chainName ?? 'EVM'}, re-centering`;
     case 'KRYSTAL_LP_CLAIM_FEES':
       return `<b>Claim EVM LP fees</b> — $${p.feesOwedUsd?.toFixed(2) ?? '?'} from ${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'} on ${p.chainName ?? 'EVM'}`;
+    case 'HL_PERP_OPEN':
+      return `<b>${p.side ?? 'LONG'} ${p.coin ?? '?'}-PERP</b> — $${p.sizeUsd?.toFixed(0) ?? '?'} at ${p.leverage ?? 2}x (conviction: ${((p.conviction ?? 0) * 100).toFixed(0)}%, SL: ${p.stopLossPct ?? 5}%, TP: ${p.takeProfitPct ?? 10}%)`;
+    case 'HL_PERP_NEWS':
+      return `<b>📰 ${p.side ?? 'LONG'} ${p.coin ?? '?'}-PERP</b> — news-reactive $${p.sizeUsd?.toFixed(0) ?? '?'} (${p.change24hPct != null ? `${p.change24hPct > 0 ? '+' : ''}${p.change24hPct.toFixed(1)}%` : 'big move'}, SL: 3%)`;
+    case 'HL_PERP_CLOSE': {
+      const pnlStr = p.unrealizedPnl != null
+        ? ` (PnL: ${p.unrealizedPnl >= 0 ? '+' : ''}$${p.unrealizedPnl.toFixed(2)})`
+        : '';
+      return `<b>Close ${p.side ?? '?'} ${p.coin ?? '?'}-PERP</b> — $${p.sizeUsd?.toFixed(0) ?? '?'}${pnlStr}`;
+    }
     default:
       return `<b>${d.type}</b> — ${d.reasoning.length > 60 ? d.reasoning.slice(0, 57) + '…' : d.reasoning}`;
   }

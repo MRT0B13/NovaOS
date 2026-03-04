@@ -56,6 +56,21 @@ export interface CFOEnv {
   hlHedgeCoins: string[];                        // coins eligible for hedging (default: auto from treasury + HL listing)
   hlHedgeMinExposureUsd: number;                 // minimum USD exposure per coin to bother hedging (default: 50)
 
+  // ── Hyperliquid Perp Trading (signal-driven) ──────────────────────
+  hlPerpTradingEnabled: boolean;                 // master switch for directional perp trades (default: false)
+  hlPerpTradingCoins: string[];                  // coins eligible for perp trading (default: BTC,ETH,SOL)
+  hlPerpMaxPositionUsd: number;                  // max single perp position size (default: 100)
+  hlPerpMaxTotalUsd: number;                     // max total perp exposure (all coins combined, default: 300)
+  hlPerpMaxPositions: number;                    // max simultaneous perp positions (default: 3)
+  hlPerpDefaultLeverage: number;                 // default leverage for perp trades (default: 2)
+  hlPerpStopLossPct: number;                     // default stop-loss % (default: 5)
+  hlPerpTakeProfitPct: number;                   // default take-profit % (default: 10)
+  hlPerpCooldownMs: number;                      // min time between perp trade decisions per coin (default: 4h)
+  hlPerpMinConviction: number;                   // minimum conviction score to trade (0-1, default: 0.4)
+  hlPerpNewsReactiveEnabled: boolean;            // Phase 3: enable news-reactive trades (default: false)
+  hlPerpNewsMaxUsd: number;                      // max per-trade for news-reactive entries (default: 50)
+  hlPerpNewsCooldownMs: number;                  // cooldown for news-reactive trades (default: 2h)
+
   // ── Kamino ────────────────────────────────────────────────────────
   maxKaminoUsd: number;
   kaminoMaxLtvPct: number;                        // never borrow above this LTV (default 60)
@@ -257,6 +272,22 @@ export function getCFOEnv(bust = false): CFOEnv {
     hlHedgeCoins: (process.env.CFO_HL_HEDGE_COINS ?? '')
       .split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
     hlHedgeMinExposureUsd: Number(process.env.CFO_HL_HEDGE_MIN_EXPOSURE_USD ?? 50),
+
+    // Perp trading (signal-driven)
+    hlPerpTradingEnabled: process.env.CFO_HL_PERP_TRADING_ENABLE === 'true',
+    hlPerpTradingCoins: (process.env.CFO_HL_PERP_TRADING_COINS ?? 'BTC,ETH,SOL')
+      .split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+    hlPerpMaxPositionUsd: Number(process.env.CFO_HL_PERP_MAX_POSITION_USD ?? 100),
+    hlPerpMaxTotalUsd: Number(process.env.CFO_HL_PERP_MAX_TOTAL_USD ?? 300),
+    hlPerpMaxPositions: Number(process.env.CFO_HL_PERP_MAX_POSITIONS ?? 3),
+    hlPerpDefaultLeverage: Math.min(5, Number(process.env.CFO_HL_PERP_DEFAULT_LEVERAGE ?? 2)),
+    hlPerpStopLossPct: Number(process.env.CFO_HL_PERP_STOP_LOSS_PCT ?? 5),
+    hlPerpTakeProfitPct: Number(process.env.CFO_HL_PERP_TAKE_PROFIT_PCT ?? 10),
+    hlPerpCooldownMs: Number(process.env.CFO_HL_PERP_COOLDOWN_HOURS ?? 4) * 3600_000,
+    hlPerpMinConviction: Math.max(0, Math.min(1, Number(process.env.CFO_HL_PERP_MIN_CONVICTION ?? 0.4))),
+    hlPerpNewsReactiveEnabled: process.env.CFO_HL_PERP_NEWS_ENABLE === 'true',
+    hlPerpNewsMaxUsd: Number(process.env.CFO_HL_PERP_NEWS_MAX_USD ?? 50),
+    hlPerpNewsCooldownMs: Number(process.env.CFO_HL_PERP_NEWS_COOLDOWN_HOURS ?? 2) * 3600_000,
 
     maxKaminoUsd: Number(process.env.CFO_MAX_KAMINO_USD ?? 1000),
     kaminoMaxLtvPct: Number(process.env.CFO_KAMINO_MAX_LTV_PCT ?? 60),
