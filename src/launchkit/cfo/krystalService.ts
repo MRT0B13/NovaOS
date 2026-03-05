@@ -191,17 +191,87 @@ const ERC20_ABI = [
 const POOL_ABI = [
   'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
   'function tickSpacing() view returns (int24)',
+  'function feeGrowthGlobal0X128() view returns (uint256)',
+  'function feeGrowthGlobal1X128() view returns (uint256)',
+  'function ticks(int24 tick) view returns (uint128 liquidityGross, int128 liquidityNet, uint256 feeGrowthOutside0X128, uint256 feeGrowthOutside1X128, int56 tickCumulativeOutside, uint160 secondsPerLiquidityOutsideX128, uint32 secondsOutside, bool initialized)',
 ];
 
 // Aerodrome CL (Slipstream) pool ABI — slot0 returns 6 values (no feeProtocol)
 const AERODROME_POOL_ABI = [
   'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, bool unlocked)',
   'function tickSpacing() view returns (int24)',
+  'function feeGrowthGlobal0X128() view returns (uint256)',
+  'function feeGrowthGlobal1X128() view returns (uint256)',
+  'function ticks(int24 tick) view returns (uint128 liquidityGross, int128 liquidityNet, uint256 feeGrowthOutside0X128, uint256 feeGrowthOutside1X128, int56 tickCumulativeOutside, uint160 secondsPerLiquidityOutsideX128, uint32 secondsOutside, bool initialized)',
 ];
 
 /** Pick correct pool ABI based on protocol variant */
 function getPoolAbi(isAerodrome: boolean): string[] {
   return isAerodrome ? AERODROME_POOL_ABI : POOL_ABI;
+}
+
+// ============================================================================
+// Uniswap V3 Pending Fee Computation
+// ============================================================================
+/**
+ * Compute true pending fees for a V3 position using fee growth checkpoints.
+ * Equivalent to what Uniswap's SDK does with collectFeesQuote.
+ * Uses unsigned 256-bit wraparound arithmetic (Q128 mask) for correctness.
+ *
+ * Returns { fees0, fees1 } in raw token units (not divided by decimals).
+ * Both tokensOwed (already collected but not claimed) + uncollected growth.
+ */
+async function computePendingFeesV3(
+  poolContract: any,
+  posData: any,           // return value from nfpm.positions(tokenId)
+  currentTick: number,
+): Promise<{ fees0: bigint; fees1: bigint }> {
+  const Q128   = BigInt('0x100000000000000000000000000000000'); // 2^128
+  const MASK128 = Q128 - 1n;
+
+  const tickLower  = Number(posData.tickLower  ?? posData[5] ?? 0);
+  const tickUpper  = Number(posData.tickUpper  ?? posData[6] ?? 0);
+  const liquidity  = BigInt(posData.liquidity  ?? posData[7] ?? 0);
+  const fg0Last    = BigInt(posData.feeGrowthInside0LastX128 ?? posData[8] ?? 0);
+  const fg1Last    = BigInt(posData.feeGrowthInside1LastX128 ?? posData[9] ?? 0);
+  const tokensOwed0 = BigInt(posData.tokensOwed0 ?? posData[10] ?? 0);
+  const tokensOwed1 = BigInt(posData.tokensOwed1 ?? posData[11] ?? 0);
+
+  if (liquidity === 0n) return { fees0: tokensOwed0, fees1: tokensOwed1 };
+
+  // Read pool globals + tick data in parallel
+  const [fg0Raw, fg1Raw, tickLoData, tickHiData] = await Promise.all([
+    poolContract.feeGrowthGlobal0X128(),
+    poolContract.feeGrowthGlobal1X128(),
+    poolContract.ticks(tickLower),
+    poolContract.ticks(tickUpper),
+  ]);
+
+  const fgGlobal0 = BigInt(fg0Raw ?? 0);
+  const fgGlobal1 = BigInt(fg1Raw ?? 0);
+
+  // feeGrowthOutside from tick structs
+  const tickLoFGO0 = BigInt(tickLoData.feeGrowthOutside0X128 ?? tickLoData[2] ?? 0);
+  const tickLoFGO1 = BigInt(tickLoData.feeGrowthOutside1X128 ?? tickLoData[3] ?? 0);
+  const tickHiFGO0 = BigInt(tickHiData.feeGrowthOutside0X128 ?? tickHiData[2] ?? 0);
+  const tickHiFGO1 = BigInt(tickHiData.feeGrowthOutside1X128 ?? tickHiData[3] ?? 0);
+
+  // Standard V3 fee growth below / above formula (see UniswapV3Pool.sol)
+  const fgBelow0 = currentTick >= tickLower ? tickLoFGO0 : (fgGlobal0 - tickLoFGO0) & MASK128;
+  const fgBelow1 = currentTick >= tickLower ? tickLoFGO1 : (fgGlobal1 - tickLoFGO1) & MASK128;
+  const fgAbove0 = currentTick  < tickUpper ? tickHiFGO0 : (fgGlobal0 - tickHiFGO0) & MASK128;
+  const fgAbove1 = currentTick  < tickUpper ? tickHiFGO1 : (fgGlobal1 - tickHiFGO1) & MASK128;
+
+  const fgInside0 = (fgGlobal0 - fgBelow0 - fgAbove0) & MASK128;
+  const fgInside1 = (fgGlobal1 - fgBelow1 - fgAbove1) & MASK128;
+
+  // Delta (unsigned wraparound)
+  const delta0 = (fgInside0 - fg0Last) & MASK128;
+  const delta1 = (fgInside1 - fg1Last) & MASK128;
+
+  const fees0 = tokensOwed0 + (delta0 * liquidity / Q128);
+  const fees1 = tokensOwed1 + (delta1 * liquidity / Q128);
+  return { fees0, fees1 };
 }
 
 const MaxUint128 = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF');
@@ -981,13 +1051,10 @@ export async function fetchKrystalPositions(
       rawPositions = Array.isArray(data) ? data : (data?.positions ?? []);
       if (!Array.isArray(rawPositions)) rawPositions = [];
     } catch (apiErr) {
-      // Expected timeout — on-chain fallback handles it fine
-      const errName = (apiErr as any)?.name ?? '';
-      if (errName === 'TimeoutError' || errName === 'AbortError') {
-        logger.debug(`[Krystal] Positions API timed out, using on-chain fallback`);
-      } else {
-        logger.warn('[Krystal] Positions API failed, will try on-chain fallback:', apiErr);
-      }
+      // Positions API 500 is expected — our positions are opened directly via NFPM,
+      // not through Krystal's portal, so they may not appear in their index.
+      // On-chain fallback via DB records handles this correctly.
+      logger.debug('[Krystal] Positions API unavailable, using on-chain fallback:', (apiErr as any)?.message ?? apiErr);
     }
 
     // Build lookup from DB records for openedAt timestamps
@@ -1286,11 +1353,27 @@ export async function fetchKrystalPositions(
           // Fallback to entryUsd if on-chain calc failed or returned 0
           if (valueUsd <= 0) valueUsd = dbRec.entryUsd;
 
-          // Pending fees from NFPM positions data
-          const tokensOwed0 = Number(ethers.formatUnits(posData.tokensOwed0 ?? posData[10] ?? 0, Number(dec0)));
-          const tokensOwed1 = Number(ethers.formatUnits(posData.tokensOwed1 ?? posData[11] ?? 0, Number(dec1)));
-          // Rough fee USD estimation: stablecoins ≈ $1, native tokens ≈ native price
+          // Pending fees: use proper V3 fee growth math (tokensOwed0/1 are stale until collect())
+          // Falls back to raw tokensOwed if pool read fails or no pool address available.
           const nativePrice = await getNativeTokenPrice(dbRec.chainNumericId);
+          let tokensOwed0 = 0;
+          let tokensOwed1 = 0;
+          if (poolAddress && currentTick !== 0) {
+            try {
+              const poolContract = new ethers.Contract(poolAddress, getPoolAbi(isAerodrome), provider);
+              const { fees0, fees1 } = await computePendingFeesV3(poolContract, posData, currentTick);
+              tokensOwed0 = Number(ethers.formatUnits(fees0, Number(dec0)));
+              tokensOwed1 = Number(ethers.formatUnits(fees1, Number(dec1)));
+            } catch (feeErr) {
+              // Fallback to raw tokensOwed (may be stale/0)
+              tokensOwed0 = Number(ethers.formatUnits(posData.tokensOwed0 ?? posData[10] ?? 0, Number(dec0)));
+              tokensOwed1 = Number(ethers.formatUnits(posData.tokensOwed1 ?? posData[11] ?? 0, Number(dec1)));
+              logger.debug(`[Krystal] Fee growth math failed for ${dbRec.posId}, using raw tokensOwed:`, feeErr);
+            }
+          } else {
+            tokensOwed0 = Number(ethers.formatUnits(posData.tokensOwed0 ?? posData[10] ?? 0, Number(dec0)));
+            tokensOwed1 = Number(ethers.formatUnits(posData.tokensOwed1 ?? posData[11] ?? 0, Number(dec1)));
+          }
           const fee0Usd = isStablecoin(String(sym0)) ? tokensOwed0 : tokensOwed0 * nativePrice;
           const fee1Usd = isStablecoin(String(sym1)) ? tokensOwed1 : tokensOwed1 * nativePrice;
 
