@@ -124,6 +124,8 @@ interface OrcaWhirlpool {
   tickSpacing: number;
   price: number;              // current price of tokenA in tokenB
   lpFeeRate: number;          // e.g. 0.0004 = 0.04%
+  tvl?: number;               // on-chain TVL in USD (from Orca API)
+  volume?: { day?: number; week?: number; month?: number };
 }
 
 /** A fully enriched pool candidate — merged from DeFiLlama + Orca API */
@@ -250,22 +252,31 @@ export async function discoverOrcaPools(forceRefresh = false): Promise<OrcaPoolC
 
       // Pick the best whirlpool for this pair:
       // - Prefer tick spacings in our preferred set
-      // - Among those, pick the one with the highest fee rate (more revenue)
+      // - Among those, pick the one with the highest TVL (most liquidity = safest)
+      // BUG FIX: Previously sorted by lpFeeRate, which picked tiny fee-tier pools
+      // (e.g. SOL/JitoSOL 2% fee with $14 TVL instead of 0.01% fee with $31M TVL)
       const ranked = matchingWhirlpools
         .filter(wp => PREFERRED_TICK_SPACINGS.has(wp.tickSpacing))
         .sort((a, b) => {
-          // Prefer the tick spacing that best matches the APY we're seeing
-          // Higher fee rate = more revenue per trade, but also wider spread = less volume
-          // Use a heuristic: for volatile pairs, prefer higher fee tiers; for stable, lower
-          const isStable = llama.stablecoin;
-          if (isStable) {
-            return a.tickSpacing - b.tickSpacing; // prefer tightest for stables
-          }
-          return b.lpFeeRate - a.lpFeeRate; // prefer highest fee for volatile
+          // Primary: sort by TVL descending — always prefer the deepest pool
+          const tvlA = a.tvl ?? 0;
+          const tvlB = b.tvl ?? 0;
+          if (tvlA !== tvlB) return tvlB - tvlA;
+          // Tiebreaker: prefer tighter tick spacing (lower fees, more active)
+          return a.tickSpacing - b.tickSpacing;
         });
 
       const bestWp = ranked[0] ?? matchingWhirlpools[0]; // fallback to any if no preferred tick spacing
       if (!bestWp) continue;
+
+      // Validate: Orca API TVL must also meet minimum threshold.
+      // This catches cases where DeFiLlama reports inflated/stale TVL
+      // for a pool that's actually empty on-chain.
+      const orcaTvl = bestWp.tvl ?? 0;
+      if (orcaTvl < MIN_TVL_USD) {
+        logger.debug(`[OrcaDiscovery] Skipping ${bestWp.address.slice(0, 8)}… — Orca TVL $${orcaTvl.toFixed(0)} < min $${MIN_TVL_USD} (DeFiLlama said $${llama.tvlUsd.toFixed(0)})`);
+        continue;
+      }
 
       const symbolA = resolveSymbol(bestWp.tokenA.mint, bestWp.tokenA.symbol);
       const symbolB = resolveSymbol(bestWp.tokenB.mint, bestWp.tokenB.symbol);
@@ -283,7 +294,7 @@ export async function discoverOrcaPools(forceRefresh = false): Promise<OrcaPoolC
         tickSpacing: bestWp.tickSpacing,
         lpFeeRate: bestWp.lpFeeRate,
         currentPrice: bestWp.price,
-        tvlUsd: llama.tvlUsd,
+        tvlUsd: bestWp.tvl ?? llama.tvlUsd,  // prefer Orca on-chain TVL over DeFiLlama
         apyBase24h: (llama.apyBase ?? 0) * 100,
         apyBase7d,
         apyMean30d: (llama.apyMean30d ?? 0) * 100,
