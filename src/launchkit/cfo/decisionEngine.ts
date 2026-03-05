@@ -4675,9 +4675,10 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const sizeInCoin = pos.sizeUsd / pos.markPrice;
         const isBuy = side === 'SHORT'; // buy back to close short, sell to close long
         const closeFraction = 1.0; // full close
-        // Use marginUsed (collateral) NOT sizeUsd (notional) — PnL = received - costBasis
-        // where costBasis is also margin, so PnL ≈ unrealizedPnlUsd (the actual profit/loss).
-        const closeReceivedUsd = pos.marginUsed + (pos.unrealizedPnlUsd ?? 0) * closeFraction;
+        // Use exit notional (markPrice × size) as receivedUsd and entry notional as costBasis.
+        // realizedPnl = exitNotional − entryNotional = (exitPrice − entryPrice) × size.
+        // Margin-based tracking distorts PnL when cross-margin changes marginUsed dynamically.
+        const closeReceivedUsd = pos.sizeUsd * closeFraction;
         const result = await hl.closePosition(coin, sizeInCoin, isBuy);
         if (result.success) {
           markDecision(`HL_PERP_CLOSE_${coin}`);

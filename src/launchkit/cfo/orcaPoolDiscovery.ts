@@ -61,7 +61,8 @@ export const KNOWN_MINTS: Record<string, string> = {
 };
 
 // Minimum thresholds for pool inclusion
-const MIN_TVL_USD = 200_000;          // $200k TVL minimum — filters dead or micro pools
+// CFO_ORCA_LP_MIN_TVL_USD: minimum pool TVL ($) to qualify for discovery (default 250k)
+const MIN_TVL_USD = Number(process.env.CFO_ORCA_LP_MIN_TVL_USD) || 250_000;
 const MIN_VOLUME_1D_USD = 50_000;     // $50k daily volume minimum — needs real activity
 const MIN_APY_BASE_7D = 0.5;         // 0.5% minimum 7d APY — must generate some fees
 

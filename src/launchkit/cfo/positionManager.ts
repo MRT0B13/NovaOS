@@ -272,7 +272,7 @@ export class PositionManager {
       entryPrice: params.entryPrice,
       currentPrice: params.entryPrice,
       sizeUnits: params.sizeUsd / params.entryPrice,
-      costBasisUsd: params.sizeUsd / params.leverage, // margin used
+      costBasisUsd: params.sizeUsd, // full notional — PnL = exitNotional - entryNotional
       currentValueUsd: params.sizeUsd,
       realizedPnlUsd: 0,
       unrealizedPnlUsd: 0,

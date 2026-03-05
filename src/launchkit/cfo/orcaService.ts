@@ -887,11 +887,31 @@ export async function getPositions(): Promise<OrcaPosition[]> {
         const posWhirlpool = await client.getPool(data.whirlpool);
         const poolData = posWhirlpool.getData();
 
-        // Determine token decimals for this pool from our dynamic registry; fall back to 9/6 (SOL/USDC).
+        // Determine token decimals for this pool from our dynamic registry.
+        // If not registered yet, read decimals from the mint accounts on-chain and
+        // permanently register them so subsequent cycles use the correct values.
         const poolAddress = data.whirlpool.toBase58();
-        const knownPool = _poolDecimalRegistry[poolAddress];
-        const tokenADec = knownPool?.tokenADecimals ?? 9;
-        const tokenBDec = knownPool?.tokenBDecimals ?? 6;
+        let knownPool = _poolDecimalRegistry[poolAddress];
+        if (!knownPool) {
+          try {
+            const [mintAInfo, mintBInfo] = await Promise.all([
+              connection.getParsedAccountInfo(poolData.tokenMintA),
+              connection.getParsedAccountInfo(poolData.tokenMintB),
+            ]);
+            const decA = (mintAInfo.value?.data as any)?.parsed?.info?.decimals ?? 9;
+            const decB = (mintBInfo.value?.data as any)?.parsed?.info?.decimals ?? 9;
+            registerPoolDecimals(poolAddress, decA, decB);
+            knownPool = _poolDecimalRegistry[poolAddress];
+            logger.info(`[Orca] Auto-registered pool ${poolAddress.slice(0, 8)}… decimals A=${decA} B=${decB}`);
+          } catch (mintErr) {
+            logger.debug('[Orca] Could not read mint decimals, falling back to 9/9 for LST pools:', mintErr);
+            // For unknown pools default both to 9 (SOL-like) — safer than 9/6 which inflates one side 1000x
+            registerPoolDecimals(poolAddress, 9, 9);
+            knownPool = _poolDecimalRegistry[poolAddress];
+          }
+        }
+        const tokenADec = knownPool.tokenADecimals;
+        const tokenBDec = knownPool.tokenBDecimals;
 
         const currentPrice = PriceMath.sqrtPriceX64ToPrice(
           poolData.sqrtPrice,
