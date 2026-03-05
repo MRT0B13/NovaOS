@@ -2414,11 +2414,14 @@ export async function generateDecisions(
     //   high   = volatile/volatile (WETH/ARB) → wide range, high APR, high IL
     //
     const evmLpHeadroomUsd = Math.max(0, env.krystalLpMaxUsd - state.evmLpTotalValueUsd);
-    // Cap deploy to 80% of available EVM USDC across all chains
-    const evmUsdcCap = state.evmTotalUsdcAllChains * 0.8;
+    // Cap deploy to 80% of total deployable EVM value (stables + WETH + native).
+    // The execution code (Phase 2b/3) handles swapping WETH/native → pool tokens,
+    // so we should not gate on stablecoins alone.
+    const evmTotalDeployableUsd = state.evmTotalUsdcAllChains + state.evmTotalNativeAllChains;
+    const evmDeployCap = evmTotalDeployableUsd * 0.8;
     if (
       evmLpHeadroomUsd >= 20 &&
-      state.evmTotalUsdcAllChains >= 20 &&
+      evmTotalDeployableUsd >= 20 &&
       state.evmLpPositions.length < env.krystalLpMaxPositions &&
       intel.marketCondition !== 'bearish' &&
       checkCooldown('KRYSTAL_LP_OPEN', env.krystalLpOpenCooldownMs)
@@ -2530,7 +2533,7 @@ export async function generateDecisions(
                 .reduce((s, b) => s + b.totalValueUsd, 0) * 0.97
             : 0;
           const effectiveValue = targetChainLocalValue + otherChainsValue;
-          const deployUsd = Math.min(perTierMaxUsd, env.krystalLpMaxUsd, evmUsdcCap, effectiveValue * 0.9);
+          const deployUsd = Math.min(perTierMaxUsd, env.krystalLpMaxUsd, evmDeployCap, effectiveValue * 0.9);
 
           if (deployUsd < 15) {
             krystalSkip(`${tier} tier: deploy amount too small ($${deployUsd.toFixed(0)}, local=$${targetChainLocalValue.toFixed(0)}, bridgeable=$${otherChainsValue.toFixed(0)})`);
@@ -2618,7 +2621,7 @@ export async function generateDecisions(
             // Cap deploy per increase to per-tier budget
             const targetChainBal = state.evmChainBalances.find(b => b.chainId === incPool.chainNumericId);
             const localValue = targetChainBal?.totalValueUsd ?? 0;
-            const deployUsd = Math.min(perTierMaxUsd, env.krystalLpMaxUsd, evmUsdcCap, localValue * 0.9);
+            const deployUsd = Math.min(perTierMaxUsd, env.krystalLpMaxUsd, evmDeployCap, localValue * 0.9);
             if (deployUsd < 10) continue; // too small to bother
 
             decisions.push({
@@ -3698,7 +3701,7 @@ export async function generateDecisions(
       const tierTag = [...env.krystalLpRiskTiers].join('/');
       if (state.evmLpPositions.length > 0) diag.push(`KrystalLP:active(${state.evmLpPositions.length})[${tierTag}]`);
       else if (intel.marketCondition === 'danger') diag.push('KrystalLP:danger');
-      else if (state.evmTotalUsdcAllChains < 20) diag.push(`KrystalLP:low-usdc($${state.evmTotalUsdcAllChains.toFixed(0)})`);
+      else if (state.evmTotalUsdcAllChains + state.evmTotalNativeAllChains < 20) diag.push(`KrystalLP:low-funds($${(state.evmTotalUsdcAllChains + state.evmTotalNativeAllChains).toFixed(0)})`);
       else if (state.evmLpPositions.length >= env.krystalLpMaxPositions) diag.push(`KrystalLP:max-pos(${state.evmLpPositions.length})`);
       else if (intel.marketCondition === 'bearish') diag.push('KrystalLP:bearish');
       else if (!checkCooldown('KRYSTAL_LP_OPEN', env.krystalLpOpenCooldownMs)) diag.push('KrystalLP:cooldown');
