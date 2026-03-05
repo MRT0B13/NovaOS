@@ -314,10 +314,30 @@ export async function openPosition(
     }
 
     const inputTokenMint = useUsdc ? whirlpoolData.tokenMintB : whirlpoolData.tokenMintA;
-    const inputTokenAmount = useUsdc ? usdcInputBN : tokenAInputBN;
+    let inputTokenAmount = useUsdc ? usdcInputBN : tokenAInputBN;
 
     const slippageTolerance = Percentage.fromFraction(10, 1000); // 1%
-    const quote = increaseLiquidityQuoteByInputTokenWithParams({
+
+    // ── Helper: get SPL / SOL balance for a mint ────────────────────────────
+    const SOL_NATIVE_MINT = 'So11111111111111111111111111111111111111112';
+    const SOL_FEE_RESERVE_LAMPORTS = 50_000_000; // keep 0.05 SOL for tx fees
+    const solBalance = await connection.getBalance(walletKeypair.publicKey);
+
+    const getSplBalance = async (mintPubkey: PublicKey): Promise<BN> => {
+      if (mintPubkey.toBase58() === SOL_NATIVE_MINT) {
+        return new BN(Math.max(0, solBalance - SOL_FEE_RESERVE_LAMPORTS));
+      }
+      const accounts = await connection.getParsedTokenAccountsByOwner(walletKeypair.publicKey, { mint: mintPubkey });
+      let total = new BN(0);
+      for (const { account } of accounts.value) {
+        const amt = (account.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0';
+        total = total.add(new BN(amt));
+      }
+      return total;
+    };
+
+    // ── Initial quote ───────────────────────────────────────────────────────
+    let quote = increaseLiquidityQuoteByInputTokenWithParams({
       tokenMintA: whirlpoolData.tokenMintA,
       tokenMintB: whirlpoolData.tokenMintB,
       sqrtPrice: whirlpoolData.sqrtPrice,
@@ -330,27 +350,50 @@ export async function openPosition(
       tokenExtensionCtx: NO_TOKEN_EXTENSION_CONTEXT,
     });
 
+    // ── Auto-fit: shrink position if the "other side" exceeds wallet balance ─
+    // The BorrowLP pipeline splits USDC 50/50 between tokenA and tokenB, but
+    // concentrated LP positions rarely need exactly 50/50 by value.  The quote
+    // computes tokenMaxB (with slippage) from the tokenA input — if that exceeds
+    // the actual tokenB balance from the swap, scale down and re-quote so both
+    // sides fit.  This avoids hard failures + auto-unwinds on every non-USDC pool.
+    const otherMint  = useUsdc ? whirlpoolData.tokenMintA : whirlpoolData.tokenMintB;
+    const otherMax   = useUsdc ? quote.tokenMaxA : quote.tokenMaxB;
+    if (otherMax.gtn(0)) {
+      const otherBal = await getSplBalance(otherMint);
+      if (otherMax.gt(otherBal) && otherBal.gtn(0)) {
+        // Scale input down so the other side's tokenMax fits within available balance.
+        // Extra 2% haircut (× 0.98) to absorb rounding / micro price drift.
+        const ratio = otherBal.toNumber() / otherMax.toNumber() * 0.98;
+        const scaledInput = new BN(Math.floor(inputTokenAmount.toNumber() * ratio));
+        logger.info(`[Orca] Auto-fit: other-side balance ${otherBal.toString()} < tokenMax ${otherMax.toString()} — ` +
+          `scaling input from ${inputTokenAmount.toString()} → ${scaledInput.toString()} (ratio=${ratio.toFixed(4)})`);
+        inputTokenAmount = scaledInput;
+        quote = increaseLiquidityQuoteByInputTokenWithParams({
+          tokenMintA: whirlpoolData.tokenMintA,
+          tokenMintB: whirlpoolData.tokenMintB,
+          sqrtPrice: whirlpoolData.sqrtPrice,
+          tickCurrentIndex: whirlpoolData.tickCurrentIndex,
+          tickLowerIndex: lowerTick,
+          tickUpperIndex: upperTick,
+          inputTokenMint,
+          inputTokenAmount,
+          slippageTolerance,
+          tokenExtensionCtx: NO_TOKEN_EXTENSION_CONTEXT,
+        });
+        logger.info(`[Orca] Auto-fit re-quote: tokenMaxA=${quote.tokenMaxA.toString()}, tokenMaxB=${quote.tokenMaxB.toString()}`);
+      }
+    }
+
     // ── Wallet balance preflight ────────────────────────────────────────────
     // Check actual on-chain balances BEFORE submitting so we get a clean error
     // (and trigger auto-unwind) rather than an on-chain "insufficient lamports" failure.
-    const SOL_NATIVE_MINT = 'So11111111111111111111111111111111111111112';
-    const SOL_FEE_RESERVE_LAMPORTS = 50_000_000; // keep 0.05 SOL for tx fees
-    const solBalance = await connection.getBalance(walletKeypair.publicKey);
 
     logger.info(`[Orca] Quote: input=${inputTokenAmount.toString()} (${useUsdc ? 'USDC' : 'tokenA'}), ` +
       `tokenMaxA=${quote.tokenMaxA.toString()}, tokenMaxB=${quote.tokenMaxB.toString()}, ` +
       `liquidity=${quote.liquidityAmount?.toString() ?? 'n/a'}, solBalance=${solBalance}`);
 
     // Helper: get SPL token balance for a given mint (returns BN base units)
-    const getSplBalance = async (mintPubkey: typeof whirlpoolData.tokenMintA): Promise<typeof quote.tokenMaxA> => {
-      const accounts = await connection.getParsedTokenAccountsByOwner(walletKeypair.publicKey, { mint: mintPubkey });
-      let total = new BN(0);
-      for (const { account } of accounts.value) {
-        const amt = (account.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0';
-        total = total.add(new BN(amt));
-      }
-      return total;
-    };
+    // (uses getSplBalance defined above, which already handles SOL native mint)
 
     if (mintAStr === SOL_NATIVE_MINT && quote.tokenMaxA.gtn(0)) {
       const maxAllowed = new BN(Math.max(0, solBalance - SOL_FEE_RESERVE_LAMPORTS));
