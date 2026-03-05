@@ -3177,6 +3177,11 @@ export async function generateDecisions(
       conviction: number;
       reasoning: string;
       sources: string[];
+      // TA-specific fields (undefined = sentiment signal)
+      tradeStyle?: TradeStyle;
+      taStopLossPct?: number;
+      taTakeProfitPct?: number;
+      taMaxHoldHours?: number;
     };
 
     const signals: CoinSignal[] = [];
@@ -3295,69 +3300,16 @@ export async function generateDecisions(
       }
     }
 
-    // Sort by conviction descending — strongest signals first
-    signals.sort((a, b) => b.conviction - a.conviction);
-
-    // ── Generate decisions from top signals ───────────────────────────────
-    for (const sig of signals) {
-      // Check position limits
-      if (existingPerpCount + decisions.filter(d => d.type === 'HL_PERP_OPEN' || d.type === 'HL_PERP_NEWS').length >= maxPositions) break;
-      if (existingPerpTotalUsd + decisions.filter(d => d.type === 'HL_PERP_OPEN' || d.type === 'HL_PERP_NEWS').reduce((s, d) => s + (d.params.sizeUsd ?? 0), 0) >= maxTotalUsd) break;
-
-      // Check margin
-      if (state.hlAvailableMargin < 10) break;
-
-      // Check cooldown per coin
-      if (!checkCooldown(`HL_PERP_${sig.coin}`, config.hlPerpCooldownMs)) continue;
-
-      // Already have a position in this coin? Skip (don't double up)
-      if (existingPerpPositions.some(p => p.coin === sig.coin)) continue;
-
-      // Size = conviction-scaled, capped at max position
-      const sizeUsd = Math.min(
-        maxPosUsd * sig.conviction,  // scale by conviction (0.4-1.0)
-        maxTotalUsd - existingPerpTotalUsd,
-        state.hlAvailableMargin * env.hlPerpDefaultLeverage * 0.8, // 80% of max affordable
-      );
-
-      if (sizeUsd < 10) continue; // below HL minimum
-
-      const d: Decision = {
-        type: 'HL_PERP_OPEN',
-        reasoning:
-          `${sig.side} ${sig.coin}-PERP: conviction ${(sig.conviction * 100).toFixed(0)}% ` +
-          `[${sig.reasoning}]. ` +
-          `Size: $${sizeUsd.toFixed(0)} at ${env.hlPerpDefaultLeverage}x. ` +
-          `HL margin: $${state.hlAvailableMargin.toFixed(0)}. ` +
-          `Perp positions: ${existingPerpCount}/${maxPositions}, total: $${existingPerpTotalUsd.toFixed(0)}/$${maxTotalUsd}.`,
-        params: {
-          coin: sig.coin,
-          side: sig.side,
-          sizeUsd,
-          leverage: env.hlPerpDefaultLeverage,
-          stopLossPct: learnedPerpSL,
-          takeProfitPct: learnedPerpTP,
-          signal: sig.sources.join('+'),
-          conviction: sig.conviction,
-        },
-        urgency: sig.conviction > 0.7 ? 'medium' : 'low',
-        estimatedImpactUsd: sizeUsd,
-        intelUsed: sig.sources,
-        tier: 'AUTO', // will be reclassified by classifyTier
-      };
-      d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
-      decisions.push(d);
-      logger.info(
-        `[CFO:Decision] Section M: ${sig.side} ${sig.coin}-PERP $${sizeUsd.toFixed(0)} ` +
-        `conviction=${(sig.conviction * 100).toFixed(0)}% [${sig.reasoning}]`,
-      );
-    }
-
-    // ── Phase 4: TA-driven entries (multi-timeframe analysis) ──────────────
+    // ── Phase 2b: TA-driven signals (multi-timeframe analysis) ──────────────
     // Scalp (5m trigger + 1h filter), Day (1h trigger + 1d filter), Swing (1d trigger + 1h confirm).
-    // TA signals run after sentiment decisions — remaining position slots are filled by TA.
+    // TA signals are merged into the same signal pool as sentiment so they compete
+    // fairly for position slots by conviction — no separate phase, no starvation.
     // Sentiment signal for the same coin boosts/penalises TA conviction.
     // ──────────────────────────────────────────────────────────────────────────
+    let taSignalCount = 0;
+    let taNeutralCount = 0;
+    let taStyleConvRejects = 0;
+    let taDangerRejects = 0;
     if (config.hlPerpTaEnabled) {
       const ta = await import('./hlTechnicalAnalysis.ts');
       const enabledStyles: TradeStyle[] = [];
@@ -3366,57 +3318,19 @@ export async function generateDecisions(
       if (config.hlPerpSwingEnabled) enabledStyles.push('swing');
 
       if (enabledStyles.length > 0) {
-        const taSignals = await ta.scoreCoins(perpCoins, enabledStyles);
-        logger.info(
-          `[CFO:Decision] Section M/TA: scored ${perpCoins.length} coins × ${enabledStyles.length} styles → ` +
-          `${taSignals.length} signals (${enabledStyles.join(',')})`,
-        );
+        const taRawSignals = await ta.scoreCoins(perpCoins, enabledStyles);
+        taSignalCount = taRawSignals.length;
 
-        // Rejection tracking for diagnostics
-        const taRejects = { neutral: 0, slots: 0, usdCap: 0, margin: 0, cooldown: 0, duplicate: 0, conviction: 0, styleConv: 0, danger: 0, tooSmall: 0, accepted: 0 };
+        for (const taSig of taRawSignals) {
+          if (taSig.bias === 'NEUTRAL') { taNeutralCount++; continue; }
 
-        for (const taSig of taSignals) {
-          if (taSig.bias === 'NEUTRAL') { taRejects.neutral++; continue; }
+          // ── Danger market gate — skip new longs in danger mode ────────
+          if (intel.marketCondition === 'danger' && taSig.bias === 'LONG') { taDangerRejects++; continue; }
 
-          // ── Position / margin limits ──────────────────────────────────
-          // Account for pending opens AND closes from earlier phases
-          const pendingOpens = decisions.filter(d =>
-            d.type === 'HL_PERP_OPEN' || d.type === 'HL_PERP_NEWS',
-          );
-          const pendingCloses = decisions.filter(d => d.type === 'HL_PERP_CLOSE');
-          const openCount = existingPerpCount + pendingOpens.length - pendingCloses.length;
-          if (openCount >= maxPositions) {
-            taRejects.slots += taSignals.length - taRejects.neutral - taRejects.slots - taRejects.usdCap - taRejects.margin - taRejects.cooldown - taRejects.duplicate - taRejects.conviction - taRejects.styleConv - taRejects.danger - taRejects.tooSmall - taRejects.accepted;
-            logger.debug(
-              `[CFO:Decision] Section M/TA: slots full (${openCount}/${maxPositions}) — ` +
-              `${existingPerpCount} existing + ${pendingOpens.length} pending opens - ${pendingCloses.length} pending closes`,
-            );
-            break;
-          }
-
-          const openUsd = existingPerpTotalUsd + pendingOpens.reduce(
-            (s, d) => s + (d.params.sizeUsd ?? 0), 0,
-          );
-          if (openUsd >= maxTotalUsd) {
-            taRejects.usdCap++;
-            logger.debug(`[CFO:Decision] Section M/TA: total USD cap hit ($${openUsd.toFixed(0)}/$${maxTotalUsd.toFixed(0)})`);
-            break;
-          }
-          if (state.hlAvailableMargin < 10) {
-            taRejects.margin++;
-            logger.debug(`[CFO:Decision] Section M/TA: margin too low ($${state.hlAvailableMargin.toFixed(2)})`);
-            break;
-          }
-
-          // ── Cooldown per coin+style ───────────────────────────────────
-          const cooldownMs = taSig.style === 'scalp'
-            ? config.hlPerpScalpCooldownMs
-            : config.hlPerpCooldownMs;
-          if (!checkCooldown(`HL_PERP_TA_${taSig.coin}_${taSig.style}`, cooldownMs)) { taRejects.cooldown++; continue; }
-
-          // ── Skip duplicate coin positions / pending decisions ─────────
-          if (existingPerpPositions.some(p => p.coin === taSig.coin)) { taRejects.duplicate++; continue; }
-          if (pendingOpens.some(d => d.params.coin === taSig.coin)) { taRejects.duplicate++; continue; }
+          // ── Per-style learning: conviction floor ─────────────────────
+          const styleConvFloor = learned.hlPerpStyleConvictionFloors?.[taSig.style] ?? 0;
+          const effectiveStyleConvFloor = styleConvFloor * conf;
+          if (effectiveStyleConvFloor > 0 && taSig.conviction < effectiveStyleConvFloor) { taStyleConvRejects++; continue; }
 
           // ── Blend TA conviction with sentiment ────────────────────────
           let finalConviction = taSig.conviction;
@@ -3425,96 +3339,174 @@ export async function generateDecisions(
             if (sentimentSig.side === taSig.bias) {
               finalConviction = Math.min(1.0, finalConviction + sentimentSig.conviction * 0.2);
             } else if (sentimentSig.conviction > 0.5) {
-              finalConviction *= 0.6;
+              finalConviction *= 0.6; // sentiment disagrees → dampen
             }
           }
-          if (finalConviction < minConviction) { taRejects.conviction++; continue; }
+          if (finalConviction < minConviction) { taStyleConvRejects++; continue; }
 
-          // ── Per-style learning overrides (conviction floor, size, SL) ─
-          const styleConvFloor = learned.hlPerpStyleConvictionFloors?.[taSig.style] ?? 0;
-          const effectiveStyleConvFloor = styleConvFloor * conf;
-          if (effectiveStyleConvFloor > 0 && finalConviction < effectiveStyleConvFloor) { taRejects.styleConv++; continue; }
-
+          // ── TA-specific params ────────────────────────────────────────
           const styleSizeMult = learned.hlPerpStyleSizeMultipliers?.[taSig.style] ?? 1.0;
           const styleStopMult = learned.hlPerpStyleStopMultipliers?.[taSig.style] ?? 1.0;
-
-          // ── Danger market gate — skip new longs in danger mode ────────
-          if (intel.marketCondition === 'danger' && taSig.bias === 'LONG') { taRejects.danger++; continue; }
-
-          // ── Size = conviction-scaled, capped, with per-style learning ─
-          const taMaxPosUsd = applyAdaptive(maxPosUsd, styleSizeMult, conf);
-          const taSizeUsd = Math.min(
-            taMaxPosUsd * finalConviction,
-            maxTotalUsd - openUsd,
-            state.hlAvailableMargin * env.hlPerpDefaultLeverage * 0.8,
-          );
-          if (taSizeUsd < 10) { taRejects.tooSmall++; continue; }
-
-          taRejects.accepted++;
-
           const styleConfig = ta.getStyleConfig(taSig.style);
           const learnedStyleSL = applyAdaptive(styleConfig.stopLossPct, styleStopMult, conf);
-          const d: Decision = {
-            type: 'HL_PERP_OPEN',
-            reasoning:
-              `[TA:${taSig.style}] ${taSig.bias} ${taSig.coin}-PERP: ` +
-              `conviction ${(finalConviction * 100).toFixed(0)}% ` +
-              `(TA ${(taSig.conviction * 100).toFixed(0)}%${sentimentSig ? ` + sentiment ${sentimentSig.side}` : ''}). ` +
-              `${taSig.reasoning}. ` +
-              `Size: $${taSizeUsd.toFixed(0)} at ${env.hlPerpDefaultLeverage}x` +
-              `${styleSizeMult !== 1 ? ` (style×${styleSizeMult.toFixed(2)})` : ''}. ` +
-              `SL: ${learnedStyleSL.toFixed(1)}% / TP: ${styleConfig.takeProfitPct}% / maxHold: ${styleConfig.maxHoldHours}h.`,
-            params: {
-              coin: taSig.coin,
-              side: taSig.bias,
-              sizeUsd: taSizeUsd,
-              leverage: env.hlPerpDefaultLeverage,
-              stopLossPct: learnedStyleSL,
-              takeProfitPct: styleConfig.takeProfitPct,
-              signal: `ta-${taSig.style}`,
-              conviction: finalConviction,
-              tradeStyle: taSig.style,
-            },
-            urgency: finalConviction > 0.7 ? 'medium' : 'low',
-            estimatedImpactUsd: taSizeUsd,
-            intelUsed: sentimentSig ? [...sentimentSig.sources, `ta-${taSig.style}`] : [`ta-${taSig.style}`],
-            tier: 'AUTO',
-          };
-          d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
-          decisions.push(d);
-          logger.info(
-            `[CFO:Decision] Section M/TA: [${taSig.style}] ${taSig.bias} ${taSig.coin}-PERP ` +
-            `$${taSizeUsd.toFixed(0)} conviction=${(finalConviction * 100).toFixed(0)}% ` +
-            `SL=${learnedStyleSL.toFixed(1)}% TP=${styleConfig.takeProfitPct}% maxHold=${styleConfig.maxHoldHours}h` +
-            `${styleSizeMult !== 1 ? ` size×${styleSizeMult.toFixed(2)}` : ''}` +
-            `${styleStopMult !== 1 ? ` sl×${styleStopMult.toFixed(2)}` : ''}`,
-          );
+
+          signals.push({
+            coin: taSig.coin,
+            side: taSig.bias,
+            conviction: finalConviction,
+            reasoning: `[TA:${taSig.style}] ${taSig.reasoning}${sentimentSig ? ` + sentiment ${sentimentSig.side}` : ''}`,
+            sources: sentimentSig ? [...sentimentSig.sources, `ta-${taSig.style}`] : [`ta-${taSig.style}`],
+            tradeStyle: taSig.style,
+            taStopLossPct: learnedStyleSL,
+            taTakeProfitPct: styleConfig.takeProfitPct,
+            taMaxHoldHours: styleConfig.maxHoldHours,
+          });
         }
 
-        // TA rejection summary — always log at info so it's visible
-        if (taRejects.accepted === 0 && taSignals.length > 0) {
-          const parts: string[] = [];
-          if (taRejects.neutral > 0)    parts.push(`neutral=${taRejects.neutral}`);
-          if (taRejects.slots > 0)      parts.push(`slots_full=${taRejects.slots}`);
-          if (taRejects.usdCap > 0)     parts.push(`usd_cap=${taRejects.usdCap}`);
-          if (taRejects.margin > 0)     parts.push(`margin=${taRejects.margin}`);
-          if (taRejects.cooldown > 0)   parts.push(`cooldown=${taRejects.cooldown}`);
-          if (taRejects.duplicate > 0)  parts.push(`dup_coin=${taRejects.duplicate}`);
-          if (taRejects.conviction > 0) parts.push(`low_conviction=${taRejects.conviction}`);
-          if (taRejects.styleConv > 0)  parts.push(`style_conv_floor=${taRejects.styleConv}`);
-          if (taRejects.danger > 0)     parts.push(`danger_gate=${taRejects.danger}`);
-          if (taRejects.tooSmall > 0)   parts.push(`size<$10=${taRejects.tooSmall}`);
-          logger.info(
-            `[CFO:Decision] Section M/TA: 0/${taSignals.length} signals passed — rejections: ${parts.join(', ')} ` +
-            `(maxPos=${maxPositions}, existing=${existingPerpCount}, minConv=${minConviction.toFixed(2)}, ` +
-            `maxPosUsd=$${maxPosUsd.toFixed(0)}, maxTotalUsd=$${maxTotalUsd.toFixed(0)}, margin=$${state.hlAvailableMargin.toFixed(0)})`,
-          );
-        } else if (taRejects.accepted > 0) {
-          logger.info(
-            `[CFO:Decision] Section M/TA: ${taRejects.accepted}/${taSignals.length} signals → decisions ` +
-            `(rejected: cooldown=${taRejects.cooldown}, dup=${taRejects.duplicate}, conv=${taRejects.conviction}, neutral=${taRejects.neutral})`,
-          );
-        }
+        logger.info(
+          `[CFO:Decision] Section M/TA: scored ${perpCoins.length} coins × ${enabledStyles.length} styles → ` +
+          `${taSignalCount} raw, ${taSignalCount - taNeutralCount - taStyleConvRejects - taDangerRejects} merged into signal pool ` +
+          `(neutral=${taNeutralCount}, styleConv=${taStyleConvRejects}, danger=${taDangerRejects})`,
+        );
+      }
+    }
+
+    // Sort by conviction descending — strongest signals first (sentiment + TA mixed)
+    signals.sort((a, b) => b.conviction - a.conviction);
+
+    // ── Generate decisions from top signals (sentiment + TA unified) ─────
+    let sentimentAccepted = 0;
+    let taAccepted = 0;
+    const taRejects = { slots: 0, usdCap: 0, margin: 0, cooldown: 0, duplicate: 0, tooSmall: 0 };
+    for (const sig of signals) {
+      // Check position limits (including pending opens from this loop)
+      const pendingOpens = decisions.filter(d => d.type === 'HL_PERP_OPEN' || d.type === 'HL_PERP_NEWS');
+      const pendingCloses = decisions.filter(d => d.type === 'HL_PERP_CLOSE');
+      const openCount = existingPerpCount + pendingOpens.length - pendingCloses.length;
+      if (openCount >= maxPositions) {
+        if (sig.tradeStyle) taRejects.slots++;
+        continue; // continue, not break — higher-conviction TA signals for same coin may be skipped but later ones might fit if a close freed a slot
+      }
+      const openUsd = existingPerpTotalUsd + pendingOpens.reduce((s, d) => s + (d.params.sizeUsd ?? 0), 0);
+      if (openUsd >= maxTotalUsd) {
+        if (sig.tradeStyle) taRejects.usdCap++;
+        continue;
+      }
+
+      // Check margin
+      if (state.hlAvailableMargin < 10) {
+        if (sig.tradeStyle) taRejects.margin++;
+        break; // margin is global, no point continuing
+      }
+
+      // Check cooldown per coin (TA uses per-style cooldown)
+      const cooldownKey = sig.tradeStyle
+        ? `HL_PERP_TA_${sig.coin}_${sig.tradeStyle}`
+        : `HL_PERP_${sig.coin}`;
+      const cooldownMs = sig.tradeStyle === 'scalp'
+        ? config.hlPerpScalpCooldownMs
+        : config.hlPerpCooldownMs;
+      if (!checkCooldown(cooldownKey, cooldownMs)) {
+        if (sig.tradeStyle) taRejects.cooldown++;
+        continue;
+      }
+
+      // Already have a position in this coin? Skip (don't double up)
+      if (existingPerpPositions.some(p => p.coin === sig.coin)) {
+        if (sig.tradeStyle) taRejects.duplicate++;
+        continue;
+      }
+      // Also skip if another signal for same coin already accepted this cycle
+      if (pendingOpens.some(d => d.params.coin === sig.coin)) {
+        if (sig.tradeStyle) taRejects.duplicate++;
+        continue;
+      }
+
+      // ── Size: TA uses per-style learned multiplier, sentiment uses base ──
+      const effectiveSizeMult = sig.tradeStyle
+        ? (learned.hlPerpStyleSizeMultipliers?.[sig.tradeStyle] ?? 1.0)
+        : 1.0;
+      const effectiveMaxPosUsd = applyAdaptive(maxPosUsd, effectiveSizeMult, conf);
+      const sizeUsd = Math.min(
+        effectiveMaxPosUsd * sig.conviction,
+        maxTotalUsd - openUsd,
+        state.hlAvailableMargin * env.hlPerpDefaultLeverage * 0.8,
+      );
+
+      if (sizeUsd < 10) {
+        if (sig.tradeStyle) taRejects.tooSmall++;
+        continue;
+      }
+
+      // ── Build decision ──────────────────────────────────────────────────
+      const effectiveSL = sig.taStopLossPct ?? learnedPerpSL;
+      const effectiveTP = sig.taTakeProfitPct ?? learnedPerpTP;
+
+      const d: Decision = {
+        type: 'HL_PERP_OPEN',
+        reasoning:
+          `${sig.side} ${sig.coin}-PERP: conviction ${(sig.conviction * 100).toFixed(0)}% ` +
+          `[${sig.reasoning}]. ` +
+          `Size: $${sizeUsd.toFixed(0)} at ${env.hlPerpDefaultLeverage}x. ` +
+          `SL: ${effectiveSL.toFixed(1)}% / TP: ${effectiveTP}%.` +
+          `${sig.taMaxHoldHours ? ` maxHold: ${sig.taMaxHoldHours}h.` : ''} ` +
+          `HL margin: $${state.hlAvailableMargin.toFixed(0)}. ` +
+          `Perp positions: ${existingPerpCount}/${maxPositions}, total: $${existingPerpTotalUsd.toFixed(0)}/$${maxTotalUsd}.`,
+        params: {
+          coin: sig.coin,
+          side: sig.side,
+          sizeUsd,
+          leverage: env.hlPerpDefaultLeverage,
+          stopLossPct: effectiveSL,
+          takeProfitPct: effectiveTP,
+          signal: sig.sources.join('+'),
+          conviction: sig.conviction,
+          ...(sig.tradeStyle ? { tradeStyle: sig.tradeStyle } : {}),
+        },
+        urgency: sig.conviction > 0.7 ? 'medium' : 'low',
+        estimatedImpactUsd: sizeUsd,
+        intelUsed: sig.sources,
+        tier: 'AUTO',
+      };
+      d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
+      decisions.push(d);
+
+      if (sig.tradeStyle) {
+        taAccepted++;
+        logger.info(
+          `[CFO:Decision] Section M: [TA:${sig.tradeStyle}] ${sig.side} ${sig.coin}-PERP ` +
+          `$${sizeUsd.toFixed(0)} conviction=${(sig.conviction * 100).toFixed(0)}% ` +
+          `SL=${effectiveSL.toFixed(1)}% TP=${effectiveTP}% maxHold=${sig.taMaxHoldHours ?? '-'}h`,
+        );
+      } else {
+        sentimentAccepted++;
+        logger.info(
+          `[CFO:Decision] Section M: ${sig.side} ${sig.coin}-PERP $${sizeUsd.toFixed(0)} ` +
+          `conviction=${(sig.conviction * 100).toFixed(0)}% [${sig.reasoning}]`,
+        );
+      }
+    }
+
+    // TA rejection summary (if TA was enabled and produced signals)
+    if (taSignalCount > 0) {
+      const merged = taSignalCount - taNeutralCount - taStyleConvRejects - taDangerRejects;
+      if (taAccepted === 0 && merged > 0) {
+        const parts: string[] = [];
+        if (taRejects.slots > 0)     parts.push(`slots_full=${taRejects.slots}`);
+        if (taRejects.usdCap > 0)    parts.push(`usd_cap=${taRejects.usdCap}`);
+        if (taRejects.margin > 0)    parts.push(`margin=${taRejects.margin}`);
+        if (taRejects.cooldown > 0)  parts.push(`cooldown=${taRejects.cooldown}`);
+        if (taRejects.duplicate > 0) parts.push(`dup_coin=${taRejects.duplicate}`);
+        if (taRejects.tooSmall > 0)  parts.push(`size<$10=${taRejects.tooSmall}`);
+        logger.info(
+          `[CFO:Decision] Section M/TA: 0/${merged} eligible TA signals accepted — rejections: ${parts.join(', ')} ` +
+          `(maxPos=${maxPositions}, existing=${existingPerpCount}, margin=$${state.hlAvailableMargin.toFixed(0)})`,
+        );
+      } else {
+        logger.info(
+          `[CFO:Decision] Section M/TA: ${taAccepted}/${merged} TA signals accepted, ${sentimentAccepted} sentiment accepted ` +
+          `(total signals: ${signals.length}, slots: ${existingPerpCount}/${maxPositions})`,
+        );
       }
     }
 
