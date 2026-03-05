@@ -520,9 +520,13 @@ const KRYSTAL_CB_COOLDOWN_MS = 5 * 60_000;   // 5 min cooldown once tripped
 let _krystalCbFails   = 0;
 let _krystalCbOpenAt  = 0;                   // timestamp when breaker opened
 
-async function krystalFetch(path: string, params?: Record<string, string>): Promise<any> {
-  // ── Circuit breaker check ──
-  if (_krystalCbFails >= KRYSTAL_CB_THRESHOLD) {
+async function krystalFetch(
+  path: string,
+  params?: Record<string, string>,
+  opts: { skipBreaker?: boolean } = {},
+): Promise<any> {
+  // ── Circuit breaker check (skip for endpoints with on-chain fallback) ──
+  if (!opts.skipBreaker && _krystalCbFails >= KRYSTAL_CB_THRESHOLD) {
     const elapsed = Date.now() - _krystalCbOpenAt;
     if (elapsed < KRYSTAL_CB_COOLDOWN_MS) {
       throw new Error(`[Krystal] Circuit breaker OPEN — skipping API call (${((KRYSTAL_CB_COOLDOWN_MS - elapsed) / 1000).toFixed(0)}s remaining)`);
@@ -562,10 +566,12 @@ async function krystalFetch(path: string, params?: Record<string, string>): Prom
 
     return resp.json();
   } catch (err) {
-    _krystalCbFails++;
-    if (_krystalCbFails >= KRYSTAL_CB_THRESHOLD && _krystalCbOpenAt === 0) {
-      _krystalCbOpenAt = Date.now();
-      logger.warn(`[Krystal] Circuit breaker OPEN after ${_krystalCbFails} consecutive failures — cooling down ${KRYSTAL_CB_COOLDOWN_MS / 1000}s`);
+    if (!opts.skipBreaker) {
+      _krystalCbFails++;
+      if (_krystalCbFails >= KRYSTAL_CB_THRESHOLD && _krystalCbOpenAt === 0) {
+        _krystalCbOpenAt = Date.now();
+        logger.warn(`[Krystal] Circuit breaker OPEN after ${_krystalCbFails} consecutive failures — cooling down ${KRYSTAL_CB_COOLDOWN_MS / 1000}s`);
+      }
     }
     throw err;
   }
@@ -969,7 +975,9 @@ export async function fetchKrystalPositions(
   try {
     let rawPositions: any[] = [];
     try {
-      const data = await krystalFetch('/v1/positions', { wallet: ownerAddress });
+      // skipBreaker: position endpoint has on-chain fallback — don't let its
+      // 500s trip the shared circuit breaker and block pool discovery
+      const data = await krystalFetch('/v1/positions', { wallet: ownerAddress }, { skipBreaker: true });
       rawPositions = Array.isArray(data) ? data : (data?.positions ?? []);
       if (!Array.isArray(rawPositions)) rawPositions = [];
     } catch (apiErr) {
