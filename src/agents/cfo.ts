@@ -1985,6 +1985,56 @@ export class CFOAgent extends BaseAgent {
         await notifyAdminForce(`⚠️ CFO HYPERLIQUID: ${risk.warning}`);
       }
     } catch { /* non-fatal if HL not funded */ }
+
+    // ── Lightweight scalp/day exit monitor ─────────────────────────
+    // Runs every 15 min (faster than the 30-min decision cycle).
+    // Checks TA-tracked positions for hold-duration expiry and tight SL/TP.
+    try {
+      const { getTrackedTradeStyles, clearTradeStyle } = await import('../launchkit/cfo/decisionEngine.ts');
+      const styles = getTrackedTradeStyles();
+      if (styles.size === 0) return;
+
+      const hlMod = await import('../launchkit/cfo/hyperliquidService.ts');
+      const ta = await import('../launchkit/cfo/hlTechnicalAnalysis.ts');
+      const summary = await hlMod.getAccountSummary();
+
+      for (const [key, info] of styles) {
+        const [coin, side] = key.split('-') as [string, 'LONG' | 'SHORT'];
+        const pos = summary.positions.find(p => p.coin === coin && p.side === side);
+        if (!pos) {
+          // Position gone from exchange — clean up stale tracker entry
+          clearTradeStyle(key);
+          continue;
+        }
+
+        const sc = ta.getStyleConfig(info.style);
+        const marginPct = pos.marginUsed > 0 ? (pos.unrealizedPnlUsd / pos.marginUsed) * 100 : 0;
+        const holdExpired = ta.isHoldExpired(info.style, info.openedAt);
+        const stopHit = marginPct < -sc.stopLossPct;
+        const tpHit = marginPct > sc.takeProfitPct;
+
+        if (holdExpired || stopHit || tpHit) {
+          const reason = stopHit
+            ? `SL hit (${marginPct.toFixed(1)}% on margin, limit=${sc.stopLossPct}%)`
+            : tpHit
+              ? `TP hit (${marginPct.toFixed(1)}% gain, target=${sc.takeProfitPct}%)`
+              : `hold expired (${info.style}: ${sc.maxHoldHours}h)`;
+
+          logger.info(`[CFO] Scalp monitor: closing ${side} ${coin}-PERP — ${reason}`);
+          const sizeInCoin = pos.sizeUsd / pos.markPrice;
+          const isBuy = side === 'SHORT';
+          const result = await hlMod.closePosition(coin, sizeInCoin, isBuy);
+          if (result.success) {
+            clearTradeStyle(key); // clean up tracker
+            const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+            await notifyAdminForce(
+              `📊 [${info.style}] Closed ${side} ${coin}-PERP: ${reason}\n` +
+              `PnL: ${marginPct >= 0 ? '+' : ''}${marginPct.toFixed(1)}%`,
+            );
+          }
+        }
+      }
+    } catch (err) { logger.debug('[CFO] Scalp exit monitor error:', err); }
   }
 
   // ── Gas check ─────────────────────────────────────────────────────

@@ -41,6 +41,24 @@ import { logger } from '@elizaos/core';
 import { getCFOEnv, type CFOEnv } from './cfoEnv.ts';
 import { refreshLearning, getAdaptiveParams, applyAdaptive, formatLearningSummary, setLearningPool, type AdaptiveParams } from './learningEngine.ts';
 import * as swapSvc from './evmSwapService.ts';
+import type { TradeStyle, MTFSignal } from './hlTechnicalAnalysis.ts';
+
+// ============================================================================
+// TA trade style tracker (in-memory — survives across cycles but not restarts)
+// Key: "COIN-SIDE" e.g. "BTC-LONG", Value: { style, openedAt }
+// Used by exit logic to apply style-specific SL/TP and hold-duration limits.
+// ============================================================================
+const _perpTradeStyles = new Map<string, { style: TradeStyle; openedAt: string }>();
+
+/** Expose tracked trade styles for the lightweight scalp exit monitor in cfo.ts */
+export function getTrackedTradeStyles(): Map<string, { style: TradeStyle; openedAt: string }> {
+  return new Map(_perpTradeStyles);
+}
+
+/** Remove a tracked trade style after the position is closed (from scalp monitor or external close) */
+export function clearTradeStyle(key: string): void {
+  _perpTradeStyles.delete(key);
+}
 
 // ============================================================================
 // Constants
@@ -357,6 +375,13 @@ export interface DecisionConfig {
   hlPerpCooldownMs: number;             // min time between perp trades per coin
   hlPerpNewsEnabled: boolean;           // enable news-reactive perp trades
   hlPerpNewsCooldownMs: number;         // cooldown for news-reactive trades
+
+  // Multi-timeframe TA
+  hlPerpTaEnabled: boolean;             // master switch for TA-driven entries
+  hlPerpScalpEnabled: boolean;          // enable scalp style (5m/1h)
+  hlPerpDayEnabled: boolean;            // enable day style (1h/1d)
+  hlPerpSwingEnabled: boolean;          // enable swing style (1d/1h)
+  hlPerpScalpCooldownMs: number;        // cooldown for scalp entries per coin
 }
 
 export function getDecisionConfig(): DecisionConfig {
@@ -389,6 +414,13 @@ export function getDecisionConfig(): DecisionConfig {
     hlPerpCooldownMs:           Number(process.env.CFO_HL_PERP_COOLDOWN_HOURS ?? 4) * 3600_000,
     hlPerpNewsEnabled:          process.env.CFO_HL_PERP_NEWS_ENABLE === 'true',
     hlPerpNewsCooldownMs:       Number(process.env.CFO_HL_PERP_NEWS_COOLDOWN_HOURS ?? 2) * 3600_000,
+
+    // Multi-timeframe TA
+    hlPerpTaEnabled:            process.env.CFO_HL_PERP_TA_ENABLE === 'true',
+    hlPerpScalpEnabled:         process.env.CFO_HL_PERP_SCALP_ENABLE !== 'false',
+    hlPerpDayEnabled:           process.env.CFO_HL_PERP_DAY_ENABLE !== 'false',
+    hlPerpSwingEnabled:         process.env.CFO_HL_PERP_SWING_ENABLE !== 'false',
+    hlPerpScalpCooldownMs:      Number(process.env.CFO_HL_PERP_SCALP_COOLDOWN_MIN ?? 10) * 60_000,
   };
 }
 
@@ -3321,23 +3353,154 @@ export async function generateDecisions(
       );
     }
 
-    // ── Close existing perp positions if signal reversed ──────────────────
+    // ── Phase 4: TA-driven entries (multi-timeframe analysis) ──────────────
+    // Scalp (5m trigger + 1h filter), Day (1h trigger + 1d filter), Swing (1d trigger + 1h confirm).
+    // TA signals run after sentiment decisions — remaining position slots are filled by TA.
+    // Sentiment signal for the same coin boosts/penalises TA conviction.
+    // ──────────────────────────────────────────────────────────────────────────
+    if (config.hlPerpTaEnabled) {
+      const ta = await import('./hlTechnicalAnalysis.ts');
+      const enabledStyles: TradeStyle[] = [];
+      if (config.hlPerpScalpEnabled) enabledStyles.push('scalp');
+      if (config.hlPerpDayEnabled)   enabledStyles.push('day');
+      if (config.hlPerpSwingEnabled) enabledStyles.push('swing');
+
+      if (enabledStyles.length > 0) {
+        const taSignals = await ta.scoreCoins(perpCoins, enabledStyles);
+        logger.info(
+          `[CFO:Decision] Section M/TA: scored ${perpCoins.length} coins × ${enabledStyles.length} styles → ` +
+          `${taSignals.length} signals (${enabledStyles.join(',')})`,
+        );
+
+        for (const taSig of taSignals) {
+          if (taSig.bias === 'NEUTRAL') continue;
+
+          // ── Position / margin limits ──────────────────────────────────
+          const pendingOpens = decisions.filter(d =>
+            d.type === 'HL_PERP_OPEN' || d.type === 'HL_PERP_NEWS',
+          );
+          const openCount = existingPerpCount + pendingOpens.length;
+          if (openCount >= maxPositions) break;
+
+          const openUsd = existingPerpTotalUsd + pendingOpens.reduce(
+            (s, d) => s + (d.params.sizeUsd ?? 0), 0,
+          );
+          if (openUsd >= maxTotalUsd) break;
+          if (state.hlAvailableMargin < 10) break;
+
+          // ── Cooldown per coin+style ───────────────────────────────────
+          const cooldownMs = taSig.style === 'scalp'
+            ? config.hlPerpScalpCooldownMs
+            : config.hlPerpCooldownMs;
+          if (!checkCooldown(`HL_PERP_TA_${taSig.coin}_${taSig.style}`, cooldownMs)) continue;
+
+          // ── Skip duplicate coin positions / pending decisions ─────────
+          if (existingPerpPositions.some(p => p.coin === taSig.coin)) continue;
+          if (pendingOpens.some(d => d.params.coin === taSig.coin)) continue;
+
+          // ── Blend TA conviction with sentiment ────────────────────────
+          let finalConviction = taSig.conviction;
+          const sentimentSig = signals.find(s => s.coin === taSig.coin);
+          if (sentimentSig) {
+            if (sentimentSig.side === taSig.bias) {
+              // Sentiment agrees → boost by 20% of sentiment conviction
+              finalConviction = Math.min(1.0, finalConviction + sentimentSig.conviction * 0.2);
+            } else if (sentimentSig.conviction > 0.5) {
+              // Strong disagreement → reduce TA conviction by 40%
+              finalConviction *= 0.6;
+            }
+          }
+          if (finalConviction < minConviction) continue;
+
+          // ── Danger market gate — skip new longs in danger mode ────────
+          if (intel.marketCondition === 'danger' && taSig.bias === 'LONG') continue;
+
+          // ── Size = conviction-scaled, capped ──────────────────────────
+          const taSizeUsd = Math.min(
+            maxPosUsd * finalConviction,
+            maxTotalUsd - openUsd,
+            state.hlAvailableMargin * env.hlPerpDefaultLeverage * 0.8,
+          );
+          if (taSizeUsd < 10) continue;
+
+          const styleConfig = ta.getStyleConfig(taSig.style);
+          const d: Decision = {
+            type: 'HL_PERP_OPEN',
+            reasoning:
+              `[TA:${taSig.style}] ${taSig.bias} ${taSig.coin}-PERP: ` +
+              `conviction ${(finalConviction * 100).toFixed(0)}% ` +
+              `(TA ${(taSig.conviction * 100).toFixed(0)}%${sentimentSig ? ` + sentiment ${sentimentSig.side}` : ''}). ` +
+              `${taSig.reasoning}. ` +
+              `Size: $${taSizeUsd.toFixed(0)} at ${env.hlPerpDefaultLeverage}x. ` +
+              `SL: ${styleConfig.stopLossPct}% / TP: ${styleConfig.takeProfitPct}% / maxHold: ${styleConfig.maxHoldHours}h.`,
+            params: {
+              coin: taSig.coin,
+              side: taSig.bias,
+              sizeUsd: taSizeUsd,
+              leverage: env.hlPerpDefaultLeverage,
+              stopLossPct: styleConfig.stopLossPct,
+              takeProfitPct: styleConfig.takeProfitPct,
+              signal: `ta-${taSig.style}`,
+              conviction: finalConviction,
+              tradeStyle: taSig.style,
+            },
+            urgency: finalConviction > 0.7 ? 'medium' : 'low',
+            estimatedImpactUsd: taSizeUsd,
+            intelUsed: sentimentSig ? [...sentimentSig.sources, `ta-${taSig.style}`] : [`ta-${taSig.style}`],
+            tier: 'AUTO',
+          };
+          d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
+          decisions.push(d);
+          logger.info(
+            `[CFO:Decision] Section M/TA: [${taSig.style}] ${taSig.bias} ${taSig.coin}-PERP ` +
+            `$${taSizeUsd.toFixed(0)} conviction=${(finalConviction * 100).toFixed(0)}% ` +
+            `SL=${styleConfig.stopLossPct}% TP=${styleConfig.takeProfitPct}% maxHold=${styleConfig.maxHoldHours}h`,
+          );
+        }
+      }
+    }
+
+    // ── Close existing perp positions if signal reversed / SL / TP / hold expired ─
     for (const pos of existingPerpPositions) {
       const currentSignal = signals.find(s => s.coin === pos.coin);
       // Close if: signal reversed to opposite side, or conviction dropped to 0
       const signalReversed = currentSignal && currentSignal.side !== pos.side && currentSignal.conviction >= minConviction;
+
+      // Look up TA trade style (if this position was opened by TA)
+      const styleKey = `${pos.coin}-${pos.side}`;
+      const styleInfo = _perpTradeStyles.get(styleKey);
+
+      // Style-specific SL/TP overrides
+      let posSL = learnedPerpSL;
+      let posTP = learnedPerpTP;
+      if (styleInfo) {
+        const ta = await import('./hlTechnicalAnalysis.ts');
+        const sc = ta.getStyleConfig(styleInfo.style);
+        posSL = sc.stopLossPct;
+        posTP = sc.takeProfitPct;
+      }
+
       // Also close if P&L stop-loss breached (check unrealized PnL vs margin)
       const marginPct = pos.marginUsed > 0 ? (pos.unrealizedPnlUsd / pos.marginUsed) * 100 : 0;
-      const stopHit = marginPct < -learnedPerpSL;
+      const stopHit = marginPct < -posSL;
       // Take profit
-      const tpHit = marginPct > learnedPerpTP;
+      const tpHit = marginPct > posTP;
 
-      if (signalReversed || stopHit || tpHit) {
+      // Hold duration expired (TA styles only — scalp: 1h, day: 24h, swing: 7d)
+      let holdExpired = false;
+      if (styleInfo) {
+        const ta = await import('./hlTechnicalAnalysis.ts');
+        holdExpired = ta.isHoldExpired(styleInfo.style, styleInfo.openedAt);
+      }
+
+      if (signalReversed || stopHit || tpHit || holdExpired) {
         const reason = stopHit
-          ? `stop-loss hit (${marginPct.toFixed(1)}% loss on margin)`
+          ? `stop-loss hit (${marginPct.toFixed(1)}% loss on margin, SL=${posSL}%${styleInfo ? ` [${styleInfo.style}]` : ''})`
           : tpHit
-            ? `take-profit hit (${marginPct.toFixed(1)}% gain on margin)`
-            : `signal reversed to ${currentSignal!.side} (conviction: ${(currentSignal!.conviction * 100).toFixed(0)}%)`;
+            ? `take-profit hit (${marginPct.toFixed(1)}% gain on margin, TP=${posTP}%${styleInfo ? ` [${styleInfo.style}]` : ''})`
+            : holdExpired
+              ? `hold duration expired (${styleInfo!.style}: opened ${styleInfo!.openedAt}, PnL: ${marginPct.toFixed(1)}%)`
+              : `signal reversed to ${currentSignal!.side} (conviction: ${(currentSignal!.conviction * 100).toFixed(0)}%)`;
 
         const d: Decision = {
           type: 'HL_PERP_CLOSE',
@@ -3347,6 +3510,7 @@ export async function generateDecisions(
             side: pos.side,
             sizeUsd: pos.sizeUsd,
             unrealizedPnl: pos.unrealizedPnlUsd,
+            tradeStyle: styleInfo?.style,
           },
           urgency: stopHit ? 'high' : 'medium',
           estimatedImpactUsd: pos.sizeUsd,
@@ -4409,7 +4573,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       case 'HL_PERP_OPEN':
       case 'HL_PERP_NEWS': {
         const hl = await import('./hyperliquidService.ts');
-        const { coin, side, sizeUsd, leverage, stopLossPct, takeProfitPct, signal, conviction } = decision.params;
+        const { coin, side, sizeUsd, leverage, stopLossPct, takeProfitPct, signal, conviction, tradeStyle } = decision.params;
         const result = await hl.openPerpTrade({
           coin,
           side,
@@ -4423,8 +4587,19 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         if (result.success) {
           const cooldownKey = decision.type === 'HL_PERP_NEWS'
             ? `HL_PERP_NEWS_${coin}`
-            : `HL_PERP_${coin}`;
+            : tradeStyle
+              ? `HL_PERP_TA_${coin}_${tradeStyle}`
+              : `HL_PERP_${coin}`;
           markDecision(cooldownKey);
+
+          // Track trade style for exit logic (style-specific SL/TP + hold limits)
+          if (tradeStyle) {
+            _perpTradeStyles.set(`${coin}-${side}`, {
+              style: tradeStyle as TradeStyle,
+              openedAt: new Date().toISOString(),
+            });
+            logger.debug(`[CFO:Decision] Tracking TA style: ${coin}-${side} → ${tradeStyle}`);
+          }
         }
         return {
           ...base,
@@ -4450,7 +4625,11 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const closeFraction = 1.0; // full close
         const closeReceivedUsd = pos.sizeUsd + (pos.unrealizedPnlUsd ?? 0) * closeFraction;
         const result = await hl.closePosition(coin, sizeInCoin, isBuy);
-        if (result.success) markDecision(`HL_PERP_CLOSE_${coin}`);
+        if (result.success) {
+          markDecision(`HL_PERP_CLOSE_${coin}`);
+          // Clean up trade style tracker
+          _perpTradeStyles.delete(`${coin}-${side}`);
+        }
         return {
           ...base,
           executed: true,
@@ -4692,8 +4871,10 @@ function _humanAction(d: Decision, state: PortfolioState): string {
         : `<b>Rebalance EVM LP</b> — ${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'} on ${p.chainName ?? 'EVM'}, re-centering`;
     case 'KRYSTAL_LP_CLAIM_FEES':
       return `<b>Claim EVM LP fees</b> — $${p.feesOwedUsd?.toFixed(2) ?? '?'} from ${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'} on ${p.chainName ?? 'EVM'}`;
-    case 'HL_PERP_OPEN':
-      return `<b>${p.side ?? 'LONG'} ${p.coin ?? '?'}-PERP</b> — $${p.sizeUsd?.toFixed(0) ?? '?'} at ${p.leverage ?? 2}x (conviction: ${((p.conviction ?? 0) * 100).toFixed(0)}%, SL: ${p.stopLossPct ?? 5}%, TP: ${p.takeProfitPct ?? 10}%)`;
+    case 'HL_PERP_OPEN': {
+      const styleTag = p.tradeStyle ? `[${p.tradeStyle}] ` : '';
+      return `<b>${styleTag}${p.side ?? 'LONG'} ${p.coin ?? '?'}-PERP</b> — $${p.sizeUsd?.toFixed(0) ?? '?'} at ${p.leverage ?? 2}x (conviction: ${((p.conviction ?? 0) * 100).toFixed(0)}%, SL: ${p.stopLossPct ?? 5}%, TP: ${p.takeProfitPct ?? 10}%)`;
+    }
     case 'HL_PERP_NEWS':
       return `<b>📰 ${p.side ?? 'LONG'} ${p.coin ?? '?'}-PERP</b> — news-reactive $${p.sizeUsd?.toFixed(0) ?? '?'} (${p.change24hPct != null ? `${p.change24hPct > 0 ? '+' : ''}${p.change24hPct.toFixed(1)}%` : 'big move'}, SL: 3%)`;
     case 'HL_PERP_CLOSE': {

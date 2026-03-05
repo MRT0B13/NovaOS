@@ -71,6 +71,13 @@ export interface CFOEnv {
   hlPerpNewsMaxUsd: number;                      // max per-trade for news-reactive entries (default: 50)
   hlPerpNewsCooldownMs: number;                  // cooldown for news-reactive trades (default: 2h)
 
+  // ── Hyperliquid Perp: Multi-Timeframe TA ──────────────────────────────
+  hlPerpTaEnabled: boolean;                      // master switch for TA-driven perp entries (default: false)
+  hlPerpScalpEnabled: boolean;                   // enable scalp style 5m/1h (default: true when TA on)
+  hlPerpDayEnabled: boolean;                     // enable day-trade style 1h/1d (default: true when TA on)
+  hlPerpSwingEnabled: boolean;                   // enable swing style 1d/1h (default: true when TA on)
+  hlPerpScalpCooldownMs: number;                 // cooldown between scalp entries per coin (default: 10m)
+
   // ── Kamino ────────────────────────────────────────────────────────
   maxKaminoUsd: number;
   kaminoMaxLtvPct: number;                        // never borrow above this LTV (default 60)
@@ -293,6 +300,13 @@ export function getCFOEnv(bust = false): CFOEnv {
     hlPerpNewsReactiveEnabled: process.env.CFO_HL_PERP_NEWS_ENABLE === 'true',
     hlPerpNewsMaxUsd: Number(process.env.CFO_HL_PERP_NEWS_MAX_USD ?? 50),
     hlPerpNewsCooldownMs: Number(process.env.CFO_HL_PERP_NEWS_COOLDOWN_HOURS ?? 2) * 3600_000,
+
+    // Multi-timeframe TA
+    hlPerpTaEnabled: process.env.CFO_HL_PERP_TA_ENABLE === 'true',
+    hlPerpScalpEnabled: process.env.CFO_HL_PERP_SCALP_ENABLE !== 'false',   // default ON when TA enabled
+    hlPerpDayEnabled: process.env.CFO_HL_PERP_DAY_ENABLE !== 'false',
+    hlPerpSwingEnabled: process.env.CFO_HL_PERP_SWING_ENABLE !== 'false',
+    hlPerpScalpCooldownMs: Number(process.env.CFO_HL_PERP_SCALP_COOLDOWN_MIN ?? 10) * 60_000,
 
     maxKaminoUsd: Number(process.env.CFO_MAX_KAMINO_USD ?? 1000),
     kaminoMaxLtvPct: Number(process.env.CFO_KAMINO_MAX_LTV_PCT ?? 60),
