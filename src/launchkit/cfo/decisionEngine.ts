@@ -3845,11 +3845,13 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const reduceSizeCoin = reduceUsd / coinShort.markPrice;
         const result = await hl.closePosition(coin, reduceSizeCoin, true); // buy back to reduce short
         if (result.success) markDecision(`CLOSE_HEDGE_${coin}`);
-        // receivedUsd = portion of cost basis returned + PnL from the short
+        // receivedUsd = portion of margin returned + PnL from the short
         // For a SHORT: if price dropped, we profit; if price rose, we lose.
         // Use the mark-to-market fraction of unrealized PnL proportional to the close size.
         const closeFraction = coinShort.sizeUsd > 0 ? reduceUsd / coinShort.sizeUsd : 1;
-        const closeReceivedUsd = reduceUsd + (coinShort.unrealizedPnlUsd ?? 0) * closeFraction;
+        // Use marginUsed (collateral), not sizeUsd (notional) — proportional to close fraction
+        const marginReturned = coinShort.marginUsed * closeFraction;
+        const closeReceivedUsd = marginReturned + (coinShort.unrealizedPnlUsd ?? 0) * closeFraction;
         return {
           ...base,
           executed: true,
@@ -3872,8 +3874,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
         const sizeInCoin = pos.sizeUsd / pos.markPrice;
         const isBuy = pos.side === 'SHORT'; // buy to close short, sell to close long
-        // Actual return = cost basis + unrealized PnL (which is negative for losers)
-        const closeReceivedUsd = Math.max(0, pos.sizeUsd + (pos.unrealizedPnlUsd ?? 0));
+        // Actual return = margin + unrealized PnL (use marginUsed, NOT sizeUsd/notional)
+        const closeReceivedUsd = Math.max(0, pos.marginUsed + (pos.unrealizedPnlUsd ?? 0));
         const result = await hl.closePosition(pos.coin, sizeInCoin, isBuy);
         if (result.success) markDecision('CLOSE_LOSING');
         return {
@@ -4681,7 +4683,9 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         const sizeInCoin = pos.sizeUsd / pos.markPrice;
         const isBuy = side === 'SHORT'; // buy back to close short, sell to close long
         const closeFraction = 1.0; // full close
-        const closeReceivedUsd = pos.sizeUsd + (pos.unrealizedPnlUsd ?? 0) * closeFraction;
+        // Use marginUsed (collateral) NOT sizeUsd (notional) — PnL = received - costBasis
+        // where costBasis is also margin, so PnL ≈ unrealizedPnlUsd (the actual profit/loss).
+        const closeReceivedUsd = pos.marginUsed + (pos.unrealizedPnlUsd ?? 0) * closeFraction;
         const result = await hl.closePosition(coin, sizeInCoin, isBuy);
         if (result.success) {
           markDecision(`HL_PERP_CLOSE_${coin}`);
