@@ -3376,17 +3376,32 @@ export async function generateDecisions(
           if (taSig.bias === 'NEUTRAL') continue;
 
           // ── Position / margin limits ──────────────────────────────────
+          // Account for pending opens AND closes from earlier phases
           const pendingOpens = decisions.filter(d =>
             d.type === 'HL_PERP_OPEN' || d.type === 'HL_PERP_NEWS',
           );
-          const openCount = existingPerpCount + pendingOpens.length;
-          if (openCount >= maxPositions) break;
+          const pendingCloses = decisions.filter(d => d.type === 'HL_PERP_CLOSE');
+          const openCount = existingPerpCount + pendingOpens.length - pendingCloses.length;
+          if (openCount >= maxPositions) {
+            logger.debug(
+              `[CFO:Decision] Section M/TA: slots full (${openCount}/${maxPositions}) — ` +
+              `${existingPerpCount} existing + ${pendingOpens.length} pending opens - ${pendingCloses.length} pending closes. ` +
+              `Skipping remaining ${taSignals.length} TA signals.`,
+            );
+            break;
+          }
 
           const openUsd = existingPerpTotalUsd + pendingOpens.reduce(
             (s, d) => s + (d.params.sizeUsd ?? 0), 0,
           );
-          if (openUsd >= maxTotalUsd) break;
-          if (state.hlAvailableMargin < 10) break;
+          if (openUsd >= maxTotalUsd) {
+            logger.debug(`[CFO:Decision] Section M/TA: total USD cap hit ($${openUsd.toFixed(0)}/$${maxTotalUsd.toFixed(0)}) — skipping TA signals`);
+            break;
+          }
+          if (state.hlAvailableMargin < 10) {
+            logger.debug(`[CFO:Decision] Section M/TA: margin too low ($${state.hlAvailableMargin.toFixed(2)}) — skipping TA signals`);
+            break;
+          }
 
           // ── Cooldown per coin+style ───────────────────────────────────
           const cooldownMs = taSig.style === 'scalp'
