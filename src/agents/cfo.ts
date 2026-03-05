@@ -550,9 +550,14 @@ export class CFOAgent extends BaseAgent {
               const pos = summary.positions.find((pp: any) => pp.coin === coin);
               if (pos) entryPrice = pos.markPrice;
             } catch { /* non-fatal */ }
+            // Use per-style strategy tag for TA trades (learning engine tracks per-style)
+            const tradeStyle = p.tradeStyle as string | undefined;
+            const perpStrategyTag = (tradeStyle === 'scalp' || tradeStyle === 'day' || tradeStyle === 'swing')
+              ? `hl_perp_${tradeStyle}` as PositionStrategy
+              : 'hl_perp' as PositionStrategy;
             const perpPos: CFOPosition = {
               id: `hl-perp-${coin.toLowerCase()}-${Date.now()}`,
-              strategy: 'hl_perp' as PositionStrategy,
+              strategy: perpStrategyTag,
               asset: `${coin}-PERP`,
               description: `${side} ${coin} ${leverage}x (${d.type === 'HL_PERP_NEWS' ? 'news' : 'signal'})`,
               chain: 'arbitrum',
@@ -580,7 +585,7 @@ export class CFOAgent extends BaseAgent {
             await this.repo.upsertPosition(perpPos);
             await this.repo.insertTransaction({
               id: `tx-hl-perp-${r.txId ?? Date.now()}`, timestamp: now,
-              chain: 'arbitrum', strategyTag: 'hl_perp', txType: 'swap',
+              chain: 'arbitrum', strategyTag: perpStrategyTag, txType: 'swap',
               tokenIn: 'USDC', amountIn: sizeUsd / leverage,
               tokenOut: `${coin}-PERP-${side}`, amountOut: sizeUsd,
               feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
@@ -595,19 +600,25 @@ export class CFOAgent extends BaseAgent {
             const coin = p.coin;
             const side = p.side as 'LONG' | 'SHORT';
             const receivedUsd = r.receivedUsd ?? d.estimatedImpactUsd ?? 0;
-            // Find matching open perp position
-            const openPerps = await this.repo.getOpenPositions('hl_perp' as PositionStrategy);
-            const perpMatch = openPerps.find(pos =>
-              (pos.metadata as any)?.coin === coin && (pos.metadata as any)?.side === side,
-            );
+            // Find matching open perp position (search all per-style strategy tags)
+            const perpStrategies: PositionStrategy[] = ['hl_perp', 'hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing'];
+            let perpMatch: CFOPosition | undefined;
+            for (const strat of perpStrategies) {
+              const openPerps = await this.repo.getOpenPositions(strat);
+              perpMatch = openPerps.find(pos =>
+                (pos.metadata as any)?.coin === coin && (pos.metadata as any)?.side === side,
+              );
+              if (perpMatch) break;
+            }
             if (perpMatch) {
               await this.positionManager.closePosition(perpMatch.id, 0, r.txId ?? '', receivedUsd);
               const pnl = receivedUsd - perpMatch.costBasisUsd;
               logger.info(`[CFO] Persisted HL_PERP_CLOSE: closed ${perpMatch.id} (${side} ${coin}) PnL $${pnl.toFixed(2)}`);
             }
+            const closeStrategyTag = perpMatch?.strategy ?? 'hl_perp';
             await this.repo.insertTransaction({
               id: `tx-hl-perp-close-${r.txId ?? Date.now()}`, timestamp: now,
-              chain: 'arbitrum', strategyTag: 'hl_perp', txType: 'swap',
+              chain: 'arbitrum', strategyTag: closeStrategyTag, txType: 'swap',
               tokenIn: `${coin}-PERP-${side}`, amountIn: d.estimatedImpactUsd,
               tokenOut: 'USDC', amountOut: receivedUsd,
               feeUsd: 0, txHash: r.txId, walletAddress: '',

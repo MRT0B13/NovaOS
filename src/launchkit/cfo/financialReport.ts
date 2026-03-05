@@ -105,6 +105,9 @@ interface PeriodReport {
 const STRAT_NAMES: Record<string, string> = {
   hyperliquid: 'HL Hedge',
   hl_perp: 'HL Perps',
+  hl_perp_scalp: 'HL Scalp',
+  hl_perp_day: 'HL Day',
+  hl_perp_swing: 'HL Swing',
   kamino: 'Kamino',
   kamino_loop: 'Kamino Loop',
   orca_lp: 'Orca LP',
@@ -424,6 +427,21 @@ export async function generateReport(
   }
   if (Math.abs((lp.hlPerpSizeMultiplier ?? 1) - 1) > 0.05) {
     adjustmentsSummary.push(`Perp sizing ${(lp.hlPerpSizeMultiplier ?? 1) > 1 ? 'increased' : 'reduced'} to ${((lp.hlPerpSizeMultiplier ?? 1) * 100).toFixed(0)}%`);
+  }
+  // Per-style perp learning adjustments
+  if (lp.hlPerpStyleSizeMultipliers) {
+    const styleAdj: string[] = [];
+    for (const [style, mult] of Object.entries(lp.hlPerpStyleSizeMultipliers as Record<string, number>)) {
+      if (Math.abs(mult - 1) > 0.05) {
+        styleAdj.push(`${style} sizing ×${mult.toFixed(2)}`);
+      }
+    }
+    for (const [style, mult] of Object.entries((lp.hlPerpStyleStopMultipliers ?? {}) as Record<string, number>)) {
+      if (Math.abs(mult - 1) > 0.05) {
+        styleAdj.push(`${style} SL ×${mult.toFixed(2)}`);
+      }
+    }
+    if (styleAdj.length > 0) adjustmentsSummary.push(`Perp styles: ${styleAdj.join(', ')}`);
   }
   if ((lp.globalRiskMultiplier ?? 1) < 0.9) {
     adjustmentsSummary.push(`Risk-off mode (×${(lp.globalRiskMultiplier ?? 1).toFixed(2)})`);

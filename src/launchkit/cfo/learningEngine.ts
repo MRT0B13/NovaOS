@@ -99,6 +99,11 @@ export interface AdaptiveParams {
   hlPerpStopLossMultiplier: number; // tighter/wider SL for perps specifically
   hlPerpMaxPositionsAdj: number;    // -N to +N adjustment on max simultaneous positions
 
+  // Hyperliquid perp per-style overrides (scalp/day/swing learn independently)
+  hlPerpStyleSizeMultipliers: Record<string, number>;     // { scalp: 1.0, day: 1.0, swing: 1.0 }
+  hlPerpStyleStopMultipliers: Record<string, number>;     // per-style SL multiplier
+  hlPerpStyleConvictionFloors: Record<string, number>;    // per-style conviction floor
+
   // LP (Orca + Krystal) — global
   lpRangeWidthMultiplier: number;  // wider/narrower ranges based on rebalance frequency
   lpMinAprAdjustment: number;      // increase min APR floor if LP positions underperform
@@ -570,6 +575,20 @@ function detectDriftAlerts(
       ['Perp SL', current.hlPerpStopLossMultiplier, prior.hlPerpStopLossMultiplier],
     ];
 
+    // Add per-style perp drift checks
+    for (const style of ['scalp', 'day', 'swing'] as const) {
+      const currSize = current.hlPerpStyleSizeMultipliers?.[style] ?? 1;
+      const prevSize = prior.hlPerpStyleSizeMultipliers?.[style] ?? 1;
+      if (prevSize !== 1 || currSize !== 1) {
+        drifts.push([`Perp ${style} size`, currSize, prevSize]);
+      }
+      const currStop = current.hlPerpStyleStopMultipliers?.[style] ?? 1;
+      const prevStop = prior.hlPerpStyleStopMultipliers?.[style] ?? 1;
+      if (prevStop !== 1 || currStop !== 1) {
+        drifts.push([`Perp ${style} SL`, currStop, prevStop]);
+      }
+    }
+
     for (const [name, curr, prev] of drifts) {
       if (prev === 0) continue;
       const changePct = Math.abs((curr - prev) / prev) * 100;
@@ -759,6 +778,42 @@ function computeAdaptiveParams(
     if (perpSt.recentAvgPnlUsd < -2 && perpSt.avgPnlUsd > 0) {
       perpSizeMult *= 0.7; // reduce exposure during regime shift
       perpStopMult *= 0.85;
+    }
+  }
+
+  // ── Per-style HL perp adaptations (scalp/day/swing learn independently) ──
+  // Mirrors the LP per-tier pattern: each style adapts its own size, SL, and conviction floor
+  const perpStyleSizeMults: Record<string, number> = { scalp: 1.0, day: 1.0, swing: 1.0 };
+  const perpStyleStopMults: Record<string, number> = { scalp: 1.0, day: 1.0, swing: 1.0 };
+  const perpStyleConvFloors: Record<string, number> = { scalp: 0, day: 0, swing: 0 };
+
+  for (const style of ['scalp', 'day', 'swing'] as const) {
+    const styleSt = stats[`hl_perp_${style}`];
+    if (!styleSt || styleSt.totalTrades < MIN_TRADES_FOR_CONFIDENCE) continue;
+
+    // Size multiplier: cut if losing, lean in if profitable
+    if (styleSt.avgPnlUsd < -3) {
+      perpStyleSizeMults[style] = 0.6;
+    } else if (styleSt.avgPnlUsd > 3 && styleSt.sharpeApprox > 0.5) {
+      perpStyleSizeMults[style] = 1.3;
+    }
+
+    // SL multiplier: tighten if drawdowns severe, loosen if winning
+    if (styleSt.maxDrawdownUsd < -20 && Math.abs(styleSt.maxDrawdownUsd) > styleSt.avgPnlUsd * 3) {
+      perpStyleStopMults[style] = 0.7;
+    } else if (styleSt.winRate > 0.55 && styleSt.sharpeApprox > 0.3) {
+      perpStyleStopMults[style] = 1.15;
+    }
+
+    // Conviction floor: raise if too many losing trades
+    if (styleSt.winRate < 0.35 && styleSt.totalPnlUsd < 0) {
+      perpStyleConvFloors[style] = Math.min(0.7, 0.3 + (0.35 - styleSt.winRate));
+    }
+
+    // Regime shift within style
+    if (styleSt.recentAvgPnlUsd < -2 && styleSt.avgPnlUsd > 0) {
+      perpStyleSizeMults[style] *= 0.7;
+      perpStyleStopMults[style] *= 0.85;
     }
   }
 
@@ -959,6 +1014,21 @@ function computeAdaptiveParams(
     hlPerpSizeMultiplier: blend(perpSizeMult, prior?.hlPerpSizeMultiplier),
     hlPerpStopLossMultiplier: blend(perpStopMult, prior?.hlPerpStopLossMultiplier),
     hlPerpMaxPositionsAdj: blend(perpMaxPosAdj, prior?.hlPerpMaxPositionsAdj),
+    hlPerpStyleSizeMultipliers: {
+      scalp: blend(perpStyleSizeMults.scalp, prior?.hlPerpStyleSizeMultipliers?.scalp),
+      day: blend(perpStyleSizeMults.day, prior?.hlPerpStyleSizeMultipliers?.day),
+      swing: blend(perpStyleSizeMults.swing, prior?.hlPerpStyleSizeMultipliers?.swing),
+    },
+    hlPerpStyleStopMultipliers: {
+      scalp: blend(perpStyleStopMults.scalp, prior?.hlPerpStyleStopMultipliers?.scalp),
+      day: blend(perpStyleStopMults.day, prior?.hlPerpStyleStopMultipliers?.day),
+      swing: blend(perpStyleStopMults.swing, prior?.hlPerpStyleStopMultipliers?.swing),
+    },
+    hlPerpStyleConvictionFloors: {
+      scalp: blend(perpStyleConvFloors.scalp, prior?.hlPerpStyleConvictionFloors?.scalp),
+      day: blend(perpStyleConvFloors.day, prior?.hlPerpStyleConvictionFloors?.day),
+      swing: blend(perpStyleConvFloors.swing, prior?.hlPerpStyleConvictionFloors?.swing),
+    },
     lpRangeWidthMultiplier: blend(lpRangeMult, prior?.lpRangeWidthMultiplier),
     lpMinAprAdjustment: blend(lpMinAprAdj, prior?.lpMinAprAdjustment),
     lpRebalanceTriggerMultiplier: blend(lpRebalTriggerMult, prior?.lpRebalanceTriggerMultiplier),
@@ -1067,7 +1137,7 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
     const prior = await loadPrior(dbPool);
 
     // 2. Compute stats for each strategy
-    const strategies = ['polymarket', 'hyperliquid', 'hl_perp', 'kamino', 'jito', 'orca_lp', 'krystal_lp', 'evm_flash_arb'];
+    const strategies = ['polymarket', 'hyperliquid', 'hl_perp', 'hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing', 'kamino', 'jito', 'orca_lp', 'krystal_lp', 'evm_flash_arb'];
     const statsEntries = await Promise.all(
       strategies.map(async s => [s, await computeStrategyStats(dbPool, s)] as const),
     );
@@ -1128,6 +1198,7 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
       `hedge×${params.hlHedgeTargetMultiplier.toFixed(2)} | ` +
       `perpSize×${params.hlPerpSizeMultiplier.toFixed(2)} | ` +
       `perpSL×${params.hlPerpStopLossMultiplier.toFixed(2)} | ` +
+      `perpStyles: S×${params.hlPerpStyleSizeMultipliers?.scalp?.toFixed(2) ?? '1'} D×${params.hlPerpStyleSizeMultipliers?.day?.toFixed(2) ?? '1'} W×${params.hlPerpStyleSizeMultipliers?.swing?.toFixed(2) ?? '1'} | ` +
       `lpRange×${params.lpRangeWidthMultiplier.toFixed(2)} | ` +
       `lpTiers: L×${params.lpTierRangeMultipliers.low?.toFixed(2) ?? '1'} M×${params.lpTierRangeMultipliers.medium?.toFixed(2) ?? '1'} H×${params.lpTierRangeMultipliers.high?.toFixed(2) ?? '1'} | ` +
       `arbMin×${params.evmArbMinProfitMultiplier.toFixed(2)} | ` +
@@ -1200,6 +1271,9 @@ export function getDefaultParams(): AdaptiveParams {
     hlPerpSizeMultiplier: 1.0,
     hlPerpStopLossMultiplier: 1.0,
     hlPerpMaxPositionsAdj: 0,
+    hlPerpStyleSizeMultipliers: { scalp: 1.0, day: 1.0, swing: 1.0 },
+    hlPerpStyleStopMultipliers: { scalp: 1.0, day: 1.0, swing: 1.0 },
+    hlPerpStyleConvictionFloors: { scalp: 0, day: 0, swing: 0 },
     lpRangeWidthMultiplier: 1.0,
     lpMinAprAdjustment: 0,
     lpRebalanceTriggerMultiplier: 1.0,
@@ -1261,7 +1335,9 @@ export function formatLearningSummary(params: AdaptiveParams): string {
 
   // Best/worst strategies with names expanded
   const stratNameMap: Record<string, string> = {
-    hyperliquid: 'HL Hedge', hl_perp: 'HL Perps', kamino: 'Kamino', jito: 'Jito Staking',
+    hyperliquid: 'HL Hedge', hl_perp: 'HL Perps',
+    hl_perp_scalp: 'HL Scalp', hl_perp_day: 'HL Day', hl_perp_swing: 'HL Swing',
+    kamino: 'Kamino', jito: 'Jito Staking',
     orca_lp: 'Orca LP', krystal_lp: 'EVM LP', evm_flash_arb: 'Arb Scanner',
     polymarket: 'Polymarket',
   };
@@ -1295,6 +1371,21 @@ export function formatLearningSummary(params: AdaptiveParams): string {
   }
   if (Math.abs(params.hlHedgeTargetMultiplier - 1) > 0.05) {
     adj.push(`Hedge target ${params.hlHedgeTargetMultiplier > 1 ? 'increased' : 'decreased'}`);
+  }
+  // Per-style perp adjustments
+  if (params.hlPerpStyleSizeMultipliers) {
+    const styleAdj: string[] = [];
+    for (const [style, mult] of Object.entries(params.hlPerpStyleSizeMultipliers)) {
+      if (Math.abs(mult - 1) > 0.05) {
+        styleAdj.push(`${style} size ×${mult.toFixed(2)}`);
+      }
+    }
+    for (const [style, mult] of Object.entries(params.hlPerpStyleStopMultipliers ?? {})) {
+      if (Math.abs(mult - 1) > 0.05) {
+        styleAdj.push(`${style} SL ×${mult.toFixed(2)}`);
+      }
+    }
+    if (styleAdj.length > 0) adj.push(`Perp styles: ${styleAdj.join(', ')}`);
   }
   if (Math.abs(params.lpRangeWidthMultiplier - 1) > 0.05) {
     adj.push(`LP ranges ${params.lpRangeWidthMultiplier > 1 ? 'widened' : 'tightened'}`);

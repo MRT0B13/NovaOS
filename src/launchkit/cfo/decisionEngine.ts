@@ -3412,18 +3412,28 @@ export async function generateDecisions(
           }
           if (finalConviction < minConviction) continue;
 
+          // ── Per-style learning overrides (conviction floor, size, SL) ─
+          const styleConvFloor = learned.hlPerpStyleConvictionFloors?.[taSig.style] ?? 0;
+          const effectiveStyleConvFloor = styleConvFloor * conf;
+          if (effectiveStyleConvFloor > 0 && finalConviction < effectiveStyleConvFloor) continue;
+
+          const styleSizeMult = learned.hlPerpStyleSizeMultipliers?.[taSig.style] ?? 1.0;
+          const styleStopMult = learned.hlPerpStyleStopMultipliers?.[taSig.style] ?? 1.0;
+
           // ── Danger market gate — skip new longs in danger mode ────────
           if (intel.marketCondition === 'danger' && taSig.bias === 'LONG') continue;
 
-          // ── Size = conviction-scaled, capped ──────────────────────────
+          // ── Size = conviction-scaled, capped, with per-style learning ─
+          const taMaxPosUsd = applyAdaptive(maxPosUsd, styleSizeMult, conf);
           const taSizeUsd = Math.min(
-            maxPosUsd * finalConviction,
+            taMaxPosUsd * finalConviction,
             maxTotalUsd - openUsd,
             state.hlAvailableMargin * env.hlPerpDefaultLeverage * 0.8,
           );
           if (taSizeUsd < 10) continue;
 
           const styleConfig = ta.getStyleConfig(taSig.style);
+          const learnedStyleSL = applyAdaptive(styleConfig.stopLossPct, styleStopMult, conf);
           const d: Decision = {
             type: 'HL_PERP_OPEN',
             reasoning:
@@ -3431,14 +3441,15 @@ export async function generateDecisions(
               `conviction ${(finalConviction * 100).toFixed(0)}% ` +
               `(TA ${(taSig.conviction * 100).toFixed(0)}%${sentimentSig ? ` + sentiment ${sentimentSig.side}` : ''}). ` +
               `${taSig.reasoning}. ` +
-              `Size: $${taSizeUsd.toFixed(0)} at ${env.hlPerpDefaultLeverage}x. ` +
-              `SL: ${styleConfig.stopLossPct}% / TP: ${styleConfig.takeProfitPct}% / maxHold: ${styleConfig.maxHoldHours}h.`,
+              `Size: $${taSizeUsd.toFixed(0)} at ${env.hlPerpDefaultLeverage}x` +
+              `${styleSizeMult !== 1 ? ` (style×${styleSizeMult.toFixed(2)})` : ''}. ` +
+              `SL: ${learnedStyleSL.toFixed(1)}% / TP: ${styleConfig.takeProfitPct}% / maxHold: ${styleConfig.maxHoldHours}h.`,
             params: {
               coin: taSig.coin,
               side: taSig.bias,
               sizeUsd: taSizeUsd,
               leverage: env.hlPerpDefaultLeverage,
-              stopLossPct: styleConfig.stopLossPct,
+              stopLossPct: learnedStyleSL,
               takeProfitPct: styleConfig.takeProfitPct,
               signal: `ta-${taSig.style}`,
               conviction: finalConviction,
@@ -3454,7 +3465,9 @@ export async function generateDecisions(
           logger.info(
             `[CFO:Decision] Section M/TA: [${taSig.style}] ${taSig.bias} ${taSig.coin}-PERP ` +
             `$${taSizeUsd.toFixed(0)} conviction=${(finalConviction * 100).toFixed(0)}% ` +
-            `SL=${styleConfig.stopLossPct}% TP=${styleConfig.takeProfitPct}% maxHold=${styleConfig.maxHoldHours}h`,
+            `SL=${learnedStyleSL.toFixed(1)}% TP=${styleConfig.takeProfitPct}% maxHold=${styleConfig.maxHoldHours}h` +
+            `${styleSizeMult !== 1 ? ` size×${styleSizeMult.toFixed(2)}` : ''}` +
+            `${styleStopMult !== 1 ? ` sl×${styleStopMult.toFixed(2)}` : ''}`,
           );
         }
       }
