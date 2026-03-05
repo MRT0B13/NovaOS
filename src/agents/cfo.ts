@@ -161,6 +161,9 @@ export class CFOAgent extends BaseAgent {
         // Reconcile Polymarket ghost positions — reopen DB entries where shares still exist on-chain
         setTimeout(() => this.reconcilePolymarketGhosts(), 20_000);
 
+        // Reconcile HL perp ghost positions — close DB entries that no longer exist on HL
+        setTimeout(() => this.reconcileHlPerpPositions(), 25_000);
+
         // Reload pending sell orders from DB metadata (survive restarts)
         setTimeout(() => this.reloadPendingSellOrders(), 5_000);
 
@@ -565,7 +568,7 @@ export class CFOAgent extends BaseAgent {
               entryPrice,
               currentPrice: entryPrice,
               sizeUnits: entryPrice > 0 ? sizeUsd / entryPrice : 0,
-              costBasisUsd: sizeUsd / leverage, // margin used
+              costBasisUsd: sizeUsd, // full notional — PnL = exitNotional - entryNotional
               currentValueUsd: sizeUsd,
               realizedPnlUsd: 0,
               unrealizedPnlUsd: 0,
@@ -599,6 +602,9 @@ export class CFOAgent extends BaseAgent {
           case 'HL_PERP_CLOSE': {
             const coin = p.coin;
             const side = p.side as 'LONG' | 'SHORT';
+            // Use HL's ground-truth unrealizedPnl (from exchange API) instead of
+            // computing from costBasis/receivedUsd which can mismatch (margin vs notional).
+            const hlPnl: number | undefined = r.hlUnrealizedPnl ?? p.unrealizedPnl;
             const receivedUsd = r.receivedUsd ?? d.estimatedImpactUsd ?? 0;
             // Find matching open perp position (search all per-style strategy tags)
             const perpStrategies: PositionStrategy[] = ['hl_perp', 'hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing'];
@@ -611,9 +617,12 @@ export class CFOAgent extends BaseAgent {
               if (perpMatch) break;
             }
             if (perpMatch) {
-              await this.positionManager.closePosition(perpMatch.id, 0, r.txId ?? '', receivedUsd);
-              const pnl = receivedUsd - perpMatch.costBasisUsd;
+              // Pass hlPnl as the realizedPnlOverride so we use HL's ground truth
+              await this.positionManager.closePosition(perpMatch.id, 0, r.txId ?? '', receivedUsd, hlPnl);
+              const pnl = hlPnl ?? (receivedUsd - perpMatch.costBasisUsd);
               logger.info(`[CFO] Persisted HL_PERP_CLOSE: closed ${perpMatch.id} (${side} ${coin}) PnL $${pnl.toFixed(2)}`);
+            } else {
+              logger.warn(`[CFO] HL_PERP_CLOSE: no DB position found for ${side} ${coin} — closed on HL but not in DB`);
             }
             const closeStrategyTag = perpMatch?.strategy ?? 'hl_perp';
             await this.repo.insertTransaction({
@@ -623,7 +632,7 @@ export class CFOAgent extends BaseAgent {
               tokenOut: 'USDC', amountOut: receivedUsd,
               feeUsd: 0, txHash: r.txId, walletAddress: '',
               positionId: perpMatch?.id, status: 'confirmed',
-              metadata: { coin, side, reason: d.reasoning },
+              metadata: { coin, side, reason: d.reasoning, hlPnl },
             });
             break;
           }
@@ -3055,6 +3064,52 @@ export class CFOAgent extends BaseAgent {
       }
     } catch (err) {
       logger.warn('[CFO] Polymarket reconciliation error:', err);
+    }
+  }
+
+  /**
+   * Reconcile HL perp positions: close DB entries that no longer exist on Hyperliquid.
+   * Catches positions that were closed on HL (manual close, TP/SL, liquidation)
+   * but the DB close failed or was skipped.
+   */
+  private async reconcileHlPerpPositions(): Promise<void> {
+    if (!this.repo || !this.positionManager) return;
+    try {
+      const hlMod = await import('../launchkit/cfo/hyperliquidService.ts');
+      const summary = await hlMod.getAccountSummary();
+      const hlCoins = new Set(summary.positions.map((p: any) => `${p.coin}-${p.side}`));
+
+      const perpStrategies = ['hl_perp', 'hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing'] as const;
+      let closed = 0;
+
+      for (const strat of perpStrategies) {
+        const openPositions = await this.repo.getOpenPositions(strat as any);
+        for (const dbPos of openPositions) {
+          const meta = dbPos.metadata as { coin?: string; side?: string };
+          const key = `${meta.coin}-${meta.side}`;
+          if (!hlCoins.has(key)) {
+            // Position exists in DB but not on HL — close it as a ghost
+            // We don't have the exact PnL, but it's better than leaving it stuck open.
+            // Use HL's last known unrealizedPnl from DB if available.
+            const pnl = dbPos.unrealizedPnlUsd ?? 0;
+            await this.positionManager.closePosition(
+              dbPos.id, 0, 'reconciled-ghost', 0, pnl,
+            );
+            logger.warn(
+              `[CFO] HL reconciliation: closed ghost position ${dbPos.id} ` +
+              `(${meta.side} ${meta.coin}) — not found on HL, PnL ~$${pnl.toFixed(2)}`,
+            );
+            closed++;
+          }
+        }
+      }
+
+      if (closed > 0) {
+        const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+        await notifyAdminForce(`🔄 Reconciled ${closed} ghost HL perp position(s) — closed in DB (not found on exchange)`);
+      }
+    } catch (err) {
+      logger.warn('[CFO] HL perp reconciliation error:', err);
     }
   }
 

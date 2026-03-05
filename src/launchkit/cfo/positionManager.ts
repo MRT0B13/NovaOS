@@ -370,12 +370,16 @@ export class PositionManager {
 
   /**
    * Mark a position as closed after a sell order is confirmed.
+   * @param realizedPnlOverride  When provided, use this as the exact PnL instead of
+   *                             computing from receivedUsd − costBasisUsd.  Preferred
+   *                             for HL perps where the exchange provides the ground-truth PnL.
    */
   async closePosition(
     positionId: string,
     exitPrice: number,
     exitTxHash: string,
     receivedUsd: number,
+    realizedPnlOverride?: number,
   ): Promise<void> {
     const pos = await this.repo.getPosition(positionId);
     if (!pos) {
@@ -383,13 +387,13 @@ export class PositionManager {
       return;
     }
 
-    const realizedPnl = receivedUsd - pos.costBasisUsd;
+    const realizedPnl = realizedPnlOverride ?? (receivedUsd - pos.costBasisUsd);
 
     await this.repo.closePosition(positionId, exitTxHash, realizedPnl, exitPrice);
 
     logger.info(
-      `[PositionManager] Closed ${positionId}: PnL ${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)} ` +
-      `(${pos.costBasisUsd.toFixed(2)} in → ${receivedUsd.toFixed(2)} out)`,
+      `[PositionManager] Closed ${positionId}: PnL ${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)}` +
+      (realizedPnlOverride != null ? ' (HL ground-truth)' : ` (${pos.costBasisUsd.toFixed(2)} in → ${receivedUsd.toFixed(2)} out)`),
     );
   }
 

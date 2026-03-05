@@ -142,6 +142,7 @@ export interface DecisionResult {
   txId?: string;
   error?: string;
   receivedUsd?: number;       // actual USD received (for sell/exit operations)
+  hlUnrealizedPnl?: number;  // HL exchange ground-truth PnL (for perp closes)
   dryRun: boolean;
   pendingApproval?: boolean;  // true if queued for admin approval
   traceId?: string;           // correlation ID linking all decisions in one cycle
@@ -4674,11 +4675,9 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         }
         const sizeInCoin = pos.sizeUsd / pos.markPrice;
         const isBuy = side === 'SHORT'; // buy back to close short, sell to close long
-        const closeFraction = 1.0; // full close
-        // Use exit notional (markPrice × size) as receivedUsd and entry notional as costBasis.
-        // realizedPnl = exitNotional − entryNotional = (exitPrice − entryPrice) × size.
-        // Margin-based tracking distorts PnL when cross-margin changes marginUsed dynamically.
-        const closeReceivedUsd = pos.sizeUsd * closeFraction;
+        // Capture HL's unrealizedPnl BEFORE closing — this is the exchange ground truth.
+        // Using costBasis/receivedUsd math is fragile (margin vs notional mismatch).
+        const hlUnrealizedPnl = pos.unrealizedPnlUsd ?? 0;
         const result = await hl.closePosition(coin, sizeInCoin, isBuy);
         if (result.success) {
           markDecision(`HL_PERP_CLOSE_${coin}`);
@@ -4690,7 +4689,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           executed: true,
           success: result.success,
           txId: result.orderId?.toString(),
-          receivedUsd: result.success ? Math.max(0, closeReceivedUsd) : undefined,
+          receivedUsd: result.success ? pos.sizeUsd : undefined,
+          hlUnrealizedPnl: result.success ? hlUnrealizedPnl : undefined,
           error: result.error,
         };
       }
