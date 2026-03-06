@@ -962,8 +962,9 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
       orcaPositions = positions.map(p => {
         const dbInfo = p.whirlpoolAddress ? dbTierMap.get(p.whirlpoolAddress) : undefined;
         const discInfo = p.whirlpoolAddress && discoveryCache ? discoveryCache.get(p.whirlpoolAddress) : undefined;
-        // Convert unclaimed fees to USD (SOL fees * SOL price + USDC fees * $1)
-        const feesUsd = (p.unclaimedFeesSol * solPriceUsd) + p.unclaimedFeesUsdc;
+        // Convert unclaimed fees to USD using per-token prices from the position
+        const feesUsd = (p.unclaimedFeesA ?? p.unclaimedFeesSol ?? 0) * (p.tokenAPriceUsd ?? solPriceUsd)
+                      + (p.unclaimedFeesB ?? p.unclaimedFeesUsdc ?? 0) * (p.tokenBPriceUsd ?? 1);
         // Priority: on-chain position data > DB metadata > pool discovery cache
         return {
           positionMint: p.positionMint,

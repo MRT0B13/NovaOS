@@ -137,7 +137,13 @@ export interface OrcaPosition {
   upperPrice: number;
   currentPrice: number;
   liquidityUsd: number;
+  unclaimedFeesA: number;        // unclaimed fees in tokenA UI units
+  unclaimedFeesB: number;        // unclaimed fees in tokenB UI units
+  tokenAPriceUsd: number;        // USD price used for tokenA
+  tokenBPriceUsd: number;        // USD price used for tokenB
+  /** @deprecated use unclaimedFeesB — kept for backward compat */
   unclaimedFeesUsdc: number;
+  /** @deprecated use unclaimedFeesA — kept for backward compat */
   unclaimedFeesSol: number;
   inRange: boolean;
   rangeUtilisationPct: number;  // 0-100: how centred the current price is in the range
@@ -934,8 +940,51 @@ export async function getPositions(): Promise<OrcaPosition[]> {
         // PoolUtil.getTokenAmountsFromLiquidity returns the underlying token
         // amounts for the position's liquidity at the current pool price.
         let liquidityUsd = 0;
-        let unclaimedFeesSol = 0;
-        let unclaimedFeesUsdc = 0;
+        let unclaimedFeesA = 0;
+        let unclaimedFeesB = 0;
+
+        // ── Resolve per-token USD prices ──────────────────────────────
+        // currentPrice = tokenB-per-tokenA from the pool's sqrtPriceX64.
+        // If one side is a stablecoin, currentPrice IS the USD price of the other.
+        // If one side is SOL/WSOL, use solPriceUsd and derive the other.
+        const symA = (knownPool?.tokenASymbol ?? '').toUpperCase();
+        const symB = (knownPool?.tokenBSymbol ?? '').toUpperCase();
+        const tokenAIsStable = _isStableToken(symA);
+        const tokenBIsStable = _isStableToken(symB);
+        const tokenAIsSol = symA === 'SOL' || symA === 'WSOL';
+        const tokenBIsSol = symB === 'SOL' || symB === 'WSOL';
+
+        let tokenAPriceUsd: number;
+        let tokenBPriceUsd: number;
+
+        if (tokenAIsStable && tokenBIsStable) {
+          // stable/stable — both $1
+          tokenAPriceUsd = 1;
+          tokenBPriceUsd = 1;
+        } else if (tokenBIsStable) {
+          // e.g. JLP/USDC, SOL/USDC — currentPrice = USDC per tokenA = USD price of tokenA
+          tokenAPriceUsd = currentPrice > 0 ? currentPrice : 1;
+          tokenBPriceUsd = 1;
+        } else if (tokenAIsStable) {
+          // e.g. USDC/SOL — currentPrice = SOL per USDC, so tokenB price = 1/currentPrice in USD
+          tokenAPriceUsd = 1;
+          tokenBPriceUsd = currentPrice > 0 ? (1 / currentPrice) : 1;
+        } else if (tokenAIsSol) {
+          // e.g. SOL/BONK — tokenA = SOL
+          tokenAPriceUsd = solPriceUsd;
+          tokenBPriceUsd = currentPrice > 0 ? (solPriceUsd / currentPrice) : 0;
+        } else if (tokenBIsSol) {
+          // e.g. JLP/SOL — currentPrice = SOL per tokenA
+          tokenAPriceUsd = currentPrice > 0 ? currentPrice * solPriceUsd : 0;
+          tokenBPriceUsd = solPriceUsd;
+        } else {
+          // Neither stable nor SOL — best-effort: assume pool price × SOL
+          // This is inaccurate but avoids 0; should be rare
+          tokenAPriceUsd = solPriceUsd; // fallback
+          tokenBPriceUsd = currentPrice > 0 ? (solPriceUsd / currentPrice) : solPriceUsd;
+          logger.debug(`[Orca] Unknown pair ${symA}/${symB} — using SOL-based fallback pricing`);
+        }
+
         try {
           const lowerSqrtPrice = PriceMath.tickIndexToSqrtPriceX64(data.tickLowerIndex);
           const upperSqrtPrice = PriceMath.tickIndexToSqrtPriceX64(data.tickUpperIndex);
@@ -948,12 +997,6 @@ export async function getPositions(): Promise<OrcaPosition[]> {
           );
           const tokenAUi = Number(amounts.tokenA.toString()) / (10 ** tokenADec);
           const tokenBUi = Number(amounts.tokenB.toString()) / (10 ** tokenBDec);
-          // Token B is typically the quote token (USDC/stables) priced at $1
-          // Token A is typically the base token (SOL, etc.) priced via oracle
-          const tokenAIsStable = _isStableToken(knownPool?.tokenASymbol);
-          const tokenBIsStable = _isStableToken(knownPool?.tokenBSymbol);
-          const tokenAPriceUsd = tokenAIsStable ? 1 : (currentPrice > 0 ? solPriceUsd : 1);
-          const tokenBPriceUsd = tokenBIsStable ? 1 : solPriceUsd;
           liquidityUsd = tokenAUi * tokenAPriceUsd + tokenBUi * tokenBPriceUsd;
         } catch (liqErr) {
           logger.debug('[Orca] liquidityUsd calc failed, defaulting to 0:', liqErr);
@@ -980,24 +1023,22 @@ export async function getPositions(): Promise<OrcaPosition[]> {
           });
           const feeOwedAUi = Number(feeQuote.feeOwedA.toString()) / (10 ** tokenADec);
           const feeOwedBUi = Number(feeQuote.feeOwedB.toString()) / (10 ** tokenBDec);
-          unclaimedFeesSol = feeOwedAUi;
-          unclaimedFeesUsdc = feeOwedBUi;
+          unclaimedFeesA = feeOwedAUi;
+          unclaimedFeesB = feeOwedBUi;
         } catch (feeErr) {
           // Fallback to raw on-chain feeOwedA/B (may be stale but better than 0)
           try {
             const feeOwedAUi = Number(data.feeOwedA?.toString?.() ?? '0') / (10 ** tokenADec);
             const feeOwedBUi = Number(data.feeOwedB?.toString?.() ?? '0') / (10 ** tokenBDec);
-            unclaimedFeesSol = feeOwedAUi;
-            unclaimedFeesUsdc = feeOwedBUi;
+            unclaimedFeesA = feeOwedAUi;
+            unclaimedFeesB = feeOwedBUi;
           } catch { /* leave at 0 */ }
           logger.debug('[Orca] collectFeesQuote failed, fell back to raw feeOwed:', feeErr);
         }
 
         // Derive risk tier from token composition (same logic as orcaPoolDiscovery)
         const _stables = new Set(['USDC', 'USDT', 'DAI', 'USDH', 'UXD', 'PYUSD', 'USDS']);
-        const symA = knownPool?.tokenASymbol ?? '';
-        const symB = knownPool?.tokenBSymbol ?? '';
-        const sA = _stables.has(symA.toUpperCase()), sB = _stables.has(symB.toUpperCase());
+        const sA = _stables.has(symA), sB = _stables.has(symB);
         const riskTier: 'low' | 'medium' | 'high' = (sA && sB) ? 'low' : (sA || sB) ? 'medium' : 'high';
 
         result.push({
@@ -1010,8 +1051,13 @@ export async function getPositions(): Promise<OrcaPosition[]> {
           upperPrice,
           currentPrice,
           liquidityUsd,
-          unclaimedFeesUsdc,
-          unclaimedFeesSol,
+          unclaimedFeesA,
+          unclaimedFeesB,
+          tokenAPriceUsd,
+          tokenBPriceUsd,
+          // Backward-compat aliases (deprecated)
+          unclaimedFeesUsdc: unclaimedFeesB,
+          unclaimedFeesSol: unclaimedFeesA,
           inRange,
           rangeUtilisationPct,
         });
