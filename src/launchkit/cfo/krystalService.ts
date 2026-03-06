@@ -2292,6 +2292,17 @@ export async function openEvmLpPosition(
       } catch (estErr) {
         const reason = (estErr as any)?.reason ?? (estErr as Error).message;
         logger.warn(`[Krystal] Mint estimateGas failed: ${reason}`);
+        // Record swap failure for token(s) that caused STF/revert so hasSwapFailure()
+        // blocks future pool selection involving this token (TTL 2h)
+        if (reason?.toLowerCase?.().includes('stf') || reason?.toLowerCase?.().includes('transfer')) {
+          try {
+            const swapSvc = await import('./evmSwapService.ts');
+            // Record both tokens — we don't know which one caused the STF
+            swapSvc.recordSwapFailure(chainNumericId, sortedToken0.address);
+            swapSvc.recordSwapFailure(chainNumericId, sortedToken1.address);
+            logger.info(`[Krystal] Recorded swap failure for ${sortedToken0.symbol} & ${sortedToken1.symbol} on chain ${chainNumericId} (STF revert)`);
+          } catch { /* non-fatal */ }
+        }
         return { success: false, error: `Mint would revert: ${reason}` };
       }
 

@@ -2467,11 +2467,21 @@ export async function generateDecisions(
           ? new Set([...fundedChainIds, ...Object.keys(env.evmRpcUrls).map(Number)])
           : fundedChainIds;
 
+        // Build set of chains with enough native gas for LP operations (approve×2 + swap + mint).
+        // 0.003 ETH ~= $6 — covers multi-step txs on all EVM chains comfortably.
+        const MIN_GAS_NATIVE = 0.003;
+        const gasReadyChainIds = new Set(
+          state.evmChainBalances
+            .filter(b => b.nativeBalance >= MIN_GAS_NATIVE)
+            .map(b => b.chainId),
+        );
+
         const eligible = pools.filter(p =>
           p.tvlUsd >= env.krystalLpMinTvlUsd &&
           p.apr7d >= learnedMinApr &&
           (env.evmRpcUrls[p.chainNumericId] || p.chainNumericId === 42161) &&
           deployableChainIds.has(p.chainNumericId) && // deploy on funded chains OR bridge-reachable chains
+          gasReadyChainIds.has(p.chainNumericId) &&   // must have enough native gas on target chain
           env.krystalLpRiskTiers.has(p.riskTier) &&
           // Skip pools with known-unswappable tokens (populated by pre-flight failures, TTL 2h)
           !swapSvc.hasSwapFailure(p.chainNumericId, p.token0.address) &&
@@ -4588,7 +4598,9 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
             err.includes('not on') ||  // "Pool not on X factory"
             err.includes('no gas') ||
             err.includes('no nfpm') ||
-            err.includes('no swap route')
+            err.includes('no swap route') ||
+            err.includes('would revert') || // pre-flight simulation failure (STF, etc.)
+            err.includes('stf')              // SafeTransferFrom — token contract blocking transfers
           ) {
             markDecision('KRYSTAL_LP_OPEN');
             logger.info(`[CFO:Decision] KRYSTAL_LP_OPEN failed (deterministic) — marking cooldown to avoid retry: ${err.slice(0, 80)}`);

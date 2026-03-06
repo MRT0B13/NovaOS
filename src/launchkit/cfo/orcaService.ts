@@ -947,12 +947,27 @@ export async function getPositions(): Promise<OrcaPosition[]> {
         // currentPrice = tokenB-per-tokenA from the pool's sqrtPriceX64.
         // If one side is a stablecoin, currentPrice IS the USD price of the other.
         // If one side is SOL/WSOL, use solPriceUsd and derive the other.
+        //
+        // CRITICAL: Use mint addresses (not symbols) for identification because
+        // auto-registered pools may not have symbols in the registry.
+        const mintA = poolData.tokenMintA.toBase58();
+        const mintB = poolData.tokenMintB.toBase58();
         const symA = (knownPool?.tokenASymbol ?? '').toUpperCase();
         const symB = (knownPool?.tokenBSymbol ?? '').toUpperCase();
-        const tokenAIsStable = _isStableToken(symA);
-        const tokenBIsStable = _isStableToken(symB);
-        const tokenAIsSol = symA === 'SOL' || symA === 'WSOL';
-        const tokenBIsSol = symB === 'SOL' || symB === 'WSOL';
+
+        const _KNOWN_STABLE_MINTS = new Set([
+          'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+          'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',  // USDT
+          'USDhTjkwnpNQoB7VFMXmrz2sg9Ho22HSqYGh5oGJHfN',   // USDH
+          '7kbnvuGBxxj8AG9qp8Scn56muWGaRaFqxg1FsRp3PaFT',  // UXD
+          '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo',  // PYUSD
+        ]);
+        const _SOL_MINT = 'So11111111111111111111111111111111111111112';
+
+        const tokenAIsStable = _KNOWN_STABLE_MINTS.has(mintA) || _isStableToken(symA);
+        const tokenBIsStable = _KNOWN_STABLE_MINTS.has(mintB) || _isStableToken(symB);
+        const tokenAIsSol = mintA === _SOL_MINT || symA === 'SOL' || symA === 'WSOL';
+        const tokenBIsSol = mintB === _SOL_MINT || symB === 'SOL' || symB === 'WSOL';
 
         let tokenAPriceUsd: number;
         let tokenBPriceUsd: number;
@@ -1037,16 +1052,20 @@ export async function getPositions(): Promise<OrcaPosition[]> {
         }
 
         // Derive risk tier from token composition (same logic as orcaPoolDiscovery)
-        const _stables = new Set(['USDC', 'USDT', 'DAI', 'USDH', 'UXD', 'PYUSD', 'USDS']);
-        const sA = _stables.has(symA), sB = _stables.has(symB);
+        // Use both mint and symbol checks so auto-registered pools without symbols still get correct tier
+        const sA = tokenAIsStable, sB = tokenBIsStable;
         const riskTier: 'low' | 'medium' | 'high' = (sA && sB) ? 'low' : (sA || sB) ? 'medium' : 'high';
+
+        // Use original-cased symbols for display (fall back to mint-derived labels)
+        const displayA = knownPool?.tokenASymbol || (tokenAIsSol ? 'SOL' : (tokenAIsStable ? 'USDC' : ''));
+        const displayB = knownPool?.tokenBSymbol || (tokenBIsSol ? 'SOL' : (tokenBIsStable ? 'USDC' : ''));
 
         result.push({
           positionMint: parsed.mint,
           whirlpoolAddress: poolAddress,
-          tokenA: symA || undefined,
-          tokenB: symB || undefined,
-          riskTier: (symA || symB) ? riskTier : undefined,
+          tokenA: displayA || undefined,
+          tokenB: displayB || undefined,
+          riskTier: (displayA || displayB) ? riskTier : undefined,
           lowerPrice,
           upperPrice,
           currentPrice,
