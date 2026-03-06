@@ -1092,6 +1092,14 @@ export class CFOAgent extends BaseAgent {
             const resultAny = r as any;
             // Use actual deployed USD from the mint result if available, fall back to target
             const actualUsd = resultAny.actualDeployUsd ?? p.deployUsd ?? 0;
+
+            // Guard: don't persist positions with negligible actual value
+            // This prevents phantom $0 positions from being tracked (e.g. mints
+            // that succeeded on-chain but deposited near-zero token amounts).
+            if (actualUsd < 2) {
+              logger.warn(`[CFO] Skipping persist for KRYSTAL_LP_OPEN: actualUsd=$${actualUsd.toFixed(2)} too small (min $2). Pair: ${p.pair} on ${p.chainName}`);
+              break;
+            }
             await this.repo.insertTransaction({
               id: `tx-krystal-lp-open-${r.txId ?? Date.now()}`, timestamp: now,
               chain: p.chainName ?? 'evm', strategyTag: 'krystal_lp', txType: 'liquidity_add' as TransactionType,
@@ -1150,6 +1158,12 @@ export class CFOAgent extends BaseAgent {
             const pool = p.pool ?? {};
             const resultAny = r as any;
             const actualUsd = resultAny.actualDeployUsd ?? p.deployUsd ?? 0;
+
+            // Guard: don't persist increases with negligible actual value
+            if (actualUsd < 1) {
+              logger.warn(`[CFO] Skipping persist for KRYSTAL_LP_INCREASE: actualUsd=$${actualUsd.toFixed(2)} too small. PosId: ${p.existingPosId}`);
+              break;
+            }
             await this.repo.insertTransaction({
               id: `tx-krystal-lp-increase-${Date.now()}`, timestamp: now,
               chain: p.chainName ?? 'evm', strategyTag: 'krystal_lp', txType: 'liquidity_add' as TransactionType,

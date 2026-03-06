@@ -1176,6 +1176,7 @@ function adaptiveLpRangeWidthPct(
   intel: SwarmIntel,
   baseWidthPct: number,
   learned?: AdaptiveParams,
+  token1Symbol?: string,
 ): number {
   // Apply learned LP range multiplier (wider if high OOR rate, tighter if profitable)
   const learnedBase = learned
@@ -1188,7 +1189,9 @@ function adaptiveLpRangeWidthPct(
     return learnedBase; // stale or missing — safe default
   }
 
-  const analystPrice = intel.analystPrices?.[tokenSymbol];
+  // Try primary symbol first, then fallback to token1 (e.g. when token0=USDC)
+  const analystPrice = intel.analystPrices?.[tokenSymbol]
+    ?? (token1Symbol ? intel.analystPrices?.[token1Symbol] : undefined);
   if (!analystPrice) return learnedBase;
 
   const absChange = Math.abs(analystPrice.change24h ?? 0);
@@ -1196,20 +1199,27 @@ function adaptiveLpRangeWidthPct(
   if (absChange > 15) return Math.min(learnedBase * 2.0, 60);  // very volatile: ±30% max
   if (absChange > 10) return Math.min(learnedBase * 1.5, 40);  // volatile: ±20%
   if (absChange > 5)  return learnedBase;                       // normal: use configured width
-  if (absChange > 2)  return Math.max(learnedBase * 0.75, 10); // calm: tighten to ±7.5%
-  return Math.max(learnedBase * 0.5, 8);                        // very calm: ±5-6% for max fees
+  if (absChange > 2)  return Math.max(learnedBase * 0.7, 6);   // calm: tighten aggressively
+  return Math.max(learnedBase * 0.45, 4);                       // very calm: ±2-3% for max fees
 }
 
 /**
  * Compute adaptive LP range width in ticks for EVM concentrated LP.
  * Mirrors adaptiveLpRangeWidthPct() but returns tick-based width (e.g. 400 = ±200 ticks).
  * Wider in volatile conditions, narrower when calm.
+ *
+ * @param tokenSymbol  Primary token symbol (usually the volatile side, e.g. WETH)
+ * @param intel        Swarm intel with analyst prices
+ * @param baseWidthTicks  Pre-computed base width (already includes tier × learned tier multipliers)
+ * @param learned      Learning engine adaptive params
+ * @param token1Symbol Optional second token symbol — if token0 has no analyst data, try token1
  */
 function adaptiveLpRangeWidthTicks(
   tokenSymbol: string,
   intel: SwarmIntel,
   baseWidthTicks: number,
   learned?: AdaptiveParams,
+  token1Symbol?: string,
 ): number {
   // Apply learned LP range multiplier
   const learnedBase = learned
@@ -1221,16 +1231,22 @@ function adaptiveLpRangeWidthTicks(
     return learnedBase;
   }
 
-  const analystPrice = intel.analystPrices?.[tokenSymbol];
+  // Try token0 first, then token1 — this handles cases where token0
+  // is a stable (USDC) with no analyst price but token1 (cbBTC, WETH) does.
+  const analystPrice = intel.analystPrices?.[tokenSymbol]
+    ?? (token1Symbol ? intel.analystPrices?.[token1Symbol] : undefined);
   if (!analystPrice) return learnedBase;
 
   const absChange = Math.abs(analystPrice.change24h ?? 0);
 
+  // Tighter floors than before — concentrated liquidity earns more fees
+  // at narrower ranges when volatility is low. Old floor of 150 was too
+  // conservative and left significant fee revenue on the table.
   if (absChange > 15) return Math.min(learnedBase * 2.0, 2000); // very volatile
   if (absChange > 10) return Math.min(learnedBase * 1.5, 1200);  // volatile
   if (absChange > 5)  return learnedBase;                        // normal
-  if (absChange > 2)  return Math.max(learnedBase * 0.75, 200); // calm
-  return Math.max(learnedBase * 0.5, 150);                        // very calm
+  if (absChange > 2)  return Math.max(learnedBase * 0.7, 80);   // calm: tighter (was 0.75/200)
+  return Math.max(learnedBase * 0.45, 60);                        // very calm: much tighter (was 0.5/150)
 }
 
 /**
@@ -2240,9 +2256,9 @@ export async function generateDecisions(
 
     // ── Tier-based range width multipliers (mirrored from Krystal) ──
     const ORCA_TIER_RANGE_MULT: Record<string, number> = {
-      low: 0.4,    // stables barely move → narrow range captures more fees
-      medium: 1.0, // standard range
-      high: 2.0,   // volatile pairs need wide range to stay in-range
+      low: 0.3,    // stables barely move → narrow range captures more fees
+      medium: 0.8, // tighter than old 1.0 — earn more fees while near-price
+      high: 1.5,   // volatile pairs need wide range but 2.0 was too generous
     };
     const ORCA_TIER_REBALANCE_MULT: Record<string, number> = {
       low: 0.8,    // stables rebalance sooner (tight range)
@@ -2264,6 +2280,7 @@ export async function generateDecisions(
           ? await getPoolByAddress(pos.whirlpoolAddress).catch(() => null)
           : null;
         const tokenASymbol = pos.tokenA ?? poolInfo?.tokenA.symbol ?? 'SOL';
+        const tokenBSymbol = pos.tokenB ?? poolInfo?.tokenB?.symbol ?? 'USDC';
 
         decisions.push({
           type: 'ORCA_LP_REBALANCE',
@@ -2282,6 +2299,7 @@ export async function generateDecisions(
               intel,
               env.orcaLpRangeWidthPct * tierRangeMult * learnedTierMult,
               learned,
+              tokenBSymbol,
             ),
           },
           urgency: pos.inRange ? 'low' : 'medium',
@@ -2360,7 +2378,7 @@ export async function generateDecisions(
       const s0 = _stableSet.has(t0.toUpperCase()), s1 = _stableSet.has(t1.toUpperCase());
       return s0 && s1 ? 'low' : (s0 || s1) ? 'medium' : 'high';
     };
-    const _tierRangeMults: Record<string, number> = { low: 0.4, medium: 1.0, high: 2.0 };
+    const _tierRangeMults: Record<string, number> = { low: 0.3, medium: 0.8, high: 1.5 };
 
     for (const pos of state.evmLpPositions) {
       const posTier = _inferTier(pos.token0Symbol, pos.token1Symbol);
@@ -2394,6 +2412,7 @@ export async function generateDecisions(
               intel,
               env.krystalLpRangeWidthTicks * tierMult * learnedTierMult,
               learned,
+              pos.token1Symbol,
             )),
           },
           urgency: pos.inRange ? 'low' : 'medium',
@@ -2484,10 +2503,12 @@ export async function generateDecisions(
         }
 
         // ── Tier-based range width multipliers ──
+        // Tighter ranges = more concentrated liquidity = higher fee capture.
+        // Only widen for genuinely volatile pairs, and even then keep it moderate.
         const TIER_RANGE_MULT: Record<string, number> = {
-          low: 0.4,    // stables barely move → narrow range captures more fees
-          medium: 1.0, // standard range
-          high: 2.0,   // volatile pairs need wide range to stay in-range
+          low: 0.3,    // stables barely move → very narrow range captures max fees
+          medium: 0.8, // major-volatile/stable pairs → moderately narrow (was 1.0)
+          high: 1.5,   // volatile pairs need wider range but not 2x (was 2.0)
         };
 
         // ── Tier-based rebalance trigger adjustments (lower = more sensitive) ──
@@ -2505,11 +2526,21 @@ export async function generateDecisions(
         const bestSolanaApr = state.orcaLpFeeApy ?? 0;
         let tiersOpened = 0;
 
+        // Track pairs already selected for OPEN this cycle to prevent duplicate
+        // positions for the same pair across tiers (e.g. WETH/USDC appearing in
+        // both 'medium' and 'high' tiers from different DEXes).
+        const pairsSelectedThisCycle = new Set<string>();
+
         for (const tier of enabledTiers) {
           // Respect max positions (could have filled up from another tier)
           if (state.evmLpPositions.length + tiersOpened >= env.krystalLpMaxPositions) break;
 
-          const tierPools = newPools.filter(p => p.riskTier === tier);
+          // Exclude pools whose pair was already selected in another tier this cycle
+          const tierPools = newPools.filter(p =>
+            p.riskTier === tier &&
+            !pairsSelectedThisCycle.has(`${p.chainNumericId}_${p.token0.symbol.toUpperCase()}_${p.token1.symbol.toUpperCase()}`) &&
+            !pairsSelectedThisCycle.has(`${p.chainNumericId}_${p.token1.symbol.toUpperCase()}_${p.token0.symbol.toUpperCase()}`),
+          );
           if (tierPools.length === 0) {
             krystalSkip(`no ${tier}-risk NEW pools pass filters (${newPools.length} new, ${increasePools.length} increase-eligible)`);
             continue;
@@ -2548,6 +2579,7 @@ export async function generateDecisions(
             intel,
             env.krystalLpRangeWidthTicks * tierRangeMult * learnedTierMult,
             learned,
+            best.token1.symbol,
           ));
 
           decisions.push({
@@ -2593,6 +2625,15 @@ export async function generateDecisions(
             tier: classifyTier('KRYSTAL_LP_OPEN', 'low', deployUsd, config, intel.marketCondition),
           });
           tiersOpened++;
+
+          // Mark this pair as selected so no other tier can open it again this cycle
+          const pairKey0 = `${best.chainNumericId}_${best.token0.symbol.toUpperCase()}_${best.token1.symbol.toUpperCase()}`;
+          const pairKey1 = `${best.chainNumericId}_${best.token1.symbol.toUpperCase()}_${best.token0.symbol.toUpperCase()}`;
+          pairsSelectedThisCycle.add(pairKey0);
+          pairsSelectedThisCycle.add(pairKey1);
+          // Also add to existingPairMap so INCREASE section doesn't double-up
+          existingPairMap.set(pairKey0, { posId: 'pending', inRange: true, valueUsd: deployUsd });
+          existingPairMap.set(pairKey1, { posId: 'pending', inRange: true, valueUsd: deployUsd });
         }
 
         // ── KRYSTAL_LP_INCREASE: add liquidity to existing in-range positions ──
@@ -2770,7 +2811,7 @@ export async function generateDecisions(
         const estimatedLpFeeApy = 0.15;
         const borrowCost = state.kaminoBorrowApy > 0 ? state.kaminoBorrowApy : 0.08;
         const spreadPct = (estimatedLpFeeApy - borrowCost) * 100;
-        const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct, learned);
+        const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct, learned, 'USDC');
 
         decisions.push({
           type: 'KAMINO_BORROW_LP',
@@ -2832,7 +2873,7 @@ export async function generateDecisions(
         borrowLpSkip(`spread ${spreadPct.toFixed(1)}% < min ${env.kaminoBorrowLpMinSpreadPct ?? 5}% (LP ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow ~${(borrowCost * 100).toFixed(0)}%)`);
       } else {
         // ── 3-tier risk system: discover pools, use classifier tiers, open one per enabled tier ──
-        const ORCA_TIER_RANGE_MULT_K: Record<string, number> = { low: 0.4, medium: 1.0, high: 2.0 };
+        const ORCA_TIER_RANGE_MULT_K: Record<string, number> = { low: 0.3, medium: 0.8, high: 1.5 };
 
         // Get discovered pools (cached — refreshes every 2h)
         // Pools already carry riskTier from classifyOrcaPoolRisk() in orcaPoolDiscovery.ts
@@ -2910,6 +2951,7 @@ export async function generateDecisions(
             intel,
             env.orcaLpRangeWidthPct * tierRangeMult * learnedTierMult,
             learned,
+            tokenB,
           );
 
           decisions.push({
@@ -2967,7 +3009,7 @@ export async function generateDecisions(
           const borrowUsd = totalBorrowBudget;
           const usdcSide = borrowUsd / 2;
           const solSide = borrowUsd / 2 / state.solPriceUsd;
-          const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct, learned);
+          const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct, learned, 'USDC');
 
           decisions.push({
             type: 'KAMINO_BORROW_LP',
@@ -3039,7 +3081,6 @@ export async function generateDecisions(
     if (deployUsd >= 20) {
       const usdcSide = deployUsd / 2;
       const solSide = deployUsd / 2 / state.solPriceUsd;
-      const adaptiveRange = adaptiveLpRangeWidthPct('SOL', intel, env.orcaLpRangeWidthPct, learned);
 
       // Try to use discovered pools
       let selectedPool: any = null;
@@ -3055,6 +3096,7 @@ export async function generateDecisions(
       const pair = selectedPool?.pair ?? 'SOL/USDC';
       const tokenA = selectedPool?.tokenA?.symbol ?? 'SOL';
       const tokenB = selectedPool?.tokenB?.symbol ?? 'USDC';
+      const adaptiveRange = adaptiveLpRangeWidthPct(tokenA, intel, env.orcaLpRangeWidthPct, learned, tokenB);
 
       decisions.push({
         type: 'ORCA_LP_OPEN',
@@ -3186,6 +3228,7 @@ export async function generateDecisions(
       taStopLossPct?: number;
       taTakeProfitPct?: number;
       taMaxHoldHours?: number;
+      taLeverage?: number;          // per-style leverage from StyleConfig × learned multiplier
     };
 
     const signals: CoinSignal[] = [];
@@ -3351,8 +3394,15 @@ export async function generateDecisions(
           // ── TA-specific params ────────────────────────────────────────
           const styleSizeMult = learned.hlPerpStyleSizeMultipliers?.[taSig.style] ?? 1.0;
           const styleStopMult = learned.hlPerpStyleStopMultipliers?.[taSig.style] ?? 1.0;
+          const styleLevMult = learned.hlPerpStyleLeverageMultipliers?.[taSig.style] ?? 1.0;
           const styleConfig = ta.getStyleConfig(taSig.style);
           const learnedStyleSL = applyAdaptive(styleConfig.stopLossPct, styleStopMult, conf);
+          // Per-style leverage: StyleConfig base × learned multiplier, capped at env max
+          const styleLevBase = styleConfig.defaultLeverage ?? env.hlPerpDefaultLeverage;
+          const learnedStyleLev = Math.min(
+            env.maxHyperliquidLeverage,
+            Math.max(1, Math.round(applyAdaptive(styleLevBase, styleLevMult, conf))),
+          );
 
           signals.push({
             coin: taSig.coin,
@@ -3364,6 +3414,7 @@ export async function generateDecisions(
             taStopLossPct: learnedStyleSL,
             taTakeProfitPct: styleConfig.takeProfitPct,
             taMaxHoldHours: styleConfig.maxHoldHours,
+            taLeverage: learnedStyleLev,
           });
         }
 
@@ -3426,6 +3477,9 @@ export async function generateDecisions(
         continue;
       }
 
+      // ── Leverage: TA signals carry per-style leverage, sentiment uses default ──
+      const effectiveLeverage = sig.taLeverage ?? env.hlPerpDefaultLeverage;
+
       // ── Size: TA uses per-style learned multiplier, sentiment uses base ──
       const effectiveSizeMult = sig.tradeStyle
         ? (learned.hlPerpStyleSizeMultipliers?.[sig.tradeStyle] ?? 1.0)
@@ -3434,7 +3488,7 @@ export async function generateDecisions(
       const sizeUsd = Math.min(
         effectiveMaxPosUsd * sig.conviction,
         maxTotalUsd - openUsd,
-        state.hlAvailableMargin * env.hlPerpDefaultLeverage * 0.8,
+        state.hlAvailableMargin * effectiveLeverage * 0.8,
       );
 
       if (sizeUsd < 10) {
@@ -3451,7 +3505,7 @@ export async function generateDecisions(
         reasoning:
           `${sig.side} ${sig.coin}-PERP: conviction ${(sig.conviction * 100).toFixed(0)}% ` +
           `[${sig.reasoning}]. ` +
-          `Size: $${sizeUsd.toFixed(0)} at ${env.hlPerpDefaultLeverage}x. ` +
+          `Size: $${sizeUsd.toFixed(0)} at ${effectiveLeverage}x. ` +
           `SL: ${effectiveSL.toFixed(1)}% / TP: ${effectiveTP}%.` +
           `${sig.taMaxHoldHours ? ` maxHold: ${sig.taMaxHoldHours}h.` : ''} ` +
           `HL margin: $${state.hlAvailableMargin.toFixed(0)}. ` +
@@ -3460,7 +3514,7 @@ export async function generateDecisions(
           coin: sig.coin,
           side: sig.side,
           sizeUsd,
-          leverage: env.hlPerpDefaultLeverage,
+          leverage: effectiveLeverage,
           stopLossPct: effectiveSL,
           takeProfitPct: effectiveTP,
           signal: sig.sources.join('+'),
@@ -4518,7 +4572,27 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         }
 
         const result = await krystal.openEvmLpPosition(pool, deployUsd, rangeWidthTicks, resolvedBridgeFunding);
-        if (result.success) markDecision('KRYSTAL_LP_OPEN');
+        if (result.success) {
+          markDecision('KRYSTAL_LP_OPEN');
+        } else {
+          // Mark cooldown on deterministic/repeatable failures to prevent
+          // hammering the same doomed open every cycle (insufficient funds,
+          // one-sided zap, pool not on factory, gas issues, etc.)
+          const err = String(result.error ?? '').toLowerCase();
+          if (
+            err.includes('insufficient funding') ||
+            err.includes('zap swap failed') ||
+            err.includes('cannot mint') ||
+            err.includes('no token0 or token1') ||
+            err.includes('not on') ||  // "Pool not on X factory"
+            err.includes('no gas') ||
+            err.includes('no nfpm') ||
+            err.includes('no swap route')
+          ) {
+            markDecision('KRYSTAL_LP_OPEN');
+            logger.info(`[CFO:Decision] KRYSTAL_LP_OPEN failed (deterministic) — marking cooldown to avoid retry: ${err.slice(0, 80)}`);
+          }
+        }
         return {
           ...base,
           executed: true,

@@ -106,7 +106,7 @@ export interface CFOEnv {
   krystalLpMinTvlUsd: number;                     // min pool TVL filter (default 500000)
   krystalLpMinApr7d: number;                      // min 7d APR filter (default 15)
   krystalLpMaxPositions: number;                  // max concurrent EVM LP positions (default 3)
-  krystalLpRangeWidthTicks: number;               // range width in ticks (default 400)
+  krystalLpRangeWidthTicks: number;               // range width in ticks (default 300, ±150 ticks ≈ ±1.5%)
   krystalLpRebalanceTriggerPct: number;           // rebalance when utilisation drops below X% (default 10)
   krystalLpRiskTiers: Set<string>;                 // enabled risk tiers: low,medium,high (default: low,medium)
   krystalLpOpenCooldownMs: number;                // cooldown between KRYSTAL_LP_OPEN decisions (default 4h)
@@ -137,9 +137,11 @@ export interface CFOEnv {
   // ── x402 Micropayments ────────────────────────────────────────────
   x402PriceRugcheck: number;                      // USDC per rug-check report
   x402PriceSignal: number;                        // USDC per KOL signal
-  x402PriceTrend: number;                         // USDC per trend report  x402PriceScoutDigest: number;                   // USDC per scout digest
+  x402PriceTrend: number;                         // USDC per trend report
+  x402PriceScoutDigest: number;                   // USDC per scout digest
   x402PriceNarrativeShift: number;                // USDC per narrative shift report
-  x402PriceLpPositions: number;                   // USDC per LP positions snapshot  x402BaseUrl: string;                            // Nova's public API base URL
+  x402PriceLpPositions: number;                   // USDC per LP positions snapshot
+  x402BaseUrl: string;                            // Nova's public API base URL
 
   // ── Helius ────────────────────────────────────────────────────────
   heliusApiKey: string | undefined;
@@ -321,7 +323,7 @@ export function getCFOEnv(bust = false): CFOEnv {
     kaminoLstLoopEnabled: process.env.CFO_KAMINO_LST_LOOP_ENABLE === 'true',
     kaminoMultiplyVaultEnabled: process.env.CFO_KAMINO_MULTIPLY_VAULT_ENABLE === 'true',
     orcaLpEnabled: process.env.CFO_ORCA_LP_ENABLE === 'true',
-    orcaLpRangeWidthPct: Number(process.env.CFO_ORCA_LP_RANGE_WIDTH_PCT ?? 20),
+    orcaLpRangeWidthPct: Number(process.env.CFO_ORCA_LP_RANGE_WIDTH_PCT ?? 15),  // tightened from 20% for better fee capture
     orcaLpMaxUsd: Number(process.env.CFO_ORCA_LP_MAX_USD ?? 500),
     orcaLpRebalanceTriggerPct: Number(process.env.CFO_ORCA_LP_REBALANCE_TRIGGER_PCT ?? 5),
     orcaLpMaxPositions: Number(process.env.CFO_ORCA_LP_MAX_POSITIONS ?? 3),
@@ -336,7 +338,7 @@ export function getCFOEnv(bust = false): CFOEnv {
     krystalLpMinTvlUsd: Number(process.env.CFO_KRYSTAL_LP_MIN_TVL_USD ?? 500_000),
     krystalLpMinApr7d: Number(process.env.CFO_KRYSTAL_LP_MIN_APR_7D ?? 15),
     krystalLpMaxPositions: Number(process.env.CFO_KRYSTAL_LP_MAX_POSITIONS ?? 3),
-    krystalLpRangeWidthTicks: Number(process.env.CFO_KRYSTAL_LP_RANGE_WIDTH_TICKS ?? 400),
+    krystalLpRangeWidthTicks: Number(process.env.CFO_KRYSTAL_LP_RANGE_WIDTH_TICKS ?? 300),
     krystalLpRebalanceTriggerPct: Number(process.env.CFO_KRYSTAL_LP_REBALANCE_TRIGGER_PCT ?? 10),
     krystalLpRiskTiers: new Set(
       (process.env.CFO_KRYSTAL_LP_RISK_TIERS ?? 'low,medium,high')
@@ -378,5 +380,5 @@ export function getCFOEnv(bust = false): CFOEnv {
     emergencyCooldownMinutes: Number(process.env.CFO_EMERGENCY_COOLDOWN_MINUTES ?? 240),
   };
 
-  return _cached;
+  return _cached!;
 }

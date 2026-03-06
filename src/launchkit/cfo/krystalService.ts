@@ -1564,9 +1564,32 @@ export async function openEvmLpPosition(
       usdPerToken0 = 1;
       usdPerToken1 = 1 / price0In1;
     } else {
+      // Neither token is a stablecoin (e.g. SIREN/WBNB, cbBTC/WETH).
+      // Identify which token (if any) is the chain's wrapped native so we can
+      // anchor pricing to the native-token oracle price.
       const nPrice = await getNativeTokenPrice(chainNumericId);
-      usdPerToken0 = nPrice;
-      usdPerToken1 = nPrice * price0In1;
+      const wrappedAddr = WRAPPED_NATIVE_ADDR[chainNumericId]?.toLowerCase();
+      const is0Native = wrappedAddr && pool.token0.address.toLowerCase() === wrappedAddr;
+      const is1Native = wrappedAddr && pool.token1.address.toLowerCase() === wrappedAddr;
+
+      if (is0Native) {
+        // token0 IS the native wrapper (e.g. WETH/SIREN) → anchor token0
+        usdPerToken0 = nPrice;
+        usdPerToken1 = nPrice / price0In1; // 1 t0 = price0In1 t1 → t1 = nPrice / price0In1
+      } else if (is1Native) {
+        // token1 IS the native wrapper (e.g. SIREN/WBNB) → anchor token1
+        usdPerToken1 = nPrice;
+        usdPerToken0 = price0In1 * nPrice; // 1 t0 = price0In1 × t1_usd
+      } else {
+        // Neither token is native (rare, e.g. PEPE/SHIB) — best-effort: use
+        // ratio from pool & native price, log a warning.
+        logger.warn(
+          `[Krystal] Neither ${pool.token0.symbol} nor ${pool.token1.symbol} is wrapped native ` +
+          `on chain ${chainNumericId} — pricing may be inaccurate (using native price as token0 proxy).`,
+        );
+        usdPerToken0 = nPrice;
+        usdPerToken1 = nPrice / price0In1;
+      }
     }
 
     // Compute total value of currently-held tokens
@@ -1701,6 +1724,12 @@ export async function openEvmLpPosition(
             // No single source covers the full amount — log total available
             const totalAvailable = allCandidates.reduce((s, c) => s + c.balance, 0);
             logger.warn(`[Krystal] Insufficient funds on source chain ${srcChain}: $${totalAvailable.toFixed(2)} available < $${bridgeAmountUsd.toFixed(2)} needed`);
+
+            // If the target chain also has zero balance, abort early — no point
+            // proceeding to zap/mint with nothing.
+            if (totalHeldUsd < 1) {
+              return { success: false, error: `Insufficient funds: $${totalAvailable.toFixed(2)} on source chain + $${totalHeldUsd.toFixed(2)} on target chain` };
+            }
           }
         }
       } catch (err) {
@@ -2328,6 +2357,19 @@ export async function openEvmLpPosition(
 
     const verb = existingTokenId ? 'LP increased' : 'LP minted';
     logger.info(`[Krystal] ${verb}: tokenId=${tokenId} tx=${receipt.hash} actual=$${realDeployUsd.toFixed(2)}`);
+
+    // Post-mint guard: if the actual deposited value is negligible ($<1),
+    // the position is worthless and shouldn't be persisted upstream.
+    // This catches cases where the NFPM accepted the tx but deposited
+    // near-zero amounts (e.g. extreme tick misalignment, dust zaps).
+    if (realDeployUsd < 1 && !existingTokenId) {
+      logger.warn(
+        `[Krystal] Post-mint value too low: $${realDeployUsd.toFixed(2)} — position ${tokenId} ` +
+        `is effectively empty. Returning failure to prevent phantom persist.`,
+      );
+      return { success: false, error: `Minted position value negligible ($${realDeployUsd.toFixed(2)})`, tokenId, txHash: receipt.hash };
+    }
+
     return { success: true, tokenId, txHash: receipt.hash, actualDeployUsd: realDeployUsd };
   } catch (err) {
     logger.error('[Krystal] openEvmLpPosition error:', err);

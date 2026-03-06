@@ -58,9 +58,11 @@ export interface MTFSignal {
   conviction: number;             // 0-1 combined conviction
   triggerTf: TimeframeSignal;     // lower timeframe (entry trigger)
   filterTf: TimeframeSignal;      // higher timeframe (directional filter)
+  microTf?: TimeframeSignal;      // micro timeframe (1m for scalps, optional)
   reasoning: string;
   stopLossPct: number;
   takeProfitPct: number;
+  leverage: number;               // style-specific base leverage
 }
 
 /** Configuration per trade style */
@@ -69,6 +71,10 @@ export interface StyleConfig {
   triggerInterval: CandleInterval;
   /** Higher timeframe (bias filter) */
   filterInterval: CandleInterval;
+  /** Micro timeframe for extra-tight entry confirmation (optional, e.g. 1m for scalps) */
+  microTriggerInterval?: CandleInterval;
+  /** Candle lookback for micro trigger TF */
+  microTriggerLookback?: number;
   /** Candle lookback for trigger TF (number of candles to fetch) */
   triggerLookback: number;
   /** Candle lookback for filter TF */
@@ -79,17 +85,22 @@ export interface StyleConfig {
   takeProfitPct: number;
   /** Max hold duration in hours (0 = unlimited) */
   maxHoldHours: number;
+  /** Default leverage for this style (scalp=3x, day=2x, swing=2x) */
+  defaultLeverage: number;
 }
 
 const STYLE_CONFIGS: Record<TradeStyle, StyleConfig> = {
   scalp: {
     triggerInterval: '5m',
     filterInterval: '1h',
-    triggerLookback: 100,   // ~8.3 hours of 5m candles (enough for EMA 50)
-    filterLookback: 60,     // 60 hours of 1h candles
+    microTriggerInterval: '1m',   // 1m chart for tighter entry confirmation
+    microTriggerLookback: 60,     // 60 × 1m = 1h of 1m candles (enough for EMA 50)
+    triggerLookback: 100,         // ~8.3 hours of 5m candles (enough for EMA 50)
+    filterLookback: 60,           // 60 hours of 1h candles
     stopLossPct: 1.5,
     takeProfitPct: 3,
     maxHoldHours: 1,
+    defaultLeverage: 3,           // scalps use higher leverage — tight SL limits risk
   },
   day: {
     triggerInterval: '1h',
@@ -99,6 +110,7 @@ const STYLE_CONFIGS: Record<TradeStyle, StyleConfig> = {
     stopLossPct: 3,
     takeProfitPct: 8,
     maxHoldHours: 24,
+    defaultLeverage: 2,
   },
   swing: {
     triggerInterval: '1d',
@@ -108,6 +120,7 @@ const STYLE_CONFIGS: Record<TradeStyle, StyleConfig> = {
     stopLossPct: 5,
     takeProfitPct: 15,
     maxHoldHours: 168,       // 7 days
+    defaultLeverage: 2,
   },
 };
 
@@ -401,11 +414,15 @@ export async function analyseMultiTimeframe(
 ): Promise<MTFSignal | null> {
   const cfg = STYLE_CONFIGS[style];
 
-  // Fetch candles for both timeframes in parallel
-  const [triggerCandles, filterCandles] = await Promise.all([
+  // Fetch candles for both timeframes in parallel (+ micro TF if configured)
+  const fetches: Promise<Candle[]>[] = [
     fetchCandles(coin, cfg.triggerInterval, cfg.triggerLookback),
     fetchCandles(coin, cfg.filterInterval, cfg.filterLookback),
-  ]);
+  ];
+  if (cfg.microTriggerInterval && cfg.microTriggerLookback) {
+    fetches.push(fetchCandles(coin, cfg.microTriggerInterval, cfg.microTriggerLookback));
+  }
+  const [triggerCandles, filterCandles, microCandles] = await Promise.all(fetches);
 
   if (triggerCandles.length < 21 || filterCandles.length < 21) {
     return null; // not enough data
@@ -413,6 +430,12 @@ export async function analyseMultiTimeframe(
 
   const triggerTf = analyseTimeframe(triggerCandles, cfg.triggerInterval);
   const filterTf = analyseTimeframe(filterCandles, cfg.filterInterval);
+
+  // Micro timeframe analysis (1m for scalps — tighter entry confirmation)
+  let microTf: TimeframeSignal | undefined;
+  if (microCandles && microCandles.length >= 21) {
+    microTf = analyseTimeframe(microCandles, cfg.microTriggerInterval!);
+  }
 
   // ── Confluence check ──
   // For scalp & day: filter TF sets the allowed direction, trigger TF must agree
@@ -439,6 +462,18 @@ export async function analyseMultiTimeframe(
     bias = filterTf.bias;
     // Conviction = weighted blend: trigger strength matters more for entry timing
     conviction = triggerTf.strength * 0.6 + filterTf.strength * 0.4;
+
+    // Scalp with micro TF: 1m must agree or be neutral for higher conviction
+    if (style === 'scalp' && microTf) {
+      if (microTf.bias === bias) {
+        // All 3 timeframes agree (1m + 5m + 1h) — boost conviction for precision entry
+        conviction = Math.min(1.0, conviction + microTf.strength * 0.15);
+      } else if (microTf.bias !== 'NEUTRAL') {
+        // 1m disagrees with 5m+1h — dampen conviction (short-term counter-move)
+        conviction *= 0.7;
+      }
+      // 1m neutral = no adjustment, 5m+1h alone are sufficient
+    }
   }
 
   if (conviction < 0.2) return null; // too weak
@@ -460,6 +495,7 @@ export async function analyseMultiTimeframe(
   const reasoning = [
     `${style}:${bias}`,
     `${cfg.triggerInterval} ${emaCrossLabel}`,
+    ...(microTf ? [`${cfg.microTriggerInterval} micro:${microTf.bias}`] : []),
     `${cfg.filterInterval} filter:${filterTf.bias}`,
     trendLabel,
     rsiLabel,
@@ -474,9 +510,11 @@ export async function analyseMultiTimeframe(
     conviction,
     triggerTf,
     filterTf,
+    microTf,
     reasoning,
     stopLossPct: cfg.stopLossPct,
     takeProfitPct: cfg.takeProfitPct,
+    leverage: cfg.defaultLeverage,
   };
 }
 

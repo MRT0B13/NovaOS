@@ -103,6 +103,7 @@ export interface AdaptiveParams {
   hlPerpStyleSizeMultipliers: Record<string, number>;     // { scalp: 1.0, day: 1.0, swing: 1.0 }
   hlPerpStyleStopMultipliers: Record<string, number>;     // per-style SL multiplier
   hlPerpStyleConvictionFloors: Record<string, number>;    // per-style conviction floor
+  hlPerpStyleLeverageMultipliers: Record<string, number>; // per-style leverage multiplier (scalp can go higher)
 
   // LP (Orca + Krystal) — global
   lpRangeWidthMultiplier: number;  // wider/narrower ranges based on rebalance frequency
@@ -786,6 +787,7 @@ function computeAdaptiveParams(
   const perpStyleSizeMults: Record<string, number> = { scalp: 1.0, day: 1.0, swing: 1.0 };
   const perpStyleStopMults: Record<string, number> = { scalp: 1.0, day: 1.0, swing: 1.0 };
   const perpStyleConvFloors: Record<string, number> = { scalp: 0, day: 0, swing: 0 };
+  const perpStyleLevMults: Record<string, number> = { scalp: 1.0, day: 1.0, swing: 1.0 };
 
   for (const style of ['scalp', 'day', 'swing'] as const) {
     const styleSt = stats[`hl_perp_${style}`];
@@ -808,6 +810,19 @@ function computeAdaptiveParams(
     // Conviction floor: raise if too many losing trades
     if (styleSt.winRate < 0.35 && styleSt.totalPnlUsd < 0) {
       perpStyleConvFloors[style] = Math.min(0.7, 0.3 + (0.35 - styleSt.winRate));
+    }
+
+    // Leverage multiplier: scalps with tight SL benefit from higher leverage.
+    // If winning with a style, lean into higher leverage; if losing, reduce.
+    if (styleSt.winRate > 0.55 && styleSt.sharpeApprox > 0.3 && styleSt.totalPnlUsd > 0) {
+      // Profitable style — allow higher leverage (up to 1.5× base)
+      perpStyleLevMults[style] = 1.3;
+    } else if (styleSt.winRate < 0.35 && styleSt.totalPnlUsd < 0) {
+      // Losing style — reduce leverage
+      perpStyleLevMults[style] = 0.7;
+    } else if (styleSt.avgPnlUsd < -5) {
+      // Significant avg loss — cut leverage
+      perpStyleLevMults[style] = 0.6;
     }
 
     // Regime shift within style
@@ -834,7 +849,9 @@ function computeAdaptiveParams(
       lpRangeMult = Math.max(lpRangeMult, 1.3);
       lpRebalTriggerMult = Math.max(lpRebalTriggerMult, 0.8); // tighter rebalance trigger
     } else if (lp.outOfRangeRate < 0.15 && lp.avgPnlPerDayUsd > 0) {
-      lpRangeMult = Math.min(lpRangeMult, 0.85);
+      // Positions are staying in range AND profitable → tighten more aggressively
+      // Narrower ranges = higher fee concentration. Allow down to 0.65× (was 0.85).
+      lpRangeMult = Math.min(lpRangeMult, lp.outOfRangeRate < 0.05 ? 0.65 : 0.75);
     }
 
     // If avg PnL per day is negative, raise APR floor
@@ -885,7 +902,9 @@ function computeAdaptiveParams(
     } else if (avgOorRate > 0.3) {
       lpTierRangeMultipliers[tier] = 1.2;
     } else if (avgOorRate < 0.1 && avgPnlPerDay > 0) {
-      lpTierRangeMultipliers[tier] = 0.85; // always in range + profitable → tighten for more fees
+      // Positions are consistently in-range AND profitable → tighten aggressively
+      // for this tier. Lower multiplier = narrower range = more fee concentration.
+      lpTierRangeMultipliers[tier] = avgOorRate < 0.03 ? 0.6 : 0.75;
     }
 
     // Tier-specific APR floor
@@ -1028,6 +1047,11 @@ function computeAdaptiveParams(
       scalp: blend(perpStyleConvFloors.scalp, prior?.hlPerpStyleConvictionFloors?.scalp),
       day: blend(perpStyleConvFloors.day, prior?.hlPerpStyleConvictionFloors?.day),
       swing: blend(perpStyleConvFloors.swing, prior?.hlPerpStyleConvictionFloors?.swing),
+    },
+    hlPerpStyleLeverageMultipliers: {
+      scalp: blend(perpStyleLevMults.scalp, prior?.hlPerpStyleLeverageMultipliers?.scalp),
+      day: blend(perpStyleLevMults.day, prior?.hlPerpStyleLeverageMultipliers?.day),
+      swing: blend(perpStyleLevMults.swing, prior?.hlPerpStyleLeverageMultipliers?.swing),
     },
     lpRangeWidthMultiplier: blend(lpRangeMult, prior?.lpRangeWidthMultiplier),
     lpMinAprAdjustment: blend(lpMinAprAdj, prior?.lpMinAprAdjustment),
@@ -1274,6 +1298,7 @@ export function getDefaultParams(): AdaptiveParams {
     hlPerpStyleSizeMultipliers: { scalp: 1.0, day: 1.0, swing: 1.0 },
     hlPerpStyleStopMultipliers: { scalp: 1.0, day: 1.0, swing: 1.0 },
     hlPerpStyleConvictionFloors: { scalp: 0, day: 0, swing: 0 },
+    hlPerpStyleLeverageMultipliers: { scalp: 1.0, day: 1.0, swing: 1.0 },
     lpRangeWidthMultiplier: 1.0,
     lpMinAprAdjustment: 0,
     lpRebalanceTriggerMultiplier: 1.0,
