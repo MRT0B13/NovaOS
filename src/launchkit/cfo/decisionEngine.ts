@@ -4336,13 +4336,20 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
             logger.warn(`[CFO] KAMINO_BORROW_LP step 2b: USDC→${tokenB} failed — unwinding tokenA, repaying`);
             let unwindNote = 'Unwind not attempted';
             try {
-              const jupUnwindA = isTokenASol
-                ? await jupMod.swapSolToUsdc(tokenAReceived * 0.99, 100)
-                : await (async () => {
-                    const q = await jupMod.getQuote(tokenAMint!, jupMod.MINTS.USDC, tokenAReceived * 0.99, 100);
-                    if (!q) return { success: false as const, outputAmount: 0 };
-                    return jupMod.executeSwap(q);
-                  })();
+              // Use actual wallet balance instead of tokenAReceived*0.99 to avoid dust
+              const SOL_FEE_RESERVE_2B = 0.05;
+              const aMintForBal = isTokenASol ? jupMod.MINTS.SOL : tokenAMint!;
+              let unwindAmtA2 = await jupMod.getTokenBalance(aMintForBal);
+              if (isTokenASol) unwindAmtA2 = Math.max(0, unwindAmtA2 - SOL_FEE_RESERVE_2B);
+              const jupUnwindA = unwindAmtA2 > 0
+                ? isTokenASol
+                  ? await jupMod.swapSolToUsdc(unwindAmtA2, 100)
+                  : await (async () => {
+                      const q = await jupMod.getQuote(tokenAMint!, jupMod.MINTS.USDC, unwindAmtA2, 100);
+                      if (!q) return { success: false as const, outputAmount: 0 };
+                      return jupMod.executeSwap(q);
+                    })()
+                : { success: false as const, outputAmount: 0 };
               // tokenB swap failed so the second USDC half is still in wallet
               const totalUsdc = (jupUnwindA.success ? jupUnwindA.outputAmount ?? 0 : 0) + usdcAmount;
               const repay = await kamino.repay('USDC', Math.min(totalUsdc, borrowUsd) * 0.995).catch(() => ({ success: false, error: 'threw' }));
@@ -4366,30 +4373,42 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           // Mark cooldown immediately so the next cycle doesn't borrow again on top.
           markDecision('KAMINO_BORROW_LP');
           logger.error(`[CFO] KAMINO_BORROW_LP LP open failed after borrow+swap — attempting auto-unwind`);
-          // Attempt to unwind: swap the SOL we received back to USDC, then repay Kamino.
+          // Attempt to unwind: swap tokens back to USDC using ACTUAL wallet balance
+          // (not the recorded swap amount) so we don't leave $1+ of dust behind.
           let unwindNote = 'Unwind not attempted';
+          const SOL_FEE_RESERVE = 0.05; // keep for tx fees
           try {
-            // Unwind: swap tokenA back to USDC (SOL or arbitrary token)
-            const jupUnwind = isTokenASol
-              ? await jupMod.swapSolToUsdc(tokenAReceived * 0.99, 100)
-              : await (async () => {
-                  const q = await jupMod.getQuote(tokenAMint!, jupMod.MINTS.USDC, tokenAReceived * 0.99, 100);
-                  if (!q) return { success: false, inputMint: tokenAMint!, outputMint: jupMod.MINTS.USDC, inputAmount: tokenAReceived, outputAmount: 0, priceImpactPct: 0, error: 'No unwind quote' } as typeof jupMod extends { swapSolToUsdc: (...a: any[]) => Promise<infer R> } ? R : never;
-                  return jupMod.executeSwap(q);
-                })();
+            // Unwind: swap tokenA back to USDC — use real balance, not tokenAReceived*0.99
+            const tokenAMintForBal = isTokenASol ? jupMod.MINTS.SOL : tokenAMint!;
+            let unwindAmtA = await jupMod.getTokenBalance(tokenAMintForBal);
+            if (isTokenASol) unwindAmtA = Math.max(0, unwindAmtA - SOL_FEE_RESERVE);
+            const jupUnwind = unwindAmtA > 0
+              ? isTokenASol
+                ? await jupMod.swapSolToUsdc(unwindAmtA, 100)
+                : await (async () => {
+                    const q = await jupMod.getQuote(tokenAMint!, jupMod.MINTS.USDC, unwindAmtA, 100);
+                    if (!q) return { success: false, inputMint: tokenAMint!, outputMint: jupMod.MINTS.USDC, inputAmount: unwindAmtA, outputAmount: 0, priceImpactPct: 0, error: 'No unwind quote' } as typeof jupMod extends { swapSolToUsdc: (...a: any[]) => Promise<infer R> } ? R : never;
+                    return jupMod.executeSwap(q);
+                  })()
+              : { success: false as const, outputAmount: 0, error: 'zero balance' };
             if (jupUnwind.success) {
               let usdcRecovered = jupUnwind.outputAmount ?? 0;
               // If tokenB was swapped from USDC (non-USDC pool), also unwind tokenB → USDC
               if (!isTokenBUsdc && tokenBDepositAmount > 0) {
                 try {
-                  const unwindB = isTokenBSol
-                    ? await jupMod.swapSolToUsdc(tokenBDepositAmount * 0.99, 100)
-                    : await (async () => {
-                        const q = await jupMod.getQuote(tokenBMint!, jupMod.MINTS.USDC, tokenBDepositAmount * 0.99, 100);
-                        if (!q) return { success: false as const, outputAmount: 0 };
-                        return jupMod.executeSwap(q);
-                      })();
-                  usdcRecovered += unwindB.success ? (unwindB.outputAmount ?? 0) : 0;
+                  const tokenBMintForBal = isTokenBSol ? jupMod.MINTS.SOL : tokenBMint!;
+                  let unwindAmtB = await jupMod.getTokenBalance(tokenBMintForBal);
+                  if (isTokenBSol) unwindAmtB = Math.max(0, unwindAmtB - SOL_FEE_RESERVE);
+                  if (unwindAmtB > 0) {
+                    const unwindB = isTokenBSol
+                      ? await jupMod.swapSolToUsdc(unwindAmtB, 100)
+                      : await (async () => {
+                          const q = await jupMod.getQuote(tokenBMint!, jupMod.MINTS.USDC, unwindAmtB, 100);
+                          if (!q) return { success: false as const, outputAmount: 0 };
+                          return jupMod.executeSwap(q);
+                        })();
+                    usdcRecovered += unwindB.success ? (unwindB.outputAmount ?? 0) : 0;
+                  }
                 } catch { /* best-effort tokenB unwind */ }
               } else {
                 usdcRecovered += usdcAmount; // tokenB side was USDC, still in wallet
@@ -4411,6 +4430,42 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
         markDecision('KAMINO_BORROW_LP');
         logger.info(`[CFO] KAMINO_BORROW_LP step 3: opened Orca LP ${lpResult.positionMint?.slice(0, 8)} | tx: ${lpResult.txSignature}`);
+
+        // Step 4: Sweep dust — the LP rarely consumes 100% of both tokens.
+        // Swap any leftover tokenA/tokenB back to USDC so small balances
+        // (KMNO, bSOL, INF etc.) don't accumulate in the wallet.
+        try {
+          // Sweep tokenA dust (skip if SOL — that's the gas/launch reserve)
+          if (!isTokenASol && tokenAMint) {
+            const dustA = await jupMod.getTokenBalance(tokenAMint);
+            if (dustA > 0) {
+              const quoteA = await jupMod.getQuote(tokenAMint, jupMod.MINTS.USDC, dustA, 200);
+              if (quoteA) {
+                const sweepA = await jupMod.executeSwap(quoteA);
+                if (sweepA.success) {
+                  logger.info(`[CFO] KAMINO_BORROW_LP dust sweep: ${dustA.toFixed(6)} ${tokenA} → $${(sweepA.outputAmount ?? 0).toFixed(2)} USDC`);
+                }
+              }
+            }
+          }
+
+          // Sweep tokenB dust (skip if USDC — already the target; skip if SOL — gas reserve)
+          if (!isTokenBUsdc && !isTokenBSol && tokenBMint) {
+            const dustB = await jupMod.getTokenBalance(tokenBMint);
+            if (dustB > 0) {
+              const quoteB = await jupMod.getQuote(tokenBMint, jupMod.MINTS.USDC, dustB, 200);
+              if (quoteB) {
+                const sweepB = await jupMod.executeSwap(quoteB);
+                if (sweepB.success) {
+                  logger.info(`[CFO] KAMINO_BORROW_LP dust sweep: ${dustB.toFixed(6)} ${tokenB} → $${(sweepB.outputAmount ?? 0).toFixed(2)} USDC`);
+                }
+              }
+            }
+          }
+        } catch (dustErr) {
+          logger.debug(`[CFO] KAMINO_BORROW_LP dust sweep failed (non-critical):`, dustErr);
+        }
+
         return {
           ...base,
           executed: true,

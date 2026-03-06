@@ -390,6 +390,36 @@ export async function openPosition(
       }
     }
 
+    // ── Second auto-fit: ensure the INPUT side also fits available balance ──
+    // The first auto-fit only scales for the OTHER side. For pools where both
+    // sides are SOL-denominated (SOL/bSOL, SOL/jitoSOL), the fee reserve can
+    // make tokenMaxA exceed available SOL even after the other-side fit.
+    {
+      const inputMintKey  = useUsdc ? whirlpoolData.tokenMintB : whirlpoolData.tokenMintA;
+      const inputMax      = useUsdc ? quote.tokenMaxB : quote.tokenMaxA;
+      const inputBal      = await getSplBalance(inputMintKey); // already deducts SOL fee reserve
+      if (inputMax.gt(inputBal) && inputBal.gtn(0)) {
+        const ratio2 = inputBal.toNumber() / inputMax.toNumber() * 0.98;
+        const scaledInput2 = new BN(Math.floor(inputTokenAmount.toNumber() * ratio2));
+        logger.info(`[Orca] Auto-fit (input side): tokenMax ${inputMax.toString()} > balance ${inputBal.toString()} — ` +
+          `scaling input ${inputTokenAmount.toString()} → ${scaledInput2.toString()} (ratio=${ratio2.toFixed(4)})`);
+        inputTokenAmount = scaledInput2;
+        quote = increaseLiquidityQuoteByInputTokenWithParams({
+          tokenMintA: whirlpoolData.tokenMintA,
+          tokenMintB: whirlpoolData.tokenMintB,
+          sqrtPrice: whirlpoolData.sqrtPrice,
+          tickCurrentIndex: whirlpoolData.tickCurrentIndex,
+          tickLowerIndex: lowerTick,
+          tickUpperIndex: upperTick,
+          inputTokenMint,
+          inputTokenAmount,
+          slippageTolerance,
+          tokenExtensionCtx: NO_TOKEN_EXTENSION_CONTEXT,
+        });
+        logger.info(`[Orca] Auto-fit (input side) re-quote: tokenMaxA=${quote.tokenMaxA.toString()}, tokenMaxB=${quote.tokenMaxB.toString()}`);
+      }
+    }
+
     // ── Wallet balance preflight ────────────────────────────────────────────
     // Check actual on-chain balances BEFORE submitting so we get a clean error
     // (and trigger auto-unwind) rather than an on-chain "insufficient lamports" failure.
