@@ -993,11 +993,30 @@ export async function getPositions(): Promise<OrcaPosition[]> {
           tokenAPriceUsd = currentPrice > 0 ? currentPrice * solPriceUsd : 0;
           tokenBPriceUsd = solPriceUsd;
         } else {
-          // Neither stable nor SOL — best-effort: assume pool price × SOL
-          // This is inaccurate but avoids 0; should be rare
-          tokenAPriceUsd = solPriceUsd; // fallback
-          tokenBPriceUsd = currentPrice > 0 ? (solPriceUsd / currentPrice) : solPriceUsd;
-          logger.debug(`[Orca] Unknown pair ${symA}/${symB} — using SOL-based fallback pricing`);
+          // Neither stable nor SOL on either side (e.g. JLP/BONK, WIF/BONK).
+          // Use Jupiter Price API to fetch actual USD prices for the mints.
+          // If Jupiter fails, fall back to pool-price × solPriceUsd as rough estimate.
+          try {
+            const jupRes = await fetch(`https://api.jup.ag/price/v2?ids=${mintA},${mintB}`, {
+              signal: AbortSignal.timeout(5000),
+            });
+            if (jupRes.ok) {
+              const jupData = (await jupRes.json()) as { data?: Record<string, { price?: string }> };
+              const priceA = Number(jupData.data?.[mintA]?.price ?? 0);
+              const priceB = Number(jupData.data?.[mintB]?.price ?? 0);
+              if (priceA > 0) tokenAPriceUsd = priceA;
+              else tokenAPriceUsd = priceB > 0 && currentPrice > 0 ? priceB * currentPrice : solPriceUsd;
+              if (priceB > 0) tokenBPriceUsd = priceB;
+              else tokenBPriceUsd = priceA > 0 && currentPrice > 0 ? priceA / currentPrice : solPriceUsd;
+            } else {
+              throw new Error(`Jupiter price API ${jupRes.status}`);
+            }
+          } catch (jupErr) {
+            // Last resort: rough estimate using SOL as numeraire
+            tokenAPriceUsd = solPriceUsd;
+            tokenBPriceUsd = currentPrice > 0 ? (solPriceUsd / currentPrice) : solPriceUsd;
+            logger.debug(`[Orca] Unknown pair ${symA || mintA.slice(0, 8)}/${symB || mintB.slice(0, 8)} — Jupiter price failed, using SOL fallback: ${jupErr}`);
+          }
         }
 
         try {
