@@ -296,6 +296,7 @@ export interface PortfolioState {
     chainName: string;
     chainNumericId: number;
     protocol: string; // e.g. 'Uniswap V3', 'PancakeSwap V3', 'Aerodrome Concentrated'
+    poolAddress: string;
     token0Symbol: string;
     token1Symbol: string;
     token0Address: string;
@@ -1060,6 +1061,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
               chainName: p.chainName,
               chainNumericId: p.chainNumericId,
               protocol: p.protocol,
+              poolAddress: p.poolAddress,
               token0Symbol: p.token0.symbol,
               token1Symbol: p.token1.symbol,
               token0Address: p.token0.address,
@@ -2400,6 +2402,7 @@ export async function generateDecisions(
             chainNumericId: pos.chainNumericId,
             chainName: pos.chainName,
             protocol: pos.protocol,
+            poolAddress: pos.poolAddress,
             token0Symbol: pos.token0Symbol,
             token1Symbol: pos.token1Symbol,
             token0Address: pos.token0Address,
@@ -4730,6 +4733,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           token0,
           token1,
           protocol: rebalProto,
+          originalPoolAddress: decision.params.poolAddress,
         });
 
         if (!closeResult.success) {

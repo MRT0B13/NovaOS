@@ -2656,16 +2656,34 @@ export async function closeEvmLpPosition(params: {
 
                 let usdPer0: number;
                 let usdPer1: number;
-                if (is1Stable) {
+                // 6-case cascade: stable, native-aware pricing (same as position tracker)
+                const wrappedNative = WRAPPED_NATIVE_ADDR[chainNumericId]?.toLowerCase();
+                const t0Addr = (t0.address ?? '').toLowerCase();
+                const t1Addr = (t1.address ?? '').toLowerCase();
+                const is0Native = !!wrappedNative && t0Addr === wrappedNative;
+                const is1Native = !!wrappedNative && t1Addr === wrappedNative;
+                if (is0Stable && is1Stable) {
+                  usdPer0 = 1; usdPer1 = 1;
+                } else if (is1Stable) {
                   usdPer1 = 1;
                   usdPer0 = price0In1; // token0 priced in stable token1
                 } else if (is0Stable) {
                   usdPer0 = 1;
-                  usdPer1 = 1 / price0In1;
-                } else {
+                  usdPer1 = price0In1 > 0 ? 1 / price0In1 : 0;
+                } else if (is0Native) {
                   const nPrice = await getNativeTokenPrice(chainNumericId);
-                  usdPer0 = nPrice; // rough: assume token0 ≈ native
-                  usdPer1 = nPrice / price0In1;
+                  usdPer0 = nPrice;
+                  usdPer1 = price0In1 > 0 ? nPrice / price0In1 : 0;
+                } else if (is1Native) {
+                  const nPrice = await getNativeTokenPrice(chainNumericId);
+                  usdPer1 = nPrice;
+                  usdPer0 = price0In1 > 0 ? price0In1 * nPrice : 0;
+                } else {
+                  // Neither stable nor native — best-effort: anchor token0 at native price
+                  const nPrice = await getNativeTokenPrice(chainNumericId);
+                  usdPer0 = nPrice;
+                  usdPer1 = price0In1 > 0 ? nPrice / price0In1 : 0;
+                  logger.debug(`[Krystal] Close value: unknown pair ${t0.symbol}/${t1.symbol} — using pool-ratio × native fallback`);
                 }
                 valueRecoveredUsd = human0 * usdPer0 + human1 * usdPer1;
                 priced = true;
@@ -2956,6 +2974,8 @@ export async function rebalanceEvmLpPosition(params: {
   token1?: { address: string; symbol: string; decimals: number };
   /** Protocol key for multi-protocol NFPM routing */
   protocol?: string;
+  /** Original pool address — rebalance will reopen on the SAME pool if available */
+  originalPoolAddress?: string;
 }): Promise<{
   closeResult: EvmLpCloseResult;
   openResult?: EvmLpOpenResult;
@@ -2979,19 +2999,46 @@ export async function rebalanceEvmLpPosition(params: {
     return { closeResult };
   }
 
-  // Step 2: Discover current best pool on the same chain and reopen
-  const pools = await discoverKrystalPools();
-  const eligible = pools.filter(p =>
-    p.chainNumericId === chainNumericId &&
-    p.tvlUsd >= env.krystalLpMinTvlUsd,
-  );
+  // Step 2: Reopen on the SAME pool if originalPoolAddress + token info is available.
+  // Only fall back to discovery if the original pool info is missing.
+  let targetPool: {
+    chainId: string;
+    chainNumericId: number;
+    poolAddress: string;
+    token0: { address: string; symbol: string; decimals: number };
+    token1: { address: string; symbol: string; decimals: number };
+    protocol: string | { name: string };
+    feeTier: number;
+  };
 
-  if (eligible.length === 0) {
-    logger.warn(`[Krystal] Rebalance: no eligible pools on chain ${chainNumericId} — close only`);
-    return { closeResult };
+  if (params.originalPoolAddress && params.token0 && params.token1 && params.protocol) {
+    // Reopen on the same pool — use closeResult.feeTier which was read from on-chain
+    targetPool = {
+      chainId,
+      chainNumericId,
+      poolAddress: params.originalPoolAddress,
+      token0: params.token0,
+      token1: params.token1,
+      protocol: params.protocol,
+      feeTier: closeResult.feeTier,
+    };
+    logger.info(`[Krystal] Rebalance: reopening on SAME pool ${params.token0.symbol}/${params.token1.symbol} @ ${params.originalPoolAddress.slice(0, 10)}…`);
+  } else {
+    // Fallback: discover pools (legacy path)
+    const pools = await discoverKrystalPools();
+    const eligible = pools.filter(p =>
+      p.chainNumericId === chainNumericId &&
+      p.tvlUsd >= env.krystalLpMinTvlUsd,
+    );
+
+    if (eligible.length === 0) {
+      logger.warn(`[Krystal] Rebalance: no eligible pools on chain ${chainNumericId} — close only`);
+      return { closeResult };
+    }
+
+    targetPool = eligible[0]; // already sorted by score
+    logger.info(`[Krystal] Rebalance: no original pool info — using best discovered pool ${(targetPool.token0 as any).symbol}/${(targetPool.token1 as any).symbol}`);
   }
-
-  const best = eligible[0]; // already sorted by score
 
   // Compute deployUsd from actual wallet balances for the target pool.
   // closeResult.valueRecoveredUsd can be $0 when positions go fully out of range
@@ -3000,23 +3047,29 @@ export async function rebalanceEvmLpPosition(params: {
   let deployUsd = closeResult.valueRecoveredUsd > 1
     ? closeResult.valueRecoveredUsd
     : env.krystalLpMaxUsd * 0.5;
+  // Safety cap: never deploy more than krystalLpMaxUsd regardless of value estimation
+  deployUsd = Math.min(deployUsd, env.krystalLpMaxUsd);
   try {
     const ethers = await loadEthers();
     const wallet = await getEvmWallet(chainNumericId);
     const provider = await getEvmProvider(chainNumericId);
+    const t0Addr = typeof targetPool.token0 === 'string' ? targetPool.token0 : (targetPool.token0 as any).address;
+    const t1Addr = typeof targetPool.token1 === 'string' ? targetPool.token1 : (targetPool.token1 as any).address;
+    const t0Sym = typeof targetPool.token0 === 'string' ? '?' : (targetPool.token0 as any).symbol ?? '?';
+    const t1Sym = typeof targetPool.token1 === 'string' ? '?' : (targetPool.token1 as any).symbol ?? '?';
     const [walBal0, walBal1] = await Promise.all([
-      new ethers.Contract(best.token0.address, ERC20_ABI, provider).balanceOf(wallet.address).catch(() => BigInt(0)),
-      new ethers.Contract(best.token1.address, ERC20_ABI, provider).balanceOf(wallet.address).catch(() => BigInt(0)),
+      new ethers.Contract(t0Addr, ERC20_ABI, provider).balanceOf(wallet.address).catch(() => BigInt(0)),
+      new ethers.Contract(t1Addr, ERC20_ABI, provider).balanceOf(wallet.address).catch(() => BigInt(0)),
     ]);
-    const dec0 = best.token0.decimals ?? 18;
-    const dec1 = best.token1.decimals ?? 18;
+    const dec0 = (targetPool.token0 as any).decimals ?? 18;
+    const dec1 = (targetPool.token1 as any).decimals ?? 18;
     const human0 = Number(ethers.formatUnits(walBal0, dec0));
     const human1 = Number(ethers.formatUnits(walBal1, dec1));
 
-    const protoName = typeof best.protocol === 'string' ? best.protocol : best.protocol?.name ?? '';
+    const protoName = typeof targetPool.protocol === 'string' ? targetPool.protocol : (targetPool.protocol as any)?.name ?? '';
     const protoResolved = resolveProtocol(protoName.toLowerCase(), chainNumericId);
     const isAero = protoResolved?.def.abi === 'aerodrome-cl';
-    const poolContract = new ethers.Contract(best.poolAddress, getPoolAbi(!!isAero), provider);
+    const poolContract = new ethers.Contract(targetPool.poolAddress, getPoolAbi(!!isAero), provider);
     const slot0 = await poolContract.slot0();
     const sqrtPriceX96 = slot0.sqrtPriceX96 ?? slot0[0];
     const sqrtP = Number(sqrtPriceX96) / (2 ** 96);
@@ -3024,19 +3077,25 @@ export async function rebalanceEvmLpPosition(params: {
     const price0In1 = rawPrice * (10 ** dec0) / (10 ** dec1);
 
     const stableSymbols = ['USDC', 'USDT', 'DAI', 'BUSD', 'USDCE', 'USDC.E', 'USDT0'];
-    const s0 = stableSymbols.includes(best.token0.symbol.toUpperCase());
-    const s1 = stableSymbols.includes(best.token1.symbol.toUpperCase());
+    const s0 = stableSymbols.includes(t0Sym.toUpperCase());
+    const s1 = stableSymbols.includes(t1Sym.toUpperCase());
+    const wrappedNative = WRAPPED_NATIVE_ADDR[chainNumericId]?.toLowerCase();
+    const is0Native = !!wrappedNative && t0Addr.toLowerCase() === wrappedNative;
+    const is1Native = !!wrappedNative && t1Addr.toLowerCase() === wrappedNative;
     let usdPer0: number;
     let usdPer1: number;
-    if (s1) { usdPer1 = 1; usdPer0 = price0In1; }
-    else if (s0) { usdPer0 = 1; usdPer1 = 1 / price0In1; }
-    else { const np = await getNativeTokenPrice(chainNumericId); usdPer0 = np; usdPer1 = np / price0In1; }
+    if (s0 && s1) { usdPer0 = 1; usdPer1 = 1; }
+    else if (s1) { usdPer1 = 1; usdPer0 = price0In1; }
+    else if (s0) { usdPer0 = 1; usdPer1 = price0In1 > 0 ? 1 / price0In1 : 0; }
+    else if (is0Native) { const np = await getNativeTokenPrice(chainNumericId); usdPer0 = np; usdPer1 = price0In1 > 0 ? np / price0In1 : 0; }
+    else if (is1Native) { const np = await getNativeTokenPrice(chainNumericId); usdPer1 = np; usdPer0 = price0In1 > 0 ? price0In1 * np : 0; }
+    else { const np = await getNativeTokenPrice(chainNumericId); usdPer0 = np; usdPer1 = price0In1 > 0 ? np / price0In1 : 0; }
 
     const walletValueUsd = human0 * usdPer0 + human1 * usdPer1;
     if (walletValueUsd > 1) {
       // Cap at krystalLpMaxUsd to avoid over-deploying tokens from other positions
       deployUsd = Math.min(walletValueUsd, env.krystalLpMaxUsd);
-      logger.info(`[Krystal] Rebalance: wallet holds $${walletValueUsd.toFixed(2)} for ${best.token0.symbol}/${best.token1.symbol} → deployUsd=$${deployUsd.toFixed(2)}`);
+      logger.info(`[Krystal] Rebalance: wallet holds $${walletValueUsd.toFixed(2)} for ${t0Sym}/${t1Sym} → deployUsd=$${deployUsd.toFixed(2)}`);
     }
   } catch (err) {
     logger.warn('[Krystal] Rebalance: wallet value calc failed (using close estimate):', err);
@@ -3044,13 +3103,13 @@ export async function rebalanceEvmLpPosition(params: {
 
   const openResult = await openEvmLpPosition(
     {
-      chainId: best.chainId,
-      chainNumericId: best.chainNumericId,
-      poolAddress: best.poolAddress,
-      token0: best.token0,
-      token1: best.token1,
-      protocol: best.protocol,
-      feeTier: best.feeTier,
+      chainId: targetPool.chainId,
+      chainNumericId: targetPool.chainNumericId,
+      poolAddress: targetPool.poolAddress,
+      token0: targetPool.token0,
+      token1: targetPool.token1,
+      protocol: targetPool.protocol,
+      feeTier: targetPool.feeTier,
     },
     deployUsd,
     rangeWidthTicks,
