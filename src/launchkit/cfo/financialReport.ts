@@ -189,7 +189,7 @@ async function getTransactionSummary(
   const res = await pool.query(
     `SELECT strategy_tag,
             COALESCE(SUM(fee_usd), 0) AS total_fees,
-            COALESCE(SUM(CASE WHEN tx_type IN ('fee_collect', 'prediction_sell') THEN amount_out ELSE 0 END), 0) AS revenue
+            COALESCE(SUM(CASE WHEN tx_type = 'fee_collect' THEN amount_out ELSE 0 END), 0) AS revenue
      FROM cfo_transactions
      WHERE timestamp >= $1::timestamptz
        AND timestamp < $2::timestamptz

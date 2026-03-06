@@ -3907,21 +3907,21 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
         const reduceUsd = Math.min(decision.params.reduceUsd, coinShort.sizeUsd);
         const reduceSizeCoin = reduceUsd / coinShort.markPrice;
+        // Capture HL ground-truth PnL BEFORE closing (proportional to close fraction)
+        const closeFraction = coinShort.sizeUsd > 0 ? reduceUsd / coinShort.sizeUsd : 1;
+        const hlPnlForClose = (coinShort.unrealizedPnlUsd ?? 0) * closeFraction;
         const result = await hl.closePosition(coin, reduceSizeCoin, true); // buy back to reduce short
         if (result.success) markDecision(`CLOSE_HEDGE_${coin}`);
-        // receivedUsd = portion of margin returned + PnL from the short
-        // For a SHORT: if price dropped, we profit; if price rose, we lose.
-        // Use the mark-to-market fraction of unrealized PnL proportional to the close size.
-        const closeFraction = coinShort.sizeUsd > 0 ? reduceUsd / coinShort.sizeUsd : 1;
         // Use marginUsed (collateral), not sizeUsd (notional) — proportional to close fraction
         const marginReturned = coinShort.marginUsed * closeFraction;
-        const closeReceivedUsd = marginReturned + (coinShort.unrealizedPnlUsd ?? 0) * closeFraction;
+        const closeReceivedUsd = marginReturned + hlPnlForClose;
         return {
           ...base,
           executed: true,
           success: result.success,
           txId: result.orderId?.toString(),
           receivedUsd: result.success ? Math.max(0, closeReceivedUsd) : undefined,
+          hlUnrealizedPnl: result.success ? hlPnlForClose : undefined,
           error: result.error,
         };
       }
@@ -3938,8 +3938,10 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
         const sizeInCoin = pos.sizeUsd / pos.markPrice;
         const isBuy = pos.side === 'SHORT'; // buy to close short, sell to close long
+        // Capture HL ground-truth PnL BEFORE closing
+        const hlPnlForLoss = pos.unrealizedPnlUsd ?? 0;
         // Actual return = margin + unrealized PnL (use marginUsed, NOT sizeUsd/notional)
-        const closeReceivedUsd = Math.max(0, pos.marginUsed + (pos.unrealizedPnlUsd ?? 0));
+        const closeReceivedUsd = Math.max(0, pos.marginUsed + hlPnlForLoss);
         const result = await hl.closePosition(pos.coin, sizeInCoin, isBuy);
         if (result.success) markDecision('CLOSE_LOSING');
         return {
@@ -3948,6 +3950,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           success: result.success,
           txId: result.orderId?.toString(),
           receivedUsd: result.success ? closeReceivedUsd : undefined,
+          hlUnrealizedPnl: result.success ? hlPnlForLoss : undefined,
           error: result.error,
         };
       }

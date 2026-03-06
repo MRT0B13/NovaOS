@@ -488,14 +488,17 @@ export class CFOAgent extends BaseAgent {
           case 'CLOSE_HEDGE': {
             const coin = p.coin ?? 'SOL';
             const reduceUsd = r.receivedUsd ?? p.reduceUsd ?? d.estimatedImpactUsd;
+            // HL ground-truth PnL from executor (same pattern as HL_PERP_CLOSE)
+            const hlHedgePnl: number | undefined = r.hlUnrealizedPnl;
             // Find matching open HL position and close it
             const openHL = await this.repo.getOpenPositions('hyperliquid' as PositionStrategy);
             const coinShort = openHL.find(pos =>
               (pos.metadata as any)?.coin === coin && (pos.metadata as any)?.side === 'SHORT',
             );
             if (coinShort) {
-              const pnl = reduceUsd - coinShort.costBasisUsd;
-              await this.positionManager.closePosition(coinShort.id, 0, r.txId ?? '', reduceUsd);
+              // Use HL ground-truth PnL as override when available
+              await this.positionManager.closePosition(coinShort.id, 0, r.txId ?? '', reduceUsd, hlHedgePnl);
+              const pnl = hlHedgePnl ?? (reduceUsd - coinShort.costBasisUsd);
               logger.info(`[CFO] Persisted CLOSE_HEDGE: closed ${coinShort.id} (${coin}) PnL $${pnl.toFixed(2)}`);
             }
             await this.repo.insertTransaction({
@@ -521,9 +524,11 @@ export class CFOAgent extends BaseAgent {
             // Use actual receivedUsd from executor (includes unrealized PnL),
             // not 0 which would record a 100% loss
             const lossReceivedUsd = r.receivedUsd ?? 0;
+            // HL ground-truth PnL from executor (same pattern as HL_PERP_CLOSE)
+            const hlLossPnl: number | undefined = r.hlUnrealizedPnl;
             if (match) {
-              await this.positionManager.closePosition(match.id, 0, r.txId ?? '', lossReceivedUsd);
-              const lossPnl = lossReceivedUsd - match.costBasisUsd;
+              await this.positionManager.closePosition(match.id, 0, r.txId ?? '', lossReceivedUsd, hlLossPnl);
+              const lossPnl = hlLossPnl ?? (lossReceivedUsd - match.costBasisUsd);
               logger.info(`[CFO] Persisted CLOSE_LOSING: closed ${match.id} (${p.coin} ${p.side}) PnL $${lossPnl.toFixed(2)}`);
             }
             await this.repo.insertTransaction({
