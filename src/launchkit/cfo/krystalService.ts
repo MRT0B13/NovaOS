@@ -1897,10 +1897,11 @@ export async function openEvmLpPosition(
         const nativePrice = await getNativeTokenPrice(chainNumericId);
         const wethUsd = wethBal * nativePrice;
 
-        // Check native balance
+        // Check native balance — keep a real gas reserve (not 0.005!)
+        // On Polygon wrapping POL→WPOL costs value + gas, so 0.005 is never enough.
         const nativeBal = await provider.getBalance(wallet.address);
         const nativeBalHuman = Number(ethers.formatEther(nativeBal));
-        const gasReserve = 0.005;
+        const gasReserve = 0.05; // ~$0.15 on Polygon, ~$120 on ETH mainnet — plenty for gas
         const usableNative = Math.max(0, nativeBalHuman - gasReserve);
         const nativeUsd = usableNative * nativePrice;
 
@@ -1911,15 +1912,20 @@ export async function openEvmLpPosition(
           const needToken0 = held0Usd < halfTarget * 0.3;
           const needToken1 = held1Usd < halfTarget * 0.3;
 
-          // If we have WETH and need a pool token, swap WETH → pool token via LI.FI
+          // If we have WETH and need a pool token, swap WETH → pool token via DEX.
+          // CRITICAL: if WETH IS one of the pool tokens (WPOL/USDT, WETH/USDC etc.),
+          // only swap HALF the WETH so the other half funds the WETH side of the LP.
           if (wethInfo && wethBal > 0.0001) {
             const t0IsWeth = pool.token0.address.toLowerCase() === wethInfo.toLowerCase();
             const t1IsWeth = pool.token1.address.toLowerCase() === wethInfo.toLowerCase();
+            const wethIsPoolToken = t0IsWeth || t1IsWeth;
+            // When WETH is one of the pool tokens, cap what we swap to leave the rest for the LP.
+            const maxSwappableWeth = wethIsPoolToken ? wethBal / 2 : wethBal;
 
             // Swap WETH into whichever pool token we need
             // If WETH IS a pool token, swap into the OTHER token only
             if (needToken0 && !t0IsWeth && wethUsd > 1) {
-              const swapAmt = Math.min(wethBal, (halfTarget - held0Usd) / nativePrice);
+              const swapAmt = Math.min(maxSwappableWeth, (halfTarget - held0Usd) / nativePrice);
               if (swapAmt > 0.0001) {
                 const result = await swap.executeEvmSwap(chainNumericId, wethInfo, pool.token0.address, swapAmt, pool.feeTier);
                 if (result.success) logger.info(`[Krystal] Swapped ${swapAmt.toFixed(4)} WETH → ${pool.token0.symbol}`);
@@ -1929,7 +1935,8 @@ export async function openEvmLpPosition(
             if (needToken1 && !t1IsWeth && wethUsd > 1) {
               // Re-check WETH balance (may have swapped some above)
               const currentWeth = await bridge.getEvmTokenBalance(chainNumericId, wethInfo, wallet.address);
-              const swapAmt = Math.min(currentWeth, (halfTarget - held1Usd) / nativePrice);
+              const capWeth = wethIsPoolToken ? Math.max(0, currentWeth - wethBal / 2) : currentWeth;
+              const swapAmt = Math.min(capWeth, (halfTarget - held1Usd) / nativePrice);
               if (swapAmt > 0.0001) {
                 const result = await swap.executeEvmSwap(chainNumericId, wethInfo, pool.token1.address, swapAmt, pool.feeTier);
                 if (result.success) logger.info(`[Krystal] Swapped ${swapAmt.toFixed(4)} WETH → ${pool.token1.symbol}`);
@@ -1985,8 +1992,8 @@ export async function openEvmLpPosition(
 
         if (shouldWrapForPool || shouldWrapForSwap) {
           const nativeBal = await provider.getBalance(wallet.address);
-          // Keep 0.005 native for gas, wrap the rest (up to what we need)
-          const gasReserve = ethers.parseEther('0.005');
+          // Keep 0.05 native for gas — wrapping requires value + gas in a single tx
+          const gasReserve = ethers.parseEther('0.05');
           if (nativeBal > gasReserve) {
             const nativePrice = await getNativeTokenPrice(chainNumericId);
 
