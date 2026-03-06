@@ -59,9 +59,9 @@ interface PeriodReport {
   portfolioChangePct: number; // (end - start) / start
 
   // Capital flows
-  depositsUsd: number;        // SOL deposited in period (converted to USD)
+  depositsUsd: number;        // Inferred external deposits (USD)
   withdrawalsUsd: number;     // SOL withdrawn in period (converted to USD)
-  organicChangePct: number;   // portfolio change minus deposits/withdrawals
+  organicChangePct: number;   // P&L-based return (realized + unrealized change) / start
 
   // P&L
   totalRealizedPnl: number;
@@ -279,10 +279,10 @@ async function getCapitalFlows(
 async function getLearnedParams(pool: Pool): Promise<any | null> {
   try {
     const res = await pool.query(
-      `SELECT value FROM kv_store WHERE key = 'cfo_learning_params'`,
+      `SELECT data FROM kv_store WHERE key = 'cfo_learning_params'`,
     );
     if (res.rows.length === 0) return null;
-    const raw = res.rows[0].value;
+    const raw = res.rows[0].data;
     return typeof raw === 'string' ? JSON.parse(raw) : raw;
   } catch {
     return null;
@@ -322,17 +322,21 @@ export async function generateReport(
   const changePct = startValue > 0 ? (endValue - startValue) / startValue : 0;
 
   // ── Capital flows (deposits/withdrawals) ──
-  // Use average SOL price from snapshots to convert SOL flows to USD
+  // pnl_sol_flows only tracks SOL pump-wallet flows, NOT USDC CFO deposits.
+  // So we compute organic change from actual P&L (realized + unrealized delta)
+  // which inherently excludes external deposits.
   const avgSolPrice = snapshots.length > 0
     ? snapshots.reduce((s, snap) => s + snap.solPriceUsd, 0) / snapshots.length
     : 0;
   const depositsUsd = capitalFlows.deposited * avgSolPrice;
   const withdrawalsUsd = capitalFlows.withdrawn * avgSolPrice;
   const netCapitalFlowUsd = depositsUsd - withdrawalsUsd;
-  // Organic change = portfolio change minus capital injections
-  const organicChangePct = startValue > 0
-    ? ((endValue - netCapitalFlowUsd) - startValue) / startValue
-    : 0;
+
+  // Infer actual deposits: portfolio change that isn't explained by P&L
+  // deposit_inferred = portfolio_change - realized_pnl - unrealized_change
+  const startUnrealized = startSnap?.unrealizedPnl ?? 0;
+  const endUnrealized = endSnap?.unrealizedPnl ?? 0;
+  const unrealizedChange = endUnrealized - startUnrealized;
 
   // ── Per-strategy breakdown ──
   const stratMap = new Map<string, StrategyBreakdown>();
@@ -384,6 +388,12 @@ export async function generateReport(
   const totalRealizedPnl = closedPositions.reduce((s, p) => s + p.realizedPnlUsd, 0);
   const totalUnrealizedPnl = openPositions.reduce((s, p) => s + p.unrealizedPnlUsd, 0);
   const netPnl = totalRealizedPnl + txSummary.feesCollected - txSummary.feesPaid;
+
+  // Organic change: P&L-based return (excludes external deposits)
+  // = (realized P&L + unrealized P&L change) / starting portfolio
+  const organicChangePct = startValue > 0
+    ? (totalRealizedPnl + unrealizedChange) / startValue
+    : 0;
 
   // ── Top trades ──
   const allClosedSorted = [...closedPositions].sort((a, b) => b.realizedPnlUsd - a.realizedPnlUsd);
@@ -456,6 +466,10 @@ export async function generateReport(
   const portfolioHistory = snapshots.map(s => ({ date: s.date, value: s.totalPortfolioUsd }));
   const solPriceHistory = snapshots.map(s => ({ date: s.date, price: s.solPriceUsd }));
 
+  // Infer external deposits: portfolio growth not explained by P&L
+  const inferredDepositsUsd = Math.max(0,
+    (endValue - startValue) - totalRealizedPnl - unrealizedChange);
+
   return {
     type,
     periodStart,
@@ -463,7 +477,7 @@ export async function generateReport(
     startPortfolioUsd: startValue,
     endPortfolioUsd: endValue,
     portfolioChangePct: changePct,
-    depositsUsd,
+    depositsUsd: Math.max(depositsUsd, inferredDepositsUsd),
     withdrawalsUsd,
     organicChangePct,
     totalRealizedPnl: totalRealizedPnl,

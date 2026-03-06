@@ -200,30 +200,47 @@ async function backfillHyperliquid() {
   console.log(`  Querying fills from ${new Date(startTime).toISOString().slice(0, 10)}...\n`);
 
   // ── 1. Fetch ALL fills ────────────────────────────────────────────
-  // Use userFills (recent fills, no time filter) — more reliable than
-  // userFillsByTime with aggregateByTime which can miss fills.
+  // Use BOTH userFills (recent fills) AND userFillsByTime (time-based)
+  // to ensure we capture all fills including newest ones.
   let allFills: any[] = [];
   try {
     allFills = await info.userFills({ user: wallet.address });
-    console.log(`  📊 Total fills from exchange (userFills): ${allFills.length}`);
+    console.log(`  📊 Total fills from userFills: ${allFills.length}`);
 
-    // If that didn't get enough, also try userFillsByTime from start
-    if (allFills.length < 200) {
-      try {
-        const byTimeFills = await info.userFillsByTime({
+    // ALWAYS also query userFillsByTime to catch fills that userFills might miss
+    // Must use aggregateByTime: false to get individual fills (not aggregated)
+    // Direct HTTP call because SDK may ignore aggregateByTime parameter
+    try {
+      const seenTids = new Set(allFills.map((f: any) => f.tid));
+      let totalAdded = 0;
+
+      // Query recent fills directly via HL API (non-aggregated)
+      const recentStart = Math.max(startTime, Date.now() - 30 * 86400000);
+      const resp = await fetch('https://api.hyperliquid.xyz/info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'userFillsByTime',
           user: wallet.address,
-          startTime,
-        });
-        // Merge, dedup by tid
-        const seenTids = new Set(allFills.map((f: any) => f.tid));
+          startTime: recentStart,
+          aggregateByTime: false,
+        }),
+      });
+      if (resp.ok) {
+        const byTimeFills: any[] = await resp.json();
         for (const f of byTimeFills) {
           if (!seenTids.has(f.tid)) {
             allFills.push(f);
             seenTids.add(f.tid);
+            totalAdded++;
           }
         }
-        console.log(`  📊 After merging userFillsByTime: ${allFills.length} total fills`);
-      } catch { /* userFillsByTime optional */ }
+        console.log(`  📊 userFillsByTime (direct) returned ${byTimeFills.length} fills, added ${totalAdded} new`);
+      }
+
+      console.log(`  📊 Combined: ${allFills.length} total fills`);
+    } catch (err) {
+      console.log(`  ⚠️ userFillsByTime failed: ${(err as Error).message}`);
     }
   } catch (err) {
     console.log(`  ❌ userFills failed: ${(err as Error).message}`);
@@ -353,91 +370,176 @@ async function backfillHyperliquid() {
   }
 
   // ── 6. Match fills to DB positions and identify corrections ───────
-  // Group fills by (coin, opening→closing cycles) using dir field
-  // dir format: "Open Long", "Close Long", "Open Short", "Close Short"
+  // Improved algorithm: group by coin+side, sort by closed_at, greedily assign fills
+  // to prevent double-counting across overlapping positions.
   const closedPositions = dbRes.rows.filter((r: any) => r.status === 'CLOSED');
   let corrected = 0;
   let alreadyCorrect = 0;
   let unmatched = 0;
 
+  // Group positions and fills by coin+side
+  type CoinSideKey = string;
+  const positionGroups = new Map<CoinSideKey, any[]>();
+  const closeFillGroups = new Map<CoinSideKey, any[]>();
+
   for (const pos of closedPositions) {
-    const coin = pos.coin;
-    const side = pos.side;
-    if (!coin) { unmatched++; continue; }
+    if (!pos.coin) { unmatched++; continue; }
+    const key = `${pos.coin}|${pos.side}`;
+    if (!positionGroups.has(key)) positionGroups.set(key, []);
+    positionGroups.get(key)!.push(pos);
+  }
 
-    const openedAt = new Date(pos.opened_at).getTime();
-    const closedAt = pos.closed_at ? new Date(pos.closed_at).getTime() : Date.now();
+  // Separate close fills by coin+side
+  // Include all fill types that realize P&L: Close*, Short > Long, Long > Short,
+  // Liquidated, Auto-Deleveraging
+  const allDirValues = new Set<string>();
+  const isClosingFill = (dir: string): 'SHORT' | 'LONG' | null => {
+    if (dir.startsWith('Close Short') || dir === 'Short > Long') return 'SHORT';
+    if (dir.startsWith('Close Long') || dir === 'Long > Short') return 'LONG';
+    if (dir.includes('Liquidated') && dir.includes('Short')) return 'SHORT';
+    if (dir.includes('Liquidated') && dir.includes('Long')) return 'LONG';
+    if (dir === 'Auto-Deleveraging') return null; // Can't determine side from dir alone
+    return null;
+  };
+  for (const fill of allFills) {
+    allDirValues.add(fill.dir);
+    const closingSide = isClosingFill(fill.dir);
+    if (!closingSide) continue;
+    const key = `${fill.coin}|${closingSide}`;
+    if (!closeFillGroups.has(key)) closeFillGroups.set(key, []);
+    closeFillGroups.get(key)!.push(fill);
+  }
+  console.log(`\n  All fill dir values: ${[...allDirValues].join(', ')}`);
+  console.log(`  Close fill groups: ${closeFillGroups.size}`);
+  
+  // Also show fill time range per coin for debugging
+  const coinTimeRanges: Record<string, { min: number; max: number; closeFills: number; openFills: number }> = {};
+  for (const fill of allFills) {
+    const t = Number(fill.time);
+    if (!coinTimeRanges[fill.coin]) coinTimeRanges[fill.coin] = { min: t, max: t, closeFills: 0, openFills: 0 };
+    const r = coinTimeRanges[fill.coin];
+    r.min = Math.min(r.min, t);
+    r.max = Math.max(r.max, t);
+    if (fill.dir.startsWith('Close')) r.closeFills++;
+    else r.openFills++;
+  }
+  // Show coins that have DB positions
+  const dbCoins = new Set(closedPositions.map((p: any) => p.coin));
+  console.log('\n  Fill time ranges for DB coins:');
+  for (const coin of dbCoins) {
+    const r = coinTimeRanges[coin];
+    if (r) {
+      console.log(`    ${coin}: ${new Date(r.min).toISOString().slice(0,16)} → ${new Date(r.max).toISOString().slice(0,16)} (${r.openFills} open, ${r.closeFills} close fills)`);
+    } else {
+      console.log(`    ${coin}: NO FILLS FOUND`);
+    }
+  }
 
-    // Find closing fills that match this position's time window and coin
-    const closeDir = side === 'SHORT' ? 'Close Short' : 'Close Long';
-    const matchingFills = allFills.filter((f: any) =>
-      f.coin === coin &&
-      f.dir.includes(closeDir.split(' ')[1]) && // Match Long/Short
-      f.dir.startsWith('Close') &&
-      f.time >= openedAt - 60000 && // 1 min tolerance
-      f.time <= closedAt + 60000,
+  // For each coin+side group, match fills to positions chronologically
+  // Debug: show group sizes
+  for (const [key, positions] of positionGroups) {
+    const closeFills = closeFillGroups.get(key) || [];
+    console.log(`\n  Group ${key}: ${positions.length} positions, ${closeFills.length} close fills`);
+    if (closeFills.length > 0) {
+      const sampleFill = closeFills[0];
+      console.log(`    Sample fill time type: ${typeof sampleFill.time}, value: ${sampleFill.time}`);
+    }
+    if (positions.length > 0) {
+      const samplePos = positions[0];
+      const closedAt = new Date(samplePos.closed_at).getTime();
+      console.log(`    Sample pos closedAt: ${closedAt} (${samplePos.closed_at})`);
+    }
+  }
+
+  for (const [key, positions] of positionGroups) {
+    // Sort positions by closed_at ascending
+    positions.sort((a: any, b: any) =>
+      new Date(a.closed_at).getTime() - new Date(b.closed_at).getTime()
     );
+    const closeFills = (closeFillGroups.get(key) || [])
+      .sort((a: any, b: any) => a.time - b.time);
+    const usedFillIndices = new Set<number>();
 
-    if (matchingFills.length === 0) {
-      // Try broader match — just coin + close direction + rough time
-      const broaderFills = allFills.filter((f: any) =>
-        f.coin === coin &&
-        f.dir.startsWith('Close') &&
-        f.time >= openedAt - 3600000 && // 1 hour tolerance
-        f.time <= closedAt + 3600000,
-      );
+    for (const pos of positions) {
+      const closedAt = pos.closed_at ? new Date(pos.closed_at).getTime() : Date.now();
+      const openedAt = new Date(pos.opened_at).getTime();
 
-      if (broaderFills.length === 0) {
+      // Find unassigned close fills near closed_at (within 2 min), expanding if needed
+      let matchedFills: any[] = [];
+      for (const tolerance of [120_000, 600_000, 3_600_000]) {
+        matchedFills = closeFills
+          .map((f: any, i: number) => ({ ...f, _idx: i }))
+          .filter((f: any) =>
+            !usedFillIndices.has(f._idx) &&
+            f.time >= closedAt - tolerance &&
+            f.time <= closedAt + tolerance
+          );
+        if (matchedFills.length > 0) break;
+
+        // Also try matching near opened_at for positions that were immediately closed
+        if (closedAt - openedAt < 120_000) {
+          matchedFills = closeFills
+            .map((f: any, i: number) => ({ ...f, _idx: i }))
+            .filter((f: any) =>
+              !usedFillIndices.has(f._idx) &&
+              f.time >= openedAt - tolerance &&
+              f.time <= closedAt + tolerance
+            );
+          if (matchedFills.length > 0) break;
+        }
+      }
+
+      if (matchedFills.length === 0) {
         unmatched++;
         continue;
       }
-    }
 
-    // Sum closedPnl for matching fills
-    const fills = matchingFills.length > 0 ? matchingFills : allFills.filter((f: any) =>
-      f.coin === coin && f.dir.startsWith('Close') &&
-      f.time >= openedAt - 3600000 && f.time <= closedAt + 3600000,
-    );
+      // Mark fills as used
+      for (const f of matchedFills) usedFillIndices.add(f._idx);
 
-    const exchangePnl = fills.reduce((s: number, f: any) => s + Number(f.closedPnl), 0);
-    const exchangeFees = fills.reduce((s: number, f: any) => s + Number(f.fee), 0);
-    const dbPnl = Number(pos.realized_pnl_usd);
+      // Sum closedPnl for matching fills
+      const fills = matchedFills;
 
-    const diff = Math.abs(exchangePnl - dbPnl);
-    if (diff < 0.50) {
-      alreadyCorrect++;
-      continue;
-    }
+      const exchangePnl = fills.reduce((s: number, f: any) => s + Number(f.closedPnl), 0);
+      const exchangeFees = fills.reduce((s: number, f: any) => s + Number(f.fee), 0);
+      const dbPnl = Number(pos.realized_pnl_usd);
 
-    console.log(`\n  ── ${pos.description || `${coin} ${side}`} (${pos.id.slice(0, 8)}...)`);
-    console.log(`     DB P&L:       $${dbPnl.toFixed(2)}`);
-    console.log(`     Exchange P&L: $${exchangePnl.toFixed(2)} (${fills.length} closing fills, fees: $${exchangeFees.toFixed(2)})`);
-    console.log(`     Correction:   $${(exchangePnl - dbPnl).toFixed(2)}`);
+      const diff = Math.abs(exchangePnl - dbPnl);
+      if (diff < 0.50) {
+        alreadyCorrect++;
+        continue;
+      }
 
-    if (!DRY_RUN) {
-      await query(
-        `UPDATE cfo_positions
-         SET realized_pnl_usd = $2, updated_at = NOW(),
-             metadata = metadata || $3::jsonb
-         WHERE id = $1`,
-        [
-          pos.id,
-          exchangePnl,
-          JSON.stringify({
-            backfill_source: 'hl_exchange',
-            backfill_date: new Date().toISOString(),
-            original_pnl: dbPnl,
-            exchange_closing_fills: fills.length,
-            exchange_fees: exchangeFees,
-          }),
-        ],
-      );
-      console.log(`     ✅ UPDATED`);
-    } else {
-      console.log(`     🔍 DRY RUN — would update`);
-    }
-    corrected++;
-  }
+      console.log(`\n  ── ${pos.description || `${pos.coin} ${pos.side}`} (${pos.id.slice(0, 8)}...)`);
+      console.log(`     DB P&L:       $${dbPnl.toFixed(2)}`);
+      console.log(`     Exchange P&L: $${exchangePnl.toFixed(2)} (${fills.length} closing fills, fees: $${exchangeFees.toFixed(2)})`);
+      console.log(`     Correction:   $${(exchangePnl - dbPnl).toFixed(2)}`);
+
+      if (!DRY_RUN) {
+        await query(
+          `UPDATE cfo_positions
+           SET realized_pnl_usd = $2, updated_at = NOW(),
+               metadata = metadata || $3::jsonb
+           WHERE id = $1`,
+          [
+            pos.id,
+            exchangePnl,
+            JSON.stringify({
+              backfill_source: 'hl_exchange',
+              backfill_date: new Date().toISOString(),
+              original_pnl: dbPnl,
+              exchange_closing_fills: fills.length,
+              exchange_fees: exchangeFees,
+            }),
+          ],
+        );
+        console.log(`     ✅ UPDATED`);
+      } else {
+        console.log(`     🔍 DRY RUN — would update`);
+      }
+      corrected++;
+    } // end position loop
+  } // end coin+side group loop
 
   console.log(`\n  HL Summary:`);
   console.log(`    Already correct: ${alreadyCorrect}`);
