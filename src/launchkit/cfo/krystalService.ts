@@ -1320,6 +1320,9 @@ export async function fetchKrystalPositions(
           // Uses getAmountsForLiquidity: given current sqrtPrice and tick range,
           // calculate how much of each token the position holds.
           let valueUsd = 0;
+          // Per-token USD prices — computed once, reused for both value and fee conversion
+          let perTokenPriceUsd0 = 0;
+          let perTokenPriceUsd1 = 0;
           try {
             const ethersLib = ethers; // use the already-imported ethers
             // We already have currentTick + slot0 from pool lookup above.
@@ -1340,11 +1343,58 @@ export async function fetchKrystalPositions(
               const ui0 = Number(ethersLib.formatUnits(amount0, Number(dec0)));
               const ui1 = Number(ethersLib.formatUnits(amount1, Number(dec1)));
 
-              // Price tokens: stablecoins ≈ $1, others ≈ native price
+              // ── Per-token USD pricing (pool-price aware) ──────────────────
+              // Derive the price ratio from sqrtPriceX96: price = (sqrtPrice / 2^96)^2
+              // This gives token1-per-token0 adjusted for decimals.
+              const sqrtPriceNum = Number(sqrtPriceX96) / (2 ** 96);
+              const rawPrice = sqrtPriceNum * sqrtPriceNum;
+              // Adjust for decimal difference: rawPrice is in raw units, need to scale
+              const decimalAdj = 10 ** (Number(dec0) - Number(dec1));
+              const price0In1 = rawPrice * decimalAdj; // how many token1 per 1 token0
+
               const nativePriceForVal = await getNativeTokenPrice(dbRec.chainNumericId);
-              const usd0 = isStablecoin(String(sym0)) ? ui0 : ui0 * nativePriceForVal;
-              const usd1 = isStablecoin(String(sym1)) ? ui1 : ui1 * nativePriceForVal;
+              const wrappedNative = WRAPPED_NATIVE_ADDR[dbRec.chainNumericId]?.toLowerCase();
+
+              const s0 = String(sym0).toUpperCase();
+              const s1 = String(sym1).toUpperCase();
+              const t0IsStable = isStablecoin(s0);
+              const t1IsStable = isStablecoin(s1);
+              const t0IsNative = wrappedNative && token0Addr.toLowerCase() === wrappedNative;
+              const t1IsNative = wrappedNative && token1Addr.toLowerCase() === wrappedNative;
+
+              let usd0: number;
+              let usd1: number;
+
+              if (t0IsStable && t1IsStable) {
+                usd0 = ui0;
+                usd1 = ui1;
+              } else if (t0IsStable) {
+                // token0 is stable → 1 token0 = $1, so token1 price = price0In1 (token1 per token0) → $1/price0In1
+                usd0 = ui0;
+                usd1 = price0In1 > 0 ? ui1 * (1 / price0In1) : 0;
+              } else if (t1IsStable) {
+                // token1 is stable → token0 price = price0In1 (how many stable per token0)
+                usd0 = ui0 * price0In1;
+                usd1 = ui1;
+              } else if (t0IsNative) {
+                // token0 is wrapped native (WETH etc.) → price it at nativePrice
+                usd0 = ui0 * nativePriceForVal;
+                // token1 price = nativePrice / price0In1 (since price0In1 = token1 per token0)
+                usd1 = price0In1 > 0 ? ui1 * (nativePriceForVal / price0In1) : 0;
+              } else if (t1IsNative) {
+                // token1 is wrapped native → price from pool ratio
+                usd1 = ui1 * nativePriceForVal;
+                usd0 = price0In1 > 0 ? ui0 * (price0In1 * nativePriceForVal) : 0;
+              } else {
+                // Neither stable nor native — fall back to native pricing for both (best-effort)
+                usd0 = ui0 * nativePriceForVal;
+                usd1 = price0In1 > 0 ? ui1 * (nativePriceForVal / price0In1) : 0;
+                logger.debug(`[Krystal] Unknown pair ${sym0}/${sym1} — using pool-ratio × native fallback`);
+              }
               valueUsd = usd0 + usd1;
+              // Store per-token prices for fee calculation below
+              perTokenPriceUsd0 = ui0 > 0 ? usd0 / ui0 : 0;
+              perTokenPriceUsd1 = ui1 > 0 ? usd1 / ui1 : 0;
               logger.debug(`[Krystal] On-chain value: ${sym0}=${ui0.toFixed(6)} ($${usd0.toFixed(2)}), ${sym1}=${ui1.toFixed(6)} ($${usd1.toFixed(2)}) → $${valueUsd.toFixed(2)}`);
             }
           } catch (valErr) {
@@ -1355,7 +1405,6 @@ export async function fetchKrystalPositions(
 
           // Pending fees: use proper V3 fee growth math (tokensOwed0/1 are stale until collect())
           // Falls back to raw tokensOwed if pool read fails or no pool address available.
-          const nativePrice = await getNativeTokenPrice(dbRec.chainNumericId);
           let tokensOwed0 = 0;
           let tokensOwed1 = 0;
           if (poolAddress && currentTick !== 0) {
@@ -1374,8 +1423,9 @@ export async function fetchKrystalPositions(
             tokensOwed0 = Number(ethers.formatUnits(posData.tokensOwed0 ?? posData[10] ?? 0, Number(dec0)));
             tokensOwed1 = Number(ethers.formatUnits(posData.tokensOwed1 ?? posData[11] ?? 0, Number(dec1)));
           }
-          const fee0Usd = isStablecoin(String(sym0)) ? tokensOwed0 : tokensOwed0 * nativePrice;
-          const fee1Usd = isStablecoin(String(sym1)) ? tokensOwed1 : tokensOwed1 * nativePrice;
+          // Re-use per-token USD prices derived from sqrtPriceX96 value calc above
+          const fee0Usd = tokensOwed0 * perTokenPriceUsd0;
+          const fee1Usd = tokensOwed1 * perTokenPriceUsd1;
 
           const chainName = dbRec.chainName || NATIVE_SYMBOLS[dbRec.chainNumericId]?.toLowerCase() || 'evm';
 
