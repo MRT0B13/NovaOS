@@ -713,104 +713,120 @@ export async function gatherSwarmIntel(pool: any): Promise<SwarmIntel> {
 export async function gatherPortfolioState(): Promise<PortfolioState> {
   const env = getCFOEnv();
 
-  // Prices from Pyth
+  // ── Stage 0: SOL price + SOL/USDC balances (needed for LST valuations) ──
+  // Run price + balances in parallel since they're independent
   let solPriceUsd = 0;
-  try {
-    const pyth = await import('./pythOracleService.ts');
-    solPriceUsd = await pyth.getSolPrice();
-  } catch { solPriceUsd = 85; /* fallback */ }
-
-  // SOL balance from Jupiter service
   let solBalance = 0;
   let solanaUsdcBalance = 0;
-  try {
-    const jupiter = await import('./jupiterService.ts');
-    solBalance = await jupiter.getTokenBalance(jupiter.MINTS.SOL);
-    solanaUsdcBalance = await jupiter.getTokenBalance(jupiter.MINTS.USDC);
-  } catch { /* 0 */ }
+  {
+    const [priceResult, balanceResult] = await Promise.allSettled([
+      import('./pythOracleService.ts').then(pyth => pyth.getSolPrice()),
+      import('./jupiterService.ts').then(async jupiter => ({
+        sol: await jupiter.getTokenBalance(jupiter.MINTS.SOL),
+        usdc: await jupiter.getTokenBalance(jupiter.MINTS.USDC),
+      })),
+    ]);
+    solPriceUsd = priceResult.status === 'fulfilled' ? priceResult.value : 85;
+    if (balanceResult.status === 'fulfilled') {
+      solBalance = balanceResult.value.sol;
+      solanaUsdcBalance = balanceResult.value.usdc;
+    }
+  }
 
-  // Jito position
+  // ── Stage 1: Jito + LSTs (need solPriceUsd), HL, Poly, Kamino, Orca — ALL IN PARALLEL ──
+  // These are independent of each other — only share solPriceUsd from Stage 0.
   let jitoSolBalance = 0;
   let jitoSolValueUsd = 0;
-  if (env.jitoEnabled) {
-    try {
-      const jito = await import('./jitoStakingService.ts');
-      const pos = await jito.getStakePosition(solPriceUsd);
-      jitoSolBalance = pos.jitoSolBalance;
-      jitoSolValueUsd = pos.jitoSolValueUsd;
-    } catch { /* 0 */ }
-  }
-
-  // Multi-LST wallet balances (mSOL, bSOL — JitoSOL covered above)
-  const lstBalances: Record<string, { balance: number; valueUsd: number }> = {
-    JitoSOL: { balance: jitoSolBalance, valueUsd: jitoSolValueUsd },
-  };
-  if (env.kaminoEnabled && (env.kaminoLstLoopEnabled || env.kaminoMultiplyVaultEnabled)) {
-    try {
-      const jupiter = await import('./jupiterService.ts');
-      const kamino = await import('./kaminoService.ts');
-      // Dynamic: fetch all LSTs from the reserve registry
-      const lstReserves = await kamino.getLstAssets();
-      for (const r of lstReserves) {
-        if (r.symbol === 'JitoSOL') continue; // already fetched via jitoStakingService
-        const balance = await jupiter.getTokenBalance(r.mint);
-        // LSTs are roughly 1:1 with SOL (with a small premium from staking rewards)
-        const valueUsd = balance * solPriceUsd * 1.02; // ~2% staking premium
-        lstBalances[r.symbol] = { balance, valueUsd };
-      }
-    } catch { /* non-fatal */ }
-  }
+  const lstBalances: Record<string, { balance: number; valueUsd: number }> = {};
 
   // Hyperliquid state
   let hlEquity = 0;
   let hlAvailableMargin = 0;
   let hlTotalPnl = 0;
   let hlPositions: PortfolioState['hlPositions'] = [];
+  // ── Stage 1: Jito/LSTs, HL, Poly — all in parallel (only need solPriceUsd) ──
+  const parallelJobs: Promise<void>[] = [];
+
+  // Job A: Jito + LSTs
+  parallelJobs.push((async () => {
+    if (env.jitoEnabled) {
+      try {
+        const jito = await import('./jitoStakingService.ts');
+        const pos = await jito.getStakePosition(solPriceUsd);
+        jitoSolBalance = pos.jitoSolBalance;
+        jitoSolValueUsd = pos.jitoSolValueUsd;
+      } catch { /* 0 */ }
+    }
+    lstBalances.JitoSOL = { balance: jitoSolBalance, valueUsd: jitoSolValueUsd };
+    if (env.kaminoEnabled && (env.kaminoLstLoopEnabled || env.kaminoMultiplyVaultEnabled)) {
+      try {
+        const jupiter = await import('./jupiterService.ts');
+        const kamino = await import('./kaminoService.ts');
+        const lstReserves = await kamino.getLstAssets();
+        for (const r of lstReserves) {
+          if (r.symbol === 'JitoSOL') continue;
+          const balance = await jupiter.getTokenBalance(r.mint);
+          const valueUsd = balance * solPriceUsd * 1.02;
+          lstBalances[r.symbol] = { balance, valueUsd };
+        }
+      } catch { /* non-fatal */ }
+    }
+  })());
+
+  // Job B: Hyperliquid
   if (env.hyperliquidEnabled) {
-    try {
-      const hl = await import('./hyperliquidService.ts');
-      const summary = await hl.getAccountSummary();
-      hlEquity = summary.equity;
-      hlAvailableMargin = summary.availableMargin;
-      hlTotalPnl = summary.totalPnl;
-      hlPositions = summary.positions.map((p) => ({
-        coin: p.coin,
-        side: p.side,
-        sizeUsd: p.sizeUsd,
-        unrealizedPnlUsd: p.unrealizedPnlUsd,
-        leverage: p.leverage,
-        liquidationPrice: p.liquidationPrice,
-        markPrice: p.markPrice,
-        marginUsed: p.marginUsed,
-      }));
-    } catch { /* 0 */ }
+    parallelJobs.push((async () => {
+      try {
+        const hl = await import('./hyperliquidService.ts');
+        const summary = await hl.getAccountSummary();
+        hlEquity = summary.equity;
+        hlAvailableMargin = summary.availableMargin;
+        hlTotalPnl = summary.totalPnl;
+        hlPositions = summary.positions.map((p) => ({
+          coin: p.coin,
+          side: p.side,
+          sizeUsd: p.sizeUsd,
+          unrealizedPnlUsd: p.unrealizedPnlUsd,
+          leverage: p.leverage,
+          liquidationPrice: p.liquidationPrice,
+          markPrice: p.markPrice,
+          marginUsed: p.marginUsed,
+        }));
+      } catch { /* 0 */ }
+    })());
   }
 
-  // Polymarket state
+  // Job C: Polymarket state
   let polyDeployedUsd = 0;
   let polyUsdcBalance = 0;
   let polyPositionCount = 0;
   let polyPositions: PortfolioState['polyPositions'] = [];
   if (env.polymarketEnabled) {
-    try {
-      const polyMod = await import('./polymarketService.ts');
-      const evmMod = await import('./evmWalletService.ts');
-      const positions = await polyMod.fetchPositions();
-      polyPositionCount = positions.length;
-      polyDeployedUsd = positions.reduce((s: number, p: any) => s + (p.currentValueUsd ?? 0), 0);
-      polyPositions = positions.map((p: any) => ({
-        question: p.question ?? 'Unknown',
-        outcome: p.outcome ?? '?',
-        costBasisUsd: p.costBasisUsd ?? 0,
-        currentValueUsd: p.currentValueUsd ?? 0,
-        unrealizedPnlUsd: p.unrealizedPnlUsd ?? 0,
-        currentPrice: p.currentPrice ?? 0,
-      }));
-      polyUsdcBalance = await evmMod.getUSDCBalance();
-    } catch (err) {
-      logger.warn('[CFO] Polymarket state fetch failed:', err);
-    }
+    parallelJobs.push((async () => {
+      try {
+        const polyMod = await import('./polymarketService.ts');
+        const evmMod = await import('./evmWalletService.ts');
+        const positions = await polyMod.fetchPositions();
+        polyPositionCount = positions.length;
+        polyDeployedUsd = positions.reduce((s: number, p: any) => s + (p.currentValueUsd ?? 0), 0);
+        polyPositions = positions.map((p: any) => ({
+          question: p.question ?? 'Unknown',
+          outcome: p.outcome ?? '?',
+          costBasisUsd: p.costBasisUsd ?? 0,
+          currentValueUsd: p.currentValueUsd ?? 0,
+          unrealizedPnlUsd: p.unrealizedPnlUsd ?? 0,
+          currentPrice: p.currentPrice ?? 0,
+        }));
+        polyUsdcBalance = await evmMod.getUSDCBalance();
+      } catch (err) {
+        logger.warn('[CFO] Polymarket state fetch failed:', err);
+      }
+    })());
   }
+
+  // ── Wait for all Stage 1 parallel jobs ──
+  await Promise.allSettled(parallelJobs);
+
   const polyHeadroomUsd = Math.min(polyUsdcBalance, env.maxPolymarketUsd - polyDeployedUsd);
 
   // SOL-correlated exposure = raw SOL + all LSTs (JitoSOL, mSOL, bSOL, etc.)
@@ -845,152 +861,15 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
   const reserveNeeded = Number(process.env.CFO_STAKE_RESERVE_SOL ?? 0.5);
   const idleSolForStaking = Math.max(0, solBalance - reserveNeeded);
 
-  // Kamino state
+  // ── Stage 2: Kamino + Orca + EVM in parallel ──────────────────────────
   let kaminoDepositValueUsd = 0, kaminoBorrowValueUsd = 0, kaminoNetValueUsd = 0;
   let kaminoLtv = 0, kaminoHealthFactor = 999, kaminoBorrowApy = 0.12, kaminoSupplyApy = 0.08;
   let kaminoSolBorrowApy = 0.10, kaminoJitoSupplyApy = 0.07, kaminoUsdcSupplyApy = 0.08;
   let kaminoBorrowableUsd = 0, kaminoJitoLoopActive = false, kaminoJitoLoopApy = 0;
   let kaminoActiveLstLoop: string | null = null;
-  if (env.kaminoEnabled) {
-    try {
-      const kamino = await import('./kaminoService.ts');
-      const [pos, apys] = await Promise.all([kamino.getPosition(), kamino.getApys()]);
-      kaminoDepositValueUsd = pos.deposits.reduce((s, d) => s + d.valueUsd, 0);
-      kaminoBorrowValueUsd  = pos.borrows.reduce((s, b) => s + b.valueUsd, 0);
-      kaminoNetValueUsd     = pos.netValueUsd;
-      kaminoLtv             = pos.ltv;
-      kaminoHealthFactor    = pos.healthFactor;
-      kaminoBorrowApy       = apys.USDC?.borrowApy    ?? 0.12;
-      kaminoSolBorrowApy    = apys.SOL?.borrowApy     ?? 0.10;
-      kaminoJitoSupplyApy   = apys.JitoSOL?.supplyApy ?? 0.07;
-      kaminoUsdcSupplyApy   = apys.USDC?.supplyApy    ?? 0.08;
-      kaminoSupplyApy       = kaminoUsdcSupplyApy;
-
-      // USDC borrowable headroom for simple collateral loop
-      const maxBorrowLtv = (env.kaminoBorrowMaxLtvPct ?? 60) / 100;
-      kaminoBorrowableUsd = Math.max(0, Math.min(
-        kaminoDepositValueUsd * maxBorrowLtv - kaminoBorrowValueUsd,
-        env.maxKaminoBorrowUsd - kaminoBorrowValueUsd,
-      ));
-
-      // Detect JitoSOL loop: has JitoSOL deposits AND SOL borrows simultaneously
-      const hasJitoDeposit = pos.deposits.some(d => d.asset === 'JitoSOL');
-      const hasSolBorrow   = pos.borrows.some(b => b.asset === 'SOL');
-      kaminoJitoLoopActive = hasJitoDeposit && hasSolBorrow;
-
-      if (kaminoJitoLoopActive) {
-        const jitoDepositUsd = pos.deposits.filter(d => d.asset === 'JitoSOL').reduce((s, d) => s + d.valueUsd, 0);
-        const leverage = kaminoNetValueUsd > 0 ? jitoDepositUsd / kaminoNetValueUsd : 1;
-        kaminoJitoLoopApy = leverage * kaminoJitoSupplyApy - (leverage - 1) * kaminoSolBorrowApy;
-      }
-
-      // Detect ANY active LST loop (any LST deposit + SOL borrow)
-      for (const dep of pos.deposits) {
-        const lstInfo = await kamino.getReserve(dep.asset);
-        if (lstInfo?.isLst && hasSolBorrow) {
-          kaminoActiveLstLoop = dep.asset;
-          break;
-        }
-      }
-    } catch { /* non-fatal */ }
-  }
-
-  // Kamino Multiply vault data
   let kaminoMultiplyVaults: PortfolioState['kaminoMultiplyVaults'] = [];
-  if (env.kaminoEnabled && env.kaminoMultiplyVaultEnabled) {
-    try {
-      const kamino = await import('./kaminoService.ts');
-      const vaults = await kamino.getMultiplyVaults();
-      kaminoMultiplyVaults = vaults.slice(0, 5).map(v => ({
-        name: v.name,
-        collateralToken: v.collateralToken,
-        apy: v.apy,
-        tvl: v.tvl,
-        leverage: v.leverage,
-        address: v.address,
-      }));
-    } catch { /* non-fatal */ }
-  }
-
-  // Orca LP state
   let orcaLpValueUsd = 0, orcaLpFeeApy = 0;
   let orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string; riskTier?: string; tokenA?: string; tokenB?: string; valueUsd?: number; feesUsd?: number }> = [];
-  if (env.orcaLpEnabled) {
-    try {
-      const orca = await import('./orcaService.ts');
-      const positions = await orca.getPositions();
-      logger.info(`[CFO] Orca on-chain scan returned ${positions.length} position(s)`);
-      orcaLpValueUsd = positions.reduce((s, p) => s + p.liquidityUsd, 0);
-
-      // Infer risk tier from DB position metadata (set at open time)
-      // Wrapped in its own try/catch — DB enrichment must not kill the positions
-      const dbTierMap = new Map<string, { tier?: string; tokenA?: string; tokenB?: string }>();
-      try {
-        const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
-        if (dbUrl) {
-          const { Pool } = await import('pg');
-          const pgPool = new Pool({ connectionString: dbUrl, max: 1 });
-          try {
-            const orcaDbRes = await pgPool.query(
-              `SELECT asset, metadata FROM cfo_positions WHERE strategy = 'orca_lp' AND status = 'OPEN'`,
-            );
-            for (const row of orcaDbRes.rows) {
-              const meta = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata;
-              const wp = meta?.whirlpoolAddress;
-              if (wp) dbTierMap.set(wp, { tier: meta?.riskTier, tokenA: meta?.tokenA, tokenB: meta?.tokenB });
-            }
-          } finally {
-            pgPool.end().catch(() => {});
-          }
-        }
-      } catch (dbErr) {
-        logger.debug('[CFO] Orca DB tier enrichment failed (non-fatal):', dbErr instanceof Error ? dbErr.message : dbErr);
-      }
-
-      // Also try pool discovery cache for risk tier / symbols as a fallback
-      let discoveryCache: Map<string, { tier?: string; tokenA?: string; tokenB?: string }> | null = null;
-      try {
-        const { getCachedPools } = await import('./orcaPoolDiscovery.ts');
-        const cached = getCachedPools();
-        if (cached.length > 0) {
-          discoveryCache = new Map();
-          for (const c of cached) {
-            discoveryCache.set(c.whirlpoolAddress, { tier: c.riskTier, tokenA: c.tokenA.symbol, tokenB: c.tokenB.symbol });
-          }
-        }
-      } catch { /* non-fatal */ }
-
-      orcaPositions = positions.map(p => {
-        const dbInfo = p.whirlpoolAddress ? dbTierMap.get(p.whirlpoolAddress) : undefined;
-        const discInfo = p.whirlpoolAddress && discoveryCache ? discoveryCache.get(p.whirlpoolAddress) : undefined;
-        // Convert unclaimed fees to USD using per-token prices from the position
-        const feesUsd = (p.unclaimedFeesA ?? p.unclaimedFeesSol ?? 0) * (p.tokenAPriceUsd ?? solPriceUsd)
-                      + (p.unclaimedFeesB ?? p.unclaimedFeesUsdc ?? 0) * (p.tokenBPriceUsd ?? 1);
-        // Priority: on-chain position data > DB metadata > pool discovery cache
-        return {
-          positionMint: p.positionMint,
-          rangeUtilisationPct: p.rangeUtilisationPct,
-          inRange: p.inRange,
-          whirlpoolAddress: p.whirlpoolAddress,
-          riskTier: p.riskTier ?? dbInfo?.tier ?? discInfo?.tier,
-          tokenA: p.tokenA ?? dbInfo?.tokenA ?? discInfo?.tokenA,
-          tokenB: p.tokenB ?? dbInfo?.tokenB ?? discInfo?.tokenB,
-          valueUsd: p.liquidityUsd,
-          feesUsd,
-        };
-      });
-      // Orca 0.3% fee pool at full utilisation ≈ 20-40% APY depending on volume
-      // Conservative estimate: 15% if in-range, 0% if out-of-range
-      const inRangePositions = positions.filter(p => p.inRange).length;
-      orcaLpFeeApy = positions.length > 0 ? (inRangePositions / positions.length) * 0.15 : 0;
-    } catch (orcaErr) {
-      logger.warn('[CFO] Orca position fetch failed:', orcaErr instanceof Error ? orcaErr.message : orcaErr);
-    }
-  }
-
-  // ── EVM sections (Arb + Krystal LP + Multi-chain balances) ─────────────
-  // These three are independent of each other — run in parallel to cut
-  // wall-clock time (especially when Krystal API is slow / circuit-broken).
   let evmArbProfit24h = 0, evmArbPoolCount = 0, evmArbUsdcBalance = 0;
   let evmLpPositions: PortfolioState['evmLpPositions'] = [];
   let evmLpTotalValueUsd = 0, evmLpTotalFeesUsd = 0;
@@ -998,29 +877,161 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
   let evmTotalUsdcAllChains = 0, evmTotalNativeAllChains = 0;
 
   {
-    const evmJobs: Promise<void>[] = [];
+    const stage2Jobs: Promise<void>[] = [];
 
-    // Job 1: EVM Arb state
-    if (env.evmArbEnabled) {
-      evmJobs.push((async () => {
+    // ── Job A: Kamino ──────────────────────────────────────────────────
+    if (env.kaminoEnabled) {
+      stage2Jobs.push((async () => {
         try {
-          const arbMod = await import('./evmArbService.ts');
-          evmArbProfit24h   = arbMod.getProfit24h();
-          evmArbPoolCount   = arbMod.getCandidatePoolCount();
-          evmArbUsdcBalance = await arbMod.getArbUsdcBalance();
-        } catch { /* 0 */ }
+          const kamino = await import('./kaminoService.ts');
+          const [pos, apys] = await Promise.all([kamino.getPosition(), kamino.getApys()]);
+          kaminoDepositValueUsd = pos.deposits.reduce((s, d) => s + d.valueUsd, 0);
+          kaminoBorrowValueUsd  = pos.borrows.reduce((s, b) => s + b.valueUsd, 0);
+          kaminoNetValueUsd     = pos.netValueUsd;
+          kaminoLtv             = pos.ltv;
+          kaminoHealthFactor    = pos.healthFactor;
+          kaminoBorrowApy       = apys.USDC?.borrowApy    ?? 0.12;
+          kaminoSolBorrowApy    = apys.SOL?.borrowApy     ?? 0.10;
+          kaminoJitoSupplyApy   = apys.JitoSOL?.supplyApy ?? 0.07;
+          kaminoUsdcSupplyApy   = apys.USDC?.supplyApy    ?? 0.08;
+          kaminoSupplyApy       = kaminoUsdcSupplyApy;
+
+          const maxBorrowLtv = (env.kaminoBorrowMaxLtvPct ?? 60) / 100;
+          kaminoBorrowableUsd = Math.max(0, Math.min(
+            kaminoDepositValueUsd * maxBorrowLtv - kaminoBorrowValueUsd,
+            env.maxKaminoBorrowUsd - kaminoBorrowValueUsd,
+          ));
+
+          const hasJitoDeposit = pos.deposits.some(d => d.asset === 'JitoSOL');
+          const hasSolBorrow   = pos.borrows.some(b => b.asset === 'SOL');
+          kaminoJitoLoopActive = hasJitoDeposit && hasSolBorrow;
+
+          if (kaminoJitoLoopActive) {
+            const jitoDepositUsd = pos.deposits.filter(d => d.asset === 'JitoSOL').reduce((s, d) => s + d.valueUsd, 0);
+            const leverage = kaminoNetValueUsd > 0 ? jitoDepositUsd / kaminoNetValueUsd : 1;
+            kaminoJitoLoopApy = leverage * kaminoJitoSupplyApy - (leverage - 1) * kaminoSolBorrowApy;
+          }
+
+          for (const dep of pos.deposits) {
+            const lstInfo = await kamino.getReserve(dep.asset);
+            if (lstInfo?.isLst && hasSolBorrow) {
+              kaminoActiveLstLoop = dep.asset;
+              break;
+            }
+          }
+        } catch { /* non-fatal */ }
+
+        // Kamino Multiply vaults (nested inside same job to reuse kamino import)
+        if (env.kaminoMultiplyVaultEnabled) {
+          try {
+            const kamino = await import('./kaminoService.ts');
+            const vaults = await kamino.getMultiplyVaults();
+            kaminoMultiplyVaults = vaults.slice(0, 5).map(v => ({
+              name: v.name,
+              collateralToken: v.collateralToken,
+              apy: v.apy,
+              tvl: v.tvl,
+              leverage: v.leverage,
+              address: v.address,
+            }));
+          } catch { /* non-fatal */ }
+        }
       })());
     }
 
-    // Job 2: Krystal EVM LP positions
-    if (env.krystalLpEnabled) {
-      evmJobs.push((async () => {
+    // ── Job B: Orca LP ─────────────────────────────────────────────────
+    if (env.orcaLpEnabled) {
+      stage2Jobs.push((async () => {
         try {
-          const krystal = await import('./krystalService.ts');
-          const walletAddr = env.evmPrivateKey
-            ? (await import('ethers' as string)).computeAddress(env.evmPrivateKey)
-            : undefined;
-          if (walletAddr) {
+          const orca = await import('./orcaService.ts');
+          const positions = await orca.getPositions();
+          logger.info(`[CFO] Orca on-chain scan returned ${positions.length} position(s)`);
+          orcaLpValueUsd = positions.reduce((s, p) => s + p.liquidityUsd, 0);
+
+          const dbTierMap = new Map<string, { tier?: string; tokenA?: string; tokenB?: string }>();
+          try {
+            const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+            if (dbUrl) {
+              const { Pool } = await import('pg');
+              const pgPool = new Pool({ connectionString: dbUrl, max: 1 });
+              try {
+                const orcaDbRes = await pgPool.query(
+                  `SELECT asset, metadata FROM cfo_positions WHERE strategy = 'orca_lp' AND status = 'OPEN'`,
+                );
+                for (const row of orcaDbRes.rows) {
+                  const meta = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata;
+                  const wp = meta?.whirlpoolAddress;
+                  if (wp) dbTierMap.set(wp, { tier: meta?.riskTier, tokenA: meta?.tokenA, tokenB: meta?.tokenB });
+                }
+              } finally {
+                pgPool.end().catch(() => {});
+              }
+            }
+          } catch (dbErr) {
+            logger.debug('[CFO] Orca DB tier enrichment failed (non-fatal):', dbErr instanceof Error ? dbErr.message : dbErr);
+          }
+
+          let discoveryCache: Map<string, { tier?: string; tokenA?: string; tokenB?: string }> | null = null;
+          try {
+            const { getCachedPools } = await import('./orcaPoolDiscovery.ts');
+            const cached = getCachedPools();
+            if (cached.length > 0) {
+              discoveryCache = new Map();
+              for (const c of cached) {
+                discoveryCache.set(c.whirlpoolAddress, { tier: c.riskTier, tokenA: c.tokenA.symbol, tokenB: c.tokenB.symbol });
+              }
+            }
+          } catch { /* non-fatal */ }
+
+          orcaPositions = positions.map(p => {
+            const dbInfo = p.whirlpoolAddress ? dbTierMap.get(p.whirlpoolAddress) : undefined;
+            const discInfo = p.whirlpoolAddress && discoveryCache ? discoveryCache.get(p.whirlpoolAddress) : undefined;
+            const feesUsd = (p.unclaimedFeesA ?? p.unclaimedFeesSol ?? 0) * (p.tokenAPriceUsd ?? solPriceUsd)
+                          + (p.unclaimedFeesB ?? p.unclaimedFeesUsdc ?? 0) * (p.tokenBPriceUsd ?? 1);
+            return {
+              positionMint: p.positionMint,
+              rangeUtilisationPct: p.rangeUtilisationPct,
+              inRange: p.inRange,
+              whirlpoolAddress: p.whirlpoolAddress,
+              riskTier: p.riskTier ?? dbInfo?.tier ?? discInfo?.tier,
+              tokenA: p.tokenA ?? dbInfo?.tokenA ?? discInfo?.tokenA,
+              tokenB: p.tokenB ?? dbInfo?.tokenB ?? discInfo?.tokenB,
+              valueUsd: p.liquidityUsd,
+              feesUsd,
+            };
+          });
+          const inRangePositions = positions.filter(p => p.inRange).length;
+          orcaLpFeeApy = positions.length > 0 ? (inRangePositions / positions.length) * 0.15 : 0;
+        } catch (orcaErr) {
+          logger.warn('[CFO] Orca position fetch failed:', orcaErr instanceof Error ? orcaErr.message : orcaErr);
+        }
+      })());
+    }
+
+    // ── Job C: EVM (Arb + Krystal LP + Multi-chain balances) ───────────
+    stage2Jobs.push((async () => {
+      const evmJobs: Promise<void>[] = [];
+
+      if (env.evmArbEnabled) {
+        evmJobs.push((async () => {
+          try {
+            const arbMod = await import('./evmArbService.ts');
+            evmArbProfit24h   = arbMod.getProfit24h();
+            evmArbPoolCount   = arbMod.getCandidatePoolCount();
+            evmArbUsdcBalance = await arbMod.getArbUsdcBalance();
+          } catch { /* 0 */ }
+        })());
+      }
+
+      // Job 2: Krystal EVM LP positions
+      if (env.krystalLpEnabled) {
+        evmJobs.push((async () => {
+          try {
+            const krystal = await import('./krystalService.ts');
+            const walletAddr = env.evmPrivateKey
+              ? (await import('ethers' as string)).computeAddress(env.evmPrivateKey)
+              : undefined;
+            if (walletAddr) {
             const dbRecords = (globalThis as any).__cfo_evm_lp_records as import('./krystalService.ts').EvmLpRecord[] | undefined;
             const positions = await krystal.fetchKrystalPositions(walletAddr, dbRecords);
 
@@ -1082,19 +1093,22 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     }
 
     // Job 3: Multi-chain EVM balance scan
-    if (env.krystalLpEnabled || env.lifiEnabled) {
-      evmJobs.push((async () => {
-        try {
-          const krystal = await import('./krystalService.ts');
-          const balances = await krystal.getMultiChainEvmBalances();
-          evmChainBalances        = balances;
-          evmTotalUsdcAllChains   = balances.reduce((s, b) => s + b.totalStableUsd, 0);
-          evmTotalNativeAllChains = balances.reduce((s, b) => s + b.nativeValueUsd + b.wethValueUsd, 0);
-        } catch { /* 0 */ }
-      })());
-    }
+      if (env.krystalLpEnabled || env.lifiEnabled) {
+        evmJobs.push((async () => {
+          try {
+            const krystal = await import('./krystalService.ts');
+            const balances = await krystal.getMultiChainEvmBalances();
+            evmChainBalances        = balances;
+            evmTotalUsdcAllChains   = balances.reduce((s, b) => s + b.totalStableUsd, 0);
+            evmTotalNativeAllChains = balances.reduce((s, b) => s + b.nativeValueUsd + b.wethValueUsd, 0);
+          } catch { /* 0 */ }
+        })());
+      }
 
-    await Promise.all(evmJobs);
+      await Promise.all(evmJobs);
+    })());
+
+    await Promise.allSettled(stage2Jobs);
   }
 
   // Patch totalPortfolioUsd with Kamino + Orca + EVM LP values gathered above

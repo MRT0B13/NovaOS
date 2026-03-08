@@ -256,6 +256,38 @@ export class WalletSentinel {
       const dropPct = ((prev.balanceSol - balance) / prev.balanceSol) * 100;
 
       if (dropPct >= wallet.drainThresholdPct) {
+        // ── Guard: minimum dollar-value filter ──
+        // Tiny wallets (< ~0.05 SOL) can trigger 25%+ drops from normal tx fees.
+        // Only alert if the absolute drop is at least $5 worth of SOL.
+        const roughSolPrice = 150; // conservative estimate; exact price not needed for threshold
+        const droppedSol = prev.balanceSol - balance;
+        const droppedUsd = droppedSol * roughSolPrice;
+        if (droppedUsd < 5) {
+          // Negligible drop — normal transaction costs, not a drain
+          return;
+        }
+
+        // ── Confirmation re-check: wait 30s then re-fetch balance ──
+        // Prevents false positives from RPC stale reads or in-flight transactions
+        logger.warn(`[WalletSentinel] ${wallet.label} balance drop ${dropPct.toFixed(1)}% detected — re-checking in 30s…`);
+        await new Promise(r => setTimeout(r, 30_000));
+        const confirmBalance = await this.fetchSolBalance(wallet.rpcUrl, wallet.address);
+        if (confirmBalance !== null) {
+          const confirmedDropPct = prev.balanceSol > 0 ? ((prev.balanceSol - confirmBalance) / prev.balanceSol) * 100 : 0;
+          if (confirmedDropPct < wallet.drainThresholdPct * 0.5) {
+            // Balance recovered significantly — was a transient blip
+            logger.info(`[WalletSentinel] ${wallet.label} balance recovered to ${confirmBalance.toFixed(4)} SOL — false alarm suppressed`);
+            this.lastSnapshots.set(wallet.address, {
+              address: wallet.address,
+              label: wallet.label,
+              balanceSol: confirmBalance,
+              balanceLamports: BigInt(Math.round(confirmBalance * 1e9)),
+              timestamp: Date.now(),
+            });
+            return;
+          }
+        }
+
         const event: SecurityEvent = {
           category: 'wallet',
           severity: dropPct >= 80 ? 'emergency' : 'critical',

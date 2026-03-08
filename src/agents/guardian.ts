@@ -619,16 +619,40 @@ export class GuardianAgent extends BaseAgent {
         // LP DRAIN: liquidity dropped > 40%
         if (prevLiq > 1000 && snapshot.liquidityUsd < prevLiq * 0.6) {
           const dropPct = Math.round((1 - snapshot.liquidityUsd / prevLiq) * 100);
+
+          // ── Confirmation re-check: wait 60s then re-fetch DexScreener ──
+          // Prevents false positives from transient API glitches or temporary
+          // liquidity movements (e.g. rebalancing, migration events).
+          logger.warn(`[Guardian] ${name} LP drop ${dropPct}% detected — re-checking in 60s to confirm…`);
+          await new Promise(r => setTimeout(r, 60_000));
+          const confirmSnapshots = await fetchDexScreenerLiquidity([mint]);
+          const confirmSnap = confirmSnapshots.get(mint);
+          if (confirmSnap) {
+            // Update to latest value after re-check
+            token.lastLiquidityUsd = confirmSnap.liquidityUsd;
+            token.lastPriceUsd = confirmSnap.priceUsd;
+            token.lastVolume24h = confirmSnap.volume24h;
+
+            const confirmedDropPct = Math.round((1 - confirmSnap.liquidityUsd / prevLiq) * 100);
+            if (confirmedDropPct < 30) {
+              // Recovered — was a transient blip, don't alert
+              logger.info(`[Guardian] ${name} LP recovered to $${this.formatUSD(confirmSnap.liquidityUsd)} — false alarm suppressed`);
+              continue;
+            }
+          }
+
           const rug = await this.quickRugScan(mint);
-          const alertLines = [`LP drained ${dropPct}%: $${this.formatUSD(prevLiq)} → $${this.formatUSD(snapshot.liquidityUsd)}`];
+          const confirmedLiq = confirmSnap?.liquidityUsd ?? snapshot.liquidityUsd;
+          const confirmedDrop = Math.round((1 - confirmedLiq / prevLiq) * 100);
+          const alertLines = [`LP drained ${confirmedDrop}% (confirmed): $${this.formatUSD(prevLiq)} → $${this.formatUSD(confirmedLiq)}`];
           if (rug.alerts.length) alertLines.push(...rug.alerts.map(a => `RugCheck: ${a}`));
-          await this.reportAlert(dropPct > 80 ? 'critical' : 'high', mint, {
+          await this.reportAlert(confirmedDrop > 80 ? 'critical' : 'high', mint, {
             tokenName: name,
             alerts: alertLines,
             score: rug.score,
             riskLevel: rug.riskLevel,
             isRugged: rug.isRugged,
-            liquidityUsd: snapshot.liquidityUsd,
+            liquidityUsd: confirmedLiq,
             previousLiquidityUsd: prevLiq,
             type: 'lp_drain',
           });
@@ -650,16 +674,36 @@ export class GuardianAgent extends BaseAgent {
         // PRICE CRASH: > 30% drop since last check
         if (prevPrice && prevPrice > 0 && snapshot.priceUsd < prevPrice * 0.7) {
           const crashPct = Math.round((1 - snapshot.priceUsd / prevPrice) * 100);
+
+          // ── Confirmation re-check for price crash ──
+          logger.warn(`[Guardian] ${name} price crash ${crashPct}% detected — re-checking in 60s…`);
+          await new Promise(r => setTimeout(r, 60_000));
+          const confirmSnapshots = await fetchDexScreenerLiquidity([mint]);
+          const confirmSnap = confirmSnapshots.get(mint);
+          if (confirmSnap) {
+            token.lastPriceUsd = confirmSnap.priceUsd;
+            token.lastLiquidityUsd = confirmSnap.liquidityUsd;
+            token.lastVolume24h = confirmSnap.volume24h;
+
+            const confirmedCrashPct = Math.round((1 - confirmSnap.priceUsd / prevPrice) * 100);
+            if (confirmedCrashPct < 20) {
+              logger.info(`[Guardian] ${name} price recovered to $${confirmSnap.priceUsd.toFixed(6)} — false alarm suppressed`);
+              continue;
+            }
+          }
+
+          const confirmedPrice = confirmSnap?.priceUsd ?? snapshot.priceUsd;
+          const confirmedCrash = Math.round((1 - confirmedPrice / prevPrice) * 100);
           const rug = await this.quickRugScan(mint);
-          const alertLines = [`Price crashed ${crashPct}%: $${prevPrice.toFixed(6)} → $${snapshot.priceUsd.toFixed(6)}`];
+          const alertLines = [`Price crashed ${confirmedCrash}% (confirmed): $${prevPrice.toFixed(6)} → $${confirmedPrice.toFixed(6)}`];
           if (rug.alerts.length) alertLines.push(...rug.alerts.map(a => `RugCheck: ${a}`));
-          await this.reportAlert(crashPct > 50 ? 'critical' : 'high', mint, {
+          await this.reportAlert(confirmedCrash > 50 ? 'critical' : 'high', mint, {
             tokenName: name,
             alerts: alertLines,
             score: rug.score,
             riskLevel: rug.riskLevel,
             isRugged: rug.isRugged,
-            priceUsd: snapshot.priceUsd,
+            priceUsd: confirmedPrice,
             previousPriceUsd: prevPrice,
             type: 'price_crash',
           });

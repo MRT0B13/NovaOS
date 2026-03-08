@@ -2078,16 +2078,26 @@ export class CFOAgent extends BaseAgent {
 
   // ── Gas check ─────────────────────────────────────────────────────
 
+  /** Last time a gas-related alert was sent (prevents 96x MATIC spam at 15-min interval) */
+  private lastGasAlertAt = 0;
+  private static GAS_ALERT_COOLDOWN_MS = 2 * 60 * 60_000; // 2 hours
+
   private async checkGasReserves(): Promise<void> {
     if (!this.running || !getCFOEnv().polymarketEnabled) return;
     try {
       const gas = await (await evm()).checkGas();
       if (!gas.ok || gas.warning) {
+        const now = Date.now();
+        if (now - this.lastGasAlertAt < CFOAgent.GAS_ALERT_COOLDOWN_MS) return; // suppress repeat
+        this.lastGasAlertAt = now;
         await this.reportToSupervisor('alert', (!gas.ok ? 'critical' : 'high') as any, { event: 'cfo_gas', message: gas.warning, matic: gas.matic });
         if (!gas.ok) {
           const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
           await notifyAdminForce(`⛽ CFO: ${gas.warning}`);
         }
+      } else {
+        // Gas is OK again — reset cooldown so next drop is reported immediately
+        this.lastGasAlertAt = 0;
       }
     } catch { /* non-fatal */ }
   }
