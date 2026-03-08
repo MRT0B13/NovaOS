@@ -550,10 +550,32 @@ export async function registerFactoryCommands(
       }
     });
 
-    // Alias: /skills → /skill
+    // Alias: /skills → run /skill handler with 'list' subcommand
     bot.command('skills', async (ctx: any) => {
-      ctx.message.text = ctx.message.text.replace(/^\/skills/, '/skill');
-      await bot.handleUpdate({ message: ctx.message, update_id: 0 });
+      try {
+        if (!isAdmin(ctx.chat.id)) {
+          await ctx.reply('🔒 Admin only.').catch(() => {});
+          return;
+        }
+        const { getSkillsService } = await import('./skillsService.ts');
+        const svc = getSkillsService();
+        if (!svc) {
+          await ctx.reply('⚠️ Skills service not initialized.').catch(() => {});
+          return;
+        }
+        const skills = await svc.listSkills();
+        if (skills.length === 0) {
+          await ctx.reply('📦 No skills registered yet.');
+          return;
+        }
+        const lines = skills.map((s: any) =>
+          `${s.status === 'active' ? '✅' : '❌'} <b>${s.name}</b> (${s.skillId} v${s.version})\n   📂 ${s.category} | 👥 ${s.assignedTo.length > 0 ? s.assignedTo.join(', ') : 'unassigned'}`
+        );
+        await ctx.reply(`📦 <b>Agent Skills</b>\n\n${lines.join('\n\n')}`, { parse_mode: 'HTML' });
+      } catch (err: any) {
+        logger.warn('[factory-tg] /skills error:', err.message);
+        await ctx.reply('❌ Error processing skill command.').catch(() => {});
+      }
     });
 
     isRegistered = true;

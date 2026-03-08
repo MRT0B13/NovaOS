@@ -33,6 +33,7 @@ const KNOWN_BOT_COMMANDS = new Set([
   '/request_agent', '/approve_agent',
   '/reject_agent', '/my_agents', '/stop_agent',
   '/cfo', '/help',
+  '/skill', '/skills',
 ]);
 
 // Human-readable descriptions for /help output
@@ -57,6 +58,9 @@ const COMMAND_DESCRIPTIONS: Record<string, string> = {
   stop_agent:     'Stop a running child agent',
   // ── CFO ──
   cfo:            'CFO commands (status, approve, pause, resume)',
+  // ── Skills ──
+  skill:          'Skill management (list, view, assign, enable, pending)',
+  skills:         'Alias for /skill list',
 };
 
 // ── Command dispatch registry ──────────────────────────────────────────────

@@ -30,6 +30,7 @@ const KNOWN_BOT_COMMANDS = new Set([
   '/request_agent', '/approve_agent',              // factory commands
   '/reject_agent', '/my_agents', '/stop_agent',
   '/cfo',                                          // CFO command
+  '/skill', '/skills',                             // skill management
   '/help',                                         // help / command list
 ]);
 import { recordMessageReceived } from '../services/telegramHealthMonitor.ts';
