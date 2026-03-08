@@ -821,12 +821,13 @@ async function sendReport(
   }
 
   // Persist in kv_store for later retrieval
+  // data column is jsonb — wrap raw HTML string in JSON so PostgreSQL can parse it
   try {
     await pool.query(
       `INSERT INTO kv_store (key, data, updated_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = NOW()`,
-      [`cfo_report_${type}_${periodEnd}`, html],
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET data = $2::jsonb, updated_at = NOW()`,
+      [`cfo_report_${type}_${periodEnd}`, JSON.stringify(html)],
     );
   } catch (err) {
     logger.debug('[FinancialReport] Failed to persist report in kv_store:', err);
