@@ -508,6 +508,18 @@ export async function openPosition(
       IGNORE_CACHE,
     );
     if (uninitArrays.length > 0) {
+      // Each tick array init needs ~0.07 SOL rent. Pre-check wallet has enough.
+      const TICK_ARRAY_RENT_LAMPORTS = 70_407_360; // ~0.0704 SOL per array
+      const neededLamports = uninitArrays.length * TICK_ARRAY_RENT_LAMPORTS;
+      const walletLamports = await connection.getBalance(walletKeypair.publicKey);
+      if (walletLamports < neededLamports + 5_000_000) { // +0.005 SOL buffer for tx fees
+        const neededSol = (neededLamports + 5_000_000) / 1e9;
+        const haveSol = walletLamports / 1e9;
+        throw new Error(
+          `Insufficient SOL for tick array initialization: need ${neededSol.toFixed(4)} SOL ` +
+          `(${uninitArrays.length} arrays × 0.0704 SOL rent) but wallet has ${haveSol.toFixed(4)} SOL`,
+        );
+      }
       logger.info(`[Orca] Found ${uninitArrays.length} uninitialized tick array(s) — initializing...`);
       for (const arr of uninitArrays) {
         const ix = WhirlpoolIx.initTickArrayIx(ctx.program, {
@@ -793,6 +805,28 @@ export async function rebalancePosition(
   if (usdcReceived <= 0 && solReceived <= 0) {
     logger.warn(`[Orca] Rebalance: position closed but got no tokens back (already empty?)`);
     return { success: true, txSignature: closeResult.txSignature, valueRecoveredUsd: 0, usdcReceived, solReceived };
+  }
+
+  // Pre-check: verify wallet has enough SOL for reopen (tick array init + tx fees).
+  // Tick array init costs ~0.07 SOL rent each; there can be 1-2 arrays to initialize.
+  // If wallet SOL is critically low, skip reopen to avoid stranding funds.
+  const MIN_SOL_FOR_REOPEN = 0.10; // ~0.07 rent + 0.02 tx fees + buffer
+  const connection = new Connection(getRpcUrl(), 'confirmed');
+  const walletKeypair = loadWallet();
+  const walletSolBal = (await connection.getBalance(walletKeypair.publicKey)) / 1e9;
+  if (walletSolBal < MIN_SOL_FOR_REOPEN) {
+    logger.warn(
+      `[Orca] Rebalance: wallet SOL ${walletSolBal.toFixed(4)} < ${MIN_SOL_FOR_REOPEN} minimum for reopen ` +
+      `(tick array rent + tx fees). Position closed but NOT reopened — funds in wallet.`,
+    );
+    return {
+      success: false,
+      error: `Insufficient SOL (${walletSolBal.toFixed(4)}) for reopen — need ≥${MIN_SOL_FOR_REOPEN} for tick array rent. Position closed, funds in wallet.`,
+      txSignature: closeResult.txSignature,
+      valueRecoveredUsd,
+      usdcReceived,
+      solReceived,
+    };
   }
 
   // Step 2: Pre-swap to rebalance proceeds — openPosition needs BOTH sides.

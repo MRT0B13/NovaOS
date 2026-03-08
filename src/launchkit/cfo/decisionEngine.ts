@@ -4179,7 +4179,12 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         // Recovery mode: wallet has orphaned non-USDC tokens from a failed borrow LP.
         // Swap them to USDC first, then proceed with repay.
         if (recoverTokens && usdcBal < repayUsd * 0.50) {
-          logger.info(`[CFO] KAMINO_REPAY recovery mode — scanning wallet for orphaned tokens to swap to USDC`);
+          // Pre-check: need enough SOL for swap tx fees (~0.01 SOL per swap)
+          const solBal = await jupBal.getTokenBalance(jupBal.MINTS.SOL);
+          if (solBal < 0.005) {
+            logger.warn(`[CFO] KAMINO_REPAY recovery skipped — SOL balance ${solBal.toFixed(4)} too low for swap tx fees`);
+          } else {
+          logger.info(`[CFO] KAMINO_REPAY recovery mode — scanning wallet for orphaned tokens to swap to USDC (SOL: ${solBal.toFixed(4)})`);
           try {
             const walletTokens = await jupBal.getWalletTokenBalances(0);
             const SOL_RESERVE = 0.05;
@@ -4225,6 +4230,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           } catch (recoverErr) {
             logger.error(`[CFO] KAMINO_REPAY recovery scan failed:`, recoverErr);
           }
+          } // end SOL balance gate
         }
 
         if (usdcBal < 0.50) {

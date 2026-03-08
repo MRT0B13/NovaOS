@@ -2078,9 +2078,11 @@ export class CFOAgent extends BaseAgent {
 
   // ── Gas check ─────────────────────────────────────────────────────
 
-  /** Last time a gas-related alert was sent (prevents 96x MATIC spam at 15-min interval) */
+  /** Last time a gas-related alert was sent (prevents MATIC spam) */
   private lastGasAlertAt = 0;
-  private static GAS_ALERT_COOLDOWN_MS = 2 * 60 * 60_000; // 2 hours
+  /** Last MATIC balance when alert was sent — only re-alert if balance changes significantly */
+  private lastGasAlertMatic = -1;
+  private static GAS_ALERT_COOLDOWN_MS = 24 * 60 * 60_000; // 24 hours
 
   private async checkGasReserves(): Promise<void> {
     if (!this.running || !getCFOEnv().polymarketEnabled) return;
@@ -2088,16 +2090,21 @@ export class CFOAgent extends BaseAgent {
       const gas = await (await evm()).checkGas();
       if (!gas.ok || gas.warning) {
         const now = Date.now();
-        if (now - this.lastGasAlertAt < CFOAgent.GAS_ALERT_COOLDOWN_MS) return; // suppress repeat
+        // Suppress if: (a) within cooldown AND (b) balance hasn't dropped >20% since last alert
+        const balanceChanged = this.lastGasAlertMatic < 0 ||
+          Math.abs(gas.matic - this.lastGasAlertMatic) / (this.lastGasAlertMatic || 1) > 0.20;
+        if (now - this.lastGasAlertAt < CFOAgent.GAS_ALERT_COOLDOWN_MS && !balanceChanged) return;
         this.lastGasAlertAt = now;
+        this.lastGasAlertMatic = gas.matic;
         await this.reportToSupervisor('alert', (!gas.ok ? 'critical' : 'high') as any, { event: 'cfo_gas', message: gas.warning, matic: gas.matic });
         if (!gas.ok) {
           const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
           await notifyAdminForce(`⛽ CFO: ${gas.warning}`);
         }
       } else {
-        // Gas is OK again — reset cooldown so next drop is reported immediately
+        // Gas is OK again — reset so next drop is reported immediately
         this.lastGasAlertAt = 0;
+        this.lastGasAlertMatic = -1;
       }
     } catch { /* non-fatal */ }
   }
