@@ -823,9 +823,9 @@ async function sendReport(
   // Persist in kv_store for later retrieval
   try {
     await pool.query(
-      `INSERT INTO kv_store (key, value, updated_at)
+      `INSERT INTO kv_store (key, data, updated_at)
        VALUES ($1, $2, NOW())
-       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+       ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = NOW()`,
       [`cfo_report_${type}_${periodEnd}`, html],
     );
   } catch (err) {

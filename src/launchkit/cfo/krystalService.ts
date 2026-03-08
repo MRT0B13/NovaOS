@@ -1257,11 +1257,19 @@ export async function fetchKrystalPositions(
 
           const liquidity = BigInt(posData.liquidity ?? posData[7] ?? 0);
 
-          // If liquidity is 0, position has been closed on-chain
+          // If liquidity is 0, check for uncollected tokens before declaring closed.
+          // A partial rebalance (decrease succeeded, collect failed) leaves tokensOwed > 0.
+          let isZeroLiqCollectable = false;
           if (liquidity === 0n) {
-            logger.info(`[Krystal] On-chain position ${dbRec.posId} has 0 liquidity — closed externally`);
-            closedOnChainPosIds.push(dbRec.posId);
-            continue;
+            const owed0 = BigInt(posData.tokensOwed0 ?? posData[10] ?? 0);
+            const owed1 = BigInt(posData.tokensOwed1 ?? posData[11] ?? 0);
+            if (owed0 === 0n && owed1 === 0n) {
+              logger.info(`[Krystal] On-chain position ${dbRec.posId} has 0 liquidity and no uncollected tokens — closed externally`);
+              closedOnChainPosIds.push(dbRec.posId);
+              continue;
+            }
+            logger.info(`[Krystal] On-chain position ${dbRec.posId} has 0 liquidity but uncollected tokens (owed0=${owed0}, owed1=${owed1}) — treating as collectable`);
+            isZeroLiqCollectable = true;
           }
 
           const token0Addr = posData.token0 ?? posData[2] ?? '';
@@ -1311,7 +1319,10 @@ export async function fetchKrystalPositions(
             } catch { /* use 0 tick — inRange will fall back to DB state */ }
           }
 
-          const inRange = currentTick !== 0 ? (currentTick > tickLower && currentTick < tickUpper) : true;
+          let inRange = currentTick !== 0 ? (currentTick > tickLower && currentTick < tickUpper) : true;
+          // Zero-liquidity collectable positions are always "out of range" — they need
+          // a rebalance (collect + reopen) regardless of current tick.
+          if (isZeroLiqCollectable) inRange = false;
           const rangeUtilisationPct = currentTick !== 0
             ? computeRangeUtilisation(tickLower, tickUpper, currentTick)
             : (inRange ? 50 : 0);
@@ -1392,9 +1403,40 @@ export async function fetchKrystalPositions(
                 logger.debug(`[Krystal] Unknown pair ${sym0}/${sym1} — using pool-ratio × native fallback`);
               }
               valueUsd = usd0 + usd1;
-              // Store per-token prices for fee calculation below
-              perTokenPriceUsd0 = ui0 > 0 ? usd0 / ui0 : 0;
-              perTokenPriceUsd1 = ui1 > 0 ? usd1 / ui1 : 0;
+              // Store per-token prices for fee calculation below.
+              // For zero-liquidity collectable positions, amounts are 0 so derive
+              // per-token prices directly from the pricing cascade instead.
+              if (isZeroLiqCollectable) {
+                // Derive per-token USD prices from price ratio (independent of amounts)
+                if (t0IsStable && t1IsStable) {
+                  perTokenPriceUsd0 = 1; perTokenPriceUsd1 = 1;
+                } else if (t0IsStable) {
+                  perTokenPriceUsd0 = 1;
+                  perTokenPriceUsd1 = price0In1 > 0 ? 1 / price0In1 : 0;
+                } else if (t1IsStable) {
+                  perTokenPriceUsd0 = price0In1;
+                  perTokenPriceUsd1 = 1;
+                } else if (t0IsNative) {
+                  perTokenPriceUsd0 = nativePriceForVal;
+                  perTokenPriceUsd1 = price0In1 > 0 ? nativePriceForVal / price0In1 : 0;
+                } else if (t1IsNative) {
+                  perTokenPriceUsd1 = nativePriceForVal;
+                  perTokenPriceUsd0 = price0In1 > 0 ? price0In1 * nativePriceForVal : 0;
+                } else {
+                  perTokenPriceUsd0 = nativePriceForVal;
+                  perTokenPriceUsd1 = price0In1 > 0 ? nativePriceForVal / price0In1 : 0;
+                }
+                // Compute value from uncollected tokensOwed × per-token price
+                const rawOwed0 = BigInt(posData.tokensOwed0 ?? posData[10] ?? 0);
+                const rawOwed1 = BigInt(posData.tokensOwed1 ?? posData[11] ?? 0);
+                const owedHuman0 = Number(ethersLib.formatUnits(rawOwed0, Number(dec0)));
+                const owedHuman1 = Number(ethersLib.formatUnits(rawOwed1, Number(dec1)));
+                valueUsd = owedHuman0 * perTokenPriceUsd0 + owedHuman1 * perTokenPriceUsd1;
+                logger.info(`[Krystal] Zero-liq collectable: owed ${owedHuman0.toFixed(4)} ${sym0} + ${owedHuman1.toFixed(4)} ${sym1} → $${valueUsd.toFixed(2)}`);
+              } else {
+                perTokenPriceUsd0 = ui0 > 0 ? usd0 / ui0 : 0;
+                perTokenPriceUsd1 = ui1 > 0 ? usd1 / ui1 : 0;
+              }
               logger.debug(`[Krystal] On-chain value: ${sym0}=${ui0.toFixed(6)} ($${usd0.toFixed(2)}), ${sym1}=${ui1.toFixed(6)} ($${usd1.toFixed(2)}) → $${valueUsd.toFixed(2)}`);
             }
           } catch (valErr) {
