@@ -26,6 +26,7 @@
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent } from './types.ts';
+import { getSkillsService } from '../launchkit/services/skillsService.ts';
 
 // Lazy imports — data pools
 let _getPoolStats: (() => any) | null = null;
@@ -340,6 +341,15 @@ export class AnalystAgent extends BaseAgent {
   protected async onStart(): Promise<void> {
     // Restore persisted counters from DB (survive restarts)
     await this.restorePersistedState();
+
+    // Load agent skills (hot-reloadable, 5min cache)
+    try {
+      const svc = getSkillsService();
+      if (svc) {
+        const skillCtx = await svc.loadSkillsForAgent('nova-analyst');
+        if (skillCtx) logger.debug(`[analyst] Loaded skill context (${skillCtx.length} chars)`);
+      }
+    } catch (err) { logger.warn('[analyst] Skills load error (non-fatal):', err); }
 
     this.startHeartbeat(60_000);
 

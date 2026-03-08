@@ -24,6 +24,7 @@
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent } from './types.ts';
+import { getSkillsService } from '../launchkit/services/skillsService.ts';
 
 // Lazy imports — data pools
 let _getPendingVotes: (() => any[]) | null = null;
@@ -67,6 +68,15 @@ export class CommunityAgent extends BaseAgent {
   protected async onStart(): Promise<void> {
     // Restore persisted counters from DB (survive restarts)
     await this.restorePersistedState();
+
+    // Load agent skills (hot-reloadable, 5min cache)
+    try {
+      const svc = getSkillsService();
+      if (svc) {
+        const skillCtx = await svc.loadSkillsForAgent('nova-community');
+        if (skillCtx) logger.debug(`[community] Loaded skill context (${skillCtx.length} chars)`);
+      }
+    } catch (err) { logger.warn('[community] Skills load error (non-fatal):', err); }
 
     this.startHeartbeat(60_000);
 

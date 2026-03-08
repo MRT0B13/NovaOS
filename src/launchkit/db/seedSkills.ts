@@ -28,161 +28,300 @@ interface SeedAssignment {
 
 const SEED_SKILLS: SeedSkill[] = [
   {
-    skillId: 'risk-framework',
-    name: 'Risk Management Framework',
-    description: 'Position sizing, exposure limits, and risk-adjusted decision making for DeFi portfolio management',
-    content: `## Risk Management Framework
-
-When making portfolio decisions, always apply these risk principles:
-
-1. **Position Sizing**: Never allocate more than 15% of total portfolio to a single position. Scale into large positions over 2-3 entries.
-2. **Exposure Limits**: Total leveraged exposure must not exceed 2x portfolio NAV. If health factor drops below 1.5, immediately reduce exposure.
-3. **Stop-Loss Discipline**: Set mental stop-losses at -8% for spot, -5% for leveraged positions. If a position breaches its stop, exit — do not average down.
-4. **Correlation Risk**: Avoid concentrating in correlated assets. If >40% of portfolio is in the same sector (e.g., all SOL ecosystem), flag for rebalancing.
-5. **Drawdown Circuit Breaker**: If portfolio drops 12% in 24h, halt all new entries and post admin alert.
-6. **Yield vs Risk**: For LP positions, require minimum 20% APY for volatile pairs, 8% for stablecoin pairs. Below these thresholds, capital is better deployed elsewhere.
-7. **Gas Reserve**: Always maintain minimum gas reserves (0.15 SOL on Solana, 0.5 POL on Polygon, 0.005 ETH on Ethereum).`,
-    version: '1.0.0',
-    category: 'risk',
-  },
-  {
     skillId: 'hyperliquid-trader',
-    name: 'Hyperliquid Trading Expertise',
-    description: 'Perpetual futures trading strategies on Hyperliquid DEX',
-    content: `## Hyperliquid Trading Expertise
+    name: 'Hyperliquid Perpetuals Trader',
+    category: 'finance',
+    description: 'Perpetuals trading on Hyperliquid — hedging, stop-loss, leverage decisions',
+    content: `# Hyperliquid Perpetuals — Decision Framework
 
-When trading on Hyperliquid:
+## When to Open a Hedge
+- Open short when SOL portfolio exposure exceeds hedge target ratio AND market regime is trending down
+- Hedge size = portfolio_sol_value × hedge_target_ratio × globalRiskMultiplier
+- Never hedge if recent PnL shows stop-loss has already fired (check cooldown)
+- Only open hedge if position value > CFO_HEDGE_MIN_SOL_USD
 
-1. **Order Types**: Prefer limit orders to reduce fees. Use IOC (Immediate-or-Cancel) for urgent entries. Avoid market orders unless volatility demands instant execution.
-2. **Leverage**: Default to 3-5x for trend following. Never exceed 10x. Reduce leverage when funding rates are extreme (>0.1% per 8h against your position).
-3. **Funding Arbitrage**: Monitor funding rates across assets. When funding is deeply negative, consider long positions that earn funding. When deeply positive, consider shorts.
-4. **Liquidation Safety**: Maintain at least 3x distance between entry and liquidation price. If margin ratio drops below 30%, either add margin or reduce position size.
-5. **Hedging**: Use Hyperliquid shorts to hedge spot positions on Solana/EVM. Target delta-neutral when market sentiment is unclear.
-6. **Entry Timing**: Check order book depth before entering. If top-of-book is thin (<$50k within 0.1%), use smaller orders to avoid slippage.`,
+## Stop-Loss Rules
+- Hard stop at CFO_HL_STOP_LOSS_PCT — no exceptions, bypass approval tier
+- Liquidation warning at CFO_HL_LIQUIDATION_WARNING_PCT — deleverage immediately
+- Never add to a losing HL position
+
+## Leverage
+- Default hedge: 1x (delta neutral target)
+- Max leverage: CFO_MAX_HYPERLIQUID_LEVERAGE (currently 3x)
+- Higher leverage = smaller notional needed for same hedge, but higher funding cost
+
+## Cooldowns
+- Hedge cooldown: CFO_HEDGE_COOLDOWN_HOURS (no new hedges within window)
+- Rebalance threshold: CFO_HEDGE_REBALANCE_THRESHOLD — only rebalance when drift exceeds this
+- When in doubt: do nothing, let existing position run
+
+## Common Mistakes to Avoid
+- Do not open a hedge and a long simultaneously — net neutral defeats the purpose
+- Do not use HL for speculation, only hedging unless a clear directional signal exists
+- Always verify mainnet (not testnet) before opening`,
     version: '1.0.0',
-    category: 'trading',
   },
   {
     skillId: 'polymarket-edge',
-    name: 'Polymarket Trading Edge',
-    description: 'Prediction market strategies for Polymarket positions',
-    content: `## Polymarket Trading Edge
+    name: 'Polymarket Prediction Market Edge',
+    category: 'finance',
+    description: 'Kelly criterion sizing, edge detection, and market selection for Polymarket',
+    content: `# Polymarket — Edge and Sizing Framework
 
-When evaluating Polymarket positions:
+## Market Selection
+- Only bet on markets where estimated edge > CFO_MIN_EDGE (5%)
+- Focus on: crypto price milestones, protocol launches, macro events with crypto impact
+- Avoid: political markets (jurisdiction risk), sports, markets with < 48h to resolution
+- Never bet on markets with < $10k liquidity (price impact too high)
 
-1. **Edge Calculation**: Only enter positions where you estimate ≥10% edge vs market price. If market says 40% YES, you need to believe it's at least 50% YES.
-2. **Liquidity Assessment**: Check order book depth. For markets with <$10k in liquidity, limit position size to $500 max to avoid moving the market.
-3. **Time Decay**: Prediction markets have implicit time value. As resolution approaches, positions converge to 0 or 100. Enter early when edge is highest.
-4. **Correlation with Crypto**: Many Polymarket events correlate with crypto prices (regulatory events, elections). Consider hedging crypto exposure with relevant Polymarket positions.
-5. **Portfolio Allocation**: Cap total Polymarket exposure at 10% of portfolio. These are high-conviction, binary-outcome bets.
-6. **Exit Strategy**: Take partial profits when position moves 20%+ in your favor. Let remainder ride to resolution.
-7. **News Monitoring**: Cross-reference with Scout intel — breaking news can flip market odds before prices adjust. Speed advantage matters.`,
+## Edge Calculation
+- Edge = |estimated_probability - market_implied_probability|
+- Estimated probability must come from analysis, not gut feel
+- Consider: on-chain data, KOL signals from Scout, macro context
+- Update estimate if new information arrives before resolution
+
+## Kelly Criterion Sizing
+- Bet size = (edge / odds) × kelly_fraction × total_bankroll
+- kelly_fraction = CFO_KELLY_FRACTION (currently 0.20 — conservative)
+- Max single bet = CFO_MAX_SINGLE_BET_USD regardless of Kelly output
+- Never exceed 15% of total portfolio on Polymarket total exposure
+
+## Cooldowns and Risk
+- Cooldown between bets on same market: CFO_POLY_BET_COOLDOWN_HOURS
+- Cut losses if probability estimate moves against position by > 20%
+- Record estimated_probability in position metadata for calibration tracking
+
+## After Resolution
+- Log actual outcome vs estimated probability — this feeds the calibration loop
+- If Brier score deteriorates over 10+ bets, reduce kelly_fraction`,
     version: '1.0.0',
-    category: 'trading',
   },
   {
     skillId: 'kamino-yield',
-    name: 'Kamino Yield Optimization',
-    description: 'Kamino Finance lending/borrowing and yield strategies on Solana',
-    content: `## Kamino Yield Optimization
+    name: 'Kamino Finance Yield Strategy',
+    category: 'finance',
+    description: 'Kamino lending, borrowing, JitoSOL loop, and LTV management',
+    content: `# Kamino Finance — Yield Strategy Framework
 
-When managing Kamino positions:
+## Lending (Passive Yield)
+- Deposit idle USDC into Kamino lending at prevailing rate (~5-8% APY)
+- Only deposit if USDC is not needed for Polymarket in next 24h
+- Monitor: deposit APR daily, withdraw if rate drops below 3%
 
-1. **Lending Strategy**: Prefer lending stablecoins (USDC, USDT) for base yield. Lend SOL only when utilization rate is >70% (better rates).
-2. **Borrow Management**: Monitor health factor continuously. Target health factor ≥2.0 for safety. If health drops below 1.5, trigger immediate partial repay.
-3. **Loop Strategy**: SOL borrow-lend loops can amplify yield but amplify risk. Maximum 2 loops. Always maintain ability to unwind in single transaction.
-4. **Rate Monitoring**: Kamino rates fluctuate with utilization. If borrow rate exceeds lending yield by >2%, the loop is unprofitable — unwind.
-5. **Collateral Optimization**: Use liquid staking tokens (mSOL, jitoSOL, bSOL) as collateral to earn staking yield on top of lending yield.
-6. **Liquidation Risk**: Set alert at health factor 1.8. Auto-repay at 1.5. Never let it reach 1.2 — liquidation penalties are 5-10%.
-7. **Harvest Timing**: Claim KMNO rewards at least weekly. Auto-compound when gas is cheap (< 5000 lamports priority fee).`,
+## JitoSOL Loop Strategy
+- Deposit SOL → borrow SOL against JitoSOL → re-stake = amplified yield
+- Target LTV: CFO_KAMINO_JITO_LOOP_TARGET_LTV (currently 55%)
+- Max LTV before emergency deleverage: CFO_KAMINO_JITO_LOOP_MAX_LTV_PCT (63%)
+- Max loops: CFO_KAMINO_JITO_LOOP_MAX_LOOPS (2)
+- Only loop when JitoSOL APY > borrow rate + 2% spread
+
+## Borrow-LP Strategy
+- Borrow USDC against SOL collateral to fund LP positions
+- Max borrow: CFO_MAX_KAMINO_BORROW_USD
+- LP borrow max LTV: CFO_KAMINO_BORROW_LP_MAX_LTV_PCT (50%)
+- Required spread: borrow_rate + CFO_KAMINO_BORROW_MIN_SPREAD_PCT < LP_APR
+- Only open if net yield positive after borrowing cost
+
+## LTV Management Rules
+- Hard ceiling: CFO_KAMINO_MAX_LTV_PCT (52%)
+- Reduce borrowing if LTV > 45% (approaching ceiling)
+- Emergency deleverage if LTV > 50% — do not wait for approval
+- Monitor LTV every decision cycle — Kamino can liquidate if SOL price drops
+
+## What Not To Do
+- Never borrow to chase yield on high-risk pools — net yield must be provably positive
+- Never open a borrow position if SOL price is >10% down in 24h (liquidation risk higher)`,
     version: '1.0.0',
-    category: 'defi',
   },
   {
     skillId: 'orca-lp',
-    name: 'Orca LP Management',
-    description: 'Concentrated liquidity management on Orca Whirlpools (Solana)',
-    content: `## Orca LP Management
+    name: 'Orca Whirlpool LP Strategy (Solana)',
+    category: 'finance',
+    description: 'Concentrated liquidity LP on Orca — range setting, rebalancing, fee collection',
+    content: `# Orca Whirlpool LP — Decision Framework
 
-When managing Orca Whirlpool positions:
+## Pool Selection
+- Minimum: pool must pass DeFiLlama cross-reference + Orca on-chain verification
+- Score pools on: fee revenue (35%), volume/TVL ratio (20%), TVL depth (15%), IL risk (15%), ML prediction (10%)
+- Risk tiers: low (stable pairs), medium (one volatile token), high (both volatile)
+- Apply learning engine lpBestPairs preferences when scoring is close
 
-1. **Range Selection**: For stable pairs (USDC/USDT), use tight ranges (±0.5%). For volatile pairs (SOL/USDC), use wider ranges (±15-25%) to avoid constant rebalancing.
-2. **Rebalance Triggers**: Rebalance when price moves past 75% of range bounds, not at exact boundary. This prevents whipsaw rebalancing.
-3. **Fee Tier Selection**: Use 1bp pools for stables, 30bp for major pairs, 100bp for volatile/new tokens. Higher fee tiers compensate for impermanent loss.
-4. **Position Sizing**: Split large positions across 2-3 sub-ranges for better capital efficiency and smoother rebalancing.
-5. **IL Monitoring**: Track impermanent loss vs fees earned. If IL exceeds 30-day fee income, the range is wrong — widen it or exit.
-6. **SOL Reserve**: Always keep 0.15 SOL free for transaction fees. Orca positions require multiple transactions (create, deposit, rebalance).
-7. **Harvest Schedule**: Claim fees when accrued value exceeds 2x transaction cost. Don't harvest dust.
-8. **Exit Strategy**: When closing, withdraw liquidity first, then close position. Never abandon positions — they hold rent deposits.`,
+## Range Width by Risk Tier
+- Low (stables): tighter ranges — lpRangeWidthMultiplier × low tier multiplier
+- Medium: standard range — lpRangeWidthMultiplier × medium tier multiplier
+- High: wide range — lpRangeWidthMultiplier × high tier multiplier
+- Learning engine adjusts these via lpTierRangeMultipliers
+
+## When to Rebalance
+- Trigger: position is out-of-range (earning zero fees)
+- Trigger threshold: CFO_ORCA_LP_REBALANCE_TRIGGER_PCT from center
+- Check: is rebalance cost (gas + slippage) < projected fee income in next 24h?
+- If not cost-effective: wait, don't rebalance for small price movements
+- Set metadata.outOfRange = true when position goes OOR (feeds learning engine)
+
+## Fee Collection
+- Collect fees when accumulated > gas cost × 10
+- Record fee amount in transaction metadata (feeds feeDrag tracking)
+- Never close a position just to collect fees — wait for rebalance
+
+## Position Limits
+- Max positions: CFO_ORCA_LP_MAX_POSITIONS
+- Max total USD: CFO_ORCA_LP_MAX_USD
+- Only open new position if Kamino borrow path is available OR free capital exists`,
     version: '1.0.0',
-    category: 'defi',
   },
   {
     skillId: 'krystal-lp',
-    name: 'Krystal LP Management',
-    description: 'NFPM-based concentrated liquidity on Polygon/EVM via Krystal',
-    content: `## Krystal LP Management
+    name: 'Krystal EVM LP Strategy (Multi-chain)',
+    category: 'finance',
+    description: 'Concentrated liquidity LP on EVM chains via Krystal — Uniswap V3, PancakeSwap, Aerodrome',
+    content: `# Krystal EVM LP — Decision Framework
 
-When managing Krystal/NFPM positions on Polygon:
+## Chain and Protocol Selection
+- Chains: Ethereum, Optimism, Polygon, Base, Arbitrum, BSC
+- Protocols: Uniswap V3, PancakeSwap V3, Aerodrome CL (different ABI — tick-based not fee-based)
+- Score pools: APR 7d (40%), TVL (25%), volume consistency (20%), protocol reputation (10%), range safety (5%)
+- Minimum: CFO_KRYSTAL_LP_MIN_APR_7D and CFO_KRYSTAL_LP_MIN_TVL_USD must be met
 
-1. **Token ID Tracking**: Always track the actual NFPM tokenId (not Krystal strategy ID). These are different numbers — the tokenId is what the on-chain contract uses.
-2. **Gas Awareness**: Polygon gas is cheap but spikes during congestion. Check gas before rebalance — if >200 gwei, wait. Set gas reserve at 0.5 POL minimum.
-3. **Rebalance Flow**: Krystal rebalance = (1) collect fees, (2) remove liquidity, (3) swap to target ratio, (4) mint new position. Each step is a separate tx. Ensure sufficient POL for all 4.
-4. **Range Strategy**: For WPOL/USDC, use ±20% range. For WETH/USDC, use ±15%. Monitor tick spacing — ranges must align to pool tick spacing.
-5. **Fee Collection**: Collect fees before any rebalance. Uncollected fees are lost if the NFT is burned during rebalance.
-6. **Position Health**: Check that positions have non-zero liquidity. Zero-liquidity NFTs may still have claimable fees (tokensOwed0/1) — collect before closing.
-7. **Burned NFT Detection**: Before any operation, verify the NFT still exists via ownerOf(). If it reverts, the position was already closed.
-8. **Entry USD Tracking**: Record entryUsd at position creation for accurate PnL. Thread this value through rebalances.`,
+## Risk Tiers
+- Assign riskTier to every opened position (write to metadata.riskTier)
+- low: both tokens stable (USDC/USDT, etc.)
+- medium: one volatile, one stable
+- high: both volatile
+- Record tier in cfo_positions metadata — feeds learning engine lpRangeWidthMultiplier
+
+## Range Management
+- Use CFO_KRYSTAL_LP_RANGE_WIDTH_TICKS for initial range
+- Apply learning engine lpRangeWidthMultiplier adjustments
+- Monitor via Krystal API — if API down, use on-chain fallback (NFPM.positions())
+- Rebalance when: position OOR AND CFO_KRYSTAL_LP_REBALANCE_TRIGGER_PCT exceeded
+
+## EVM Wallet Considerations
+- Gas costs on Ethereum can be significant — check before rebalancing small positions
+- Base and Arbitrum have lowest gas — prefer these for smaller positions
+- Never open a position if wallet MATIC/ETH balance < 0.01 (gas buffer)
+- __cfo_evm_lp_records must be re-synced from on-chain after any restart
+
+## Common Mistakes
+- Do not conflate Aerodrome sqrtPriceX96 parameter with Uniswap fee parameter
+- Always verify riskTier is written to metadata before position is considered tracked`,
     version: '1.0.0',
-    category: 'defi',
+  },
+  {
+    skillId: 'risk-framework',
+    name: 'CFO Risk Management Framework',
+    category: 'finance',
+    description: 'Exposure limits, approval tiers, emergency procedures, and position sizing',
+    content: `# CFO Risk Management — Standing Rules
+
+## Exposure Limits (Never Exceed)
+- Hyperliquid: max CFO_MAX_HYPERLIQUID_USD total notional
+- Polymarket: max CFO_MAX_POLYMARKET_USD total exposure
+- Kamino: max CFO_MAX_KAMINO_USD deposited/borrowed
+- Orca LP: max CFO_ORCA_LP_MAX_USD
+- Krystal LP: max CFO_KRYSTAL_LP_MAX_USD
+- Jito: max CFO_MAX_JITO_SOL staked
+- Always maintain CFO_STAKE_RESERVE_SOL liquid (never deploy below this)
+
+## Approval Tiers
+- Auto-execute: value < CFO_AUTO_TIER_USD (no notification needed)
+- Notify: CFO_AUTO_TIER_USD ≤ value < CFO_NOTIFY_TIER_USD (execute + alert admin)
+- Approval required: value ≥ CFO_NOTIFY_TIER_USD (send proposal, wait for /approve)
+- Emergency bypass: CFO_CRITICAL_BYPASS_APPROVAL=true for stop-loss/liquidation prevention
+
+## Global Risk Multiplier
+- globalRiskMultiplier from learning engine scales all position sizes
+- Risk-off regime (0.6×): reduce all position sizes, tighten stops
+- Risk-on regime (1.15×): can increase sizes up to the exposure limits
+- Never override globalRiskMultiplier manually — it exists for good reason
+
+## Emergency Procedures
+- market_crash command: pause all new decisions, close all open positions in order
+- /cfo stop: immediate pause
+- Stop-loss fires: immediate execution, no approval needed regardless of size
+
+## What the CFO Must Never Do
+- Never spend below TREASURY_MIN_RESERVE_SOL on the main wallet
+- Never open both a long and short position on the same asset simultaneously
+- Never execute more than CFO_MAX_DECISIONS_PER_CYCLE decisions in one cycle
+- Never approve its own decisions — that's what the admin is for`,
+    version: '1.0.0',
   },
   {
     skillId: 'nova-voice',
-    name: 'Nova Communication Voice',
-    description: 'Tone, style, and personality guidelines for all Nova external communications',
-    content: `## Nova Communication Voice
+    name: 'Nova Brand Voice and Content Rules',
+    category: 'content',
+    description: "Nova's authentic voice — tone, banned phrases, content rules for X and TG",
+    content: `# Nova Brand Voice — Standing Rules
 
-When crafting external communications (tweets, Telegram posts, briefings):
+## Who Nova Is
+An autonomous AI agent that launches meme tokens on pump.fun and manages a DeFi portfolio. Builder mindset, data-driven, transparent about what she does and doesn't know. Not a hype bot.
 
-1. **Tone**: Confident but not arrogant. Data-driven but accessible. Professional but with personality. Think "sharp DeFi native" not "corporate press release".
-2. **Format**: Lead with the insight, not the preamble. "SOL breaking $180 resistance — our LP ranges just went in-the-money 💰" not "We would like to inform you that..."
-3. **Data First**: Always include specific numbers when available. "$12.4k daily yield" not "great yield". "3.2x leverage" not "moderate leverage".
-4. **Emojis**: Use sparingly for emphasis. Max 2 per message. 🐝 for Nova identity, 💰 for gains, ⚠️ for alerts, 🔥 for trends.
-5. **Thread Structure**: For complex updates, use numbered points. Keep each point to 1-2 sentences. End with a clear takeaway.
-6. **Avoid**: Shilling, price predictions, financial advice language, excessive hype. Never say "to the moon", "WAGMI", "NFA but..." etc.
-7. **Admin vs Public**: Admin briefings can be technical and detailed. Public posts should be engaging and accessible to non-DeFi natives.
-8. **Timing**: Don't post during extreme market volatility unless it's a safety alert. Wait for clarity before commenting on major events.`,
+## Tone
+- Peer builder, not fan or marketer
+- Specific over vague — name the event, token, or data point
+- Transparent about uncertainty — "estimated" not "guaranteed"
+- Dry wit is good, forced enthusiasm is not
+
+## Banned Phrases (Never Use)
+- "LFG", "WAGMI", "fam", "fren", "vibes", "banger", "slaps", "fire"
+- "game changer", "groundbreaking", "revolutionary"
+- "let's build together", "transparency is key", "great to see"
+- "I've launched X tokens with Y% safety score" — never invent statistics
+- Any percentage claim about RugCheck (it gives risk scores 0-100, not percentages)
+
+## Data Rules
+- Never invent numbers. If you don't have the stat, don't use it.
+- Real stats available: launches count, graduation count, portfolio value (SOL)
+- RugCheck gives a risk score (lower = safer), not a safety percentage
+
+## Content Formula (X Posts)
+- Lead with a real data point or observation
+- Add one specific insight or question
+- One emoji max. Zero is fine.
+- Under 240 characters preferred, 280 max
+
+## Reply Rules
+- Tier 1 KOLs (aixbt, elizaos, pumpfun): substantive reply about their specific content
+- Tier 2 ecosystem: brief, relevant, on-topic
+- Skip: Samsung ads, spam, "nice project", engagement bait, unrelated to crypto
+
+## X Handles (Always Use @ Tags, Not Hashtags)
+- @Pumpfun @Rugcheckxyz @dexscreener @elizaOS @JupiterExchange @aixbt_agent`,
     version: '1.0.0',
-    category: 'communication',
   },
   {
     skillId: 'scout-intel-scoring',
-    name: 'Scout Intelligence Scoring',
-    description: 'Framework for scoring and prioritizing intelligence from KOL monitoring and trend detection',
-    content: `## Scout Intelligence Scoring
+    name: 'KOL Signal Scoring and Narrative Detection',
+    category: 'analytics',
+    description: 'How to score KOL signals, weight narratives, and decide what to forward to CFO',
+    content: `# Scout — Signal Scoring Framework
 
-When evaluating and scoring detected intelligence:
+## KOL Signal Weighting
+- Tier 1 (high weight): accounts with > 100k followers AND track record of early calls
+- Tier 2 (medium weight): active builders in the ecosystem, protocol accounts
+- Tier 3 (low weight): general crypto commentary
 
-1. **Source Tier Scoring**:
-   - Tier 1 (Score 9-10): On-chain data, protocol announcements, verified insider info
-   - Tier 2 (Score 7-8): Top KOLs with proven track record (>60% hit rate)
-   - Tier 3 (Score 5-6): Mid-tier KOLs, trending topics with moderate engagement
-   - Tier 4 (Score 3-4): Low-follower accounts, unverified rumors
-   - Tier 5 (Score 1-2): Bot-like accounts, obvious shill campaigns
+## What Constitutes a Signal
+- Specific token ticker mentioned with price target or thesis
+- Protocol launch or upgrade announcement from official account
+- Multiple Tier 1-2 KOLs converging on same narrative within 4 hours = strong signal
+- Single KOL mention without cross-reference = weak signal
 
-2. **Actionability Filter**: Score +2 if intel has a clear trade thesis. Score -1 if it's "interesting but no clear action".
+## Cross-Reference Rule
+- Any signal forwarded to CFO must have 2+ independent sources OR 1 Tier 1 source with >10 engagements
+- Trending tokens should always be cross-checked against Guardian watchlist for rug risk
 
-3. **Time Sensitivity**: Mark as URGENT if the opportunity window is <2 hours. Mark as NORMAL for 2-24h windows. Mark as RESEARCH for longer-term themes.
+## Intel Digest Content
+- Lead with highest-confidence signals
+- Include: source, confidence score, raw signal, cross-reference count
+- Exclude: price predictions without thesis, obvious hype, tokens already on watchlist
 
-4. **Deduplication**: If 3+ sources report the same event, consolidate into single high-confidence intel item. Don't flood the swarm with duplicates.
-
-5. **Sentiment Cross-Check**: Before escalating bullish intel, check for contradicting bearish signals. Report both sides.
-
-6. **Escalation Rules**: Score ≥8 → immediate alert to CFO + Admin. Score 5-7 → include in next briefing. Score <5 → log but don't escalate.
-
-7. **Track Record**: Maintain a hit rate for each source. Downgrade sources that consistently produce low-quality intel.`,
+## Forwarding to CFO
+- Narrative shifts with DeFi implications → forward with 'high' priority
+- New yield opportunities → forward as 'medium' intel
+- Speculative mentions only → do not forward to CFO, include in digest only`,
     version: '1.0.0',
-    category: 'intelligence',
   },
 ];
 
