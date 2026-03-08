@@ -308,6 +308,7 @@ export interface PortfolioState {
     rangeUtilisationPct: number;
     feesOwedUsd: number;
     openedAt: number;
+    entryUsd: number;
   }>;
   evmLpTotalValueUsd: number;     // total value in EVM LP positions
   evmLpTotalFeesUsd: number;      // total uncollected fees across positions
@@ -1084,6 +1085,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
               rangeUtilisationPct: p.rangeUtilisationPct,
               feesOwedUsd: p.feesOwedUsd,
               openedAt: p.openedAt,
+              entryUsd: p.entryUsd ?? 0,
             }));
             evmLpTotalValueUsd = evmLpPositions.reduce((s, p) => s + p.valueUsd, 0);
             evmLpTotalFeesUsd  = evmLpPositions.reduce((s, p) => s + p.feesOwedUsd, 0);
@@ -2203,9 +2205,16 @@ export async function generateDecisions(
           tier: urgency === 'critical' ? 'AUTO' : 'NOTIFY',
         });
       } else {
-        // Simple loop: repay USDC to bring LTV back to 40%
+        // Simple loop: repay USDC.
+        // When health is dangerous, try to repay as much as possible (full borrow).
+        // When merely LTV-breached, just bring LTV back to 40%.
         const targetLtv = 0.40;
-        const idealRepayUsd = Math.max(0, state.kaminoBorrowValueUsd - state.kaminoDepositValueUsd * targetLtv);
+        const deltaRepayUsd = Math.max(0, state.kaminoBorrowValueUsd - state.kaminoDepositValueUsd * targetLtv);
+        // If health is dangerous (HF < 1.5), repay the FULL outstanding borrow so every
+        // USDC dollar in the wallet goes toward reducing risk — not just the tiny LTV delta.
+        const idealRepayUsd = healthDanger
+          ? state.kaminoBorrowValueUsd
+          : deltaRepayUsd;
         if (idealRepayUsd > 0) {
           const walletUsdc = state.solanaUsdcBalance ?? 0;
           if (walletUsdc < 1) {
@@ -2242,8 +2251,8 @@ export async function generateDecisions(
               decisions.push({
                 type: 'KAMINO_REPAY',
                 reasoning:
-                  `Kamino LTV ${(state.kaminoLtv * 100).toFixed(1)}% (health: ${state.kaminoHealthFactor.toFixed(2)}) — ` +
-                  `repaying $${repayUsd.toFixed(0)} USDC to bring LTV toward ${targetLtv * 100}%` +
+                  `Kamino HF=${state.kaminoHealthFactor.toFixed(2)} LTV=${(state.kaminoLtv * 100).toFixed(1)}% — ` +
+                  `repaying $${repayUsd.toFixed(0)} USDC (of $${state.kaminoBorrowValueUsd.toFixed(0)} borrow)` +
                   (repayUsd < idealRepayUsd ? ` (capped to wallet balance $${walletUsdc.toFixed(0)})` : ''),
                 params: { repayUsd, repayAsset: 'USDC' },
                 urgency,
@@ -2458,6 +2467,7 @@ export async function generateDecisions(
             token1Address: pos.token1Address,
             token0Decimals: pos.token0Decimals,
             token1Decimals: pos.token1Decimals,
+            entryUsd: pos.entryUsd ?? 0,
             closeOnly: false,
             riskTier: posTier,
             rangeWidthTicks: Math.round(adaptiveLpRangeWidthTicks(
@@ -4874,6 +4884,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           token1,
           protocol: rebalProto,
           originalPoolAddress: decision.params.poolAddress,
+          entryUsd: decision.params.entryUsd,
         });
 
         if (!closeResult.success) {

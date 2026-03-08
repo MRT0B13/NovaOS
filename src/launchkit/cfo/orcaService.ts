@@ -850,7 +850,7 @@ export async function rebalancePosition(
       logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(4)} USDC → SOL (SOL only ${(solValueUsd / totalValueUsd * 100).toFixed(1)}% of value, need ≥${IMBALANCE_THRESHOLD * 100}%)`);
       const swapRes = await jup.swapUsdcToSol(swapAmt, 100);
       if (swapRes.success && (swapRes.outputAmount ?? 0) > 0) {
-        finalSol  = swapRes.outputAmount ?? 0;
+        finalSol  += swapRes.outputAmount ?? 0; // ADD to existing SOL, don't replace
         finalUsdc = finalUsdc - swapAmt;
         logger.info(`[Orca] Rebalance pre-swap done: ${finalSol.toFixed(6)} SOL | ${finalUsdc.toFixed(4)} USDC`);
       } else {
@@ -862,7 +862,7 @@ export async function rebalancePosition(
       logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(6)} SOL → USDC (USDC only ${(usdcValueUsd / totalValueUsd * 100).toFixed(1)}% of value, need ≥${IMBALANCE_THRESHOLD * 100}%)`);
       const swapRes = await jup.swapSolToUsdc(swapAmt, 100);
       if (swapRes.success && (swapRes.outputAmount ?? 0) > 0) {
-        finalUsdc = swapRes.outputAmount ?? 0;
+        finalUsdc += swapRes.outputAmount ?? 0; // ADD to existing USDC, don't replace
         finalSol  = finalSol - swapAmt;
         logger.info(`[Orca] Rebalance pre-swap done: ${finalSol.toFixed(6)} SOL | ${finalUsdc.toFixed(4)} USDC`);
       } else {

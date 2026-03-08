@@ -424,6 +424,8 @@ export interface KrystalPosition {
   feesOwed1: number;
   feesOwedUsd: number;
   openedAt: number;
+  /** Original entry value in USD from kv_store (used for rebalance sizing) */
+  entryUsd: number;
 }
 
 export interface EvmLpOpenResult {
@@ -1211,6 +1213,7 @@ export async function fetchKrystalPositions(
         feesOwed1,
         feesOwedUsd,
         openedAt,
+        entryUsd: dbRec?.entryUsd ?? 0,
       });
     }
 
@@ -1490,6 +1493,7 @@ export async function fetchKrystalPositions(
             feesOwed1: tokensOwed1,
             feesOwedUsd: fee0Usd + fee1Usd,
             openedAt: dbRec.openedAt,
+            entryUsd: dbRec.entryUsd ?? 0,
           });
 
           logger.info(`[Krystal] On-chain fallback: position ${dbRec.posId} (${sym0}/${sym1} on ${chainName}) — $${valueUsd.toFixed(0)}, ${inRange ? 'in-range' : 'out-of-range'}`);
@@ -3018,6 +3022,10 @@ export async function rebalanceEvmLpPosition(params: {
   protocol?: string;
   /** Original pool address — rebalance will reopen on the SAME pool if available */
   originalPoolAddress?: string;
+  /** Original entry USD value — used as preferred deploy target so the position
+   *  reopens at the same size it was originally opened at, not the (potentially
+   *  depreciated due to IL) close recovery value. */
+  entryUsd?: number;
 }): Promise<{
   closeResult: EvmLpCloseResult;
   openResult?: EvmLpOpenResult;
@@ -3082,15 +3090,21 @@ export async function rebalanceEvmLpPosition(params: {
     logger.info(`[Krystal] Rebalance: no original pool info — using best discovered pool ${(targetPool.token0 as any).symbol}/${(targetPool.token1 as any).symbol}`);
   }
 
-  // Compute deployUsd from actual wallet balances for the target pool.
-  // closeResult.valueRecoveredUsd can be $0 when positions go fully out of range
-  // (all value in one token, the stable*2 heuristic returns $0). Reading the actual
-  // wallet holdings against the pool's sqrtPriceX96 gives accurate sizing.
-  let deployUsd = closeResult.valueRecoveredUsd > 1
-    ? closeResult.valueRecoveredUsd
-    : env.krystalLpMaxUsd * 0.5;
+  // Compute deployUsd — prefer the original entry amount so the position reopens at
+  // the same size. Fall back to close recovery estimate, then wallet value scan.
+  // This prevents the slow leak where IL-depreciated positions reopen progressively
+  // smaller on each rebalance cycle.
+  const entryUsdTarget = params.entryUsd && params.entryUsd > 1 ? params.entryUsd : 0;
+  let deployUsd = entryUsdTarget > 0
+    ? entryUsdTarget
+    : closeResult.valueRecoveredUsd > 1
+      ? closeResult.valueRecoveredUsd
+      : env.krystalLpMaxUsd * 0.5;
   // Safety cap: never deploy more than krystalLpMaxUsd regardless of value estimation
   deployUsd = Math.min(deployUsd, env.krystalLpMaxUsd);
+  if (entryUsdTarget > 0) {
+    logger.info(`[Krystal] Rebalance: using original entryUsd=$${entryUsdTarget.toFixed(2)} (close recovered $${closeResult.valueRecoveredUsd.toFixed(2)})`);
+  }
   try {
     const ethers = await loadEthers();
     const wallet = await getEvmWallet(chainNumericId);
@@ -3135,9 +3149,15 @@ export async function rebalanceEvmLpPosition(params: {
 
     const walletValueUsd = human0 * usdPer0 + human1 * usdPer1;
     if (walletValueUsd > 1) {
-      // Cap at krystalLpMaxUsd to avoid over-deploying tokens from other positions
-      deployUsd = Math.min(walletValueUsd, env.krystalLpMaxUsd);
-      logger.info(`[Krystal] Rebalance: wallet holds $${walletValueUsd.toFixed(2)} for ${t0Sym}/${t1Sym} → deployUsd=$${deployUsd.toFixed(2)}`);
+      // When we have an entryUsd target, use it if the wallet has enough tokens to
+      // cover it. Otherwise use what the wallet actually holds (capped at krystalLpMaxUsd).
+      // This ensures rebalances deploy the original position size when possible,
+      // rather than shrinking every cycle due to IL and swap slippage.
+      const candidateDeploy = entryUsdTarget > 0 && walletValueUsd >= entryUsdTarget * 0.90
+        ? entryUsdTarget
+        : walletValueUsd;
+      deployUsd = Math.min(candidateDeploy, env.krystalLpMaxUsd);
+      logger.info(`[Krystal] Rebalance: wallet holds $${walletValueUsd.toFixed(2)} for ${t0Sym}/${t1Sym} → deployUsd=$${deployUsd.toFixed(2)} (entryUsd=$${entryUsdTarget.toFixed(2)})`);
     }
   } catch (err) {
     logger.warn('[Krystal] Rebalance: wallet value calc failed (using close estimate):', err);
