@@ -2209,12 +2209,27 @@ export async function generateDecisions(
         if (idealRepayUsd > 0) {
           const walletUsdc = state.solanaUsdcBalance ?? 0;
           if (walletUsdc < 1) {
-            // Wallet has no USDC — cannot repay. Skip to avoid failed-tx spam.
-            // The borrowed funds are deployed in LP positions; close those first.
-            logger.warn(
-              `[CFO:Decision] Kamino repay needed ($${idealRepayUsd.toFixed(0)}) but wallet has $${walletUsdc.toFixed(2)} USDC — ` +
-              `skipping KAMINO_REPAY (funds likely deployed in LPs, close positions first)`,
-            );
+            // Wallet has no USDC — likely orphaned tokens from a failed borrow LP.
+            // Generate a recovery-mode repay that swaps orphaned tokens → USDC first.
+            if (checkCooldown('KAMINO_REPAY_RECOVER', 2 * 3600_000)) {
+              decisions.push({
+                type: 'KAMINO_REPAY',
+                reasoning:
+                  `Kamino LTV ${(state.kaminoLtv * 100).toFixed(1)}% (health: ${state.kaminoHealthFactor.toFixed(2)}) — ` +
+                  `wallet has $${walletUsdc.toFixed(2)} USDC but borrow outstanding ($${state.kaminoBorrowValueUsd.toFixed(0)}). ` +
+                  `Recovery mode: scanning wallet for orphaned tokens from failed borrow LP to swap → USDC → repay.`,
+                params: { repayUsd: idealRepayUsd, repayAsset: 'USDC', recoverTokens: true },
+                urgency,
+                estimatedImpactUsd: idealRepayUsd,
+                intelUsed: [],
+                tier: 'AUTO',
+              });
+            } else {
+              logger.debug(
+                `[CFO:Decision] Kamino recovery repay on cooldown — wallet $${walletUsdc.toFixed(2)} USDC, ` +
+                `borrow $${state.kaminoBorrowValueUsd.toFixed(0)}`,
+              );
+            }
           } else {
             // Cap repay to what the wallet actually has (keep 5% for gas/fees)
             const repayUsd = Math.min(idealRepayUsd, walletUsdc * 0.95);
@@ -4156,10 +4171,62 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       case 'KAMINO_REPAY': {
         const kamino = await import('./kaminoService.ts');
         const jupBal = await import('./jupiterService.ts');
-        const { repayUsd } = decision.params;
+        const { repayUsd, recoverTokens } = decision.params;
 
-        // Pre-flight: check wallet actually has USDC before sending on-chain tx
-        const usdcBal = await jupBal.getTokenBalance(jupBal.MINTS.USDC);
+        // Pre-flight: check wallet USDC balance
+        let usdcBal = await jupBal.getTokenBalance(jupBal.MINTS.USDC);
+
+        // Recovery mode: wallet has orphaned non-USDC tokens from a failed borrow LP.
+        // Swap them to USDC first, then proceed with repay.
+        if (recoverTokens && usdcBal < repayUsd * 0.50) {
+          logger.info(`[CFO] KAMINO_REPAY recovery mode — scanning wallet for orphaned tokens to swap to USDC`);
+          try {
+            const walletTokens = await jupBal.getWalletTokenBalances(0);
+            const SOL_RESERVE = 0.05;
+            let totalRecovered = 0;
+            for (const tok of walletTokens) {
+              // Skip SOL (gas reserve), USDC (already target), dust amounts
+              if (tok.mint === jupBal.MINTS.SOL) continue;
+              if (tok.mint === jupBal.MINTS.USDC) continue;
+              if (tok.balance <= 0) continue;
+              // Skip tokens with very small balances (< $0.10 not worth the gas)
+              // We don't have price here, so swap anything with balance > 0
+              // Jupiter will fail gracefully on worthless tokens
+              try {
+                const quote = await jupBal.getQuote(tok.mint, jupBal.MINTS.USDC, tok.balance, 200);
+                if (!quote) continue;
+                // Skip if output < $0.50 (not worth gas)
+                const outputUsd = (quote as any).outAmount
+                  ? Number((quote as any).outAmount) / 1e6 // USDC has 6 decimals
+                  : 0;
+                if (outputUsd < 0.50) {
+                  logger.debug(`[CFO] KAMINO_REPAY recovery: skip ${tok.symbol ?? tok.mint.slice(0, 8)} — output $${outputUsd.toFixed(2)} too small`);
+                  continue;
+                }
+                const swap = await jupBal.executeSwap(quote);
+                if (swap.success) {
+                  const recovered = swap.outputAmount ?? 0;
+                  totalRecovered += recovered;
+                  logger.info(`[CFO] KAMINO_REPAY recovery: swapped ${tok.balance.toFixed(4)} ${tok.symbol ?? tok.mint.slice(0, 8)} → $${recovered.toFixed(2)} USDC`);
+                } else {
+                  logger.warn(`[CFO] KAMINO_REPAY recovery: swap ${tok.symbol ?? tok.mint.slice(0, 8)} failed: ${swap.error}`);
+                }
+              } catch (swapErr) {
+                logger.warn(`[CFO] KAMINO_REPAY recovery: swap ${tok.symbol ?? tok.mint.slice(0, 8)} error:`, swapErr);
+              }
+            }
+            if (totalRecovered > 0) {
+              // Re-check USDC balance after swaps
+              usdcBal = await jupBal.getTokenBalance(jupBal.MINTS.USDC);
+              logger.info(`[CFO] KAMINO_REPAY recovery: recovered $${totalRecovered.toFixed(2)} USDC total. Wallet now: $${usdcBal.toFixed(2)} USDC`);
+            } else {
+              logger.warn(`[CFO] KAMINO_REPAY recovery: no tokens recovered — wallet has no swappable assets`);
+            }
+          } catch (recoverErr) {
+            logger.error(`[CFO] KAMINO_REPAY recovery scan failed:`, recoverErr);
+          }
+        }
+
         if (usdcBal < 0.50) {
           logger.warn(`[CFO] KAMINO_REPAY skipped — wallet USDC $${usdcBal.toFixed(2)} insufficient (need $${repayUsd.toFixed(2)})`);
           return { ...base, executed: false, success: false, error: `Insufficient wallet USDC ($${usdcBal.toFixed(2)}) for repay ($${repayUsd.toFixed(2)})` };
