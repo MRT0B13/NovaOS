@@ -4179,27 +4179,30 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         // Recovery mode: wallet has orphaned non-USDC tokens from a failed borrow LP.
         // Swap them to USDC first, then proceed with repay.
         if (recoverTokens && usdcBal < repayUsd * 0.50) {
-          // Pre-check: need enough SOL for swap tx fees (~0.01 SOL per swap)
+          // Pre-check: need enough SOL for swap tx fees + ATA rent (~0.03 SOL minimum)
           const solBal = await jupBal.getTokenBalance(jupBal.MINTS.SOL);
-          if (solBal < 0.005) {
-            logger.warn(`[CFO] KAMINO_REPAY recovery skipped — SOL balance ${solBal.toFixed(4)} too low for swap tx fees`);
+          if (solBal < 0.03) {
+            logger.warn(`[CFO] KAMINO_REPAY recovery skipped — SOL balance ${solBal.toFixed(4)} too low for swap tx fees (need ≥0.03)`);
           } else {
           logger.info(`[CFO] KAMINO_REPAY recovery mode — scanning wallet for orphaned tokens to swap to USDC (SOL: ${solBal.toFixed(4)})`);
           try {
             const walletTokens = await jupBal.getWalletTokenBalances(0);
             const SOL_RESERVE = 0.05;
             let totalRecovered = 0;
+            let consecutiveFailures = 0;
             for (const tok of walletTokens) {
               // Skip SOL (gas reserve), USDC (already target), dust amounts
               if (tok.mint === jupBal.MINTS.SOL) continue;
               if (tok.mint === jupBal.MINTS.USDC) continue;
               if (tok.balance <= 0) continue;
-              // Skip tokens with very small balances (< $0.10 not worth the gas)
-              // We don't have price here, so swap anything with balance > 0
-              // Jupiter will fail gracefully on worthless tokens
+              // Early-break: if 2 consecutive swaps failed, likely systemic (SOL too low, network issue)
+              if (consecutiveFailures >= 2) {
+                logger.warn(`[CFO] KAMINO_REPAY recovery: aborting — ${consecutiveFailures} consecutive swap failures`);
+                break;
+              }
               try {
                 const quote = await jupBal.getQuote(tok.mint, jupBal.MINTS.USDC, tok.balance, 200);
-                if (!quote) continue;
+                if (!quote) { consecutiveFailures++; continue; }
                 // Skip if output < $0.50 (not worth gas)
                 const outputUsd = (quote as any).outAmount
                   ? Number((quote as any).outAmount) / 1e6 // USDC has 6 decimals
@@ -4212,11 +4215,14 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
                 if (swap.success) {
                   const recovered = swap.outputAmount ?? 0;
                   totalRecovered += recovered;
+                  consecutiveFailures = 0; // reset on success
                   logger.info(`[CFO] KAMINO_REPAY recovery: swapped ${tok.balance.toFixed(4)} ${tok.symbol ?? tok.mint.slice(0, 8)} → $${recovered.toFixed(2)} USDC`);
                 } else {
+                  consecutiveFailures++;
                   logger.warn(`[CFO] KAMINO_REPAY recovery: swap ${tok.symbol ?? tok.mint.slice(0, 8)} failed: ${swap.error}`);
                 }
               } catch (swapErr) {
+                consecutiveFailures++;
                 logger.warn(`[CFO] KAMINO_REPAY recovery: swap ${tok.symbol ?? tok.mint.slice(0, 8)} error:`, swapErr);
               }
             }
