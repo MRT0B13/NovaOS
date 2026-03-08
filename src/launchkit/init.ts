@@ -171,9 +171,9 @@ export async function initLaunchKit(
         const { initSkillDiscoveryService } = await import('./services/skillDiscoveryService.ts');
         const { seedAgentSkills } = await import('./db/seedSkills.ts');
 
-        initSkillsService(pool);
+        const svc = initSkillsService(pool);
         initSkillDiscoveryService(pool);
-        await seedAgentSkills(pool);
+        await seedAgentSkills(svc);
         logger.info('[LaunchKit] 🧠 Agent Skills System initialized (registry + seed + discovery)');
       }
     } catch (skillsErr) {

@@ -4,8 +4,8 @@
  * Called once at startup; uses ON CONFLICT DO NOTHING so it's idempotent.
  */
 
-import type { Pool } from 'pg';
 import { logger } from '@elizaos/core';
+import type { SkillsService } from '../services/skillsService.ts';
 
 // ============================================================================
 // Seed Data
@@ -345,22 +345,20 @@ const SEED_ASSIGNMENTS: SeedAssignment[] = [
 // Seeder
 // ============================================================================
 
-export async function seedAgentSkills(pool: Pool): Promise<void> {
+export async function seedAgentSkills(skills: SkillsService): Promise<void> {
   logger.info('[SeedSkills] Seeding agent skills...');
-  let inserted = 0;
-  let skipped = 0;
 
   for (const skill of SEED_SKILLS) {
     try {
-      const res = await pool.query(
-        `INSERT INTO agent_skills
-           (skill_id, name, description, content, version, category, source, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'seed', 'active')
-         ON CONFLICT (skill_id) DO NOTHING`,
-        [skill.skillId, skill.name, skill.description, skill.content, skill.version, skill.category],
-      );
-      if (res.rowCount && res.rowCount > 0) inserted++;
-      else skipped++;
+      await skills.upsertSkill({
+        skillId: skill.skillId,
+        name: skill.name,
+        description: skill.description,
+        content: skill.content,
+        version: skill.version,
+        category: skill.category,
+        source: 'seed',
+      });
     } catch (err) {
       logger.warn(`[SeedSkills] Failed to seed skill ${skill.skillId}:`, err);
     }
@@ -368,16 +366,11 @@ export async function seedAgentSkills(pool: Pool): Promise<void> {
 
   for (const assignment of SEED_ASSIGNMENTS) {
     try {
-      await pool.query(
-        `INSERT INTO agent_skill_assignments (agent_role, skill_id, priority)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (agent_role, skill_id) DO NOTHING`,
-        [assignment.agentRole, assignment.skillId, assignment.priority],
-      );
+      await skills.assignSkill(assignment.agentRole, assignment.skillId, assignment.priority);
     } catch (err) {
       logger.warn(`[SeedSkills] Failed assignment ${assignment.agentRole} → ${assignment.skillId}:`, err);
     }
   }
 
-  logger.info(`[SeedSkills] Done: ${inserted} inserted, ${skipped} already existed, ${SEED_ASSIGNMENTS.length} assignments checked`);
+  logger.info(`[SeedSkills] Seed complete — ${SEED_SKILLS.length} skills across ${new Set(SEED_ASSIGNMENTS.map(a => a.agentRole)).size} agents`);
 }

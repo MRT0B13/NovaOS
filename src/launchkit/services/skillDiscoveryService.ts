@@ -9,21 +9,10 @@
 
 import type { Pool } from 'pg';
 import { logger } from '@elizaos/core';
-import { getSkillsService } from './skillsService.ts';
 
 // ============================================================================
 // Constants
 // ============================================================================
-
-const AGENT_ROLES = [
-  'nova-cfo',
-  'nova-scout',
-  'nova-analyst',
-  'nova-launcher',
-  'nova-community',
-  'nova-guardian',
-  'nova-supervisor',
-] as const;
 
 const AGENT_PROFILES: Record<string, string> = {
   'nova-cfo': `Financial operator managing a live DeFi portfolio. Responsibilities:
@@ -78,11 +67,14 @@ const AGENT_PROFILES: Record<string, string> = {
 };
 
 /** GitHub repos to scan for skills */
-const SKILL_SOURCES = [
-  { type: 'repo' as const, owner: 'anthropics', repo: 'skills' },
-  { type: 'repo' as const, owner: 'elizaos', repo: 'skills' },
-  { type: 'topic' as const, query: 'agent-skills defi' },
-  { type: 'topic' as const, query: 'agent-skills elizaos' },
+const SKILL_SOURCES: Array<
+  | { type: 'repo'; owner: string; repo: string; path?: string }
+  | { type: 'topic'; query: string }
+> = [
+  { type: 'repo', owner: 'anthropics', repo: 'skills', path: 'skills' },
+  { type: 'repo', owner: 'elizaos', repo: 'skills' },
+  { type: 'topic', query: 'topic:agent-skills+topic:defi' },
+  { type: 'topic', query: 'topic:agent-skills+topic:elizaos' },
 ];
 
 const RUN_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -163,8 +155,8 @@ export class SkillDiscoveryService {
       queued++;
     }
 
-    // 5. Build admin report
-    const report = this.buildReport(evaluated, candidates.length);
+    // 5. Build admin report (with queue IDs for approve/reject commands)
+    const report = await this.buildReport(evaluated, candidates.length);
     logger.info(`[SkillDiscovery] Queued ${queued} proposals`);
 
     return report;
@@ -178,7 +170,7 @@ export class SkillDiscoveryService {
     for (const source of SKILL_SOURCES) {
       try {
         if (source.type === 'repo') {
-          const items = await this.fetchFromRepo(source.owner, source.repo);
+          const items = await this.fetchFromRepo(source.owner, source.repo, source.path);
           all.push(...items);
         } else {
           const items = await this.fetchFromTopic(source.query);
@@ -192,9 +184,10 @@ export class SkillDiscoveryService {
     return all;
   }
 
-  private async fetchFromRepo(owner: string, repo: string): Promise<SkillCandidate[]> {
+  private async fetchFromRepo(owner: string, repo: string, path?: string): Promise<SkillCandidate[]> {
     try {
-      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents`, {
+      const contentsPath = path ? `contents/${path}` : 'contents';
+      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/${contentsPath}`, {
         headers: this.githubHeaders(),
       });
       if (!res.ok) return [];
@@ -453,8 +446,7 @@ Respond ONLY with JSON in this exact format:
       await this.pool.query(
         `INSERT INTO skill_discovery_queue
            (skill_id, name, description, content, source_url, proposed_agent_roles, relevance_reasoning, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-         ON CONFLICT (skill_id) DO NOTHING`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
         [
           ev.skillId, ev.name, ev.description, ev.content,
           ev.sourceUrl, ev.matchedRoles, ev.reasoning,
@@ -467,7 +459,7 @@ Respond ONLY with JSON in this exact format:
 
   // ── Reporting ───────────────────────────────────────────────
 
-  private buildReport(evaluated: EvaluatedSkill[], totalCandidates: number): string {
+  private async buildReport(evaluated: EvaluatedSkill[], totalCandidates: number): Promise<string> {
     const lines = [
       `🔍 <b>Skill Discovery Report</b>`,
       ``,
@@ -481,7 +473,18 @@ Respond ONLY with JSON in this exact format:
       lines.push(`   Roles: ${ev.matchedRoles.join(', ')}`);
       lines.push(`   Score: ${Math.round(ev.maxRelevance * 100)}%`);
       lines.push(`   ${ev.reasoning}`);
-      lines.push(`   <code>/skill approve ${ev.skillId}</code>`);
+
+      // Look up queue ID for approve/reject commands
+      try {
+        const qRes = await this.pool.query(
+          'SELECT id FROM skill_discovery_queue WHERE skill_id = $1 ORDER BY created_at DESC LIMIT 1',
+          [ev.skillId],
+        );
+        const queueId = qRes.rows[0]?.id;
+        if (queueId) {
+          lines.push(`   <code>/skill approve ${queueId}</code> | <code>/skill reject ${queueId}</code>`);
+        }
+      } catch { /* skip command if query fails */ }
       lines.push('');
     }
 
