@@ -71,10 +71,59 @@ const SKILL_SOURCES: Array<
   | { type: 'repo'; owner: string; repo: string; path?: string }
   | { type: 'topic'; query: string }
 > = [
+  // ── Curated skill registries ────────────────────────────────
   { type: 'repo', owner: 'anthropics', repo: 'skills', path: 'skills' },
   { type: 'repo', owner: 'elizaos', repo: 'skills' },
+
+  // ── DeFi protocol SDKs & examples ──────────────────────────
+  { type: 'repo', owner: 'orca-so', repo: 'whirlpools' },            // Orca concentrated-liquidity SDK
+  { type: 'repo', owner: 'hubbleprotocol', repo: 'kamino-sdk' },     // Kamino lending/vault SDK
+  { type: 'repo', owner: 'jito-foundation', repo: 'jito-solana' },   // Jito MEV/tips integration
+  { type: 'repo', owner: 'drift-labs', repo: 'protocol-v2' },        // Drift perpetuals protocol
+  { type: 'repo', owner: 'marinade-finance', repo: 'liquid-staking-program' }, // Marinade staking
+  { type: 'repo', owner: 'raydium-io', repo: 'raydium-sdk-V2' },     // Raydium AMM SDK
+  { type: 'repo', owner: 'Jupiter-Aggregator', repo: 'jupiter-quote-api-node' }, // Jupiter aggregator
+  { type: 'repo', owner: 'hyperliquid-dex', repo: 'hyperliquid-python-sdk' },   // Hyperliquid perps
+
+  // ── Security & audit tools ─────────────────────────────────
+  { type: 'repo', owner: 'crytic', repo: 'slither' },                // Smart contract analysis
+  { type: 'repo', owner: 'AuditWizard', repo: 'audit-templates' },   // Audit checklists
+  { type: 'repo', owner: 'AuditWizard', repo: 'resources' },         // Security resources
+  { type: 'repo', owner: 'nicholasgasior', repo: 'solana-security-txt' }, // Solana security.txt
+
+  // ── AI agent & MCP frameworks ──────────────────────────────
+  { type: 'repo', owner: 'modelcontextprotocol', repo: 'servers' },   // MCP tool servers
+  { type: 'repo', owner: 'langchain-ai', repo: 'langchain' },         // LangChain tools & chains
+  { type: 'repo', owner: 'langchain-ai', repo: 'langgraph' },         // LangGraph agent patterns
+  { type: 'repo', owner: 'BerriAI', repo: 'litellm' },               // LiteLLM multi-provider routing
+
+  // ── Solana ecosystem tooling ───────────────────────────────
+  { type: 'repo', owner: 'solana-developers', repo: 'program-examples' }, // Solana program patterns
+  { type: 'repo', owner: 'coral-xyz', repo: 'anchor', path: 'examples' }, // Anchor framework examples
+  { type: 'repo', owner: 'helius-labs', repo: 'helius-sdk' },         // Helius RPC/webhooks SDK
+  { type: 'repo', owner: 'metaplex-foundation', repo: 'mpl-token-metadata' }, // Token metadata standard
+
+  // ── Trading & market data ──────────────────────────────────
+  { type: 'repo', owner: 'ccxt', repo: 'ccxt' },                     // Unified exchange API
+  { type: 'repo', owner: 'birdeye-so', repo: 'birdeye-api-docs' },   // Birdeye analytics
+  { type: 'repo', owner: 'dexscreener', repo: 'examples' },          // DexScreener API examples
+
+  // ── On-chain analytics & indexing ──────────────────────────
+  { type: 'repo', owner: 'streamflow-finance', repo: 'js-sdk' },     // Vesting/payroll SDK
+  { type: 'repo', owner: 'switchboard-xyz', repo: 'switchboard-v2' }, // Oracle feeds
+  { type: 'repo', owner: 'pyth-network', repo: 'pyth-sdk-solidity' }, // Pyth price feeds
+
+  // ── Topic-based discovery ──────────────────────────────────
   { type: 'topic', query: 'topic:agent-skills+topic:defi' },
   { type: 'topic', query: 'topic:agent-skills+topic:elizaos' },
+  { type: 'topic', query: 'topic:solana+topic:defi+topic:sdk' },
+  { type: 'topic', query: 'topic:mev+topic:solana' },
+  { type: 'topic', query: 'topic:crypto-trading+topic:bot' },
+  { type: 'topic', query: 'topic:smart-contract-security+topic:solana' },
+  { type: 'topic', query: 'topic:sentiment-analysis+topic:crypto' },
+  { type: 'topic', query: 'topic:pump-fun+topic:solana' },
+  { type: 'topic', query: 'topic:mcp+topic:tools' },
+  { type: 'topic', query: 'topic:llm-agents+topic:trading' },
 ];
 
 const RUN_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
