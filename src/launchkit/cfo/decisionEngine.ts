@@ -2205,19 +2205,39 @@ export async function generateDecisions(
       } else {
         // Simple loop: repay USDC to bring LTV back to 40%
         const targetLtv = 0.40;
-        const repayUsd = Math.max(0, state.kaminoBorrowValueUsd - state.kaminoDepositValueUsd * targetLtv);
-        if (repayUsd > 0) {
-          decisions.push({
-            type: 'KAMINO_REPAY',
-            reasoning:
-              `Kamino LTV ${(state.kaminoLtv * 100).toFixed(1)}% (health: ${state.kaminoHealthFactor.toFixed(2)}) — ` +
-              `repaying $${repayUsd.toFixed(0)} USDC to bring LTV to ${targetLtv * 100}%`,
-            params: { repayUsd, repayAsset: 'USDC' },
-            urgency,
-            estimatedImpactUsd: repayUsd,
-            intelUsed: [],
-            tier: urgency === 'critical' ? 'AUTO' : 'NOTIFY',
-          });
+        const idealRepayUsd = Math.max(0, state.kaminoBorrowValueUsd - state.kaminoDepositValueUsd * targetLtv);
+        if (idealRepayUsd > 0) {
+          const walletUsdc = state.solanaUsdcBalance ?? 0;
+          if (walletUsdc < 1) {
+            // Wallet has no USDC — cannot repay. Skip to avoid failed-tx spam.
+            // The borrowed funds are deployed in LP positions; close those first.
+            logger.warn(
+              `[CFO:Decision] Kamino repay needed ($${idealRepayUsd.toFixed(0)}) but wallet has $${walletUsdc.toFixed(2)} USDC — ` +
+              `skipping KAMINO_REPAY (funds likely deployed in LPs, close positions first)`,
+            );
+          } else {
+            // Cap repay to what the wallet actually has (keep 5% for gas/fees)
+            const repayUsd = Math.min(idealRepayUsd, walletUsdc * 0.95);
+            if (repayUsd < 0.50) {
+              logger.warn(
+                `[CFO:Decision] Kamino repay needed ($${idealRepayUsd.toFixed(0)}) but wallet only has $${walletUsdc.toFixed(2)} USDC — ` +
+                `repay amount $${repayUsd.toFixed(2)} too small, skipping`,
+              );
+            } else {
+              decisions.push({
+                type: 'KAMINO_REPAY',
+                reasoning:
+                  `Kamino LTV ${(state.kaminoLtv * 100).toFixed(1)}% (health: ${state.kaminoHealthFactor.toFixed(2)}) — ` +
+                  `repaying $${repayUsd.toFixed(0)} USDC to bring LTV toward ${targetLtv * 100}%` +
+                  (repayUsd < idealRepayUsd ? ` (capped to wallet balance $${walletUsdc.toFixed(0)})` : ''),
+                params: { repayUsd, repayAsset: 'USDC' },
+                urgency,
+                estimatedImpactUsd: repayUsd,
+                intelUsed: [],
+                tier: urgency === 'critical' ? 'AUTO' : 'NOTIFY',
+              });
+            }
+          }
         }
       }
     // H-bis: Proactive repay — if wallet has USDC from LP fees/closes and Kamino has
@@ -4135,8 +4155,18 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
       case 'KAMINO_REPAY': {
         const kamino = await import('./kaminoService.ts');
+        const jupBal = await import('./jupiterService.ts');
         const { repayUsd } = decision.params;
-        const result = await kamino.repay('USDC', repayUsd);
+
+        // Pre-flight: check wallet actually has USDC before sending on-chain tx
+        const usdcBal = await jupBal.getTokenBalance(jupBal.MINTS.USDC);
+        if (usdcBal < 0.50) {
+          logger.warn(`[CFO] KAMINO_REPAY skipped — wallet USDC $${usdcBal.toFixed(2)} insufficient (need $${repayUsd.toFixed(2)})`);
+          return { ...base, executed: false, success: false, error: `Insufficient wallet USDC ($${usdcBal.toFixed(2)}) for repay ($${repayUsd.toFixed(2)})` };
+        }
+        // Cap to actual balance with small buffer for rounding
+        const cappedRepay = Math.min(repayUsd, usdcBal * 0.995);
+        const result = await kamino.repay('USDC', cappedRepay);
         if (result.success) markDecision('KAMINO_REPAY');
         return {
           ...base,
@@ -4429,7 +4459,9 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
                         })();
                     usdcRecovered += unwindB.success ? (unwindB.outputAmount ?? 0) : 0;
                   }
-                } catch { /* best-effort tokenB unwind */ }
+                } catch (tokenBErr) {
+                  logger.error(`[CFO] KAMINO_BORROW_LP tokenB unwind failed:`, tokenBErr);
+                }
               } else {
                 usdcRecovered += usdcAmount; // tokenB side was USDC, still in wallet
               }
@@ -4445,6 +4477,18 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
             unwindNote = `Unwind error: ${(unwindErr as Error).message} — manual repay needed`;
           }
           logger.error(`[CFO] KAMINO_BORROW_LP ${unwindNote}`);
+          // Alert admin if borrow is outstanding and rollback failed
+          if (!unwindNote.startsWith('Auto-unwind OK')) {
+            try {
+              const { notifyAdminForce } = await import('../services/adminNotify.ts');
+              await notifyAdminForce(
+                `⚠️ KAMINO_BORROW_LP rollback incomplete\n` +
+                `Borrowed $${borrowUsd.toFixed(0)} USDC but LP open failed.\n` +
+                `${unwindNote}\n` +
+                `Action needed: manually swap tokens back to USDC and repay Kamino.`,
+              );
+            } catch { /* admin notify best-effort */ }
+          }
           return { ...base, executed: true, success: false, error: `LP open failed: ${lpResult.error}. ${unwindNote}` };
         }
 

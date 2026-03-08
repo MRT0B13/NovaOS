@@ -1226,6 +1226,27 @@ export async function repay(
 
   if (repayAmount <= 0) return { success: false, asset, amountRepaid: 0, error: 'Amount must be positive' };
 
+  // Pre-flight: verify wallet has enough of the repay asset before building tx
+  // Prevents wasted gas on transactions that will fail with "insufficient funds"
+  try {
+    const jupiter = await import('./jupiterService.ts');
+    const assetMint = asset === 'USDC' ? USDC_MINT : asset === 'SOL' ? jupiter.MINTS.SOL : undefined;
+    if (assetMint) {
+      const walletBal = await jupiter.getTokenBalance(assetMint);
+      if (walletBal < repayAmount * 0.50) {
+        logger.warn(`[Kamino] repay pre-flight: wallet ${asset} balance ${walletBal.toFixed(4)} < repay amount ${repayAmount.toFixed(4)} — aborting`);
+        return { success: false, asset, amountRepaid: 0, error: `Insufficient ${asset} balance (${walletBal.toFixed(4)} < ${repayAmount.toFixed(4)})` };
+      }
+      // Cap to what's actually available
+      if (repayAmount > walletBal * 0.995) {
+        logger.info(`[Kamino] repay capped from ${repayAmount.toFixed(4)} to ${(walletBal * 0.995).toFixed(4)} (wallet balance)`);
+        repayAmount = walletBal * 0.995;
+      }
+    }
+  } catch (balErr) {
+    logger.debug(`[Kamino] repay pre-flight balance check failed (proceeding anyway):`, balErr);
+  }
+
   try {
     const klend = await loadKlend();
     const wallet = loadWallet();
