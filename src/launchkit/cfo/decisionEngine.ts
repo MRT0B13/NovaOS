@@ -1484,7 +1484,7 @@ export async function generateDecisions(
   intel: SwarmIntel = { riskMultiplier: 1.0, marketCondition: 'neutral' },
   learned: AdaptiveParams = getAdaptiveParams(),
 ): Promise<Decision[]> {
-  const decisions: Decision[] = [];
+  let decisions: Decision[] = [];
   const conf = learned.confidenceLevel;
 
   // ── Strategy score gate — skip capital-deploying sections for poorly performing strategies ──
@@ -3888,6 +3888,29 @@ export async function generateDecisions(
     logger.info(`[CFO:Decision] Sections: ${diag.join(' | ')}`);
   }
 
+  // ── Dedupe: drop CLAIM_FEES if REBALANCE targets the same posId ──────────
+  // Rebalance already collects fees during the close phase — a separate claim
+  // on the same (about-to-be-burned) position just causes "nonexistent token" errors.
+  const rebalancePosIds = new Set(
+    decisions
+      .filter(d => d.type === 'KRYSTAL_LP_REBALANCE')
+      .map(d => d.params.posId)
+      .filter(Boolean),
+  );
+  if (rebalancePosIds.size > 0) {
+    const before = decisions.length;
+    decisions = decisions.filter(d => {
+      if (d.type === 'KRYSTAL_LP_CLAIM_FEES' && rebalancePosIds.has(d.params.posId)) {
+        logger.info(`[CFO:Decision] Dropping CLAIM_FEES for posId=${d.params.posId} — REBALANCE already collects fees during close`);
+        return false;
+      }
+      return true;
+    });
+    if (decisions.length < before) {
+      logger.info(`[CFO:Decision] Deduped: removed ${before - decisions.length} redundant CLAIM_FEES`);
+    }
+  }
+
   // Cap to maxDecisionsPerCycle
   return decisions.slice(0, config.maxDecisionsPerCycle);
 }
@@ -4181,14 +4204,34 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
       case 'KAMINO_REPAY': {
         const kamino = await import('./kaminoService.ts');
         const jupBal = await import('./jupiterService.ts');
-        const { repayUsd, recoverTokens } = decision.params;
+        const { recoverTokens } = decision.params;
+
+        // ── Always read the EXACT on-chain borrow amount at execution time ──
+        // This avoids using stale state data and ensures we know exactly how
+        // much was borrowed (the user's request: "it should know exactly how
+        // much it borrowed and pay that back").
+        let onChainBorrowUsd: number;
+        try {
+          const pos = await kamino.getPosition();
+          onChainBorrowUsd = pos.borrows.reduce((sum, b) => sum + b.valueUsd, 0);
+          logger.info(`[CFO] KAMINO_REPAY: on-chain borrow = $${onChainBorrowUsd.toFixed(2)}`);
+        } catch {
+          // Fallback to decision param if on-chain read fails
+          onChainBorrowUsd = decision.params.repayUsd;
+          logger.warn(`[CFO] KAMINO_REPAY: could not read on-chain borrow — using decision param $${onChainBorrowUsd.toFixed(2)}`);
+        }
+
+        if (onChainBorrowUsd < 0.50) {
+          logger.info(`[CFO] KAMINO_REPAY: on-chain borrow $${onChainBorrowUsd.toFixed(2)} — nothing to repay`);
+          return { ...base, executed: false, success: true };
+        }
 
         // Pre-flight: check wallet USDC balance
         let usdcBal = await jupBal.getTokenBalance(jupBal.MINTS.USDC);
 
         // Recovery mode: wallet has orphaned non-USDC tokens from a failed borrow LP.
         // Swap them to USDC first, then proceed with repay.
-        if (recoverTokens && usdcBal < repayUsd * 0.50) {
+        if (recoverTokens && usdcBal < onChainBorrowUsd * 0.50) {
           // Pre-check: need enough SOL for swap tx fees + ATA rent (~0.03 SOL minimum)
           const solBal = await jupBal.getTokenBalance(jupBal.MINTS.SOL);
           if (solBal < 0.03) {
@@ -4205,6 +4248,13 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
               if (tok.mint === jupBal.MINTS.SOL) continue;
               if (tok.mint === jupBal.MINTS.USDC) continue;
               if (tok.balance <= 0) continue;
+              // Per-token failure cooldown: skip tokens that previously failed recovery swap
+              // (avoids hammering Jupiter every cycle with the same dust tokens like cbBTC, KMNO)
+              const tokenCooldownKey = `KAMINO_REPAY_TOKEN_${tok.mint.slice(0, 8)}`;
+              if (!checkCooldown(tokenCooldownKey, 24 * 3600_000)) {
+                logger.debug(`[CFO] KAMINO_REPAY recovery: skip ${tok.symbol ?? tok.mint.slice(0, 8)} — on 24h failure cooldown`);
+                continue;
+              }
               // Early-break: if 2 consecutive swaps failed, likely systemic (SOL too low, network issue)
               if (consecutiveFailures >= 2) {
                 logger.warn(`[CFO] KAMINO_REPAY recovery: aborting — ${consecutiveFailures} consecutive swap failures`);
@@ -4212,13 +4262,21 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
               }
               try {
                 const quote = await jupBal.getQuote(tok.mint, jupBal.MINTS.USDC, tok.balance, 200);
-                if (!quote) { consecutiveFailures++; continue; }
+                if (!quote) {
+                  consecutiveFailures++;
+                  // Mark cooldown so we don't retry this token for 24h
+                  markDecision(tokenCooldownKey);
+                  logger.debug(`[CFO] KAMINO_REPAY recovery: skip ${tok.symbol ?? tok.mint.slice(0, 8)} — no quote (24h cooldown set)`);
+                  continue;
+                }
                 // Skip if output < $0.50 (not worth gas)
                 const outputUsd = (quote as any).outAmount
                   ? Number((quote as any).outAmount) / 1e6 // USDC has 6 decimals
                   : 0;
                 if (outputUsd < 0.50) {
-                  logger.debug(`[CFO] KAMINO_REPAY recovery: skip ${tok.symbol ?? tok.mint.slice(0, 8)} — output $${outputUsd.toFixed(2)} too small`);
+                  // Mark cooldown for dust tokens — don't retry for 24h
+                  markDecision(tokenCooldownKey);
+                  logger.debug(`[CFO] KAMINO_REPAY recovery: skip ${tok.symbol ?? tok.mint.slice(0, 8)} — output $${outputUsd.toFixed(2)} too small (24h cooldown set)`);
                   continue;
                 }
                 const swap = await jupBal.executeSwap(quote);
@@ -4229,11 +4287,14 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
                   logger.info(`[CFO] KAMINO_REPAY recovery: swapped ${tok.balance.toFixed(4)} ${tok.symbol ?? tok.mint.slice(0, 8)} → $${recovered.toFixed(2)} USDC`);
                 } else {
                   consecutiveFailures++;
-                  logger.warn(`[CFO] KAMINO_REPAY recovery: swap ${tok.symbol ?? tok.mint.slice(0, 8)} failed: ${swap.error}`);
+                  // Mark cooldown so we don't retry this token for 24h
+                  markDecision(tokenCooldownKey);
+                  logger.warn(`[CFO] KAMINO_REPAY recovery: swap ${tok.symbol ?? tok.mint.slice(0, 8)} failed: ${swap.error} (24h cooldown set)`);
                 }
               } catch (swapErr) {
                 consecutiveFailures++;
-                logger.warn(`[CFO] KAMINO_REPAY recovery: swap ${tok.symbol ?? tok.mint.slice(0, 8)} error:`, swapErr);
+                markDecision(tokenCooldownKey);
+                logger.warn(`[CFO] KAMINO_REPAY recovery: swap ${tok.symbol ?? tok.mint.slice(0, 8)} error (24h cooldown set):`, swapErr);
               }
             }
             if (totalRecovered > 0) {
@@ -4250,11 +4311,13 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         }
 
         if (usdcBal < 0.50) {
-          logger.warn(`[CFO] KAMINO_REPAY skipped — wallet USDC $${usdcBal.toFixed(2)} insufficient (need $${repayUsd.toFixed(2)})`);
-          return { ...base, executed: false, success: false, error: `Insufficient wallet USDC ($${usdcBal.toFixed(2)}) for repay ($${repayUsd.toFixed(2)})` };
+          logger.warn(`[CFO] KAMINO_REPAY skipped — wallet USDC $${usdcBal.toFixed(2)} insufficient (need $${onChainBorrowUsd.toFixed(2)})`);
+          return { ...base, executed: false, success: false, error: `Insufficient wallet USDC ($${usdcBal.toFixed(2)}) for repay ($${onChainBorrowUsd.toFixed(2)})` };
         }
-        // Cap to actual balance with small buffer for rounding
-        const cappedRepay = Math.min(repayUsd, usdcBal * 0.995);
+        // Repay: target the on-chain borrow amount, capped to wallet balance.
+        // This ensures we repay exactly what was borrowed, not a stale estimate.
+        const cappedRepay = Math.min(onChainBorrowUsd, usdcBal * 0.995);
+        logger.info(`[CFO] KAMINO_REPAY: repaying $${cappedRepay.toFixed(2)} of $${onChainBorrowUsd.toFixed(2)} on-chain borrow (wallet: $${usdcBal.toFixed(2)} USDC)`);
         const result = await kamino.repay('USDC', cappedRepay);
         if (result.success) markDecision('KAMINO_REPAY');
         return {

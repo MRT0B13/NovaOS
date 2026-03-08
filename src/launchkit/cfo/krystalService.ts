@@ -2801,6 +2801,14 @@ export async function claimEvmLpFees(params: {
     const nfpmAbi = protoResolved ? getNfpmAbiForProtocol(protoResolved.def.abi) : NFPM_ABI;
     const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, wallet);
 
+    // Pre-check: verify the NFT still exists on-chain (may have been burned by rebalance)
+    try {
+      await nfpm.ownerOf(posId);
+    } catch {
+      logger.warn(`[Krystal] claimEvmLpFees: tokenId ${posId} does not exist on-chain (burned?) — skipping`);
+      return { success: false, error: `Token ${posId} no longer exists on-chain` };
+    }
+
     const tx = await nfpm.collect({
       tokenId: posId,
       recipient: wallet.address,
