@@ -1771,8 +1771,8 @@ export class CFOAgent extends BaseAgent {
     try {
       const svc = getSkillsService();
       if (svc) {
-        const skillCtx = await svc.loadSkillsForAgent('nova-cfo');
-        if (skillCtx) logger.debug(`[CFO] Loaded skill context (${skillCtx.length} chars)`);
+        this.currentSkillContext = await svc.loadSkillsForAgent('nova-cfo');
+        if (this.currentSkillContext) logger.debug(`[CFO] Loaded skill context (${this.currentSkillContext.length} chars)`);
       }
     } catch (err) { logger.warn('[CFO] Skills load error (non-fatal):', err); }
 

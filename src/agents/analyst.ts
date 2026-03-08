@@ -342,15 +342,6 @@ export class AnalystAgent extends BaseAgent {
     // Restore persisted counters from DB (survive restarts)
     await this.restorePersistedState();
 
-    // Load agent skills (hot-reloadable, 5min cache)
-    try {
-      const svc = getSkillsService();
-      if (svc) {
-        const skillCtx = await svc.loadSkillsForAgent('nova-analyst');
-        if (skillCtx) logger.debug(`[analyst] Loaded skill context (${skillCtx.length} chars)`);
-      }
-    } catch (err) { logger.warn('[analyst] Skills load error (non-fatal):', err); }
-
     this.startHeartbeat(60_000);
 
     // Full DeFi snapshot (multi-chain TVL + volume + data pools)
@@ -499,6 +490,15 @@ export class AnalystAgent extends BaseAgent {
   private async takeSnapshot(): Promise<void> {
     if (!this.running) return;
     try {
+      // Refresh agent skills each cycle (5min cache, hot-reloadable)
+      try {
+        const svc = getSkillsService();
+        if (svc) {
+          this.currentSkillContext = await svc.loadSkillsForAgent('nova-analyst');
+          if (this.currentSkillContext) logger.debug(`[analyst] Loaded skill context (${this.currentSkillContext.length} chars)`);
+        }
+      } catch (err) { logger.warn('[analyst] Skills load error (non-fatal):', err); }
+
       await this.updateStatus('analyzing');
       await loadDataPools();
 

@@ -176,8 +176,8 @@ export class ScoutAgent extends BaseAgent {
       try {
         const svc = getSkillsService();
         if (svc) {
-          const skillCtx = await svc.loadSkillsForAgent('nova-scout');
-          if (skillCtx) logger.debug(`[scout] Loaded skill context (${skillCtx.length} chars)`);
+          this.currentSkillContext = await svc.loadSkillsForAgent('nova-scout');
+          if (this.currentSkillContext) logger.debug(`[scout] Loaded skill context (${this.currentSkillContext.length} chars)`);
         }
       } catch (err) { logger.warn('[scout] Skills load error (non-fatal):', err); }
 
@@ -207,6 +207,14 @@ export class ScoutAgent extends BaseAgent {
   private async runScan(): Promise<void> {
     if (!this.running) return;
     try {
+      // Refresh agent skills each scan cycle
+      try {
+        const svc = getSkillsService();
+        if (svc) {
+          this.currentSkillContext = await svc.loadSkillsForAgent('nova-scout');
+        }
+      } catch { /* non-fatal */ }
+
       await loadResearch();
       await loadTrendData();
       await this.updateStatus('scanning');
@@ -508,7 +516,7 @@ export class ScoutAgent extends BaseAgent {
 Nova's community are crypto-native Solana users interested in meme coins, market trends, and AI agents.
 Write the channel post in Nova's voice: direct, confident, slightly edgy — like a well-connected trader sharing what they're seeing. Never use phrases like "I have gathered" or "based on my research".
 Maximum channel post length: 600 characters. Use bullet points for key signals.
-
+${this.currentSkillContext ? '\n' + this.currentSkillContext + '\n' : ''}
 Return ONLY valid JSON matching this exact schema:
 {
   "channelPost": "string — clean readable narrative for Telegram",
@@ -585,8 +593,10 @@ Return ONLY valid JSON matching this exact schema:
           model: 'gpt-4o-mini',
           max_tokens: 120,
           temperature: 0.3,
-          messages: [{
-            role: 'user',
+          messages: [
+            ...(this.currentSkillContext ? [{ role: 'system' as const, content: this.currentSkillContext }] : []),
+            {
+            role: 'user' as const,
             content: `A trending signal has been cross-confirmed across on-chain data and web search.
 Signal topic: "${signalTitle}"
 Raw research: "${rawResult.slice(0, 400)}"

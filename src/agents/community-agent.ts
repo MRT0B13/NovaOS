@@ -69,15 +69,6 @@ export class CommunityAgent extends BaseAgent {
     // Restore persisted counters from DB (survive restarts)
     await this.restorePersistedState();
 
-    // Load agent skills (hot-reloadable, 5min cache)
-    try {
-      const svc = getSkillsService();
-      if (svc) {
-        const skillCtx = await svc.loadSkillsForAgent('nova-community');
-        if (skillCtx) logger.debug(`[community] Loaded skill context (${skillCtx.length} chars)`);
-      }
-    } catch (err) { logger.warn('[community] Skills load error (non-fatal):', err); }
-
     this.startHeartbeat(60_000);
 
     // Periodic engagement summary
@@ -100,6 +91,15 @@ export class CommunityAgent extends BaseAgent {
   private async generateSummary(): Promise<void> {
     if (!this.running) return;
     try {
+      // Refresh agent skills each cycle (5min cache, hot-reloadable)
+      try {
+        const svc = getSkillsService();
+        if (svc) {
+          this.currentSkillContext = await svc.loadSkillsForAgent('nova-community');
+          if (this.currentSkillContext) logger.debug(`[community] Loaded skill context (${this.currentSkillContext.length} chars)`);
+        }
+      } catch (err) { logger.warn('[community] Skills load error (non-fatal):', err); }
+
       await this.updateStatus('analyzing');
       await loadCommunityData();
 

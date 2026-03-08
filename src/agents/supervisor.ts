@@ -993,8 +993,8 @@ export class Supervisor extends BaseAgent {
       try {
         const svc = getSkillsService();
         if (svc) {
-          const skillCtx = await svc.loadSkillsForAgent('nova-supervisor');
-          if (skillCtx) logger.debug(`[supervisor] Loaded skill context (${skillCtx.length} chars)`);
+          this.currentSkillContext = await svc.loadSkillsForAgent('nova-supervisor');
+          if (this.currentSkillContext) logger.debug(`[supervisor] Loaded skill context (${this.currentSkillContext.length} chars)`);
         }
       } catch (err) { logger.warn('[supervisor] Skills load error (non-fatal):', err); }
 

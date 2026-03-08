@@ -237,15 +237,6 @@ export class GuardianAgent extends BaseAgent {
     // Restore persisted counters from DB (survive restarts)
     await this.restorePersistedState();
 
-    // Load agent skills (hot-reloadable, 5min cache)
-    try {
-      const svc = getSkillsService();
-      if (svc) {
-        const skillCtx = await svc.loadSkillsForAgent('nova-guardian');
-        if (skillCtx) logger.debug(`[guardian] Loaded skill context (${skillCtx.length} chars)`);
-      }
-    } catch (err) { logger.warn('[guardian] Skills load error (non-fatal):', err); }
-
     this.startHeartbeat(60_000);
 
     // ── Token Safety (Original) ────────────────────────────────
@@ -539,8 +530,22 @@ export class GuardianAgent extends BaseAgent {
 
   // ── Periodic Re-scan ─────────────────────────────────────────────
 
+  /** Refresh guardian skills at each scan cycle */
+  private async refreshSkills(): Promise<void> {
+    try {
+      const svc = getSkillsService();
+      if (svc) {
+        this.currentSkillContext = await svc.loadSkillsForAgent('nova-guardian');
+        if (this.currentSkillContext) logger.debug(`[guardian] Loaded skill context (${this.currentSkillContext.length} chars)`);
+      }
+    } catch (err) { logger.warn('[guardian] Skills load error (non-fatal):', err); }
+  }
+
   private async rescanWatchList(): Promise<void> {
     if (!this.running) return;
+
+    // Refresh skills at each scan cycle
+    await this.refreshSkills();
 
     // Re-discover newly launched tokens from DB every cycle
     // (tokens launched after Guardian started would otherwise be missed)

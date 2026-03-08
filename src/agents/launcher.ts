@@ -70,15 +70,6 @@ export class LauncherAgent extends BaseAgent {
     // Restore persisted counters from DB (survive restarts)
     await this.restorePersistedState();
 
-    // Load agent skills (hot-reloadable, 5min cache)
-    try {
-      const svc = getSkillsService();
-      if (svc) {
-        const skillCtx = await svc.loadSkillsForAgent('nova-launcher');
-        if (skillCtx) logger.debug(`[launcher] Loaded skill context (${skillCtx.length} chars)`);
-      }
-    } catch (err) { logger.warn('[launcher] Skills load error (non-fatal):', err); }
-
     this.startHeartbeat(60_000);
 
     // Periodic status check + graduation monitoring
@@ -98,6 +89,15 @@ export class LauncherAgent extends BaseAgent {
   private async checkPipelineStatus(): Promise<void> {
     if (!this.running) return;
     try {
+      // Refresh agent skills each cycle (5min cache, hot-reloadable)
+      try {
+        const svc = getSkillsService();
+        if (svc) {
+          this.currentSkillContext = await svc.loadSkillsForAgent('nova-launcher');
+          if (this.currentSkillContext) logger.debug(`[launcher] Loaded skill context (${this.currentSkillContext.length} chars)`);
+        }
+      } catch (err) { logger.warn('[launcher] Skills load error (non-fatal):', err); }
+
       await loadAutonomous();
       const status = _getAutonomousStatus!();
       const totalLaunches = (status.launchesToday || 0) + (status.reactiveLaunchesToday || 0);

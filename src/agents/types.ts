@@ -66,6 +66,9 @@ export abstract class BaseAgent {
   protected intervals: NodeJS.Timeout[] = [];
   private _stateColumnEnsured = false;
 
+  /** Skill context loaded by the skills system — refreshed each decision cycle */
+  protected currentSkillContext = '';
+
   // Shared across all agent instances — avoids repeated failing queries + PG error log spam
   private static _hasRetryCount: boolean | null = null;
 
