@@ -24,6 +24,7 @@
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent } from './types.ts';
+import { getSkillsService } from '../launchkit/services/skillsService.ts';
 
 // Lazy imports — novaResearch has heavy deps; only import when actually used
 let _runResearchCycle: (() => Promise<void>) | null = null;
@@ -171,6 +172,15 @@ export class ScoutAgent extends BaseAgent {
   private async runFullResearch(): Promise<void> {
     if (!this.running) return;
     try {
+      // Load agent skills (hot-reloadable, 5min cache)
+      try {
+        const svc = getSkillsService();
+        if (svc) {
+          const skillCtx = await svc.loadSkillsForAgent('nova-scout');
+          if (skillCtx) logger.debug(`[scout] Loaded skill context (${skillCtx.length} chars)`);
+        }
+      } catch (err) { logger.warn('[scout] Skills load error (non-fatal):', err); }
+
       await this.updateStatus('researching');
       await loadResearch();
       await _runResearchCycle!();

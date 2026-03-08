@@ -164,6 +164,22 @@ export async function initLaunchKit(
       logger.warn({ error: engErr }, '[LaunchKit] Engagement tracker init failed (non-fatal)');
     }
 
+    // Initialize Agent Skills System (registry + seed + discovery)
+    try {
+      if (pool) {
+        const { initSkillsService } = await import('./services/skillsService.ts');
+        const { initSkillDiscoveryService } = await import('./services/skillDiscoveryService.ts');
+        const { seedAgentSkills } = await import('./db/seedSkills.ts');
+
+        initSkillsService(pool);
+        initSkillDiscoveryService(pool);
+        await seedAgentSkills(pool);
+        logger.info('[LaunchKit] 🧠 Agent Skills System initialized (registry + seed + discovery)');
+      }
+    } catch (skillsErr) {
+      logger.warn({ error: skillsErr }, '[LaunchKit] Agent Skills System init failed (non-fatal)');
+    }
+
     logger.info(`[LaunchKit] DB init complete: pool=${!!pool}, swarm=${!!_swarmHandle}`);
   }
 

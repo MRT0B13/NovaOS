@@ -182,6 +182,68 @@ async function ensureCFOSchema(pool: Pool): Promise<void> {
   await pool.query(`CREATE INDEX IF NOT EXISTS cfo_transactions_strategy_idx ON cfo_transactions (strategy_tag);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS cfo_transactions_position_idx ON cfo_transactions (position_id);`);
 
+  // ── Agent Skills System ──────────────────────────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS agent_skills (
+      id SERIAL PRIMARY KEY,
+      skill_id VARCHAR(100) NOT NULL UNIQUE,
+      name VARCHAR(200) NOT NULL,
+      description TEXT NOT NULL,
+      content TEXT NOT NULL,
+      version VARCHAR(20) NOT NULL DEFAULT '1.0.0',
+      category VARCHAR(50) NOT NULL,
+      source VARCHAR(50) NOT NULL DEFAULT 'manual',
+      source_url TEXT,
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
+      proposed_by VARCHAR(50),
+      approved_by VARCHAR(50),
+      approved_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS agent_skill_assignments (
+      id SERIAL PRIMARY KEY,
+      agent_role VARCHAR(50) NOT NULL,
+      skill_id VARCHAR(100) NOT NULL REFERENCES agent_skills(skill_id) ON DELETE CASCADE,
+      priority INTEGER NOT NULL DEFAULT 50,
+      assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(agent_role, skill_id)
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS agent_skill_loads (
+      agent_role VARCHAR(50) NOT NULL,
+      skill_id VARCHAR(100) NOT NULL,
+      loaded_version VARCHAR(20) NOT NULL,
+      loaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (agent_role, skill_id)
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS skill_discovery_queue (
+      id SERIAL PRIMARY KEY,
+      skill_id VARCHAR(100) NOT NULL,
+      name VARCHAR(200) NOT NULL,
+      description TEXT NOT NULL,
+      content TEXT NOT NULL,
+      source_url TEXT NOT NULL,
+      proposed_agent_roles TEXT[] NOT NULL,
+      relevance_reasoning TEXT NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      tg_message_id INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_agent_skills_status ON agent_skills(status);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_skill_assignments_role ON agent_skill_assignments(agent_role);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_discovery_queue_status ON skill_discovery_queue(status);`);
+
   logger.info('[CFORepository] Schema ensured');
 }
 

@@ -27,6 +27,8 @@ import { logger } from '@elizaos/core';
 import { BaseAgent, type AgentMessage, type MessageType } from './types.ts';
 import { TokenChildAgent, type TokenChildConfig } from './token-child.ts';
 import { ContentFilter, type ContentScanResult } from './security/contentFilter.ts';
+import { getSkillsService } from '../launchkit/services/skillsService.ts';
+import { getSkillDiscoveryService } from '../launchkit/services/skillDiscoveryService.ts';
 
 // ============================================================================
 // Types
@@ -973,6 +975,28 @@ export class Supervisor extends BaseAgent {
       if (this.callbacks.onPostToAdmin) {
         await this.callbacks.onPostToAdmin(communityBriefing);
       }
+
+      // ── Skill Discovery (once per day, self-throttled) ──
+      try {
+        const discovery = getSkillDiscoveryService();
+        if (discovery) {
+          const report = await discovery.maybeRun();
+          if (report && this.callbacks.onPostToAdmin) {
+            await this.callbacks.onPostToAdmin(report);
+          }
+        }
+      } catch (discErr) {
+        logger.warn('[supervisor] Skill discovery error (non-fatal):', discErr);
+      }
+
+      // ── Load supervisor skills (hot-reloadable) ──
+      try {
+        const svc = getSkillsService();
+        if (svc) {
+          const skillCtx = await svc.loadSkillsForAgent('nova-supervisor');
+          if (skillCtx) logger.debug(`[supervisor] Loaded skill context (${skillCtx.length} chars)`);
+        }
+      } catch (err) { logger.warn('[supervisor] Skills load error (non-fatal):', err); }
 
       // Log
       logger.info(`[supervisor] 🐝 Briefings sent: admin (detailed + hive) | ${activeAgents.length} agents, ${this.messagesProcessed} msgs`);

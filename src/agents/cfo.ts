@@ -19,6 +19,7 @@
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent } from './types.ts';
+import { getSkillsService } from '../launchkit/services/skillsService.ts';
 import { getCFOEnv } from '../launchkit/cfo/cfoEnv.ts';
 import { PostgresCFORepository } from '../launchkit/cfo/postgresCFORepository.ts';
 import { PositionManager } from '../launchkit/cfo/positionManager.ts';
@@ -1765,6 +1766,15 @@ export class CFOAgent extends BaseAgent {
 
     logger.info(`[CFO] Decision cycle #${this.cycleCount + 1} starting...`);
     const cycleStart = Date.now();
+
+    // Load agent skills (hot-reloadable, 5min cache)
+    try {
+      const svc = getSkillsService();
+      if (svc) {
+        const skillCtx = await svc.loadSkillsForAgent('nova-cfo');
+        if (skillCtx) logger.debug(`[CFO] Loaded skill context (${skillCtx.length} chars)`);
+      }
+    } catch (err) { logger.warn('[CFO] Skills load error (non-fatal):', err); }
 
     // Lazily enrich SOLANA_TOKEN_MINTS from Kamino registry (first cycle only)
     await enrichTokenMints();

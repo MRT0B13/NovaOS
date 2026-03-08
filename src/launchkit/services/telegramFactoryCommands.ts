@@ -410,6 +410,152 @@ export async function registerFactoryCommands(
       }
     });
 
+    // ── /skill — Agent skills management ──────────────────────────
+    bot.command('skill', async (ctx: any) => {
+      try {
+        if (!isAdmin(ctx.chat.id)) {
+          await ctx.reply('🔒 Admin only.').catch(() => {});
+          return;
+        }
+
+        const text = (ctx.message?.text || '').replace(/^\/skills?\s*/i, '').trim();
+        const parts = text.split(/\s+/);
+        const sub = (parts[0] || 'help').toLowerCase();
+
+        const { getSkillsService } = await import('./skillsService.ts');
+        const svc = getSkillsService();
+        if (!svc) {
+          await ctx.reply('⚠️ Skills service not initialized.').catch(() => {});
+          return;
+        }
+
+        switch (sub) {
+          case 'list': {
+            const skills = await svc.listSkills();
+            if (skills.length === 0) {
+              await ctx.reply('📦 No skills registered yet.');
+              return;
+            }
+            const lines = skills.map(s =>
+              `${s.status === 'active' ? '✅' : '❌'} <b>${s.name}</b> (${s.skillId} v${s.version})\n   📂 ${s.category} | 👥 ${s.assignedTo.length > 0 ? s.assignedTo.join(', ') : 'unassigned'}`
+            );
+            await ctx.reply(`📦 <b>Agent Skills</b>\n\n${lines.join('\n\n')}`, { parse_mode: 'HTML' });
+            break;
+          }
+
+          case 'assign': {
+            const role = parts[1];
+            const skillId = parts[2];
+            const priority = parseInt(parts[3]) || 50;
+            if (!role || !skillId) {
+              await ctx.reply('Usage: /skill assign <role> <skill_id> [priority]');
+              return;
+            }
+            await svc.assignSkill(role, skillId, priority);
+            await ctx.reply(`✅ Assigned <code>${skillId}</code> to ${role} (priority ${priority})`, { parse_mode: 'HTML' });
+            break;
+          }
+
+          case 'unassign': {
+            const role = parts[1];
+            const skillId = parts[2];
+            if (!role || !skillId) {
+              await ctx.reply('Usage: /skill unassign <role> <skill_id>');
+              return;
+            }
+            await svc.unassignSkill(role, skillId);
+            await ctx.reply(`✅ Unassigned <code>${skillId}</code> from ${role}`, { parse_mode: 'HTML' });
+            break;
+          }
+
+          case 'enable': {
+            const skillId = parts[1];
+            if (!skillId) { await ctx.reply('Usage: /skill enable <skill_id>'); return; }
+            await svc.enableSkill(skillId);
+            await ctx.reply(`✅ Enabled skill <code>${skillId}</code>`, { parse_mode: 'HTML' });
+            break;
+          }
+
+          case 'disable': {
+            const skillId = parts[1];
+            if (!skillId) { await ctx.reply('Usage: /skill disable <skill_id>'); return; }
+            await svc.disableSkill(skillId);
+            await ctx.reply(`❌ Disabled skill <code>${skillId}</code>`, { parse_mode: 'HTML' });
+            break;
+          }
+
+          case 'pending': {
+            const pending = await svc.listPendingDiscoveries();
+            if (pending.length === 0) {
+              await ctx.reply('🔍 No pending skill discoveries.');
+              return;
+            }
+            const lines = pending.map(p =>
+              `📦 <b>${p.name}</b> (id: ${p.id})\n   Roles: ${p.proposedAgentRoles.join(', ')}\n   ${p.relevanceReasoning}\n   <code>/skill approve ${p.id}</code> | <code>/skill reject ${p.id}</code>`
+            );
+            await ctx.reply(`🔍 <b>Pending Discoveries</b>\n\n${lines.join('\n\n')}`, { parse_mode: 'HTML' });
+            break;
+          }
+
+          case 'approve': {
+            const queueId = parseInt(parts[1]);
+            if (!queueId) { await ctx.reply('Usage: /skill approve <queue_id>'); return; }
+            const approvedId = await svc.approveDiscoveredSkill(queueId, String(ctx.from?.id || 'admin'));
+            await ctx.reply(`✅ Approved skill <code>${approvedId}</code> — it will load on next agent cycle`, { parse_mode: 'HTML' });
+            break;
+          }
+
+          case 'reject': {
+            const queueId = parseInt(parts[1]);
+            if (!queueId) { await ctx.reply('Usage: /skill reject <queue_id>'); return; }
+            await svc.rejectDiscoveredSkill(queueId);
+            await ctx.reply('✅ Rejected.');
+            break;
+          }
+
+          case 'view': {
+            const skillId = parts[1];
+            if (!skillId) { await ctx.reply('Usage: /skill view <skill_id>'); return; }
+            const skill = await svc.getSkill(skillId);
+            if (!skill) { await ctx.reply('❌ Skill not found.'); return; }
+            const preview = skill.content.length > 1000 ? skill.content.slice(0, 1000) + '...' : skill.content;
+            await ctx.reply(
+              `📦 <b>${skill.name}</b> (${skill.skillId} v${skill.version})\n` +
+              `📂 ${skill.category}\n\n` +
+              `${skill.description}\n\n` +
+              `<pre>${preview}</pre>`,
+              { parse_mode: 'HTML' }
+            );
+            break;
+          }
+
+          default:
+            await ctx.reply(
+              '📦 <b>Skill Commands</b>\n\n' +
+              '<code>/skill list</code> — List all skills\n' +
+              '<code>/skill view &lt;id&gt;</code> — View skill details\n' +
+              '<code>/skill assign &lt;role&gt; &lt;id&gt; [priority]</code> — Assign skill\n' +
+              '<code>/skill unassign &lt;role&gt; &lt;id&gt;</code> — Remove assignment\n' +
+              '<code>/skill enable &lt;id&gt;</code> — Enable skill\n' +
+              '<code>/skill disable &lt;id&gt;</code> — Disable skill\n' +
+              '<code>/skill pending</code> — View pending discoveries\n' +
+              '<code>/skill approve &lt;queue_id&gt;</code> — Approve discovery\n' +
+              '<code>/skill reject &lt;queue_id&gt;</code> — Reject discovery',
+              { parse_mode: 'HTML' }
+            );
+        }
+      } catch (err: any) {
+        logger.warn('[factory-tg] /skill error:', err.message);
+        await ctx.reply('❌ Error processing skill command.').catch(() => {});
+      }
+    });
+
+    // Alias: /skills → /skill
+    bot.command('skills', async (ctx: any) => {
+      ctx.message.text = ctx.message.text.replace(/^\/skills/, '/skill');
+      await bot.handleUpdate({ message: ctx.message, update_id: 0 });
+    });
+
     isRegistered = true;
     return true;
   } catch (err: any) {
