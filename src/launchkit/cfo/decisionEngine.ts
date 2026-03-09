@@ -4117,12 +4117,12 @@ export async function generateDecisions(
 
     // Cap universe to avoid excessive TA scans
     const spotCoins = [...spotUniverse].slice(0, 25);
-    if (spotCoins.length > 0) {
-      logger.debug(
-        `[CFO:Decision] Section N: spot universe ${spotCoins.length} coins ` +
-        `(${spotCoins.slice(0, 10).join(',')}${spotCoins.length > 10 ? '...' : ''})`,
-      );
-    }
+    logger.info(
+      `[CFO:Decision] Section N: spot universe ${spotCoins.length} coins` +
+      (spotCoins.length > 0
+        ? ` (${spotCoins.slice(0, 10).join(',')}${spotCoins.length > 10 ? '...' : ''})`
+        : ' — getTopSpotByVolume returned empty (API rate-limit or no pairs >$10k vol)'),
+    );
 
     let spotTotalUsd = spotPositions.reduce((s, b) => s + b.valueUsd, 0);
     let spotDecisionCount = 0; // track decisions this cycle for slot accounting
@@ -4214,6 +4214,20 @@ export async function generateDecisions(
         if (!hlSpotSwingGated && checkCooldown(`HL_SPOT_SWING_${coin}`, config.hlSpotCooldownMs) && !isSLLockedOut(coin, 'LONG', 72 * 3600_000)) {
           swingEligible.add(coin);
         }
+      }
+
+      // Log pre-filter stats so we can diagnose 0-coin scenarios
+      if (dayEligible.size === 0 && swingEligible.size === 0 && spotCoins.length > 0) {
+        let haltedN = 0, heldN = 0, cdN = 0, slN = 0;
+        for (const coin of spotCoins) {
+          if (hl.isHalted(coin)) { haltedN++; continue; }
+          if (spotPositions.some(b => b.coin === coin)) { heldN++; continue; }
+          if (!checkCooldown(`HL_SPOT_${coin}`, config.hlSpotCooldownMs)) { cdN++; continue; }
+          if (isSLLockedOut(coin, 'LONG', 48 * 3600_000)) { slN++; continue; }
+        }
+        logger.info(
+          `[CFO:Decision] Section N: all ${spotCoins.length} coins filtered: halted=${haltedN} held=${heldN} cooldown=${cdN} slLocked=${slN}`,
+        );
       }
 
       // Union of coins needing TA + deduplicate styles per coin
@@ -4499,14 +4513,19 @@ export async function generateDecisions(
         const effectiveAccumConvFloor = accumConvFloor * conf;
         if (effectiveAccumConvFloor > 0 && accumConviction < effectiveAccumConvFloor) continue;
 
-        // Size: smaller DCA-style entries (scaled by learned size multiplier)
+        // Size: smaller DCA-style entries scaled by conviction and portfolio size.
+        // A 30% conviction on a $458 portfolio shouldn't try to buy $100 — more like $15-25.
         const accumSizeMult = learned.hlSpotStyleSizeMultipliers?.accumulation ?? learnedSpotSizeMult;
         const maxAccum = env.hlSpotAccumulationMaxPerCoin - existingValueUsd;
         const accumStopMult = learned.hlSpotStyleStopMultipliers?.accumulation ?? learnedSpotStopMult;
         const effectiveAccumSL = applyAdaptive(env.hlSpotStopLossPct * 1.5, accumStopMult, conf); // wider SL for accumulation
+        const baseDcaSize = env.hlSpotMaxPositionUsd * 0.5; // $100 default base
+        const convictionScaled = baseDcaSize * accumConviction; // 30% conviction → $30
+        const portfolioCap = totalEquity * 0.05; // max 5% of portfolio per DCA entry
         const sizeUsd = Math.min(
           maxAccum,
-          applyAdaptive(env.hlSpotMaxPositionUsd * 0.5, accumSizeMult, conf), // half of max for DCA-style
+          applyAdaptive(convictionScaled, accumSizeMult, conf),
+          portfolioCap,
           effectiveSpotMaxTotalUsd - spotTotalUsd,
         );
         if (sizeUsd < 10) continue;

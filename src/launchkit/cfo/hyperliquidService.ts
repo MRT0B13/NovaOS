@@ -1004,7 +1004,19 @@ export async function getTopSpotByVolume(
     return filtered;
   } catch (err) {
     logger.warn('[Hyperliquid] getTopSpotByVolume error:', err);
-    return _topSpotCache.filter(s => s.vol24h >= minVol24h).slice(0, maxCoins);
+    // If cache has data, use it
+    if (_topSpotCache.length > 0) {
+      return _topSpotCache.filter(s => s.vol24h >= minVol24h).slice(0, maxCoins);
+    }
+    // Cache empty too — fall back to getSpotPairs() (no volume data, but at least we get coins)
+    try {
+      const pairs = await getSpotPairs();
+      const fallback = pairs.map(p => ({ coin: p.coin, vol24h: 0, midPx: 0 }));
+      logger.info(`[Hyperliquid] getTopSpotByVolume fallback: ${fallback.length} coins from getSpotPairs (no volume data)`);
+      return fallback.slice(0, maxCoins);
+    } catch {
+      return [];
+    }
   }
 }
 
