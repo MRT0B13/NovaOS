@@ -183,6 +183,7 @@ export class CFOAgent extends BaseAgent {
     this.addInterval(() => this.monitorPositions(),      10 * 60_000);   // 10m
     this.addInterval(() => this.monitorYield(),          30 * 60_000);   // 30m
     this.addInterval(() => this.monitorHyperliquid(),     2 * 60_000);   // 2m — scalps need frequent SL/TP checks
+    this.addInterval(() => this.monitorSpotPositions(),   2 * 60_000);   // 2m — software-managed SL/TP for spot
     this.addInterval(() => this.checkGasReserves(),      15 * 60_000);   // 15m
     this.addInterval(() => this.processCommands(),       10_000);
     this.addInterval(() => this.checkDailyDigest(),       5 * 60_000);
@@ -639,6 +640,100 @@ export class CFOAgent extends BaseAgent {
               feeUsd: 0, txHash: r.txId, walletAddress: '',
               positionId: perpMatch?.id, status: 'confirmed',
               metadata: { coin, side, reason: d.reasoning, hlPnl },
+            });
+            break;
+          }
+
+          // ── HL Spot BUY ────────────────────────────────────────
+          case 'HL_SPOT_BUY': {
+            const coin = p.coin;
+            const sizeUsd = p.sizeUsd ?? d.estimatedImpactUsd;
+            const tradeStyle = p.tradeStyle as string | undefined;
+            const spotStrategyTag = (tradeStyle === 'swing')
+              ? 'hl_spot_swing' as PositionStrategy
+              : tradeStyle === 'accumulation'
+                ? 'hl_spot_accumulation' as PositionStrategy
+                : 'hl_spot' as PositionStrategy;
+
+            // Get entry price from HL
+            let entryPrice = 0;
+            try {
+              const hlMod = await import('../launchkit/cfo/hyperliquidService.ts');
+              const mids = await hlMod.getAllMidPrices();
+              entryPrice = mids[`${coin}/USDC`] ?? mids[coin] ?? 0;
+            } catch { /* non-fatal */ }
+
+            const spotPos: CFOPosition = {
+              id: `hl-spot-${coin.toLowerCase()}-${Date.now()}`,
+              strategy: spotStrategyTag,
+              asset: `${coin}-SPOT`,
+              description: `BUY ${coin} spot (${tradeStyle ?? 'ta'})`,
+              chain: 'arbitrum',
+              status: 'OPEN',
+              entryPrice,
+              currentPrice: entryPrice,
+              sizeUnits: entryPrice > 0 ? sizeUsd / entryPrice : 0,
+              costBasisUsd: sizeUsd,
+              currentValueUsd: sizeUsd,
+              realizedPnlUsd: 0,
+              unrealizedPnlUsd: 0,
+              entryTxHash: r.txId,
+              externalId: r.txId,
+              metadata: {
+                coin,
+                side: 'BUY',
+                signal: p.signal,
+                conviction: p.conviction,
+                stopLossPct: p.stopLossPct,
+                takeProfitPct: p.takeProfitPct,
+                tradeStyle,
+                decisionType: d.type,
+              },
+              openedAt: now,
+              updatedAt: now,
+            };
+            await this.repo.upsertPosition(spotPos);
+            await this.repo.insertTransaction({
+              id: `tx-hl-spot-buy-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'arbitrum', strategyTag: spotStrategyTag, txType: 'swap',
+              tokenIn: 'USDC', amountIn: sizeUsd,
+              tokenOut: coin, amountOut: entryPrice > 0 ? sizeUsd / entryPrice : 0,
+              feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
+              metadata: { coin, signal: p.signal, conviction: p.conviction, tradeStyle, reasoning: d.reasoning },
+            });
+            logger.info(`[CFO] Persisted HL_SPOT_BUY: ${coin} $${sizeUsd.toFixed(0)} (${tradeStyle ?? 'ta'})`);
+            break;
+          }
+
+          // ── HL Spot SELL ───────────────────────────────────────
+          case 'HL_SPOT_SELL': {
+            const coin = p.coin;
+            const sizeUsd = p.sizeUsd ?? d.estimatedImpactUsd;
+            // Find matching open spot position
+            const spotStrategies: PositionStrategy[] = ['hl_spot', 'hl_spot_swing', 'hl_spot_accumulation'];
+            let spotMatch: CFOPosition | undefined;
+            for (const strat of spotStrategies) {
+              const openSpots = await this.repo.getOpenPositions(strat);
+              spotMatch = openSpots.find(pos => (pos.metadata as any)?.coin === coin);
+              if (spotMatch) break;
+            }
+            if (spotMatch) {
+              const receivedUsd = r.receivedUsd ?? sizeUsd;
+              const pnl = receivedUsd - spotMatch.costBasisUsd;
+              await this.positionManager.closePosition(spotMatch.id, 0, r.txId ?? '', receivedUsd, pnl);
+              logger.info(`[CFO] Persisted HL_SPOT_SELL: closed ${spotMatch.id} (${coin}) PnL $${pnl.toFixed(2)}`);
+            } else {
+              logger.warn(`[CFO] HL_SPOT_SELL: no DB position found for ${coin} — sold on HL but not in DB`);
+            }
+            const sellStrategyTag = spotMatch?.strategy ?? 'hl_spot';
+            await this.repo.insertTransaction({
+              id: `tx-hl-spot-sell-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: 'arbitrum', strategyTag: sellStrategyTag, txType: 'swap',
+              tokenIn: coin, amountIn: sizeUsd,
+              tokenOut: 'USDC', amountOut: r.receivedUsd ?? sizeUsd,
+              feeUsd: 0, txHash: r.txId, walletAddress: '',
+              positionId: spotMatch?.id, status: 'confirmed',
+              metadata: { coin, signal: p.signal, reason: d.reasoning },
             });
             break;
           }
@@ -2145,6 +2240,113 @@ export class CFOAgent extends BaseAgent {
         }
       }
     } catch (err) { logger.debug('[CFO] Position exit monitor error:', err); }
+  }
+
+  // ── Spot position monitor (software SL/TP) ────────────────────────
+
+  /**
+   * Monitor spot positions every 2 minutes.
+   * HL spot has no native trigger orders, so we enforce SL/TP in software.
+   * Also tracks high-water-mark for potential trailing stops on larger positions.
+   */
+  private async monitorSpotPositions(): Promise<void> {
+    if (!this.running || this.paused) return;
+    if (!getCFOEnv().hyperliquidEnabled || !getCFOEnv().hlSpotTradingEnabled) return;
+
+    try {
+      const { getTrackedSpotStyles, clearSpotStyle, updateSpotStyle } =
+        await import('../launchkit/cfo/decisionEngine.ts');
+      const styles = getTrackedSpotStyles();
+      if (styles.size === 0) return;
+
+      const hlMod = await import('../launchkit/cfo/hyperliquidService.ts');
+      const balances = await hlMod.getSpotBalances();
+      const mids = await hlMod.getAllMidPrices();
+
+      for (const [coin, info] of styles) {
+        // Find current balance for this coin
+        const bal = balances.find(b => b.coin === coin);
+        if (!bal || bal.available <= 0.000001) {
+          // Position no longer exists — clean up
+          clearSpotStyle(coin);
+          continue;
+        }
+
+        // Get current price
+        const currentPrice = mids[`${coin}/USDC`] ?? mids[coin] ?? 0;
+        if (currentPrice <= 0) continue;
+
+        const entryPrice = info.entryPrice;
+        if (entryPrice <= 0) continue;
+
+        const pnlPct = ((currentPrice - entryPrice) / entryPrice) * 100;
+
+        // Update high water mark
+        if (currentPrice > info.highWaterPriceUsd) {
+          updateSpotStyle(coin, { highWaterPriceUsd: currentPrice });
+        }
+
+        // ── Stop-loss check ──────────────────────────────────────
+        const stopHit = pnlPct < -info.stopLossPct;
+
+        // ── Take-profit check ────────────────────────────────────
+        const tpHit = pnlPct >= info.takeProfitPct;
+
+        // ── Hold expiry for non-accumulation ─────────────────────
+        const holdHours = info.style === 'swing' ? 168 : info.style === 'accumulation' ? 720 : 48; // 7d for swing, 30d for accum, 2d for day
+        const holdMs = holdHours * 3600_000;
+        const holdExpired = info.style !== 'accumulation' && (Date.now() - new Date(info.openedAt).getTime()) > holdMs;
+
+        if (stopHit || tpHit || holdExpired) {
+          const reason = stopHit
+            ? `SL hit (${pnlPct.toFixed(1)}%, limit=${info.stopLossPct}%)`
+            : tpHit
+              ? `TP hit (${pnlPct.toFixed(1)}%, target=${info.takeProfitPct}%)`
+              : `hold expired (${info.style}: ${holdHours}h)`;
+
+          logger.info(`[CFO] Spot monitor: SELL ${coin}-SPOT — ${reason}`);
+          const result = await hlMod.closeSpotPosition(coin);
+          if (result.success) {
+            clearSpotStyle(coin);
+            const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+            await notifyAdminForce(
+              `📊 [${info.style}] Sold ${coin}-SPOT: ${reason}\n` +
+              `Entry: $${entryPrice.toFixed(2)} → Exit: $${currentPrice.toFixed(2)} ` +
+              `(${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`,
+            );
+
+            // Persist the close in DB
+            if (this.repo) {
+              const now = Date.now();
+              const spotStrategies: PositionStrategy[] = ['hl_spot', 'hl_spot_swing', 'hl_spot_accumulation'];
+              let spotMatch: CFOPosition | undefined;
+              for (const strat of spotStrategies) {
+                const openSpots = await this.repo.getOpenPositions(strat);
+                spotMatch = openSpots.find(pos => (pos.metadata as any)?.coin === coin);
+                if (spotMatch) break;
+              }
+              if (spotMatch) {
+                const receivedUsd = bal.valueUsd;
+                const pnl = receivedUsd - spotMatch.costBasisUsd;
+                await this.positionManager?.closePosition(spotMatch.id, 0, result.orderId?.toString() ?? '', receivedUsd, pnl);
+                logger.info(`[CFO] Persisted spot SELL: closed ${spotMatch.id} (${coin}) PnL $${pnl.toFixed(2)}`);
+              }
+              await this.repo.insertTransaction({
+                id: `tx-hl-spot-sell-${String(result.orderId ?? Date.now())}`, timestamp: String(now),
+                chain: 'arbitrum', strategyTag: 'hl_spot', txType: 'swap',
+                tokenIn: coin, amountIn: bal.valueUsd,
+                tokenOut: 'USDC', amountOut: bal.valueUsd * (1 + pnlPct / 100),
+                feeUsd: 0, txHash: result.orderId?.toString(), walletAddress: '',
+                positionId: spotMatch?.id, status: 'confirmed',
+                metadata: { coin, reason, pnlPct, style: info.style },
+              });
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.debug('[CFO] Spot position monitor error:', err);
+    }
   }
 
   // ── Gas check ─────────────────────────────────────────────────────

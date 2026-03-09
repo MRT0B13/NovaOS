@@ -1,20 +1,29 @@
 /**
- * Hyperliquid Perpetuals Service
+ * Hyperliquid Trading Service
  *
- * Provides perpetual futures trading via Hyperliquid's DEX.
+ * Provides perpetual futures + spot trading via Hyperliquid's DEX.
  * Supports:
  *  1. Treasury hedging — SHORT perps to offset on-chain exposure
  *  2. Directional perp trading — LONG/SHORT based on signals (sentiment, momentum, news)
+ *  3. Spot trading — BUY/SELL spot tokens for TA-driven trades + treasury accumulation
  *
  * Architecture doc constraints (enforced in code):
- *  - Max 20% of portfolio (configurable)
- *  - Max 5x leverage (hard cap)
+ *  - Max 20% of portfolio for perps (configurable)
+ *  - Max 5x leverage (hard cap, perps only — spot is 1x)
  *  - Perp trading gated behind CFO_HL_PERP_TRADING_ENABLE
+ *  - Spot trading gated behind CFO_HL_SPOT_TRADING_ENABLE
  *
  * Hyperliquid auth:
  *  - Uses @nktkas/hyperliquid SDK
  *  - L1 auth via EIP-712 signing with CFO_HYPERLIQUID_API_WALLET_KEY
  *  - API wallet is separate from trading wallet (set up in HL UI: Settings → API Wallets)
+ *
+ * Spot details:
+ *  - Same exchange.order() method but with pair indices starting at 10000
+ *  - No leverage, no reduce-only, no native TP/SL trigger orders
+ *  - Separate spot clearinghouse (spotClearinghouseState) for balances
+ *  - Candle data: "COIN/USDC" format for spotCandleSnapshot / candleSnapshot
+ *  - USDC must be transferred to spot account via usdClassTransfer()
  *
  * Testnet: https://app.hyperliquid-testnet.xyz
  * Mainnet: https://app.hyperliquid.xyz
@@ -91,6 +100,38 @@ export interface PerpTradeParams {
   signal?: string;
   /** Conviction score 0-1 (for logging / future sizing) */
   conviction?: number;
+}
+
+/** Parameters for a spot trade on HL (BUY or SELL) */
+export interface SpotTradeParams {
+  /** Coin to trade (e.g. 'HYPE', 'BTC', 'SOL') */
+  coin: string;
+  /** Trade direction — BUY = acquire base token, SELL = dispose base token */
+  side: 'BUY' | 'SELL';
+  /** USD notional size */
+  sizeUsd: number;
+  /** Signal source (for logging) */
+  signal?: string;
+  /** Conviction score 0-1 (for logging) */
+  conviction?: number;
+}
+
+/** Spot balance for a single token */
+export interface HLSpotBalance {
+  coin: string;
+  total: number;       // total balance (includes held/in-order)
+  hold: number;        // amount held in open orders
+  available: number;   // total - hold
+  entryNtl: number;    // entry notional in USDC
+  valueUsd: number;    // current value based on mid price
+}
+
+/** HL spot pair metadata */
+export interface HLSpotPair {
+  name: string;       // e.g. "PURR/USDC"
+  coin: string;       // base coin e.g. "PURR"
+  index: number;      // pair index (10000+)
+  szDecimals: number; // size decimal precision
 }
 
 // ============================================================================
@@ -843,6 +884,294 @@ export async function closeAllPositions(): Promise<{ closed: number; errors: str
 
   logger.info(`[Hyperliquid] Emergency close: ${closed} positions closed, ${errors.length} errors`);
   return { closed, errors };
+}
+
+// ============================================================================
+// Spot trading — BUY/SELL spot tokens on Hyperliquid
+// ============================================================================
+
+// ── Spot metadata cache ─────────────────────────────────────────────────────
+let _spotPairsCache: HLSpotPair[] = [];
+let _spotPairsCacheTs = 0;
+const SPOT_PAIRS_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Get all spot trading pairs on Hyperliquid.
+ * Returns pairs with index (10000+), base coin symbol, and szDecimals.
+ * Cached for 10 minutes.
+ */
+export async function getSpotPairs(): Promise<HLSpotPair[]> {
+  if (_spotPairsCache.length > 0 && Date.now() - _spotPairsCacheTs < SPOT_PAIRS_TTL_MS) {
+    return _spotPairsCache;
+  }
+  try {
+    const { info } = await loadHL();
+    const data = await withRetry(() => info.spotMeta(), 'getSpotPairs');
+    const universe = (data as any)?.universe ?? [];
+    const tokens = (data as any)?.tokens ?? [];
+
+    const pairs: HLSpotPair[] = [];
+    for (const u of universe) {
+      const name: string = u.name; // e.g. "PURR/USDC"
+      const pairIndex: number = u.index;
+      const baseTokenIdx: number = u.tokens?.[0];
+      const baseToken = tokens.find((t: any) => t.index === baseTokenIdx);
+      const szDecimals: number = baseToken?.szDecimals ?? 2;
+      const coin = name.split('/')[0]; // "PURR"
+      pairs.push({ name, coin, index: pairIndex, szDecimals });
+    }
+
+    _spotPairsCache = pairs;
+    _spotPairsCacheTs = Date.now();
+    return pairs;
+  } catch (err) {
+    logger.warn('[Hyperliquid] getSpotPairs error:', err);
+    return _spotPairsCache.length > 0 ? _spotPairsCache : [];
+  }
+}
+
+/**
+ * Get list of coins available for spot trading on HL.
+ * Returns base coin symbols (e.g. ['PURR', 'HYPE', 'BTC']).
+ */
+export async function getHLSpotListedCoins(): Promise<string[]> {
+  const pairs = await getSpotPairs();
+  return pairs.map(p => p.coin);
+}
+
+/**
+ * Get spot token balances from HL's spot clearinghouse.
+ * Returns non-zero balances with current USD value.
+ */
+export async function getSpotBalances(): Promise<HLSpotBalance[]> {
+  try {
+    const { info, wallet } = await loadHL();
+    const state = await withRetry(
+      () => info.spotClearinghouseState({ user: wallet.address }),
+      'getSpotBalances',
+    );
+
+    const balances: HLSpotBalance[] = [];
+    const bals = (state as any)?.balances ?? [];
+
+    // Get mid prices for valuation
+    const mids = await getAllMidPrices();
+
+    for (const b of bals) {
+      const coin: string = b.coin;
+      const total = Number(b.total ?? 0);
+      const hold = Number(b.hold ?? 0);
+      const entryNtl = Number(b.entryNtl ?? 0);
+
+      if (Math.abs(total) < 0.000001) continue; // skip dust
+
+      // Spot mid prices are keyed as "COIN/USDC" or bare coin
+      let price = mids[`${coin}/USDC`] ?? mids[coin] ?? 0;
+      if (coin === 'USDC') price = 1; // USDC is always $1
+
+      balances.push({
+        coin,
+        total,
+        hold,
+        available: total - hold,
+        entryNtl,
+        valueUsd: total * price,
+      });
+    }
+
+    return balances;
+  } catch (err) {
+    logger.warn('[Hyperliquid] getSpotBalances error:', err);
+    return [];
+  }
+}
+
+/**
+ * Get total USDC balance in the spot account (available for spot buys).
+ */
+export async function getSpotUsdcBalance(): Promise<number> {
+  const balances = await getSpotBalances();
+  const usdc = balances.find(b => b.coin === 'USDC');
+  return usdc?.available ?? 0;
+}
+
+/**
+ * Transfer USDC between perp and spot accounts.
+ * @param amount USDC amount to transfer
+ * @param toPerp true = spot→perp, false = perp→spot
+ */
+export async function transferUsdcBetweenAccounts(amount: number, toPerp: boolean): Promise<boolean> {
+  const env = getCFOEnv();
+  if (env.dryRun) {
+    logger.info(`[Hyperliquid] DRY RUN — would transfer $${amount.toFixed(2)} ${toPerp ? 'spot→perp' : 'perp→spot'}`);
+    return true;
+  }
+  try {
+    const { exchange } = await loadHL();
+    await exchange.usdClassTransfer({
+      amount: amount.toFixed(2),
+      toPerp,
+    });
+    logger.info(`[Hyperliquid] Transferred $${amount.toFixed(2)} ${toPerp ? 'spot→perp' : 'perp→spot'}`);
+    return true;
+  } catch (err) {
+    logger.error(`[Hyperliquid] USDC transfer error:`, err);
+    return false;
+  }
+}
+
+/**
+ * Open a spot trade on Hyperliquid.
+ * BUY = acquire base token, SELL = dispose base token.
+ * No leverage. No native TP/SL (software-managed by the monitor).
+ */
+export async function openSpotTrade(params: SpotTradeParams): Promise<HLOrderResult> {
+  const env = getCFOEnv();
+  const { coin, side, sizeUsd } = params;
+  const isBuy = side === 'BUY';
+  const signalTag = params.signal ?? 'manual';
+  const conviction = params.conviction ?? 0;
+
+  if (sizeUsd <= 0) {
+    return { success: false, error: 'sizeUsd must be positive' };
+  }
+
+  if (env.dryRun) {
+    logger.info(
+      `[Hyperliquid] DRY RUN — would ${side} ${coin}-SPOT $${sizeUsd.toFixed(0)} ` +
+      `signal=${signalTag} conviction=${(conviction * 100).toFixed(0)}%`,
+    );
+    return { success: true, orderId: 0, cloid: `dry-spot-${Date.now()}` };
+  }
+
+  try {
+    const { exchange, info, wallet } = await loadHL();
+
+    // Resolve spot pair
+    const pairs = await getSpotPairs();
+    const pair = pairs.find(p => p.coin === coin);
+    if (!pair) {
+      return { success: false, error: `${coin} not found in HL spot pairs` };
+    }
+
+    // Get current price (spot uses "COIN/USDC" keys in allMids)
+    const mids = await withRetry(() => info.allMids(), 'openSpotTrade:allMids');
+    const coinPrice = Number(mids[`${coin}/USDC`] ?? mids[coin] ?? 0);
+    if (coinPrice <= 0) {
+      return { success: false, error: `${coin} no spot price in HL allMids` };
+    }
+
+    const szDecimals = pair.szDecimals;
+    const szStep = Math.pow(10, szDecimals);
+
+    const sizeInCoin = sizeUsd / coinPrice;
+    const sizeFmt = Math.floor(sizeInCoin * szStep) / szStep;
+
+    if (sizeFmt <= 0) {
+      return { success: false, error: `Position too small after rounding to ${szDecimals} decimals` };
+    }
+
+    // Check USDC balance for buys
+    if (isBuy) {
+      const spotUsdc = await getSpotUsdcBalance();
+      if (spotUsdc < sizeUsd * 1.005) { // 0.5% buffer for fees
+        // Try auto-transfer from perp account
+        const shortfall = sizeUsd * 1.005 - spotUsdc;
+        const perp = await getAccountSummary();
+        if (perp.availableMargin >= shortfall + 10) { // keep $10 reserve in perp
+          const transferred = await transferUsdcBetweenAccounts(shortfall, false); // perp→spot
+          if (!transferred) {
+            return { success: false, error: `Insufficient spot USDC ($${spotUsdc.toFixed(2)}) and transfer failed` };
+          }
+        } else {
+          return { success: false, error: `Insufficient spot USDC ($${spotUsdc.toFixed(2)}) and perp margin too low to transfer` };
+        }
+      }
+    }
+
+    // For sells, check we have enough of the base token
+    if (!isBuy) {
+      const balances = await getSpotBalances();
+      const tokenBal = balances.find(b => b.coin === coin);
+      if (!tokenBal || tokenBal.available < sizeFmt) {
+        return { success: false, error: `Insufficient ${coin} balance: have ${tokenBal?.available?.toFixed(szDecimals) ?? '0'}, need ${sizeFmt}` };
+      }
+    }
+
+    // Use IoC with 2% slippage for immediate fill
+    const limitPrice = isBuy
+      ? formatLimitPrice(coinPrice * 1.02, szDecimals)
+      : formatLimitPrice(coinPrice * 0.98, szDecimals);
+
+    const order = await exchange.order({
+      orders: [{
+        a: pair.index,        // spot pair index (10000+)
+        b: isBuy,             // true = buy base token, false = sell base token
+        p: limitPrice,
+        s: sizeFmt.toString(),
+        r: false,             // no reduce-only for spot
+        t: { limit: { tif: 'Ioc' as const } },
+        c: `0x${Buffer.from(`cfo-spot-${side.toLowerCase()}-${Date.now()}`).toString('hex').padEnd(32, '0').slice(0, 32)}`,
+      }],
+      grouping: 'na',
+    });
+
+    const result = (order as any)?.response?.data?.statuses?.[0];
+    if (!result || (result as any).error) {
+      const errMsg: string = (result as any)?.error ?? 'Order rejected';
+      return { success: false, error: errMsg };
+    }
+
+    // IoC: rested = not filled
+    if ((result as any).resting) {
+      logger.warn(`[Hyperliquid] ${side} ${coin}-SPOT order rested (not filled) — IoC auto-cancelled`);
+      return { success: false, error: 'Order did not fill (IoC)' };
+    }
+
+    const orderId = (result as any).filled?.oid;
+    const avgPrice = Number((result as any).filled?.avgPx ?? limitPrice);
+
+    logger.info(
+      `[Hyperliquid] ${side} ${coin}-SPOT: ${sizeFmt} ${coin} @ ~$${avgPrice} ` +
+      `($${sizeUsd.toFixed(0)}) signal=${signalTag} ` +
+      `conviction=${(conviction * 100).toFixed(0)}%: order ${orderId}`,
+    );
+
+    return { success: true, orderId, avgPrice };
+  } catch (err: any) {
+    const msg = String(err?.message ?? err ?? '');
+    if (msg.includes('Trading is halted') || msg.includes('trading is halted')) {
+      _haltedCoins.set(coin, Date.now());
+      logger.warn(`[Hyperliquid] ${coin}-SPOT trading is halted — skipping for 30min`);
+      return { success: false, error: `${coin} trading is halted` };
+    }
+    logger.error(`[Hyperliquid] openSpotTrade(${side} ${coin}) error:`, err);
+    return { success: false, error: msg };
+  }
+}
+
+/**
+ * Close a spot position (sell all holdings of a coin).
+ */
+export async function closeSpotPosition(coin: string, sizeInCoin?: number): Promise<HLOrderResult> {
+  const balances = await getSpotBalances();
+  const bal = balances.find(b => b.coin === coin);
+  if (!bal || bal.available <= 0) {
+    return { success: false, error: `No ${coin} balance to sell` };
+  }
+
+  const sellSize = sizeInCoin ?? bal.available;
+  const mids = await getAllMidPrices();
+  const price = mids[`${coin}/USDC`] ?? mids[coin] ?? 0;
+  const sizeUsd = sellSize * price;
+
+  return openSpotTrade({
+    coin,
+    side: 'SELL',
+    sizeUsd,
+    signal: 'close-position',
+    conviction: 1,
+  });
 }
 
 // ============================================================================

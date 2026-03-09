@@ -78,6 +78,21 @@ export interface CFOEnv {
   hlPerpSwingEnabled: boolean;                   // enable swing style 1d/1h (default: true when TA on)
   hlPerpScalpCooldownMs: number;                 // cooldown between scalp entries per coin (default: 10m)
 
+  // ── Hyperliquid Spot Trading ──────────────────────────────────────────
+  hlSpotTradingEnabled: boolean;                 // master switch for spot trades (default: false)
+  hlSpotTaEnabled: boolean;                      // enable TA-driven spot entries (default: true when spot on)
+  hlSpotAccumulationEnabled: boolean;            // enable treasury accumulation mode (default: false)
+  hlSpotMaxPositionUsd: number;                  // max single spot position (default: 200)
+  hlSpotMaxTotalUsd: number;                     // max total spot exposure (default: 500)
+  hlSpotMaxPositions: number;                    // max simultaneous spot positions (default: 5)
+  hlSpotStopLossPct: number;                     // software SL % (default: 8 — wider than perps, no liq risk)
+  hlSpotTakeProfitPct: number;                   // software TP % (default: 15)
+  hlSpotCooldownMs: number;                      // cooldown between spot entries per coin (default: 4h)
+  hlSpotMinConviction: number;                   // min conviction to trade (0-1, default: 0.4)
+  hlSpotAccumulationCoins: string[];             // coins for treasury accumulation (default: BTC,ETH,SOL)
+  hlSpotAccumulationMinConviction: number;       // lower bar for accumulation (default: 0.25)
+  hlSpotAccumulationMaxPerCoin: number;          // max accumulation per coin (default: 300)
+
   // ── Kamino ────────────────────────────────────────────────────────
   maxKaminoUsd: number;
   kaminoMaxLtvPct: number;                        // never borrow above this LTV (default 60)
@@ -309,6 +324,22 @@ export function getCFOEnv(bust = false): CFOEnv {
     hlPerpDayEnabled: process.env.CFO_HL_PERP_DAY_ENABLE !== 'false',
     hlPerpSwingEnabled: process.env.CFO_HL_PERP_SWING_ENABLE !== 'false',
     hlPerpScalpCooldownMs: Number(process.env.CFO_HL_PERP_SCALP_COOLDOWN_MIN ?? 10) * 60_000,
+
+    // Spot trading
+    hlSpotTradingEnabled: process.env.CFO_HL_SPOT_TRADING_ENABLE === 'true',
+    hlSpotTaEnabled: process.env.CFO_HL_SPOT_TA_ENABLE !== 'false',        // default ON when spot enabled
+    hlSpotAccumulationEnabled: process.env.CFO_HL_SPOT_ACCUMULATION_ENABLE === 'true',
+    hlSpotMaxPositionUsd: Number(process.env.CFO_HL_SPOT_MAX_POSITION_USD ?? 200),
+    hlSpotMaxTotalUsd: Number(process.env.CFO_HL_SPOT_MAX_TOTAL_USD ?? 500),
+    hlSpotMaxPositions: Number(process.env.CFO_HL_SPOT_MAX_POSITIONS ?? 5),
+    hlSpotStopLossPct: Number(process.env.CFO_HL_SPOT_STOP_LOSS_PCT ?? 8),
+    hlSpotTakeProfitPct: Number(process.env.CFO_HL_SPOT_TAKE_PROFIT_PCT ?? 15),
+    hlSpotCooldownMs: Number(process.env.CFO_HL_SPOT_COOLDOWN_HOURS ?? 4) * 3600_000,
+    hlSpotMinConviction: Math.max(0, Math.min(1, Number(process.env.CFO_HL_SPOT_MIN_CONVICTION ?? 0.4))),
+    hlSpotAccumulationCoins: (process.env.CFO_HL_SPOT_ACCUMULATION_COINS ?? 'BTC,ETH,SOL')
+      .split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+    hlSpotAccumulationMinConviction: Math.max(0, Math.min(1, Number(process.env.CFO_HL_SPOT_ACCUMULATION_MIN_CONVICTION ?? 0.25))),
+    hlSpotAccumulationMaxPerCoin: Number(process.env.CFO_HL_SPOT_ACCUMULATION_MAX_PER_COIN ?? 300),
 
     maxKaminoUsd: Number(process.env.CFO_MAX_KAMINO_USD ?? 1000),
     kaminoMaxLtvPct: Number(process.env.CFO_KAMINO_MAX_LTV_PCT ?? 60),

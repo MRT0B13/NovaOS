@@ -72,6 +72,38 @@ interface TrackedPerpStyle {
 
 const _perpTradeStyles = new Map<string, TrackedPerpStyle>();
 
+// ── Spot position tracker ─────────────────────────────────────────────────
+// Software-managed SL/TP for spot positions (no native trigger orders on HL spot).
+interface TrackedSpotStyle {
+  style: string;          // 'day', 'swing', 'accumulation'
+  openedAt: string;
+  entryPrice: number;
+  sizeUsd: number;
+  stopLossPct: number;
+  takeProfitPct: number;
+  highWaterPriceUsd: number;  // for trailing stop
+}
+
+const _spotTradeStyles = new Map<string, TrackedSpotStyle>();
+
+/** Expose tracked spot positions for the monitor in cfo.ts */
+export function getTrackedSpotStyles(): Map<string, TrackedSpotStyle> {
+  return new Map(_spotTradeStyles);
+}
+
+/** Update a tracked spot position's state */
+export function updateSpotStyle(coin: string, update: Partial<TrackedSpotStyle>): void {
+  const existing = _spotTradeStyles.get(coin);
+  if (existing) {
+    Object.assign(existing, update);
+  }
+}
+
+/** Remove a tracked spot position */
+export function clearSpotStyle(coin: string): void {
+  _spotTradeStyles.delete(coin);
+}
+
 /** Expose tracked trade styles for the lightweight scalp exit monitor in cfo.ts */
 export function getTrackedTradeStyles(): Map<string, TrackedPerpStyle> {
   return new Map(_perpTradeStyles);
@@ -174,6 +206,8 @@ export type DecisionType =
   | 'HL_PERP_OPEN'           // open a directional perp trade (LONG or SHORT) based on signals
   | 'HL_PERP_CLOSE'          // close an existing perp trade (TP/SL hit or signal reversed)
   | 'HL_PERP_NEWS'           // news-reactive perp trade (fast entry, tight stops)
+  | 'HL_SPOT_BUY'            // buy a spot token on HL (TA-driven or accumulation)
+  | 'HL_SPOT_SELL'           // sell a spot token on HL (TP/SL hit or signal reversed)
   | 'SKIP';            // no action taken (for logging)
 
 /** Approval tier determines whether CFO executes immediately or waits for admin */
@@ -439,6 +473,13 @@ export interface DecisionConfig {
   hlPerpDayEnabled: boolean;            // enable day style (1h/1d)
   hlPerpSwingEnabled: boolean;          // enable swing style (1d/1h)
   hlPerpScalpCooldownMs: number;        // cooldown for scalp entries per coin
+
+  // Spot trading
+  hlSpotTradingEnabled: boolean;        // master switch for HL spot trading
+  hlSpotTaEnabled: boolean;             // TA-driven spot entries
+  hlSpotAccumulationEnabled: boolean;   // treasury accumulation mode
+  hlSpotMinConviction: number;          // min conviction score for spot trades
+  hlSpotCooldownMs: number;             // cooldown between spot trades per coin
 }
 
 export function getDecisionConfig(): DecisionConfig {
@@ -478,6 +519,13 @@ export function getDecisionConfig(): DecisionConfig {
     hlPerpDayEnabled:           process.env.CFO_HL_PERP_DAY_ENABLE !== 'false',
     hlPerpSwingEnabled:         process.env.CFO_HL_PERP_SWING_ENABLE !== 'false',
     hlPerpScalpCooldownMs:      Number(process.env.CFO_HL_PERP_SCALP_COOLDOWN_MIN ?? 10) * 60_000,
+
+    // Spot trading
+    hlSpotTradingEnabled:       process.env.CFO_HL_SPOT_TRADING_ENABLE === 'true',
+    hlSpotTaEnabled:            process.env.CFO_HL_SPOT_TA_ENABLE !== 'false',
+    hlSpotAccumulationEnabled:  process.env.CFO_HL_SPOT_ACCUMULATION_ENABLE === 'true',
+    hlSpotMinConviction:        Math.max(0, Math.min(1, Number(process.env.CFO_HL_SPOT_MIN_CONVICTION ?? 0.4))),
+    hlSpotCooldownMs:           Number(process.env.CFO_HL_SPOT_COOLDOWN_HOURS ?? 4) * 3600_000,
   };
 }
 
@@ -4017,6 +4065,341 @@ export async function generateDecisions(
     }
   }
 
+  // ── Section N) HL Spot Trading ───────────────────────────────────────────
+  // Two modes:
+  //   1. TA-driven spot trades — same multi-timeframe analysis as perps, but no leverage.
+  //      Uses day/swing styles (no scalps — spot fees make scalping unviable).
+  //   2. Treasury accumulation — lower conviction bar, BUY-only, for building long-term holdings.
+  //
+  // Spot positions are software-managed (no native TP/SL on HL spot).
+  // The 2-min monitor in cfo.ts checks spot balances and enforces SL/TP.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  const hlSpotGated = isStrategyGated('hl_spot');
+  if (hlSpotGated) {
+    logger.warn('[CFO:Decision] Section N: HL spot trading GATED by learning engine — skipping');
+  }
+
+  if (config.hlSpotTradingEnabled && env.hyperliquidEnabled && !hlSpotGated) {
+    const hl = await import('./hyperliquidService.ts');
+    const hlSpotCoins = new Set(await hl.getHLSpotListedCoins());
+
+    // Build dynamic spot universe (same pattern as perps — analyst + trending + movers)
+    const spotUniverse = new Set<string>();
+
+    // Analyst-tracked coins that are spot-listed
+    if (intel.analystPrices) {
+      for (const sym of Object.keys(intel.analystPrices)) {
+        const upper = sym.toUpperCase();
+        if (['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) continue;
+        if (hlSpotCoins.has(upper)) spotUniverse.add(upper);
+      }
+    }
+
+    // Analyst top movers
+    if (intel.analystMovers) {
+      for (const m of intel.analystMovers) {
+        const upper = m.symbol.toUpperCase();
+        if (['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) continue;
+        if (hlSpotCoins.has(upper)) spotUniverse.add(upper);
+      }
+    }
+
+    // CoinGecko trending
+    if (intel.analystTrending) {
+      for (const t of intel.analystTrending) {
+        const upper = t.toUpperCase();
+        if (hlSpotCoins.has(upper)) spotUniverse.add(upper);
+      }
+    }
+
+    const spotCoins = [...spotUniverse];
+    if (spotCoins.length > 0) {
+      logger.debug(
+        `[CFO:Decision] Section N: spot universe ${spotCoins.length} coins ` +
+        `(${spotCoins.slice(0, 10).join(',')}${spotCoins.length > 10 ? '...' : ''})`,
+      );
+    }
+
+    // Get current spot balances
+    const spotBalances = await hl.getSpotBalances();
+    const spotPositions = spotBalances.filter(b => b.coin !== 'USDC' && b.valueUsd >= 5);
+    const spotTotalUsd = spotPositions.reduce((s, b) => s + b.valueUsd, 0);
+
+    // ── Sub-phase 1: TA-driven spot BUY signals ──────────────────────────
+    // Use day + swing TA styles (5m scalps are not viable for spot due to fees).
+    // Spot only buys on bullish signals — no shorting spot.
+    if (config.hlSpotTaEnabled && env.hlSpotTaEnabled) {
+      const ta = await import('./hlTechnicalAnalysis.ts');
+
+      for (const coin of spotCoins) {
+        if (hl.isHalted(coin)) continue;
+
+        // Check cooldown
+        if (!checkCooldown(`HL_SPOT_${coin}`, config.hlSpotCooldownMs)) continue;
+
+        // Skip if already holding this coin in spot
+        if (spotPositions.some(b => b.coin === coin)) continue;
+
+        // Position limits
+        if (spotPositions.length >= env.hlSpotMaxPositions) break;
+        if (spotTotalUsd >= env.hlSpotMaxTotalUsd) break;
+
+        // Run TA on "COIN/USDC" (spot candle format)
+        // Use day style (1h trigger, 1d filter) — best fit for spot holds
+        try {
+          const taResult = await ta.analyseMultiTimeframe(coin, 'day');
+          if (!taResult || taResult.bias === 'NEUTRAL') continue;
+
+          // Only BUY on bullish signals (no spot shorting)
+          if (taResult.bias !== 'LONG') continue;
+
+          const conviction = Math.min(1.0, taResult.conviction);
+          if (conviction < config.hlSpotMinConviction) continue;
+
+          // Size: no leverage, so use conviction-scaled sizing
+          const maxPos = env.hlSpotMaxPositionUsd;
+          const remaining = env.hlSpotMaxTotalUsd - spotTotalUsd;
+          const sizeUsd = Math.min(maxPos, remaining, maxPos * conviction);
+          if (sizeUsd < 10) continue;
+
+          const d: Decision = {
+            type: 'HL_SPOT_BUY',
+            reasoning:
+              `TA-driven spot BUY ${coin}: ${taResult.bias} bias (conviction ${(conviction * 100).toFixed(0)}%). ` +
+              `$${sizeUsd.toFixed(0)} at spot price. ` +
+              `Indicators: ${taResult.reasoning.slice(0, 100)}`,
+            params: {
+              coin,
+              side: 'BUY',
+              sizeUsd,
+              signal: 'ta-day',
+              conviction,
+              stopLossPct: env.hlSpotStopLossPct,
+              takeProfitPct: env.hlSpotTakeProfitPct,
+              tradeStyle: 'day',
+              taConviction: conviction,
+              taBias: taResult.bias,
+            },
+            urgency: 'medium',
+            estimatedImpactUsd: sizeUsd,
+            intelUsed: ['ta', 'analyst'],
+            tier: 'AUTO',
+          };
+          d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
+          decisions.push(d);
+          logger.info(
+            `[CFO:Decision] Section N/TA: BUY ${coin}-SPOT $${sizeUsd.toFixed(0)} ` +
+            `(conviction ${(conviction * 100).toFixed(0)}%)`,
+          );
+        } catch (err) {
+          logger.debug(`[CFO:Decision] Section N: TA error for ${coin}:`, err);
+        }
+      }
+
+      // ── Sub-phase 1b: TA-driven swing spot ──────────────────────────────
+      // Swing style (1d trigger, 1h confirm) for longer-term spot holds.
+      for (const coin of spotCoins) {
+        if (hl.isHalted(coin)) continue;
+        if (!checkCooldown(`HL_SPOT_SWING_${coin}`, config.hlSpotCooldownMs)) continue;
+        if (spotPositions.some(b => b.coin === coin)) continue;
+        if (spotPositions.length >= env.hlSpotMaxPositions) break;
+        if (spotTotalUsd >= env.hlSpotMaxTotalUsd) break;
+        // Skip if we already generated a day-style signal for this coin
+        if (decisions.some(d => d.type === 'HL_SPOT_BUY' && d.params.coin === coin)) continue;
+
+        try {
+          const taResult = await ta.analyseMultiTimeframe(coin, 'swing');
+          if (!taResult || taResult.bias !== 'LONG') continue;
+
+          const conviction = Math.min(1.0, taResult.conviction);
+          if (conviction < config.hlSpotMinConviction) continue;
+
+          const maxPos = env.hlSpotMaxPositionUsd;
+          const remaining = env.hlSpotMaxTotalUsd - spotTotalUsd;
+          const sizeUsd = Math.min(maxPos, remaining, maxPos * conviction);
+          if (sizeUsd < 10) continue;
+
+          const d: Decision = {
+            type: 'HL_SPOT_BUY',
+            reasoning:
+              `Swing spot BUY ${coin}: ${taResult.bias} (conviction ${(conviction * 100).toFixed(0)}%). ` +
+              `$${sizeUsd.toFixed(0)} swing hold. ` +
+              `Indicators: ${taResult.reasoning.slice(0, 100)}`,
+            params: {
+              coin,
+              side: 'BUY',
+              sizeUsd,
+              signal: 'ta-swing',
+              conviction,
+              stopLossPct: env.hlSpotStopLossPct,
+              takeProfitPct: env.hlSpotTakeProfitPct * 1.5, // wider TP for swing
+              tradeStyle: 'swing',
+              taConviction: conviction,
+              taBias: taResult.bias,
+            },
+            urgency: 'low',
+            estimatedImpactUsd: sizeUsd,
+            intelUsed: ['ta', 'analyst'],
+            tier: 'AUTO',
+          };
+          d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
+          decisions.push(d);
+          logger.info(
+            `[CFO:Decision] Section N/Swing: BUY ${coin}-SPOT $${sizeUsd.toFixed(0)} ` +
+            `(conviction ${(conviction * 100).toFixed(0)}%)`,
+          );
+        } catch (err) {
+          logger.debug(`[CFO:Decision] Section N: Swing TA error for ${coin}:`, err);
+        }
+      }
+    }
+
+    // ── Sub-phase 2: Treasury accumulation ──────────────────────────────
+    // Lower conviction bar, BUY-only, for building long-term holdings of
+    // specific high-conviction assets (BTC, ETH, SOL by default).
+    // Uses sentiment signals (scout + analyst) rather than full TA.
+    if (config.hlSpotAccumulationEnabled && env.hlSpotAccumulationEnabled) {
+      const accumCoins = env.hlSpotAccumulationCoins.filter(c => hlSpotCoins.has(c));
+
+      for (const coin of accumCoins) {
+        if (hl.isHalted(coin)) continue;
+        if (!checkCooldown(`HL_SPOT_ACCUM_${coin}`, config.hlSpotCooldownMs * 1.5)) continue; // slightly longer cooldown
+
+        // Check how much we already hold
+        const existing = spotPositions.find(b => b.coin === coin);
+        const existingValueUsd = existing?.valueUsd ?? 0;
+        if (existingValueUsd >= env.hlSpotAccumulationMaxPerCoin) continue;
+
+        // Position & total limits
+        if (spotTotalUsd >= env.hlSpotMaxTotalUsd) break;
+
+        // Accumulation uses lighter conviction: scout + momentum only
+        let accumConviction = 0;
+        const accumReasons: string[] = [];
+
+        // Scout sentiment
+        const scoutFresh = intel.scoutReceivedAt && (Date.now() - intel.scoutReceivedAt) < 4 * 3600_000;
+        if (scoutFresh && intel.scoutBullish === true) {
+          accumConviction += 0.15;
+          accumReasons.push('scout:bullish');
+        }
+
+        // Price momentum
+        const priceData = intel.analystPrices?.[coin];
+        const priceFresh = intel.analystPricesAt && (Date.now() - intel.analystPricesAt) < 30 * 60_000;
+        if (priceData && priceFresh) {
+          const change24h = typeof priceData === 'object' ? priceData.change24h : 0;
+          if (change24h > 2) {
+            accumConviction += 0.10;
+            accumReasons.push(`momentum:+${change24h.toFixed(1)}%`);
+          } else if (change24h < -5) {
+            // Dip buying — slight positive signal for accumulation
+            accumConviction += 0.05;
+            accumReasons.push(`dip-buy:${change24h.toFixed(1)}%`);
+          }
+        }
+
+        // Market condition
+        if (intel.marketCondition === 'bullish') {
+          accumConviction += 0.10;
+          accumReasons.push('market:bullish');
+        } else if (intel.marketCondition === 'danger') {
+          accumConviction -= 0.20; // don't accumulate in danger
+          accumReasons.push('market:DANGER');
+        }
+
+        // Trending
+        if (intel.analystTrending?.includes(coin)) {
+          accumConviction += 0.05;
+          accumReasons.push('trending');
+        }
+
+        if (accumConviction < env.hlSpotAccumulationMinConviction) continue;
+        if (accumReasons.length < 1) continue;
+
+        // Size: smaller DCA-style entries
+        const maxAccum = env.hlSpotAccumulationMaxPerCoin - existingValueUsd;
+        const sizeUsd = Math.min(
+          maxAccum,
+          env.hlSpotMaxPositionUsd * 0.5, // half of max for DCA-style
+          env.hlSpotMaxTotalUsd - spotTotalUsd,
+        );
+        if (sizeUsd < 10) continue;
+
+        const d: Decision = {
+          type: 'HL_SPOT_BUY',
+          reasoning:
+            `Treasury accumulation BUY ${coin}: ${accumReasons.join(', ')}. ` +
+            `Conviction ${(accumConviction * 100).toFixed(0)}%, DCA $${sizeUsd.toFixed(0)} ` +
+            `(held: $${existingValueUsd.toFixed(0)}/${env.hlSpotAccumulationMaxPerCoin}).`,
+          params: {
+            coin,
+            side: 'BUY',
+            sizeUsd,
+            signal: 'accumulation',
+            conviction: accumConviction,
+            stopLossPct: env.hlSpotStopLossPct * 1.5, // wider SL for accumulation (12% default)
+            takeProfitPct: env.hlSpotTakeProfitPct * 2, // wider TP for accumulation (30% default)
+            tradeStyle: 'accumulation',
+          },
+          urgency: 'low',
+          estimatedImpactUsd: sizeUsd,
+          intelUsed: accumReasons.map(r => r.split(':')[0]),
+          tier: 'AUTO',
+        };
+        d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
+        decisions.push(d);
+        logger.info(
+          `[CFO:Decision] Section N/Accumulation: BUY ${coin}-SPOT $${sizeUsd.toFixed(0)} ` +
+          `(conviction ${(accumConviction * 100).toFixed(0)}%)`,
+        );
+      }
+    }
+
+    // ── Sub-phase 3: Exit signals for existing spot positions ──────────
+    // Check if any held spot tokens have TA reversal or hit SL/TP.
+    // The 2-min monitor handles real-time SL/TP; this handles TA reversals.
+    if (config.hlSpotTaEnabled && env.hlSpotTaEnabled) {
+      const ta = await import('./hlTechnicalAnalysis.ts');
+      for (const bal of spotPositions) {
+        const coin = bal.coin;
+        try {
+          const taResult = await ta.analyseMultiTimeframe(coin, 'day');
+          if (!taResult) continue;
+
+          // Only sell on strong bearish reversal
+          if (taResult.bias !== 'SHORT' || taResult.conviction < 0.3) continue;
+
+          const d: Decision = {
+            type: 'HL_SPOT_SELL',
+            reasoning:
+              `TA reversal SELL ${coin}-SPOT: bearish bias (conviction ${(taResult.conviction * 100).toFixed(0)}%). ` +
+              `Holding $${bal.valueUsd.toFixed(0)}. ${taResult.reasoning.slice(0, 80)}`,
+            params: {
+              coin,
+              side: 'SELL',
+              sizeUsd: bal.valueUsd,
+              signal: 'ta-reversal',
+              conviction: Math.min(1.0, taResult.conviction),
+            },
+            urgency: 'medium',
+            estimatedImpactUsd: bal.valueUsd,
+            intelUsed: ['ta'],
+            tier: 'AUTO',
+          };
+          d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
+          decisions.push(d);
+          logger.info(
+            `[CFO:Decision] Section N: SELL ${coin}-SPOT $${bal.valueUsd.toFixed(0)} (bearish reversal, conviction ${(taResult.conviction * 100).toFixed(0)}%)`,
+          );
+        } catch (err) {
+          logger.debug(`[CFO:Decision] Section N: Exit TA error for ${coin}:`, err);
+        }
+      }
+    }
+  }
+
   // Log tier breakdown
   const tierCounts = { AUTO: 0, NOTIFY: 0, APPROVAL: 0 };
   for (const d of decisions) tierCounts[d.tier]++;
@@ -4141,6 +4524,18 @@ export async function generateDecisions(
       }
     } else if (env.hyperliquidEnabled) {
       diag.push('Perps:off');
+    }
+
+    // N: HL Spot Trading
+    if (config.hlSpotTradingEnabled && env.hyperliquidEnabled) {
+      const spotDecisions = decisions.filter(d => d.type === 'HL_SPOT_BUY' || d.type === 'HL_SPOT_SELL');
+      if (spotDecisions.length > 0) {
+        diag.push(`Spot:${spotDecisions.map(d => `${d.params.side?.[0]}${d.params.coin}`).join(',')}`);
+      } else {
+        diag.push('Spot:no-signal');
+      }
+    } else if (env.hyperliquidEnabled) {
+      diag.push('Spot:off');
     }
 
     // Add active decisions to summary
@@ -5328,6 +5723,63 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         };
       }
 
+      // ── Spot trading ──────────────────────────────────────────────────
+      case 'HL_SPOT_BUY': {
+        const hl = await import('./hyperliquidService.ts');
+        const { coin, sizeUsd, signal, conviction, tradeStyle } = decision.params;
+        const result = await hl.openSpotTrade({
+          coin,
+          side: 'BUY',
+          sizeUsd,
+          signal,
+          conviction,
+        });
+        if (result.success) {
+          const cooldownKey = tradeStyle === 'accumulation'
+            ? `HL_SPOT_ACCUM_${coin}`
+            : tradeStyle === 'swing'
+              ? `HL_SPOT_SWING_${coin}`
+              : `HL_SPOT_${coin}`;
+          markDecision(cooldownKey);
+
+          // Track spot position for the monitor (store entry info)
+          const spotStyle = tradeStyle ?? 'day';
+          _spotTradeStyles.set(coin, {
+            style: spotStyle,
+            openedAt: new Date().toISOString(),
+            entryPrice: result.avgPrice ?? 0,
+            sizeUsd,
+            stopLossPct: decision.params.stopLossPct ?? 8,
+            takeProfitPct: decision.params.takeProfitPct ?? 15,
+            highWaterPriceUsd: result.avgPrice ?? 0,
+          });
+        }
+        return {
+          ...base,
+          executed: true,
+          success: result.success,
+          txId: result.orderId?.toString(),
+          error: result.error,
+        };
+      }
+
+      case 'HL_SPOT_SELL': {
+        const hl = await import('./hyperliquidService.ts');
+        const { coin } = decision.params;
+        const result = await hl.closeSpotPosition(coin);
+        if (result.success) {
+          markDecision(`HL_SPOT_SELL_${coin}`);
+          _spotTradeStyles.delete(coin);
+        }
+        return {
+          ...base,
+          executed: true,
+          success: result.success,
+          txId: result.orderId?.toString(),
+          error: result.error,
+        };
+      }
+
       default:
         return { ...base, executed: false, error: `Unknown decision type: ${decision.type}` };
     }
@@ -5570,6 +6022,13 @@ function _humanAction(d: Decision, state: PortfolioState): string {
         ? ` (PnL: ${p.unrealizedPnl >= 0 ? '+' : ''}$${p.unrealizedPnl.toFixed(2)})`
         : '';
       return `<b>Close ${p.side ?? '?'} ${p.coin ?? '?'}-PERP</b> — $${p.sizeUsd?.toFixed(0) ?? '?'}${pnlStr}`;
+    }
+    case 'HL_SPOT_BUY': {
+      const styleTag = p.tradeStyle ? `[${p.tradeStyle}] ` : '';
+      return `<b>${styleTag}BUY ${p.coin ?? '?'}-SPOT</b> — $${p.sizeUsd?.toFixed(0) ?? '?'} (conviction: ${((p.conviction ?? 0) * 100).toFixed(0)}%, SL: ${p.stopLossPct ?? 8}%, TP: ${p.takeProfitPct ?? 15}%)`;
+    }
+    case 'HL_SPOT_SELL': {
+      return `<b>SELL ${p.coin ?? '?'}-SPOT</b> — $${p.sizeUsd?.toFixed(0) ?? '?'} (${p.signal ?? 'signal'})`;
     }
     default:
       return `<b>${d.type}</b> — ${d.reasoning.length > 60 ? d.reasoning.slice(0, 57) + '…' : d.reasoning}`;
