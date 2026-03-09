@@ -191,8 +191,10 @@ class StandaloneTwitterClient {
     // Skip if credits depleted (backoff until reset time)
     if (this.creditsDepletedUntil > Date.now()) return [];
     try {
+      // Twitter v2 search/recent requires max_results in [10, 100]
+      const clampedMax = Math.max(10, Math.min(100, maxResults));
       const results = await this.client.v2.search(query, {
-        max_results: maxResults,
+        max_results: clampedMax,
         'tweet.fields': ['created_at', 'author_id'],
       });
       return results.data.data?.map(t => ({

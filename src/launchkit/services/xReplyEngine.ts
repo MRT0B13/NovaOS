@@ -599,7 +599,7 @@ async function findCandidates(reader: ReturnType<typeof getTwitterReader>): Prom
     if (queries.length > 0) {
       const query = queries[Math.floor(Math.random() * queries.length)];
       try {
-        const results = await reader.searchTweets(query, 5);
+        const results = await reader.searchTweets(query, 10);
         await recordSearchRead(results.length);
         let newCount = 0;
         for (const t of results) {
