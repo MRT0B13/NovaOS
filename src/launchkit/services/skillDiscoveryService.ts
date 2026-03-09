@@ -146,8 +146,16 @@ export class SkillDiscoveryService {
   /** Should be called from the supervisor's briefing cadence. Self-throttles. */
   async maybeRun(): Promise<string | null> {
     const now = Date.now();
-    if (now - this.lastRunAt < RUN_INTERVAL_MS) return null;
-    if (this.running) return null;
+    const sinceLast = now - this.lastRunAt;
+    if (sinceLast < RUN_INTERVAL_MS) {
+      const nextInH = ((RUN_INTERVAL_MS - sinceLast) / 3_600_000).toFixed(1);
+      logger.info(`[SkillDiscovery] Throttled — next run in ${nextInH}h`);
+      return null;
+    }
+    if (this.running) {
+      logger.info('[SkillDiscovery] Skipped — previous cycle still running');
+      return null;
+    }
     if (!this.anthropicApiKey) {
       logger.warn('[SkillDiscovery] No ANTHROPIC_API_KEY set — skipping discovery');
       return null;
@@ -157,7 +165,10 @@ export class SkillDiscoveryService {
     this.lastRunAt = now;
 
     try {
-      return await this.runDiscoveryCycle();
+      const t0 = Date.now();
+      const result = await this.runDiscoveryCycle();
+      logger.info(`[SkillDiscovery] ✅ Discovery cycle completed in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      return result;
     } catch (err) {
       logger.error('[SkillDiscovery] Discovery cycle failed:', err);
       return null;
@@ -573,6 +584,7 @@ let discoveryService: SkillDiscoveryService | null = null;
 
 export function initSkillDiscoveryService(pool: Pool): SkillDiscoveryService {
   discoveryService = new SkillDiscoveryService(pool);
+  logger.info('[SkillDiscovery] Service created — runs every 24h, triggered by supervisor briefing cycle');
   return discoveryService;
 }
 

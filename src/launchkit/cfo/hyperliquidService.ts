@@ -603,6 +603,54 @@ export async function getAllMidPrices(): Promise<Record<string, number>> {
 }
 
 // ============================================================================
+// Funding rates + Open Interest (per asset context)
+// ============================================================================
+
+export interface AssetContext {
+  coin: string;
+  funding: number;        // current hourly funding rate (e.g. 0.0001 = 0.01%/hr)
+  openInterest: number;   // open interest in USD
+  dayNtlVlm: number;      // 24h notional volume in USD
+  markPx: number;
+}
+
+let _assetCtxCache: Map<string, AssetContext> = new Map();
+let _assetCtxCacheTs = 0;
+const ASSET_CTX_TTL_MS = 60_000; // 1 minute — funding changes slowly
+
+/** Get per-asset context (funding rate, OI, volume) from HL.
+ *  Cached for 60s. Returns Map<coin, AssetContext>. */
+export async function getAssetContexts(): Promise<Map<string, AssetContext>> {
+  if (_assetCtxCache.size > 0 && Date.now() - _assetCtxCacheTs < ASSET_CTX_TTL_MS) {
+    return _assetCtxCache;
+  }
+  try {
+    const { info } = await loadHL();
+    const data = await withRetry(() => info.metaAndAssetCtxs(), 'getAssetContexts');
+    const universe = (data as any)?.[0]?.universe ?? (data as any)?.meta?.universe ?? [];
+    const ctxs = (data as any)?.[1] ?? (data as any)?.assetCtxs ?? [];
+    const result = new Map<string, AssetContext>();
+    for (let i = 0; i < universe.length && i < ctxs.length; i++) {
+      const name: string = universe[i].name;
+      const ctx = ctxs[i];
+      result.set(name, {
+        coin: name,
+        funding: Number(ctx.funding ?? 0),
+        openInterest: Number(ctx.openInterest ?? 0),
+        dayNtlVlm: Number(ctx.dayNtlVlm ?? 0),
+        markPx: Number(ctx.markPx ?? 0),
+      });
+    }
+    _assetCtxCache = result;
+    _assetCtxCacheTs = Date.now();
+    return result;
+  } catch (err) {
+    logger.warn('[Hyperliquid] getAssetContexts error:', err);
+    return _assetCtxCache; // return stale if available
+  }
+}
+
+// ============================================================================
 // Close position
 // ============================================================================
 

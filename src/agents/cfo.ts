@@ -2129,6 +2129,9 @@ export class CFOAgent extends BaseAgent {
             // Record SL-close for same-direction lockout
             if (stopHit) {
               recordSLClose(coin, side as 'LONG' | 'SHORT');
+              // Also feed the daily circuit breaker
+              const { recordSLHitForCircuitBreaker } = await import('../launchkit/cfo/decisionEngine.ts');
+              recordSLHitForCircuitBreaker();
             }
             clearTradeStyle(key);
             // Cancel stale native TP/SL trigger orders so they don't fire on next position

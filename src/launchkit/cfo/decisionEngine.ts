@@ -99,6 +99,16 @@ export function isSLLockedOut(coin: string, side: 'LONG' | 'SHORT', lockoutMs: n
 
 const _slLockouts = new Map<string, number>();
 
+/** Track timestamps of recent SL hits for daily circuit breaker.
+ *  Exported so the perpMonitor can call recordSLHitForCircuitBreaker() on SL close. */
+let _recentSLHits: number[] = [];
+export function recordSLHitForCircuitBreaker(): void {
+  _recentSLHits.push(Date.now());
+  // Keep only last 6h of data
+  const cutoff = Date.now() - 6 * 3600_000;
+  _recentSLHits = _recentSLHits.filter(t => t > cutoff);
+}
+
 /** Remove a tracked trade style after the position is closed (from scalp monitor or external close) */
 export function clearTradeStyle(key: string): void {
   _perpTradeStyles.delete(key);
@@ -3341,6 +3351,65 @@ export async function generateDecisions(
     const existingPerpCount = existingPerpPositions.length;
     const existingPerpTotalUsd = existingPerpPositions.reduce((s, p) => s + p.sizeUsd, 0);
 
+    // ── Fetch funding rates + OI (cached 60s) ──────────────────────────────
+    let assetContexts: Map<string, { coin: string; funding: number; openInterest: number; dayNtlVlm: number; markPx: number }> = new Map();
+    try {
+      assetContexts = await hl.getAssetContexts();
+    } catch (err) {
+      logger.warn('[CFO:Decision] Section M: Failed to fetch asset contexts (funding/OI) — proceeding without');
+    }
+
+    // ── Daily P&L circuit breaker ──────────────────────────────────────────
+    // Stop opening new perp positions after consecutive SL hits or daily drawdown.
+    // Tracks in-memory across decision cycles within the process lifetime.
+    {
+      const now = Date.now();
+      const SIX_HOURS_MS = 6 * 3600_000;
+      // Reset counter if oldest SL hit is > 6h ago
+      if (_recentSLHits.length > 0 && now - _recentSLHits[0] > SIX_HOURS_MS) {
+        _recentSLHits = _recentSLHits.filter(t => now - t < SIX_HOURS_MS);
+      }
+      if (_recentSLHits.length >= 3) {
+        logger.warn(
+          `[CFO:Decision] Section M: 🚫 Daily circuit breaker ACTIVE — ${_recentSLHits.length} SL hits in 6h. ` +
+          `Skipping all new perp entries until oldest SL hit ages out.`,
+        );
+        // Skip the entire signal-generation phase — jump to end of Section M
+        // (existing positions will still be monitored by the perpMonitor)
+        // NOTE: we still allow the rest of the decision engine to run (hedges etc.)
+        perpCoins.length = 0; // effectively disables scoring below
+      }
+    }
+
+    // ── Time-of-day filter for scalps ──────────────────────────────────────
+    // Crypto scalps perform worst during low-liquidity periods.
+    // We don't filter day/swing (longer term), but scalps are sensitive to chop.
+    const utcHour = new Date().getUTCHours();
+    const utcDay = new Date().getUTCDay(); // 0=Sun, 6=Sat
+    const isWeekendLowLiq = utcDay === 0 || utcDay === 6;
+    // Dead zones for scalps: Asian overnight (00:00-06:00 UTC) + weekends
+    const isScalpDeadZone = (utcHour >= 0 && utcHour < 6) || isWeekendLowLiq;
+
+    // ── Portfolio heat check (aggregate risk % of equity) ──────────────────
+    // Sum of (sizeUsd × SL%) across all open perp positions = total $ at risk.
+    // Cap at 8% of HL equity to prevent catastrophic correlated drawdowns.
+    const MAX_PORTFOLIO_HEAT_PCT = 8; // max 8% of equity at risk simultaneously
+    let currentHeatUsd = 0;
+    for (const pos of existingPerpPositions) {
+      // Estimate risk per position: unrealized PnL already accounts for current state
+      // For open positions, use the worst-case SL distance (we don't know each position's SL here,
+      // so use a conservative 3% assumption — matches our average SL across styles)
+      currentHeatUsd += pos.sizeUsd * 0.03;
+    }
+    const portfolioHeatPct = state.hlEquity > 0 ? (currentHeatUsd / state.hlEquity) * 100 : 0;
+    const portfolioHeatExceeded = portfolioHeatPct >= MAX_PORTFOLIO_HEAT_PCT;
+    if (portfolioHeatExceeded) {
+      logger.warn(
+        `[CFO:Decision] Section M: 🔥 Portfolio heat ${portfolioHeatPct.toFixed(1)}% >= ${MAX_PORTFOLIO_HEAT_PCT}% cap. ` +
+        `No new entries until existing positions reduce risk.`,
+      );
+    }
+
     // ── Phase 1 + 2: Score each eligible coin ────────────────────────────────
     // Conviction = f(sentiment, momentum, risk, market condition)
     // Range [0, 1] — higher = stronger signal. Side determined by net direction.
@@ -3508,6 +3577,9 @@ export async function generateDecisions(
           // ── Danger market gate — skip new longs in danger mode ────────
           if (intel.marketCondition === 'danger' && taSig.bias === 'LONG') { taDangerRejects++; continue; }
 
+          // ── Time-of-day filter — skip scalps during low-liquidity periods ──
+          if (taSig.style === 'scalp' && isScalpDeadZone) { taStyleConvRejects++; continue; }
+
           // ── Per-style learning: conviction floor ─────────────────────
           const styleConvFloor = learned.hlPerpStyleConvictionFloors?.[taSig.style] ?? 0;
           const effectiveStyleConvFloor = styleConvFloor * conf;
@@ -3523,6 +3595,39 @@ export async function generateDecisions(
               finalConviction *= 0.6; // sentiment disagrees → dampen
             }
           }
+
+          // ── Funding rate penalty — avoid entering against hourly funding bleed ──
+          const assetCtx = assetContexts.get(taSig.coin);
+          if (assetCtx) {
+            const fundingRate = assetCtx.funding; // hourly rate as decimal, e.g. 0.0001 = 0.01%/hr
+            const absRate = Math.abs(fundingRate);
+            // LONG + positive funding = you pay | SHORT + negative funding = you pay
+            const paysFunding = (taSig.bias === 'LONG' && fundingRate > 0) ||
+                                (taSig.bias === 'SHORT' && fundingRate < 0);
+            if (paysFunding && absRate > 0.0003) {
+              // Extreme funding (>0.03%/hr = 0.72%/day) — heavy penalty
+              finalConviction *= 0.5;
+            } else if (paysFunding && absRate > 0.0001) {
+              // Moderate funding (>0.01%/hr) — mild penalty
+              finalConviction *= 0.8;
+            }
+            // Earning funding boosts slightly (you get paid to hold)
+            const earnsFunding = (taSig.bias === 'LONG' && fundingRate < 0) ||
+                                 (taSig.bias === 'SHORT' && fundingRate > 0);
+            if (earnsFunding && absRate > 0.0001) {
+              finalConviction = Math.min(1.0, finalConviction * 1.05);
+            }
+          }
+
+          // ── Open Interest confirmation — OI should agree with direction ──
+          if (assetCtx && assetCtx.openInterest > 0 && assetCtx.dayNtlVlm > 0) {
+            // Very low 24h volume relative to OI = low liquidity — riskier for scalps
+            const volToOI = assetCtx.dayNtlVlm / assetCtx.openInterest;
+            if (taSig.style === 'scalp' && volToOI < 0.5) {
+              finalConviction *= 0.85; // thin liquidity → harder to exit cleanly
+            }
+          }
+
           if (finalConviction < minConviction) { taStyleConvRejects++; continue; }
 
           // ── TA-specific params ────────────────────────────────────────
@@ -3588,6 +3693,12 @@ export async function generateDecisions(
       if (state.hlAvailableMargin < 10) {
         if (sig.tradeStyle) taRejects.margin++;
         break; // margin is global, no point continuing
+      }
+
+      // Portfolio heat cap — prevent over-concentration of risk
+      if (portfolioHeatExceeded) {
+        if (sig.tradeStyle) taRejects.margin++;
+        break; // global constraint
       }
 
       // Check cooldown per coin (TA uses per-style cooldown)
@@ -3715,6 +3826,10 @@ export async function generateDecisions(
       }
 
       // ── Build decision ──────────────────────────────────────────────────
+      const fundingCtx = assetContexts.get(sig.coin);
+      const fundingLabel = fundingCtx
+        ? ` Funding:${(fundingCtx.funding * 100).toFixed(4)}%/hr.`
+        : '';
 
       const d: Decision = {
         type: 'HL_PERP_OPEN',
@@ -3724,7 +3839,9 @@ export async function generateDecisions(
           `Size: $${sizeUsd.toFixed(0)} at ${effectiveLeverage}x. ` +
           `SL: ${effectiveSL.toFixed(1)}%${sig.taAtrPct ? `(ATR:${(sig.taAtrPct*100).toFixed(2)}%)` : ''} / TP: ${effectiveTP}%.` +
           `${sig.taMaxHoldHours ? ` maxHold: ${sig.taMaxHoldHours}h.` : ''} ` +
+          `${fundingLabel} ` +
           `HL margin: $${state.hlAvailableMargin.toFixed(0)}. ` +
+          `Heat: ${portfolioHeatPct.toFixed(1)}%. ` +
           `Perp positions: ${existingPerpCount}/${maxPositions}, total: $${existingPerpTotalUsd.toFixed(0)}/$${maxTotalUsd}.`,
         params: {
           coin: sig.coin,
