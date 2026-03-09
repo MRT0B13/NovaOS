@@ -4630,7 +4630,6 @@ export async function generateDecisions(
         const portfolioCap = totalEquity * 0.05; // max 5% of portfolio per DCA entry
         
         // Check estimated available liquidity (spot USDC + available perp margin - reserve)
-        const hl = await import('./hyperliquidService.ts');
         const spotUsdc = await hl.getSpotUsdcBalance();
         const perpSummary = await hl.getAccountSummary();
         const minReserve = Math.max(perpSummary.equity * 0.05, 5);
