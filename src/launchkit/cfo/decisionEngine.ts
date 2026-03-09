@@ -4394,12 +4394,23 @@ export async function generateDecisions(
         const remaining = effectiveSpotMaxTotalUsd - spotTotalUsd;
         const dayStopMult = learned.hlSpotStyleStopMultipliers?.day ?? learnedSpotStopMult;
         const effectiveDaySL = applyAdaptive(env.hlSpotStopLossPct, dayStopMult, conf);
+        
+        // Portfolio-proportional cap: max 10% of total equity per day trade
+        const dayPortfolioCap = totalEquity * 0.10;
+        
+        // Liquidity pre-check: don't size bigger than what we can actually fund
+        const daySpotUsdc = await hl.getSpotUsdcBalance();
+        const dayPerpSummary = await hl.getAccountSummary();
+        const dayMinReserve = Math.max(dayPerpSummary.equity * 0.05, 5);
+        const dayAvailLiquidity = daySpotUsdc + Math.max(0, dayPerpSummary.availableMargin - dayMinReserve);
+        const dayLiquidityCap = dayAvailLiquidity * 0.9;
+        
         let sizeUsd: number;
         if (taResult.atrPct > 0) {
           const riskBudget = maxPos * conviction * (effectiveDaySL / 100);
-          sizeUsd = Math.min(riskBudget / (effectiveDaySL / 100), maxPos, remaining);
+          sizeUsd = Math.min(riskBudget / (effectiveDaySL / 100), maxPos, remaining, dayPortfolioCap, dayLiquidityCap);
         } else {
-          sizeUsd = Math.min(maxPos * conviction, maxPos, remaining);
+          sizeUsd = Math.min(maxPos * conviction, maxPos, remaining, dayPortfolioCap, dayLiquidityCap);
         }
         if (sizeUsd < 10) continue;
 
@@ -4481,12 +4492,23 @@ export async function generateDecisions(
         const remaining = effectiveSpotMaxTotalUsd - spotTotalUsd;
         const swingStopMult = learned.hlSpotStyleStopMultipliers?.swing ?? learnedSpotStopMult;
         const effectiveSwingSL = applyAdaptive(env.hlSpotStopLossPct, swingStopMult, conf);
+        
+        // Portfolio-proportional cap: max 10% of total equity per swing trade
+        const swingPortfolioCap = totalEquity * 0.10;
+        
+        // Liquidity pre-check: don't size bigger than what we can actually fund
+        const swingSpotUsdc = await hl.getSpotUsdcBalance();
+        const swingPerpSummary = await hl.getAccountSummary();
+        const swingMinReserve = Math.max(swingPerpSummary.equity * 0.05, 5);
+        const swingAvailLiquidity = swingSpotUsdc + Math.max(0, swingPerpSummary.availableMargin - swingMinReserve);
+        const swingLiquidityCap = swingAvailLiquidity * 0.9;
+        
         let sizeUsd: number;
         if (taResult.atrPct > 0) {
           const riskBudget = maxPos * conviction * (effectiveSwingSL / 100);
-          sizeUsd = Math.min(riskBudget / (effectiveSwingSL / 100), maxPos, remaining);
+          sizeUsd = Math.min(riskBudget / (effectiveSwingSL / 100), maxPos, remaining, swingPortfolioCap, swingLiquidityCap);
         } else {
-          sizeUsd = Math.min(maxPos * conviction, maxPos, remaining);
+          sizeUsd = Math.min(maxPos * conviction, maxPos, remaining, swingPortfolioCap, swingLiquidityCap);
         }
         if (sizeUsd < 10) continue;
 
