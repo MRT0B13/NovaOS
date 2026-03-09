@@ -167,27 +167,69 @@ async function loadHL() {
 }
 
 // ============================================================================
+// Rate limiter for HL API requests
+// ============================================================================
+
+class RateLimiter {
+  private queue: Array<() => void> = [];
+  private lastRequestTime = 0;
+  private readonly minDelay = 300; // 300ms between requests = max ~3/second
+  
+  async throttle(): Promise<void> {
+    return new Promise(resolve => {
+      this.queue.push(resolve);
+      this.processQueue();
+    });
+  }
+  
+  private processQueue(): void {
+    if (this.queue.length === 0) return;
+    
+    const now = Date.now();
+    const timeSinceLastRequest = now - this.lastRequestTime;
+    const delay = Math.max(0, this.minDelay - timeSinceLastRequest);
+    
+    setTimeout(() => {
+      const resolver = this.queue.shift();
+      if (resolver) {
+        this.lastRequestTime = Date.now();
+        resolver();
+        this.processQueue();
+      }
+    }, delay);
+  }
+}
+
+const rateLimiter = new RateLimiter();
+
 // Retry helper (exponential backoff for 429s)
 // ============================================================================
 
-async function withRetry<T>(fn: () => Promise<T>, label: string, maxAttempts = 3): Promise<T> {
+async function withRetry<T>(fn: () => Promise<T>, label: string, maxAttempts = 5): Promise<T> {
+  // Apply rate limiting before each attempt
+  await rateLimiter.throttle();
+  
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await fn();
     } catch (err: any) {
       const is429 = err?.message?.includes('429') ||
                     err?.status === 429 ||
+                    err?.response?.status === 429 ||
                     String(err).includes('Too Many Requests');
       if (is429 && attempt < maxAttempts) {
-        const delayMs = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s
-        logger.debug(`[Hyperliquid] ${label} 429 — retry ${attempt}/${maxAttempts} in ${delayMs}ms`);
+        // Longer initial delay: 2s, 4s, 8s, 16s
+        const delayMs = 2000 * Math.pow(2, attempt - 1); 
+        logger.info(`[Hyperliquid] ${label} hit rate limit (429) — retry ${attempt}/${maxAttempts} in ${delayMs/1000}s`);
         await new Promise(r => setTimeout(r, delayMs));
+        // Rate limit before retry as well
+        await rateLimiter.throttle();
         continue;
       }
       throw err;
     }
   }
-  throw new Error(`[Hyperliquid] ${label} unreachable`);
+  throw new Error(`[Hyperliquid] ${label} unreachable after ${maxAttempts} attempts`);
 }
 
 // ============================================================================
