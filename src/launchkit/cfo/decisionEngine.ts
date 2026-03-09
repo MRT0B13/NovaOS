@@ -6003,21 +6003,21 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           markDecision(cooldownKey);
 
           // Track trade style for exit logic (style-specific SL/TP + hold limits)
-          if (tradeStyle) {
-            const ta = await import('./hlTechnicalAnalysis.ts');
-            const sc = ta.getStyleConfig(tradeStyle as TradeStyle);
-            _perpTradeStyles.set(`${coin}-${side}`, {
-              style: tradeStyle as TradeStyle,
-              openedAt: new Date().toISOString(),
-              highWaterMarkPct: 0,
-              effectiveSLPct: sc.stopLossPct,
-              movedToBreakeven: false,
-              partialTaken: false,
-              entrySLPct: sc.stopLossPct,
-              entryTPPct: sc.takeProfitPct,
-            });
-            logger.debug(`[CFO:Decision] Tracking TA style: ${coin}-${side} → ${tradeStyle}`);
-          }
+          // Always track — default to 'day' for non-TA signals (scout, mover, etc.)
+          const effectiveStyle = (tradeStyle as TradeStyle) || 'day';
+          const ta = await import('./hlTechnicalAnalysis.ts');
+          const sc = ta.getStyleConfig(effectiveStyle);
+          _perpTradeStyles.set(`${coin}-${side}`, {
+            style: effectiveStyle,
+            openedAt: new Date().toISOString(),
+            highWaterMarkPct: 0,
+            effectiveSLPct: stopLossPct ?? sc.stopLossPct,
+            movedToBreakeven: false,
+            partialTaken: false,
+            entrySLPct: stopLossPct ?? sc.stopLossPct,
+            entryTPPct: takeProfitPct ?? sc.takeProfitPct,
+          });
+          logger.info(`[CFO:Decision] Tracking position: ${coin}-${side} → ${effectiveStyle} (SL=${(stopLossPct ?? sc.stopLossPct).toFixed(1)}%, TP=${(takeProfitPct ?? sc.takeProfitPct).toFixed(1)}%)`);
         }
         return {
           ...base,
