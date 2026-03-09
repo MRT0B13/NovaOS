@@ -612,7 +612,7 @@ function detectDriftAlerts(
     }
   }
 
-  // Strategy degradation alerts
+  // Strategy degradation → describe what the engine is DOING about it (not "consider pausing")
   const GATE_THRESHOLD = 15; // matches MIN_STRATEGY_SCORE in decisionEngine
   for (const [name, st] of Object.entries(strategyStats)) {
     if (st.totalTrades < MIN_TRADES_FOR_CONFIDENCE) continue;
@@ -620,22 +620,40 @@ function detectDriftAlerts(
     const score = current.strategyScores[name] ?? 50;
     if (score < 25) {
       const isGated = score < GATE_THRESHOLD && st.totalTrades >= 5;
-      if (isGated) {
-        // Strategy is already blocked by the decision engine gate — no need to alert
-        continue;
+
+      // Build list of active adaptations for this strategy
+      const adaptations: string[] = [];
+      // Check for size/SL/conviction adjustments applied
+      if (name === 'hyperliquid' || name.startsWith('hl_perp')) {
+        if (current.hlPerpSizeMultiplier < 0.95) adaptations.push(`size×${current.hlPerpSizeMultiplier.toFixed(2)}`);
+        if (current.hlPerpStopLossMultiplier < 0.95) adaptations.push(`SL tightened×${current.hlPerpStopLossMultiplier.toFixed(2)}`);
+        if (current.hlPerpConvictionFloor > 0) adaptations.push(`conv floor↑${(current.hlPerpConvictionFloor * 100).toFixed(0)}%`);
+        // Per-style
+        const style = name.replace('hl_perp_', '') as 'scalp' | 'day' | 'swing';
+        const styleSizeMult = current.hlPerpStyleSizeMultipliers?.[style];
+        if (styleSizeMult !== undefined && styleSizeMult < 0.95) adaptations.push(`${style} size×${styleSizeMult.toFixed(2)}`);
       }
+      if (name === 'hl_spot' || name.startsWith('hl_spot_')) {
+        if (current.hlSpotSizeMultiplier < 0.95) adaptations.push(`size×${current.hlSpotSizeMultiplier.toFixed(2)}`);
+      }
+
+      const actionText = adaptations.length > 0
+        ? `adapting: ${adaptations.join(', ')}`
+        : isGated
+          ? 'gated until performance improves'
+          : 'learning from losses — will adapt with more data';
+
       alerts.push(
-        `⚠️ ${name} degraded: score=${score.toFixed(0)}, ` +
-        `WR=${(st.winRate * 100).toFixed(0)}%, Sharpe=${st.sharpeApprox.toFixed(2)}, ` +
-        `avgPnL=$${st.avgPnlUsd.toFixed(2)} — consider pausing`,
+        `⚠️ ${name}: score=${score.toFixed(0)}, ` +
+        `WR=${(st.winRate * 100).toFixed(0)}%, avgPnL=$${st.avgPnlUsd.toFixed(2)} — ${actionText}`,
       );
     }
 
-    // Recent regime shift warning
-    if (st.recentWinRate < st.winRate - 0.2) {
+    // Recent regime shift warning — only if significant
+    if (st.recentWinRate < st.winRate - 0.25 && st.totalTrades >= 10) {
       alerts.push(
         `📉 ${name} regime shift: recent WR ${(st.recentWinRate * 100).toFixed(0)}% vs ` +
-        `overall ${(st.winRate * 100).toFixed(0)}% — deteriorating`,
+        `overall ${(st.winRate * 100).toFixed(0)}%`,
       );
     }
   }
@@ -720,19 +738,25 @@ function computeAdaptiveParams(
   const hlSt = stats['hyperliquid'];
 
   if (hlSt && hlSt.totalTrades >= MIN_TRADES_FOR_CONFIDENCE) {
-    // If max drawdown is severe relative to avg PnL, tighten stops
+    // Graduated stop-loss adaptation: even small persistent losses tighten stops slightly.
+    // The worse the performance, the tighter the stops.
     if (hlSt.maxDrawdownUsd < -50 && Math.abs(hlSt.maxDrawdownUsd) > hlSt.avgPnlUsd * 5) {
       hlStopMult = 0.7;
-    }
-
-    // If win rate is high with positive Sharpe, slightly loosen
-    if (hlSt.winRate > 0.6 && hlSt.sharpeApprox > 0.3) {
+    } else if (hlSt.avgPnlUsd < 0 && hlSt.sharpeApprox < 0) {
+      // Losing strategy with negative Sharpe → graduated tightening
+      // e.g. Sharpe=-0.46 → clamp(-0.46,-1,0)=0.46 → 1 - 0.46*0.3 = 0.86× SL
+      const severity = Math.min(1, Math.abs(hlSt.sharpeApprox));
+      hlStopMult = 1.0 - severity * 0.3; // range: 1.0 → 0.7
+    } else if (hlSt.winRate > 0.6 && hlSt.sharpeApprox > 0.3) {
       hlStopMult = 1.15;
     }
 
-    // Leverage bias: negative avg PnL → reduce leverage
-    if (hlSt.avgPnlUsd < -2) hlLevBias = -0.5;
-    else if (hlSt.avgPnlUsd > 5 && hlSt.sharpeApprox > 0.5) hlLevBias = 0.3;
+    // Graduated leverage bias: proportional to avg PnL severity
+    if (hlSt.avgPnlUsd < 0) {
+      hlLevBias = Math.max(-0.5, hlSt.avgPnlUsd * 0.1); // e.g. -$0.49 → -0.049, -$5 → -0.5
+    } else if (hlSt.avgPnlUsd > 5 && hlSt.sharpeApprox > 0.5) {
+      hlLevBias = 0.3;
+    }
 
     // Recent regime shift
     if (hlSt.recentAvgPnlUsd < 0 && hlSt.avgPnlUsd > 0) {
@@ -761,14 +785,17 @@ function computeAdaptiveParams(
   const perpSt = stats['hl_perp'];
 
   if (perpSt && perpSt.totalTrades >= MIN_TRADES_FOR_CONFIDENCE) {
-    // If win rate is poor, raise conviction floor to filter out weak signals
-    if (perpSt.winRate < 0.35 && perpSt.totalPnlUsd < 0) {
-      perpConvFloor = Math.min(0.7, 0.3 + (0.35 - perpSt.winRate)); // e.g. 30% WR → floor 0.35
+    // Graduated conviction floor based on how bad the win rate is
+    if (perpSt.winRate < 0.5 && perpSt.totalPnlUsd < 0) {
+      // Scale conviction floor linearly: 50% WR → floor 0.30, 35% WR → 0.45, 20% WR → 0.60
+      perpConvFloor = Math.min(0.7, 0.30 + (0.5 - perpSt.winRate) * 1.0);
     }
 
-    // If avg PnL is strongly negative, cut position sizes
-    if (perpSt.avgPnlUsd < -3) {
-      perpSizeMult = 0.6;
+    // Graduated position sizing: proportional to performance severity
+    if (perpSt.avgPnlUsd < 0) {
+      // e.g. -$0.49 → 0.95×, -$2 → 0.80×, -$5 → 0.60×
+      const severity = Math.min(1, Math.abs(perpSt.avgPnlUsd) / 5);
+      perpSizeMult = 1.0 - severity * 0.4; // range: 1.0 → 0.6
     } else if (perpSt.avgPnlUsd > 3 && perpSt.sharpeApprox > 0.5) {
       perpSizeMult = 1.3; // perps are working → lean in
     }
@@ -805,9 +832,10 @@ function computeAdaptiveParams(
     const styleSt = stats[`hl_perp_${style}`];
     if (!styleSt || styleSt.totalTrades < MIN_TRADES_FOR_CONFIDENCE) continue;
 
-    // Size multiplier: cut if losing, lean in if profitable
-    if (styleSt.avgPnlUsd < -3) {
-      perpStyleSizeMults[style] = 0.6;
+    // Graduated size multiplier: proportional to performance, not binary
+    if (styleSt.avgPnlUsd < 0) {
+      const severity = Math.min(1, Math.abs(styleSt.avgPnlUsd) / 5);
+      perpStyleSizeMults[style] = 1.0 - severity * 0.4; // 1.0 → 0.6
     } else if (styleSt.avgPnlUsd > 3 && styleSt.sharpeApprox > 0.5) {
       perpStyleSizeMults[style] = 1.3;
     }
@@ -819,9 +847,9 @@ function computeAdaptiveParams(
       perpStyleStopMults[style] = 1.15;
     }
 
-    // Conviction floor: raise if too many losing trades
-    if (styleSt.winRate < 0.35 && styleSt.totalPnlUsd < 0) {
-      perpStyleConvFloors[style] = Math.min(0.7, 0.3 + (0.35 - styleSt.winRate));
+    // Graduated conviction floor for styles
+    if (styleSt.winRate < 0.5 && styleSt.totalPnlUsd < 0) {
+      perpStyleConvFloors[style] = Math.min(0.7, 0.30 + (0.5 - styleSt.winRate) * 1.0);
     }
 
     // Leverage multiplier: scalps with tight SL benefit from higher leverage.
@@ -852,14 +880,15 @@ function computeAdaptiveParams(
   const spotSt = stats['hl_spot'];
 
   if (spotSt && spotSt.totalTrades >= MIN_TRADES_FOR_CONFIDENCE) {
-    // If win rate is poor, raise conviction floor to filter out weak signals
-    if (spotSt.winRate < 0.35 && spotSt.totalPnlUsd < 0) {
-      spotConvFloor = Math.min(0.7, 0.3 + (0.35 - spotSt.winRate));
+    // Graduated conviction floor
+    if (spotSt.winRate < 0.5 && spotSt.totalPnlUsd < 0) {
+      spotConvFloor = Math.min(0.7, 0.30 + (0.5 - spotSt.winRate) * 1.0);
     }
 
-    // If avg PnL is strongly negative, cut position sizes
-    if (spotSt.avgPnlUsd < -3) {
-      spotSizeMult = 0.6;
+    // Graduated position sizing: proportional response
+    if (spotSt.avgPnlUsd < 0) {
+      const severity = Math.min(1, Math.abs(spotSt.avgPnlUsd) / 5);
+      spotSizeMult = 1.0 - severity * 0.4;
     } else if (spotSt.avgPnlUsd > 3 && spotSt.sharpeApprox > 0.5) {
       spotSizeMult = 1.3;
     }
@@ -896,9 +925,10 @@ function computeAdaptiveParams(
     const styleSt = stats[stratKey];
     if (!styleSt || styleSt.totalTrades < MIN_TRADES_FOR_CONFIDENCE) continue;
 
-    // Size multiplier: cut if losing, lean in if profitable
-    if (styleSt.avgPnlUsd < -3) {
-      spotStyleSizeMults[style] = 0.6;
+    // Graduated size multiplier for spot styles
+    if (styleSt.avgPnlUsd < 0) {
+      const severity = Math.min(1, Math.abs(styleSt.avgPnlUsd) / 5);
+      spotStyleSizeMults[style] = 1.0 - severity * 0.4;
     } else if (styleSt.avgPnlUsd > 3 && styleSt.sharpeApprox > 0.5) {
       spotStyleSizeMults[style] = 1.3;
     }
@@ -910,9 +940,9 @@ function computeAdaptiveParams(
       spotStyleStopMults[style] = 1.15;
     }
 
-    // Conviction floor
-    if (styleSt.winRate < 0.35 && styleSt.totalPnlUsd < 0) {
-      spotStyleConvFloors[style] = Math.min(0.7, 0.3 + (0.35 - styleSt.winRate));
+    // Graduated conviction floor for spot styles
+    if (styleSt.winRate < 0.5 && styleSt.totalPnlUsd < 0) {
+      spotStyleConvFloors[style] = Math.min(0.7, 0.30 + (0.5 - styleSt.winRate) * 1.0);
     }
 
     // Regime shift within style
@@ -1247,6 +1277,7 @@ async function saveLearned(pool: any, params: AdaptiveParams): Promise<void> {
 /** In-memory cache refreshed each cycle */
 let _cachedParams: AdaptiveParams | null = null;
 let _lastRefreshMs = 0;
+let _lastAlertFingerprint = ''; // dedup: only log alerts when they change
 const REFRESH_INTERVAL_MS = 15 * 60_000; // 15 min
 
 /**
@@ -1342,19 +1373,28 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
       `best: ${topStrategy?.[0] ?? 'n/a'}(${topStrategy?.[1]?.toFixed(0) ?? '?'})`,
     );
 
-    // Log alerts
-    if (params.alerts.length > 0) {
+    // Log alerts — deduplicated so the same alerts don't spam every cycle.
+    // Only log if alerts changed from last cycle.
+    const alertFingerprint = params.alerts.join('|');
+    if (params.alerts.length > 0 && alertFingerprint !== _lastAlertFingerprint) {
       logger.warn(`[Learning] 🚨 ALERTS (${params.alerts.length}):`);
       for (const alert of params.alerts) {
         logger.warn(`[Learning]   ${alert}`);
       }
-      // Forward critical alerts to admin Telegram so they're visible outside logs
-      try {
-        const { notifyAdmin } = await import('../services/adminNotify.ts');
-        const alertMsg = `🧠 *Learning Alerts (${params.alerts.length}):*\n${params.alerts.map(a => `  • ${a}`).join('\n')}`;
-        await notifyAdmin(alertMsg, 'system');
-      } catch { /* non-fatal — admin notify may not be configured */ }
+      // Only forward truly new alerts to admin TG (not repeat degradation notices)
+      const criticalAlerts = params.alerts.filter(a => a.includes('🔴') || a.includes('💸'));
+      if (criticalAlerts.length > 0) {
+        try {
+          const { notifyAdmin } = await import('../services/adminNotify.ts');
+          const alertMsg = `🧠 *Learning Alerts:*\n${criticalAlerts.map(a => `  • ${a}`).join('\n')}`;
+          await notifyAdmin(alertMsg, 'system');
+        } catch { /* non-fatal */ }
+      }
+    } else if (params.alerts.length > 0) {
+      // Same alerts as last cycle — log at debug to reduce spam
+      logger.debug(`[Learning] Alerts unchanged (${params.alerts.length}) — suppressing repeat log`);
     }
+    _lastAlertFingerprint = alertFingerprint;
 
     // Log per-strategy detail at debug level
     for (const [name, st] of Object.entries(stats)) {
