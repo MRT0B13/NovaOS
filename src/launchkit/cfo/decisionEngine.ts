@@ -42,6 +42,7 @@ import { getCFOEnv, type CFOEnv } from './cfoEnv.ts';
 import { refreshLearning, getAdaptiveParams, applyAdaptive, formatLearningSummary, setLearningPool, type AdaptiveParams } from './learningEngine.ts';
 import * as swapSvc from './evmSwapService.ts';
 import type { TradeStyle, MTFSignal } from './hlTechnicalAnalysis.ts';
+import type { HLPosition, HLSpotBalance } from './hyperliquidService.ts';
 
 // ============================================================================
 // TA trade style tracker (in-memory — survives across cycles but not restarts)
@@ -144,6 +145,106 @@ export function recordSLHitForCircuitBreaker(): void {
 /** Remove a tracked trade style after the position is closed (from scalp monitor or external close) */
 export function clearTradeStyle(key: string): void {
   _perpTradeStyles.delete(key);
+}
+
+// ── Position reconciliation ─────────────────────────────────────────────────
+// After a restart, in-memory tracking is lost. These helpers rebuild tracking
+// state from live HL positions so trailing stops, BE moves, and partial TPs
+// continue to function.
+// ============================================================================
+
+/**
+ * Reconcile perp positions: for any HL position not already tracked,
+ * create a tracking entry with conservative defaults inferred from
+ * the live position data.
+ *
+ * Returns the number of positions reconciled.
+ */
+export function reconcilePerpTracking(
+  livePositions: HLPosition[],
+  getStyleConfig: (style: TradeStyle) => { stopLossPct: number; takeProfitPct: number },
+): number {
+  let reconciled = 0;
+  for (const pos of livePositions) {
+    const key = `${pos.coin}-${pos.side}`;
+    if (_perpTradeStyles.has(key)) continue; // already tracked
+
+    // Infer trade style from leverage:
+    // 3x → scalp, 2x → day (conservative default), 1x → swing
+    const style: TradeStyle = pos.leverage >= 3 ? 'scalp' : pos.leverage <= 1 ? 'swing' : 'day';
+    const sc = getStyleConfig(style);
+
+    // Current margin P&L %
+    const marginPct = pos.marginUsed > 0 ? (pos.unrealizedPnlUsd / pos.marginUsed) * 100 : 0;
+    const beThreshold = sc.takeProfitPct * 0.5;
+    const partialThreshold = sc.takeProfitPct * 0.66;
+
+    // If already past BE threshold, mark as moved to breakeven
+    const alreadyBE = marginPct >= beThreshold;
+    // If already past partial threshold, mark partial as taken
+    // (conservative: assume it was taken if price already moved past)
+    const alreadyPartial = marginPct >= partialThreshold;
+
+    _perpTradeStyles.set(key, {
+      style,
+      openedAt: new Date().toISOString(), // unknown — use now (conservative: no hold-expiry credit)
+      highWaterMarkPct: Math.max(marginPct, 0), // at least current PnL
+      effectiveSLPct: alreadyBE ? 0 : sc.stopLossPct,
+      movedToBreakeven: alreadyBE,
+      partialTaken: alreadyPartial,
+      entrySLPct: sc.stopLossPct,
+      entryTPPct: sc.takeProfitPct,
+    });
+    reconciled++;
+    logger.info(
+      `[CFO:Reconcile] Rebuilt perp tracking: ${key} → ${style} ` +
+      `(margin ${marginPct.toFixed(1)}%, BE=${alreadyBE}, partial=${alreadyPartial}, ` +
+      `HWM=${Math.max(marginPct, 0).toFixed(1)}%)`,
+    );
+  }
+  return reconciled;
+}
+
+/**
+ * Reconcile spot positions: for any spot balance not already tracked,
+ * create a tracking entry using entry notional data from HL.
+ *
+ * Returns the number of positions reconciled.
+ */
+export function reconcileSpotTracking(
+  liveBalances: HLSpotBalance[],
+  midPrices: Record<string, number>,
+): number {
+  let reconciled = 0;
+  for (const bal of liveBalances) {
+    if (bal.coin === 'USDC' || bal.coin === 'USDT') continue; // skip stables
+    if (bal.available <= 0.000001 && bal.total <= 0.000001) continue; // dust
+    if (_spotTradeStyles.has(bal.coin)) continue; // already tracked
+
+    const currentPrice = midPrices[`${bal.coin}/USDC`] ?? midPrices[bal.coin] ?? 0;
+    // Derive entry price from entry notional / quantity
+    const entryPrice = bal.total > 0 && bal.entryNtl > 0
+      ? bal.entryNtl / bal.total
+      : currentPrice;
+
+    // Conservative defaults: day style, moderate SL/TP
+    _spotTradeStyles.set(bal.coin, {
+      style: 'day',
+      openedAt: new Date().toISOString(),
+      entryPrice,
+      sizeUsd: bal.valueUsd,
+      stopLossPct: 8,
+      takeProfitPct: 15,
+      highWaterPriceUsd: Math.max(currentPrice, entryPrice),
+    });
+    reconciled++;
+    logger.info(
+      `[CFO:Reconcile] Rebuilt spot tracking: ${bal.coin} ` +
+      `(entry $${entryPrice.toFixed(4)}, current $${currentPrice.toFixed(4)}, ` +
+      `value $${bal.valueUsd.toFixed(2)})`,
+    );
+  }
+  return reconciled;
 }
 
 // ============================================================================

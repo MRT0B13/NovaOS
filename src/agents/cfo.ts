@@ -2134,14 +2134,27 @@ export class CFOAgent extends BaseAgent {
     // Dynamic exit logic: trailing stop, partial profit, move-to-BE,
     // in addition to hard SL/TP/hold-expiry checks.
     try {
-      const { getTrackedTradeStyles, clearTradeStyle, updateTradeStyle, recordSLClose } =
+      const { getTrackedTradeStyles, clearTradeStyle, updateTradeStyle, recordSLClose, reconcilePerpTracking } =
         await import('../launchkit/cfo/decisionEngine.ts');
-      const styles = getTrackedTradeStyles();
-      if (styles.size === 0) return;
-
       const hlMod = await import('../launchkit/cfo/hyperliquidService.ts');
       const ta = await import('../launchkit/cfo/hlTechnicalAnalysis.ts');
       const summary = await hlMod.getAccountSummary();
+
+      // ── Reconcile: rebuild tracking for positions that survived a restart ──
+      if (summary.positions.length > 0) {
+        const rebuilt = reconcilePerpTracking(summary.positions, ta.getStyleConfig);
+        if (rebuilt > 0) {
+          logger.info(`[CFO] Reconciled ${rebuilt} orphaned perp position(s) after restart`);
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(
+            `🔄 Reconciled ${rebuilt} perp position(s) after restart — ` +
+            `trailing stops & BE protection now active`,
+          );
+        }
+      }
+
+      const styles = getTrackedTradeStyles();
+      if (styles.size === 0) return;
 
       for (const [key, info] of styles) {
         const [coin, side] = key.split('-') as [string, 'LONG' | 'SHORT'];
@@ -2254,14 +2267,27 @@ export class CFOAgent extends BaseAgent {
     if (!getCFOEnv().hyperliquidEnabled || !getCFOEnv().hlSpotTradingEnabled) return;
 
     try {
-      const { getTrackedSpotStyles, clearSpotStyle, updateSpotStyle } =
+      const { getTrackedSpotStyles, clearSpotStyle, updateSpotStyle, reconcileSpotTracking } =
         await import('../launchkit/cfo/decisionEngine.ts');
-      const styles = getTrackedSpotStyles();
-      if (styles.size === 0) return;
-
       const hlMod = await import('../launchkit/cfo/hyperliquidService.ts');
       const balances = await hlMod.getSpotBalances();
       const mids = await hlMod.getAllMidPrices();
+
+      // ── Reconcile: rebuild tracking for spot positions that survived a restart ──
+      if (balances.length > 0) {
+        const rebuilt = reconcileSpotTracking(balances, mids);
+        if (rebuilt > 0) {
+          logger.info(`[CFO] Reconciled ${rebuilt} orphaned spot position(s) after restart`);
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(
+            `🔄 Reconciled ${rebuilt} spot position(s) after restart — ` +
+            `SL/TP monitoring now active`,
+          );
+        }
+      }
+
+      const styles = getTrackedSpotStyles();
+      if (styles.size === 0) return;
 
       for (const [coin, info] of styles) {
         // Find current balance for this coin
