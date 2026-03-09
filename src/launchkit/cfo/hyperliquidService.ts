@@ -264,6 +264,22 @@ function formatLimitPrice(price: number, szDecimals: number): string {
   return (Math.trunc(price * factor) / factor).toFixed(decimals);
 }
 
+/**
+ * Format price for HL spot orders.
+ * Spot uses 5 significant figures with max 8 decimal places.
+ * No szDecimals-based constraint (that only applies to perps).
+ */
+function formatSpotPrice(price: number): string {
+  if (price <= 0) return '0';
+  // 5 significant figures
+  const magnitude = Math.floor(Math.log10(Math.abs(price)));
+  const sigFigDecimals = Math.max(0, 5 - 1 - magnitude);
+  // HL spot allows up to 8 decimal places
+  const decimals = Math.min(8, sigFigDecimals);
+  const factor = Math.pow(10, decimals);
+  return (Math.trunc(price * factor) / factor).toFixed(decimals);
+}
+
 // ── Halted coins cache ──────────────────────────────────────────────────────
 // When HL returns "Trading is halted" for a coin, remember it for 30 minutes
 // so the signal engine doesn't keep trying every cycle.
@@ -1242,8 +1258,13 @@ export async function openSpotTrade(params: SpotTradeParams): Promise<HLOrderRes
 
     // Use IoC with 2% slippage for immediate fill
     const limitPrice = isBuy
-      ? formatLimitPrice(coinPrice * 1.02, szDecimals)
-      : formatLimitPrice(coinPrice * 0.98, szDecimals);
+      ? formatSpotPrice(coinPrice * 1.02)
+      : formatSpotPrice(coinPrice * 0.98);
+
+    logger.info(
+      `[Hyperliquid] openSpotTrade: ${side} ${coin} midPrice=${coinPrice} limitPrice=${limitPrice} ` +
+      `size=${sizeFmt} szDecimals=${szDecimals} pairIndex=${pair.index}`,
+    );
 
     const order = await exchange.order({
       orders: [{
