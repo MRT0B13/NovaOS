@@ -974,7 +974,7 @@ export async function getSpotPairs(): Promise<HLSpotPair[]> {
     const pairs: HLSpotPair[] = [];
     for (const u of universe) {
       const name: string = u.name; // e.g. "PURR/USDC" or "@107" (most pairs use @N index format)
-      const pairIndex: number = u.index;
+      const pairIndex: number = 10000 + u.index; // Spot pairs need 10000 offset for exchange.order()
       const baseTokenIdx: number = u.tokens?.[0];
       const quoteTokenIdx: number = u.tokens?.[1] ?? 0;
       const baseToken = tokens.find((t: any) => t.index === baseTokenIdx);
@@ -1263,7 +1263,7 @@ export async function openSpotTrade(params: SpotTradeParams): Promise<HLOrderRes
 
     logger.info(
       `[Hyperliquid] openSpotTrade: ${side} ${coin} midPrice=${coinPrice} limitPrice=${limitPrice} ` +
-      `size=${sizeFmt} szDecimals=${szDecimals} pairIndex=${pair.index}`,
+      `size=${sizeFmt} szDecimals=${szDecimals} pairIndex=${pair.index} (spot offset applied)`,
     );
 
     const order = await exchange.order({
