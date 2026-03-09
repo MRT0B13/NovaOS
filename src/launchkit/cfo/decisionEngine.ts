@@ -3434,6 +3434,8 @@ export async function generateDecisions(
     for (const coin of perpCoins) {
       // Skip coins with trading halted on HL (remembered for 30 min after a halt error)
       if (hl.isHalted(coin)) continue;
+      // Skip coins at OI cap (remembered for 15 min after rejection)
+      if (hl.isOICapped(coin)) continue;
 
       let bullScore = 0;
       let bearScore = 0;

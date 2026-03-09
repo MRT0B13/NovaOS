@@ -194,6 +194,27 @@ export function isHalted(coin: string): boolean {
   return true;
 }
 
+// ── OI-capped coins cache ───────────────────────────────────────────────────
+// When HL rejects an order because open interest is at cap, remember it for
+// 15 minutes so we don't keep wasting API calls on the same coin.
+const _oiCappedCoins = new Map<string, number>(); // coin → timestamp
+const OI_CAP_TTL_MS = 15 * 60 * 1000; // 15 min
+
+export function isOICapped(coin: string): boolean {
+  const ts = _oiCappedCoins.get(coin);
+  if (!ts) return false;
+  if (Date.now() - ts > OI_CAP_TTL_MS) {
+    _oiCappedCoins.delete(coin);
+    return false;
+  }
+  return true;
+}
+
+function markOICapped(coin: string): void {
+  _oiCappedCoins.set(coin, Date.now());
+  logger.info(`[Hyperliquid] ${coin} marked OI-capped for ${OI_CAP_TTL_MS / 60000} minutes`);
+}
+
 // ============================================================================
 // Account info
 // ============================================================================
@@ -405,6 +426,11 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
     logger.info(`[Hyperliquid] Skipping ${side} ${coin}-PERP — trading halted (cached)`);
     return { success: false, error: `${coin} trading is halted` };
   }
+  // Skip coins at OI cap (cached for 15 min after rejection)
+  if (isOICapped(coin)) {
+    logger.info(`[Hyperliquid] Skipping ${side} ${coin}-PERP — OI capped (cached)`);
+    return { success: false, error: `${coin} open interest at cap` };
+  }
 
   const leverage = Math.min(params.leverage ?? 2, env.maxHyperliquidLeverage);
   const stopLossPct = params.stopLossPct ?? 5;
@@ -492,7 +518,12 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
 
     const result = (order as any)?.response?.data?.statuses?.[0];
     if (!result || (result as any).error) {
-      return { success: false, error: (result as any)?.error ?? 'Order rejected' };
+      const errMsg: string = (result as any)?.error ?? 'Order rejected';
+      // Cache OI-capped coins to avoid retrying every cycle
+      if (errMsg.toLowerCase().includes('open interest') && errMsg.toLowerCase().includes('cap')) {
+        markOICapped(coin);
+      }
+      return { success: false, error: errMsg };
     }
 
     // IoC: if order rested instead of filling, it was auto-cancelled — treat as failure
