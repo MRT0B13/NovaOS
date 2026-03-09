@@ -76,10 +76,12 @@ const DEFAULT_QUOTER_V2   = '0x61fFE014bA17989E743c5F6cB21bF9697530B21e';
 
 /** Chain-specific overrides (Base & newer chains use different deployer addresses) */
 const CHAIN_SWAP_ROUTER: Record<number, string> = {
+  56:     '0x13f4EA83D0bd40E75C8222255bc855a974568Dd4', // PancakeSwap V3 SmartRouter (BSC)
   8453:   '0x2626664c2603336E57B271c5C0b26F421741e481', // Base
   43114:  '0xbb00FF08d01D300023C629E8fFfFcb65A5a578cE', // Avalanche
 };
 const CHAIN_QUOTER_V2: Record<number, string> = {
+  56:     '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997', // PancakeSwap V3 QuoterV2 (BSC)
   8453:   '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a', // Base
   43114:  '0xbe0F5544EC67e9B3b2D979aaA43f18Fd87E6257F', // Avalanche
 };
@@ -122,8 +124,8 @@ const AERODROME_ROUTER_ABI = [
   'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, tuple(address from, address to, bool stable, address factory)[] routes, address to, uint256 deadline) returns (uint256[] amounts)',
 ];
 
-/** Chains where Uniswap V3 SwapRouter02 is deployed */
-const UNISWAP_V3_CHAINS = new Set([1, 10, 137, 8453, 42161, 43114, 324, 534352, 59144]);
+/** Chains where Uniswap V3 / PancakeSwap V3 SwapRouter02 is deployed */
+const UNISWAP_V3_CHAINS = new Set([1, 10, 56, 137, 8453, 42161, 43114, 324, 534352, 59144]);
 
 const SWAP_ROUTER_ABI = [
   'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)',
@@ -257,7 +259,11 @@ async function quoteViaUniswap(
     // Read current sqrtPriceX96 from pool for comparison
     let priceImpactPct = 0;
     try {
-      const poolFactoryAddr = '0x1F98431c8aD98523631AE4a59f267346ea31F984';
+      // PancakeSwap V3 uses a different factory on BSC
+      const CHAIN_POOL_FACTORY: Record<number, string> = {
+        56: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // PancakeSwap V3 (BSC)
+      };
+      const poolFactoryAddr = CHAIN_POOL_FACTORY[chainId] ?? '0x1F98431c8aD98523631AE4a59f267346ea31F984';
       const factoryAbi = ['function getPool(address,address,uint24) view returns (address)'];
       const factory = new ethers.Contract(poolFactoryAddr, factoryAbi, provider);
       const poolAddr = await factory.getPool(tokenInAddr, tokenOutAddr, feeTier);
