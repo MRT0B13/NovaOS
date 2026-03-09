@@ -182,7 +182,7 @@ export class CFOAgent extends BaseAgent {
     this.addInterval(() => this.runOpportunityScan(),    60 * 60_000);   // 1h (no-ops when decision engine is on)
     this.addInterval(() => this.monitorPositions(),      10 * 60_000);   // 10m
     this.addInterval(() => this.monitorYield(),          30 * 60_000);   // 30m
-    this.addInterval(() => this.monitorHyperliquid(),    15 * 60_000);   // 15m
+    this.addInterval(() => this.monitorHyperliquid(),     2 * 60_000);   // 2m — scalps need frequent SL/TP checks
     this.addInterval(() => this.checkGasReserves(),      15 * 60_000);   // 15m
     this.addInterval(() => this.processCommands(),       10_000);
     this.addInterval(() => this.checkDailyDigest(),       5 * 60_000);
@@ -2035,11 +2035,12 @@ export class CFOAgent extends BaseAgent {
       }
     } catch { /* non-fatal if HL not funded */ }
 
-    // ── Lightweight scalp/day exit monitor ─────────────────────────
-    // Runs every 15 min (faster than the 30-min decision cycle).
-    // Checks TA-tracked positions for hold-duration expiry and tight SL/TP.
+    // ── Active position manager (runs every 2m) ────────────────────
+    // Dynamic exit logic: trailing stop, partial profit, move-to-BE,
+    // in addition to hard SL/TP/hold-expiry checks.
     try {
-      const { getTrackedTradeStyles, clearTradeStyle } = await import('../launchkit/cfo/decisionEngine.ts');
+      const { getTrackedTradeStyles, clearTradeStyle, updateTradeStyle, recordSLClose } =
+        await import('../launchkit/cfo/decisionEngine.ts');
       const styles = getTrackedTradeStyles();
       if (styles.size === 0) return;
 
@@ -2051,7 +2052,6 @@ export class CFOAgent extends BaseAgent {
         const [coin, side] = key.split('-') as [string, 'LONG' | 'SHORT'];
         const pos = summary.positions.find(p => p.coin === coin && p.side === side);
         if (!pos) {
-          // Position gone from exchange — clean up stale tracker entry
           clearTradeStyle(key);
           continue;
         }
@@ -2059,31 +2059,89 @@ export class CFOAgent extends BaseAgent {
         const sc = ta.getStyleConfig(info.style);
         const marginPct = pos.marginUsed > 0 ? (pos.unrealizedPnlUsd / pos.marginUsed) * 100 : 0;
         const holdExpired = ta.isHoldExpired(info.style, info.openedAt);
-        const stopHit = marginPct < -sc.stopLossPct;
-        const tpHit = marginPct > sc.takeProfitPct;
 
-        if (holdExpired || stopHit || tpHit) {
+        // ── Update high water mark ──────────────────────────────────
+        if (marginPct > info.highWaterMarkPct) {
+          updateTradeStyle(key, { highWaterMarkPct: marginPct });
+        }
+
+        // ── Move SL to breakeven at 50% of TP target ───────────────
+        // Once in meaningful profit, protect the entry.
+        const beThreshold = sc.takeProfitPct * 0.5;
+        if (!info.movedToBreakeven && marginPct >= beThreshold) {
+          updateTradeStyle(key, { movedToBreakeven: true, effectiveSLPct: 0 });
+          logger.info(`[CFO] Position ${side} ${coin}: moved SL to breakeven (profit ${marginPct.toFixed(1)}% >= ${beThreshold.toFixed(1)}% threshold)`);
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(`🛡️ [${info.style}] ${side} ${coin}: SL → breakeven (PnL +${marginPct.toFixed(1)}%)`);
+        }
+
+        // ── Partial profit at 66% of TP target ─────────────────────
+        // Take 50% of position off the table to lock in gains.
+        const partialThreshold = sc.takeProfitPct * 0.66;
+        if (!info.partialTaken && marginPct >= partialThreshold) {
+          const halfSize = (pos.sizeUsd / pos.markPrice) * 0.5;
+          const isBuy = side === 'SHORT';
+          logger.info(`[CFO] Partial TP: closing 50% of ${side} ${coin}-PERP at +${marginPct.toFixed(1)}% (target ${partialThreshold.toFixed(1)}%)`);
+          const result = await hlMod.closePosition(coin, halfSize, isBuy);
+          if (result.success) {
+            updateTradeStyle(key, { partialTaken: true });
+            const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+            await notifyAdminForce(
+              `💰 [${info.style}] Partial TP: closed 50% of ${side} ${coin}-PERP\n` +
+              `PnL at partial: +${marginPct.toFixed(1)}%`,
+            );
+          }
+          continue; // don't also full-close on same tick
+        }
+
+        // ── Trailing stop (activates after BE move) ─────────────────
+        // Once at breakeven, trail SL at 40% of the high water mark.
+        // e.g. if HWM = +5%, trailing SL = -(5 * 0.4) = -2% from HWM = at +3%.
+        let trailingStopHit = false;
+        if (info.movedToBreakeven && info.highWaterMarkPct > beThreshold) {
+          const trailDistance = info.highWaterMarkPct * 0.4; // 40% giveback allowed
+          const trailingSL = info.highWaterMarkPct - trailDistance;
+          if (marginPct < trailingSL && marginPct > 0) {
+            // Don't close at a loss — trailing stop only protects profit
+            trailingStopHit = true;
+          }
+        }
+
+        // ── Hard SL check (uses dynamic effectiveSLPct) ─────────────
+        const effectiveSL = info.movedToBreakeven ? 0.3 : info.effectiveSLPct; // 0.3% buffer for fees after BE
+        const stopHit = marginPct < -effectiveSL;
+        const tpHit = marginPct >= sc.takeProfitPct;
+
+        if (holdExpired || stopHit || tpHit || trailingStopHit) {
           const reason = stopHit
-            ? `SL hit (${marginPct.toFixed(1)}% on margin, limit=${sc.stopLossPct}%)`
-            : tpHit
-              ? `TP hit (${marginPct.toFixed(1)}% gain, target=${sc.takeProfitPct}%)`
-              : `hold expired (${info.style}: ${sc.maxHoldHours}h)`;
+            ? `SL hit (${marginPct.toFixed(1)}% on margin, limit=${effectiveSL.toFixed(1)}%${info.movedToBreakeven ? ' [BE]' : ''})`
+            : trailingStopHit
+              ? `trailing stop hit (${marginPct.toFixed(1)}% from HWM ${info.highWaterMarkPct.toFixed(1)}%)`
+              : tpHit
+                ? `TP hit (${marginPct.toFixed(1)}% gain, target=${sc.takeProfitPct}%)`
+                : `hold expired (${info.style}: ${sc.maxHoldHours}h)`;
 
-          logger.info(`[CFO] Scalp monitor: closing ${side} ${coin}-PERP — ${reason}`);
+          logger.info(`[CFO] Position monitor: closing ${side} ${coin}-PERP — ${reason}`);
           const sizeInCoin = pos.sizeUsd / pos.markPrice;
           const isBuy = side === 'SHORT';
           const result = await hlMod.closePosition(coin, sizeInCoin, isBuy);
           if (result.success) {
-            clearTradeStyle(key); // clean up tracker
+            // Record SL-close for same-direction lockout
+            if (stopHit) {
+              recordSLClose(coin, side as 'LONG' | 'SHORT');
+            }
+            clearTradeStyle(key);
+            // Cancel stale native TP/SL trigger orders so they don't fire on next position
+            await hlMod.cancelTriggerOrdersForCoin(coin).catch(() => {});
             const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
             await notifyAdminForce(
               `📊 [${info.style}] Closed ${side} ${coin}-PERP: ${reason}\n` +
-              `PnL: ${marginPct >= 0 ? '+' : ''}${marginPct.toFixed(1)}%`,
+              `PnL: ${marginPct >= 0 ? '+' : ''}${marginPct.toFixed(1)}%${info.partialTaken ? ' (partial already taken)' : ''}`,
             );
           }
         }
       }
-    } catch (err) { logger.debug('[CFO] Scalp exit monitor error:', err); }
+    } catch (err) { logger.debug('[CFO] Position exit monitor error:', err); }
   }
 
   // ── Gas check ─────────────────────────────────────────────────────

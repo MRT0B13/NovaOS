@@ -510,6 +510,51 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
       `conviction=${(conviction * 100).toFixed(0)}%: order ${orderId}`,
     );
 
+    // ── Place native HL TP/SL trigger orders on-exchange ──────────
+    // These fire even if our monitor is down. The 2-min monitor handles
+    // trailing stops & partial profit; these are the safety net.
+    try {
+      const slPrice = isLong
+        ? avgPrice * (1 - stopLossPct / 100)
+        : avgPrice * (1 + stopLossPct / 100);
+      const tpPrice = isLong
+        ? avgPrice * (1 + takeProfitPct / 100)
+        : avgPrice * (1 - takeProfitPct / 100);
+
+      const slPriceFmt = formatLimitPrice(slPrice, szDecimals);
+      const tpPriceFmt = formatLimitPrice(tpPrice, szDecimals);
+
+      await exchange.order({
+        orders: [
+          {
+            a: assetIdx,
+            b: !isLong,        // opposite side to close
+            p: slPriceFmt,     // for market trigger, p = triggerPx
+            s: sizeFmt.toString(),
+            r: true,           // reduce-only
+            t: { trigger: { isMarket: true, triggerPx: slPriceFmt, tpsl: 'sl' as const } },
+          },
+          {
+            a: assetIdx,
+            b: !isLong,
+            p: tpPriceFmt,
+            s: sizeFmt.toString(),
+            r: true,
+            t: { trigger: { isMarket: true, triggerPx: tpPriceFmt, tpsl: 'tp' as const } },
+          },
+        ],
+        grouping: 'positionTpsl',  // adjusts proportionally with position size
+      });
+
+      logger.info(
+        `[Hyperliquid] ${coin}-PERP native TP/SL set: ` +
+        `SL=$${slPriceFmt} (${stopLossPct}%), TP=$${tpPriceFmt} (${takeProfitPct}%)`,
+      );
+    } catch (tpslErr) {
+      // Non-fatal — the 2-min monitor will still enforce SL/TP via polling
+      logger.warn(`[Hyperliquid] Failed to place native TP/SL for ${coin}-PERP:`, tpslErr);
+    }
+
     return { success: true, orderId, avgPrice };
   } catch (err: any) {
     const msg = String(err?.message ?? err ?? '');
@@ -657,6 +702,36 @@ export async function cancelAllOpenOrders(): Promise<{ cancelled: number; errors
   }
   if (cancelled > 0) logger.info(`[Hyperliquid] Cancelled ${cancelled} stale open orders`);
   return { cancelled, errors };
+}
+
+/**
+ * Cancel all trigger (TP/SL) orders for a specific coin.
+ * Call this when the monitor closes a position to prevent stale triggers
+ * from firing on a future position in the same coin.
+ */
+export async function cancelTriggerOrdersForCoin(coin: string): Promise<void> {
+  try {
+    const { exchange, info, wallet } = await loadHL();
+    const openOrders = await info.openOrders({ user: wallet.address });
+    if (!openOrders || openOrders.length === 0) return;
+
+    const meta = await info.meta();
+    const universe = (meta as any).universe ?? [];
+    const assetIdx = universe.findIndex((u: any) => u.name === coin);
+    if (assetIdx < 0) return;
+
+    const coinOrders = openOrders.filter((o: any) => o.coin === coin);
+    for (const o of coinOrders) {
+      try {
+        await exchange.cancel({ cancels: [{ a: assetIdx, o: o.oid }] });
+        logger.info(`[Hyperliquid] Cancelled trigger order ${o.oid} for ${coin}`);
+      } catch (e) {
+        logger.debug(`[Hyperliquid] Failed to cancel order ${o.oid} for ${coin}: ${(e as Error).message}`);
+      }
+    }
+  } catch (err) {
+    logger.debug(`[Hyperliquid] cancelTriggerOrdersForCoin(${coin}) error:`, err);
+  }
 }
 
 /**

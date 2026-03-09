@@ -45,15 +45,59 @@ import type { TradeStyle, MTFSignal } from './hlTechnicalAnalysis.ts';
 
 // ============================================================================
 // TA trade style tracker (in-memory — survives across cycles but not restarts)
-// Key: "COIN-SIDE" e.g. "BTC-LONG", Value: { style, openedAt }
+// Key: "COIN-SIDE" e.g. "BTC-LONG", Value: { style, openedAt, ... }
 // Used by exit logic to apply style-specific SL/TP and hold-duration limits.
+// Also tracks dynamic position management state (trailing stop, partial TP).
 // ============================================================================
-const _perpTradeStyles = new Map<string, { style: TradeStyle; openedAt: string }>();
+interface TrackedPerpStyle {
+  style: TradeStyle;
+  openedAt: string;
+  /** Highest margin P&L % seen so far (for trailing stop) */
+  highWaterMarkPct: number;
+  /** Dynamic SL — starts at entry SL, moves to BE then trails */
+  effectiveSLPct: number;
+  /** Whether SL has been moved to breakeven (triggered at 50% of TP) */
+  movedToBreakeven: boolean;
+  /** Whether 50% partial profit has been taken (at 66% of TP) */
+  partialTaken: boolean;
+  /** Original entry SL from StyleConfig */
+  entrySLPct: number;
+  /** Original entry TP from StyleConfig */
+  entryTPPct: number;
+  /** Direction of the last SL-close on this coin (for same-direction lockout) */
+  lastSLDirection?: 'LONG' | 'SHORT';
+  /** Timestamp of the last SL-close on this coin */
+  lastSLAt?: number;
+}
+
+const _perpTradeStyles = new Map<string, TrackedPerpStyle>();
 
 /** Expose tracked trade styles for the lightweight scalp exit monitor in cfo.ts */
-export function getTrackedTradeStyles(): Map<string, { style: TradeStyle; openedAt: string }> {
+export function getTrackedTradeStyles(): Map<string, TrackedPerpStyle> {
   return new Map(_perpTradeStyles);
 }
+
+/** Update a tracked position's dynamic state (called from scalp monitor) */
+export function updateTradeStyle(key: string, update: Partial<TrackedPerpStyle>): void {
+  const existing = _perpTradeStyles.get(key);
+  if (existing) {
+    Object.assign(existing, update);
+  }
+}
+
+/** Record an SL-close for same-direction lockout */
+export function recordSLClose(coin: string, side: 'LONG' | 'SHORT'): void {
+  _slLockouts.set(`${coin}-${side}`, Date.now());
+}
+
+/** Check if a coin+side is locked out after an SL close */
+export function isSLLockedOut(coin: string, side: 'LONG' | 'SHORT', lockoutMs: number): boolean {
+  const lastSL = _slLockouts.get(`${coin}-${side}`);
+  if (!lastSL) return false;
+  return (Date.now() - lastSL) < lockoutMs;
+}
+
+const _slLockouts = new Map<string, number>();
 
 /** Remove a tracked trade style after the position is closed (from scalp monitor or external close) */
 export function clearTradeStyle(key: string): void {
@@ -3212,7 +3256,17 @@ export async function generateDecisions(
   // NOT tied to wallet balances — uses HL equity/margin for sizing.
   // Completely independent of the hedge logic in Section B.
   // ──────────────────────────────────────────────────────────────────────────
-  if (config.hlPerpTradingEnabled && env.hyperliquidEnabled) {
+
+  // ── Strategy gate: skip entire Section M if HL perp is degraded ──────────
+  const hlPerpGated = isStrategyGated('hyperliquid');
+  const hlPerpScalpGated = isStrategyGated('hl_perp_scalp');
+  const hlPerpDayGated = isStrategyGated('hl_perp_day');
+  const hlPerpSwingGated = isStrategyGated('hl_perp_swing');
+  if (hlPerpGated) {
+    logger.warn('[CFO:Decision] Section M: HL perp trading GATED by learning engine — skipping all perp decisions');
+  }
+
+  if (config.hlPerpTradingEnabled && env.hyperliquidEnabled && !hlPerpGated) {
     // Build dynamic coin universe: configured base list + any coin that is:
     //   1. Tracked by the analyst (has price data)
     //   2. Listed on Hyperliquid (tradeable as perp)
@@ -3444,6 +3498,11 @@ export async function generateDecisions(
         for (const taSig of taRawSignals) {
           if (taSig.bias === 'NEUTRAL') { taNeutralCount++; continue; }
 
+          // ── Per-style strategy gate — skip styles the learning engine has paused ──
+          if (taSig.style === 'scalp' && hlPerpScalpGated) { taStyleConvRejects++; continue; }
+          if (taSig.style === 'day'   && hlPerpDayGated)   { taStyleConvRejects++; continue; }
+          if (taSig.style === 'swing' && hlPerpSwingGated) { taStyleConvRejects++; continue; }
+
           // ── Danger market gate — skip new longs in danger mode ────────
           if (intel.marketCondition === 'danger' && taSig.bias === 'LONG') { taDangerRejects++; continue; }
 
@@ -3537,6 +3596,20 @@ export async function generateDecisions(
       if (!checkCooldown(cooldownKey, cooldownMs)) {
         if (sig.tradeStyle) taRejects.cooldown++;
         continue;
+      }
+
+      // ── Same-direction SL lockout ─────────────────────────────────
+      // If a position on this coin+side hit SL recently, don't re-enter the
+      // same direction. The TA indicators that generated the original signal are
+      // likely unchanged — we'd just re-enter the same losing trade.
+      // Lockout = 3× the max hold period for the trade style.
+      {
+        const holdHours = sig.taMaxHoldHours ?? 24;
+        const lockoutMs = holdHours * 3 * 3600_000; // 3× hold period
+        if (isSLLockedOut(sig.coin, sig.side, lockoutMs)) {
+          if (sig.tradeStyle) taRejects.cooldown++;
+          continue;
+        }
       }
 
       // Already have a position in this coin? Skip (don't double up)
@@ -5010,9 +5083,17 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
 
           // Track trade style for exit logic (style-specific SL/TP + hold limits)
           if (tradeStyle) {
+            const ta = await import('./hlTechnicalAnalysis.ts');
+            const sc = ta.getStyleConfig(tradeStyle as TradeStyle);
             _perpTradeStyles.set(`${coin}-${side}`, {
               style: tradeStyle as TradeStyle,
               openedAt: new Date().toISOString(),
+              highWaterMarkPct: 0,
+              effectiveSLPct: sc.stopLossPct,
+              movedToBreakeven: false,
+              partialTaken: false,
+              entrySLPct: sc.stopLossPct,
+              entryTPPct: sc.takeProfitPct,
             });
             logger.debug(`[CFO:Decision] Tracking TA style: ${coin}-${side} → ${tradeStyle}`);
           }
