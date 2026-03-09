@@ -297,7 +297,7 @@ export function getCFOEnv(bust = false): CFOEnv {
     hyperliquidApiWalletKey: process.env.CFO_HYPERLIQUID_API_WALLET_KEY,
     hyperliquidTestnet: process.env.CFO_HYPERLIQUID_TESTNET === 'true',
     maxHyperliquidUsd: Number(process.env.CFO_MAX_HYPERLIQUID_USD ?? 500),
-    maxHyperliquidLeverage: Math.min(5, Number(process.env.CFO_MAX_HYPERLIQUID_LEVERAGE ?? 3)),
+    maxHyperliquidLeverage: Math.min(10, Number(process.env.CFO_MAX_HYPERLIQUID_LEVERAGE ?? 3)),
     hlHedgeCoins: (process.env.CFO_HL_HEDGE_COINS ?? '')
       .split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
     hlHedgeMinExposureUsd: Number(process.env.CFO_HL_HEDGE_MIN_EXPOSURE_USD ?? 50),
@@ -309,7 +309,7 @@ export function getCFOEnv(bust = false): CFOEnv {
     hlPerpMaxPositionUsd: Number(process.env.CFO_HL_PERP_MAX_POSITION_USD ?? 100),
     hlPerpMaxTotalUsd: Number(process.env.CFO_HL_PERP_MAX_TOTAL_USD ?? 300),
     hlPerpMaxPositions: Number(process.env.CFO_HL_PERP_MAX_POSITIONS ?? 3),
-    hlPerpDefaultLeverage: Math.min(5, Number(process.env.CFO_HL_PERP_DEFAULT_LEVERAGE ?? 2)),
+    hlPerpDefaultLeverage: Math.min(10, Number(process.env.CFO_HL_PERP_DEFAULT_LEVERAGE ?? 2)),
     hlPerpStopLossPct: Number(process.env.CFO_HL_PERP_STOP_LOSS_PCT ?? 5),
     hlPerpTakeProfitPct: Number(process.env.CFO_HL_PERP_TAKE_PROFIT_PCT ?? 10),
     hlPerpCooldownMs: Number(process.env.CFO_HL_PERP_COOLDOWN_HOURS ?? 4) * 3600_000,

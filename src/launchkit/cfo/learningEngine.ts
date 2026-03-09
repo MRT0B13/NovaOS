@@ -752,16 +752,18 @@ function computeAdaptiveParams(
     }
 
     // Graduated leverage bias: proportional to avg PnL severity
+    // Range: -2 to +2 (meaningful with env max 10)
     if (hlSt.avgPnlUsd < 0) {
-      hlLevBias = Math.max(-0.5, hlSt.avgPnlUsd * 0.1); // e.g. -$0.49 → -0.049, -$5 → -0.5
+      hlLevBias = Math.max(-2, hlSt.avgPnlUsd * 0.2); // e.g. -$5 → -1.0, -$10 → -2.0
     } else if (hlSt.avgPnlUsd > 5 && hlSt.sharpeApprox > 0.5) {
-      hlLevBias = 0.3;
+      // Graduated upward bias: Sharpe 0.5 → +0.5, Sharpe 1.0 → +1.0, cap +2
+      hlLevBias = Math.min(2, hlSt.sharpeApprox);
     }
 
     // Recent regime shift
     if (hlSt.recentAvgPnlUsd < 0 && hlSt.avgPnlUsd > 0) {
       hlStopMult *= 0.8;
-      hlLevBias -= 0.3;
+      hlLevBias -= 1; // stronger pullback during regime shift
     }
 
     // Hedge target: if hedging consistently loses money, reduce target
@@ -853,16 +855,21 @@ function computeAdaptiveParams(
     }
 
     // Leverage multiplier: scalps with tight SL benefit from higher leverage.
-    // If winning with a style, lean into higher leverage; if losing, reduce.
-    if (styleSt.winRate > 0.55 && styleSt.sharpeApprox > 0.3 && styleSt.totalPnlUsd > 0) {
-      // Profitable style — allow higher leverage (up to 1.5× base)
-      perpStyleLevMults[style] = 1.3;
+    // Learning-driven: ramp leverage proportionally to edge quality.
+    // Range: 0.4× (cutting bad style hard) to 2.0× (double leverage for strong edge).
+    if (styleSt.winRate > 0.6 && styleSt.sharpeApprox > 0.8 && styleSt.totalPnlUsd > 20) {
+      // Strong consistent edge — ramp leverage aggressively (2.0× base)
+      perpStyleLevMults[style] = 2.0;
+    } else if (styleSt.winRate > 0.55 && styleSt.sharpeApprox > 0.3 && styleSt.totalPnlUsd > 0) {
+      // Good edge — graduated increase based on Sharpe quality
+      // Sharpe 0.3 → 1.3×, Sharpe 0.6 → 1.6×, Sharpe 1.0+ → 1.8×
+      perpStyleLevMults[style] = Math.min(1.8, 1.0 + styleSt.sharpeApprox);
     } else if (styleSt.winRate < 0.35 && styleSt.totalPnlUsd < 0) {
       // Losing style — reduce leverage
-      perpStyleLevMults[style] = 0.7;
+      perpStyleLevMults[style] = 0.5;
     } else if (styleSt.avgPnlUsd < -5) {
-      // Significant avg loss — cut leverage
-      perpStyleLevMults[style] = 0.6;
+      // Significant avg loss — cut leverage hard
+      perpStyleLevMults[style] = 0.4;
     }
 
     // Regime shift within style

@@ -1804,9 +1804,9 @@ export async function generateDecisions(
 
         // Gate: need enough HL margin to open the position (size / leverage)
         // If full hedge doesn't fit, scale down to what margin supports (instead of skipping)
-        // Apply learned leverage bias: negative = reduce, positive = increase (clamped)
-        const learnedMaxLev = Math.max(1, Math.min(5, env.maxHyperliquidLeverage + applyAdaptive(0, learned.hlLeverageBias, conf)));
-        const leverage = Math.min(2, learnedMaxLev);
+        // Apply learned leverage bias: negative = reduce, positive = increase (clamped to env max)
+        const learnedMaxLev = Math.max(1, Math.min(env.maxHyperliquidLeverage, env.maxHyperliquidLeverage + applyAdaptive(0, learned.hlLeverageBias, conf)));
+        const leverage = learnedMaxLev;
         const marginRequired = capped / leverage;
         if (state.hlAvailableMargin < marginRequired) {
           // Scale hedge down to what we can afford: affordableSize = margin × leverage × 80% (buffer)
@@ -3919,8 +3919,27 @@ export async function generateDecisions(
         }
       }
 
-      // ── Leverage: TA signals carry per-style leverage, sentiment uses default ──
-      const effectiveLeverage = sig.taLeverage ?? env.hlPerpDefaultLeverage;
+      // ── Leverage: conviction-gated with per-style learned multiplier ──
+      // Base leverage from TA style or default, then scale by conviction:
+      //   conviction < 0.5  → floor at 2x (conservative)
+      //   conviction 0.5-0.7 → use base learned leverage
+      //   conviction > 0.7  → allow up to base × 1.5 (capped at env max)
+      // This lets the engine ramp leverage only on high-conviction setups.
+      const baseLeverage = sig.taLeverage ?? env.hlPerpDefaultLeverage;
+      let effectiveLeverage: number;
+      if (sig.conviction >= 0.7) {
+        // High conviction: allow up to 1.5× the learned leverage
+        effectiveLeverage = Math.min(
+          Math.round(baseLeverage * 1.5),
+          env.maxHyperliquidLeverage,
+        );
+      } else if (sig.conviction >= 0.5) {
+        // Medium conviction: use learned leverage as-is
+        effectiveLeverage = baseLeverage;
+      } else {
+        // Low conviction: cap at 2x regardless of learned value
+        effectiveLeverage = Math.min(baseLeverage, 2);
+      }
 
       // ── ATR-based dynamic stop-loss ──────────────────────────────────────
       // Instead of fixed % SL per style, use ATR to set a volatility-aware SL.
