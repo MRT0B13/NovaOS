@@ -4620,23 +4620,46 @@ export async function generateDecisions(
         const maxAccum = env.hlSpotAccumulationMaxPerCoin - existingValueUsd;
         const accumStopMult = learned.hlSpotStyleStopMultipliers?.accumulation ?? learnedSpotStopMult;
         const effectiveAccumSL = applyAdaptive(env.hlSpotStopLossPct * 1.5, accumStopMult, conf); // wider SL for accumulation
-        const baseDcaSize = env.hlSpotMaxPositionUsd * 0.5; // $100 default base
-        const convictionScaled = baseDcaSize * accumConviction; // 30% conviction → $30
+        
+        // More conservative DCA sizing based on available liquidity
+        const portfolioBasedDCA = totalEquity * 0.02; // 2% of portfolio as base DCA size
+        const configBasedDCA = env.hlSpotMaxPositionUsd * 0.25; // 25% of max position (was 50%)
+        const baseDcaSize = Math.min(portfolioBasedDCA, configBasedDCA); // use smaller of the two
+        
+        const convictionScaled = baseDcaSize * accumConviction;
         const portfolioCap = totalEquity * 0.05; // max 5% of portfolio per DCA entry
+        
+        // Check estimated available liquidity (spot USDC + available perp margin - reserve)
+        const hl = await import('./hyperliquidService.ts');
+        const spotUsdc = await hl.getSpotUsdcBalance();
+        const perpSummary = await hl.getAccountSummary();
+        const minReserve = Math.max(perpSummary.equity * 0.05, 5);
+        const availableLiquidity = spotUsdc + Math.max(0, perpSummary.availableMargin - minReserve);
+        const liquidityCap = availableLiquidity * 0.9; // use at most 90% of available
+        
         const sizeUsd = Math.min(
           maxAccum,
           applyAdaptive(convictionScaled, accumSizeMult, conf),
           portfolioCap,
           effectiveSpotMaxTotalUsd - spotTotalUsd,
+          liquidityCap,
         );
-        if (sizeUsd < 10) continue;
+        if (sizeUsd < 10) {
+          logger.debug(
+            `[CFO:Decision] Skip ${coin} accumulation: size $${sizeUsd.toFixed(2)} too small ` +
+            `(base=$${baseDcaSize.toFixed(0)}, conviction=${(accumConviction*100).toFixed(0)}%, ` +
+            `liquidity=$${availableLiquidity.toFixed(0)})`,
+          );
+          continue;
+        }
 
         const d: Decision = {
           type: 'HL_SPOT_BUY',
           reasoning:
             `Treasury accumulation BUY ${coin}: ${accumReasons.join(', ')}. ` +
             `Conviction ${(accumConviction * 100).toFixed(0)}%, DCA $${sizeUsd.toFixed(0)} ` +
-            `(held: $${existingValueUsd.toFixed(0)}/${env.hlSpotAccumulationMaxPerCoin}).`,
+            `(held: $${existingValueUsd.toFixed(0)}/${env.hlSpotAccumulationMaxPerCoin}, ` +
+            `liquidity: $${availableLiquidity.toFixed(0)} available).`,
           params: {
             coin,
             side: 'BUY',

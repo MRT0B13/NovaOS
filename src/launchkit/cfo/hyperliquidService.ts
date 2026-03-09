@@ -1159,13 +1159,29 @@ export async function openSpotTrade(params: SpotTradeParams): Promise<HLOrderRes
         // Try auto-transfer from perp account
         const shortfall = sizeUsd * 1.005 - spotUsdc;
         const perp = await getAccountSummary();
-        if (perp.availableMargin >= shortfall + 10) { // keep $10 reserve in perp
+        
+        // Dynamic reserve: keep at least 5% of equity or $5, whichever is larger
+        const minReserve = Math.max(perp.equity * 0.05, 5);
+        const canTransfer = Math.max(0, perp.availableMargin - minReserve);
+        
+        logger.info(
+          `[HL:SpotBuy] Need $${shortfall.toFixed(2)} transfer: ` +
+          `spot USDC=$${spotUsdc.toFixed(2)}, perp available=$${perp.availableMargin.toFixed(2)}, ` +
+          `perp equity=$${perp.equity.toFixed(2)}, min reserve=$${minReserve.toFixed(2)}, ` +
+          `can transfer=$${canTransfer.toFixed(2)}`,
+        );
+        
+        if (canTransfer >= shortfall) {
           const transferred = await transferUsdcBetweenAccounts(shortfall, false); // perp→spot
           if (!transferred) {
             return { success: false, error: `Insufficient spot USDC ($${spotUsdc.toFixed(2)}) and transfer failed` };
           }
         } else {
-          return { success: false, error: `Insufficient spot USDC ($${spotUsdc.toFixed(2)}) and perp margin too low to transfer` };
+          return { 
+            success: false, 
+            error: `Insufficient spot USDC ($${spotUsdc.toFixed(2)}) and perp margin too low ` +
+                   `(available=$${perp.availableMargin.toFixed(2)}, need=$${shortfall.toFixed(2)}+$${minReserve.toFixed(2)} reserve)`,
+          };
         }
       }
     }
