@@ -172,30 +172,33 @@ async function loadHL() {
 
 class RateLimiter {
   private queue: Array<() => void> = [];
+  private draining = false;
   private lastRequestTime = 0;
-  private readonly minDelay = 300; // 300ms between requests = max ~3/second
+  private readonly minDelay = 500; // 500ms between requests = max 2/second
   
   async throttle(): Promise<void> {
     return new Promise(resolve => {
       this.queue.push(resolve);
-      this.processQueue();
+      // Only start drain loop if not already running
+      if (!this.draining) this.drain();
     });
   }
   
-  private processQueue(): void {
-    if (this.queue.length === 0) return;
+  private drain(): void {
+    if (this.queue.length === 0) {
+      this.draining = false;
+      return;
+    }
+    this.draining = true;
     
     const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
-    const delay = Math.max(0, this.minDelay - timeSinceLastRequest);
+    const delay = Math.max(0, this.minDelay - (now - this.lastRequestTime));
     
     setTimeout(() => {
+      this.lastRequestTime = Date.now();
       const resolver = this.queue.shift();
-      if (resolver) {
-        this.lastRequestTime = Date.now();
-        resolver();
-        this.processQueue();
-      }
+      if (resolver) resolver();
+      this.drain(); // process next item in queue
     }, delay);
   }
 }
