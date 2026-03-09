@@ -600,6 +600,11 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
       logger.warn(`[Hyperliquid] ${side} ${coin}-PERP skipped — insufficient margin`);
       return { success: false, error: 'Insufficient margin' };
     }
+    // OI cap — HL rejects new positions when the exchange's OI limit is reached
+    if (msg.toLowerCase().includes('open interest') && msg.toLowerCase().includes('cap')) {
+      markOICapped(coin);
+      return { success: false, error: `${coin} open interest at cap` };
+    }
     logger.error(`[Hyperliquid] openPerpTrade(${side} ${coin}) error:`, err);
     return { success: false, error: msg };
   }
