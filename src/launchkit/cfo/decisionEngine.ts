@@ -4123,7 +4123,8 @@ export async function generateDecisions(
       }
     }
 
-    const spotCoins = [...spotUniverse];
+    // Cap universe to avoid excessive TA scans (top coins by analyst data quality)
+    const spotCoins = [...spotUniverse].slice(0, 25);
     if (spotCoins.length > 0) {
       logger.debug(
         `[CFO:Decision] Section N: spot universe ${spotCoins.length} coins ` +
@@ -4196,147 +4197,60 @@ export async function generateDecisions(
     // ── Global gate: skip all spot entries if any blocker is active ──────
     const spotGlobalBlock = spotCircuitBreakerActive || spotDangerGate || spotHeatExceeded || spotDeadZone;
 
-    // ── Sub-phase 1: TA-driven spot BUY signals ──────────────────────────
+    // ── Sub-phase 1: TA-driven spot BUY signals (batched) ──────────────
     // Use day + swing TA styles (5m scalps are not viable for spot due to fees).
     // Spot only buys on bullish signals — no shorting spot.
+    // Pre-filter coins, then batch-scan via scoreCoins() (3-at-a-time parallelism)
+    // to avoid serial API calls that caused 300s timeouts.
     if (config.hlSpotTaEnabled && env.hlSpotTaEnabled && !spotGlobalBlock) {
       const ta = await import('./hlTechnicalAnalysis.ts');
 
+      // Pre-filter: coins eligible for at least day or swing style
+      const dayEligible = new Set<string>();
+      const swingEligible = new Set<string>();
       for (const coin of spotCoins) {
         if (hl.isHalted(coin)) continue;
-
-        // Check cooldown
-        if (!checkCooldown(`HL_SPOT_${coin}`, config.hlSpotCooldownMs)) continue;
-
-        // Skip if already holding this coin in spot
         if (spotPositions.some(b => b.coin === coin)) continue;
-
-        // SL lockout — don't re-buy a coin that recently hit spot SL
-        if (isSLLockedOut(coin, 'LONG', 48 * 3600_000)) continue; // 48h lockout for spot
-
-        // Position limits (account for pending spot decisions this cycle)
-        if ((spotPositions.length + spotDecisionCount) >= effectiveSpotMaxPositions) break;
-        if (spotTotalUsd >= effectiveSpotMaxTotalUsd) break;
-
-        // ── Cross-asset correlation guard ────────────────────────────
-        const coinSector = SPOT_SECTOR_MAP[coin];
-        if (coinSector) {
-          const sectorHeld = spotPositions.some(b => SPOT_SECTOR_MAP[b.coin] === coinSector);
-          const sectorPending = decisions.some(
-            d => d.type === 'HL_SPOT_BUY' && SPOT_SECTOR_MAP[d.params.coin] === coinSector,
-          );
-          if (sectorHeld || sectorPending) continue; // max 1 spot position per sector
+        // Day eligibility
+        if (checkCooldown(`HL_SPOT_${coin}`, config.hlSpotCooldownMs) && !isSLLockedOut(coin, 'LONG', 48 * 3600_000)) {
+          dayEligible.add(coin);
         }
-
-        // Run TA — day style (1h trigger, 1d filter) — best fit for spot holds
-        try {
-          const taResult = await ta.analyseMultiTimeframe(coin, 'day');
-          if (!taResult || taResult.bias === 'NEUTRAL') continue;
-
-          // Only BUY on bullish signals (no spot shorting)
-          if (taResult.bias !== 'LONG') continue;
-
-          // ── ADX regime filter — skip choppy markets ───────────────
-          if (taResult.regimeFiltered) {
-            logger.debug(`[CFO:Decision] Section N: ${coin} ADX regime filtered (choppy) — skip`);
-            continue;
-          }
-
-          let conviction = Math.min(1.0, taResult.conviction);
-
-          // ── Sentiment blending (same as perps) ────────────────────
-          // If scout/analyst sentiment agrees, boost conviction; if it disagrees, dampen.
-          const scoutFresh = intel.scoutReceivedAt && (Date.now() - intel.scoutReceivedAt) < 4 * 3600_000;
-          if (scoutFresh) {
-            if (intel.scoutBullish === true) {
-              conviction = Math.min(1.0, conviction + 0.05); // bullish scout boosts BUY
-            } else if (intel.scoutBullish === false) {
-              conviction *= 0.7; // bearish scout dampens BUY
-            }
-          }
-          if (intel.marketCondition === 'bearish') {
-            conviction *= 0.8; // bearish market dampens (but doesn't block like danger)
-          } else if (intel.marketCondition === 'bullish') {
-            conviction = Math.min(1.0, conviction + 0.05);
-          }
-
-          if (conviction < config.hlSpotMinConviction) continue;
-
-          // ── Learned conviction floor (raised if past trades at low conviction keep losing) ──
-          const dayConvFloor = learned.hlSpotStyleConvictionFloors?.day ?? learnedSpotConvFloor;
-          const effectiveDayConvFloor = dayConvFloor * conf;
-          if (effectiveDayConvFloor > 0 && conviction < effectiveDayConvFloor) continue;
-
-          // ── ATR-based dynamic sizing (scaled by learned size multiplier) ────
-          // Volatile coins → smaller position, stable coins → larger.
-          const daySizeMult = learned.hlSpotStyleSizeMultipliers?.day ?? learnedSpotSizeMult;
-          const maxPos = applyAdaptive(env.hlSpotMaxPositionUsd, daySizeMult, conf);
-          const remaining = effectiveSpotMaxTotalUsd - spotTotalUsd;
-          let sizeUsd: number;
-          const dayStopMult = learned.hlSpotStyleStopMultipliers?.day ?? learnedSpotStopMult;
-          const effectiveDaySL = applyAdaptive(env.hlSpotStopLossPct, dayStopMult, conf);
-          if (taResult.atrPct > 0) {
-            // Risk budget: conviction × maxPos × SL%
-            const riskBudget = maxPos * conviction * (effectiveDaySL / 100);
-            sizeUsd = Math.min(riskBudget / (effectiveDaySL / 100), maxPos, remaining);
-          } else {
-            sizeUsd = Math.min(maxPos * conviction, maxPos, remaining);
-          }
-          if (sizeUsd < 10) continue;
-
-          const d: Decision = {
-            type: 'HL_SPOT_BUY',
-            reasoning:
-              `TA-driven spot BUY ${coin}: ${taResult.bias} bias (conviction ${(conviction * 100).toFixed(0)}%). ` +
-              `$${sizeUsd.toFixed(0)} at spot price. ADX=${taResult.adxValue.toFixed(0)}, ATR=${(taResult.atrPct * 100).toFixed(1)}%. ` +
-              `Indicators: ${taResult.reasoning.slice(0, 100)}`,
-            params: {
-              coin,
-              side: 'BUY',
-              sizeUsd,
-              signal: 'ta-day',
-              conviction,
-              stopLossPct: effectiveDaySL,
-              takeProfitPct: env.hlSpotTakeProfitPct,
-              tradeStyle: 'day',
-              taConviction: conviction,
-              taBias: taResult.bias,
-              atrPct: taResult.atrPct,
-              adxValue: taResult.adxValue,
-            },
-            urgency: 'medium',
-            estimatedImpactUsd: sizeUsd,
-            intelUsed: ['ta', 'analyst'],
-            tier: 'AUTO',
-          };
-          d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
-          decisions.push(d);
-          spotDecisionCount++;
-          spotTotalUsd += sizeUsd; // running total for limit checks
-          logger.info(
-            `[CFO:Decision] Section N/TA: BUY ${coin}-SPOT $${sizeUsd.toFixed(0)} ` +
-            `(conviction ${(conviction * 100).toFixed(0)}%, ADX=${taResult.adxValue.toFixed(0)})`,
-          );
-        } catch (err) {
-          logger.debug(`[CFO:Decision] Section N: TA error for ${coin}:`, err);
+        // Swing eligibility (independent cooldown key, longer lockout)
+        if (!hlSpotSwingGated && checkCooldown(`HL_SPOT_SWING_${coin}`, config.hlSpotCooldownMs) && !isSLLockedOut(coin, 'LONG', 72 * 3600_000)) {
+          swingEligible.add(coin);
         }
       }
 
-      // ── Sub-phase 1b: TA-driven swing spot ──────────────────────────────
-      // Swing style (1d trigger, 1h confirm) for longer-term spot holds.
-      for (const coin of spotCoins) {
-        if (hl.isHalted(coin)) continue;
-        if (!checkCooldown(`HL_SPOT_SWING_${coin}`, config.hlSpotCooldownMs)) continue;
-        if (spotPositions.some(b => b.coin === coin)) continue;
-        if (isSLLockedOut(coin, 'LONG', 72 * 3600_000)) continue; // 72h lockout for swing
+      // Union of coins needing TA + deduplicate styles per coin
+      const taCoins = [...new Set([...dayEligible, ...swingEligible])];
+      const enabledSpotStyles: ('day' | 'swing')[] = [];
+      if (dayEligible.size > 0) enabledSpotStyles.push('day');
+      if (swingEligible.size > 0) enabledSpotStyles.push('swing');
+
+      // Batch TA scan — uses scoreCoins() which runs 3 coins in parallel
+      const spotTASignals = enabledSpotStyles.length > 0 && taCoins.length > 0
+        ? await ta.scoreCoins(taCoins, enabledSpotStyles)
+        : [];
+
+      logger.info(
+        `[CFO:Decision] Section N/TA: batch-scanned ${taCoins.length} coins × ${enabledSpotStyles.length} styles → ${spotTASignals.length} signals`,
+      );
+
+      // Process signals: day first, then swing (day takes priority per coin)
+      const daySignals = spotTASignals.filter(s => s.style === 'day');
+      const swingSignals = spotTASignals.filter(s => s.style === 'swing');
+      const acceptedCoins = new Set<string>(); // track coins already accepted (day takes priority)
+
+      // ── Day-style signals ─────────────────────────────────────────────
+      for (const taResult of daySignals) {
+        const coin = taResult.coin;
+        if (!dayEligible.has(coin)) continue;
+        if (taResult.bias !== 'LONG') continue;
+        if (taResult.regimeFiltered) continue;
         if ((spotPositions.length + spotDecisionCount) >= effectiveSpotMaxPositions) break;
         if (spotTotalUsd >= effectiveSpotMaxTotalUsd) break;
-        // Skip if we already generated a day-style signal for this coin
-        if (decisions.some(d => d.type === 'HL_SPOT_BUY' && d.params.coin === coin)) continue;
-        // Skip if swing style gated by learning engine (poor past performance)
-        if (hlSpotSwingGated) continue;
 
-        // Cross-asset correlation guard for swing too
+        // Cross-asset correlation guard
         const coinSector = SPOT_SECTOR_MAP[coin];
         if (coinSector) {
           const sectorHeld = spotPositions.some(b => SPOT_SECTOR_MAP[b.coin] === coinSector);
@@ -4346,78 +4260,160 @@ export async function generateDecisions(
           if (sectorHeld || sectorPending) continue;
         }
 
-        try {
-          const taResult = await ta.analyseMultiTimeframe(coin, 'swing');
-          if (!taResult || taResult.bias !== 'LONG') continue;
-          if (taResult.regimeFiltered) continue; // ADX regime filter
+        let conviction = Math.min(1.0, taResult.conviction);
 
-          let conviction = Math.min(1.0, taResult.conviction);
-
-          // Sentiment blending for swing
-          const scoutFresh = intel.scoutReceivedAt && (Date.now() - intel.scoutReceivedAt) < 4 * 3600_000;
-          if (scoutFresh && intel.scoutBullish === false) conviction *= 0.7;
-          if (scoutFresh && intel.scoutBullish === true) conviction = Math.min(1.0, conviction + 0.05);
-          if (intel.marketCondition === 'bearish') conviction *= 0.8;
-          if (intel.marketCondition === 'bullish') conviction = Math.min(1.0, conviction + 0.05);
-
-          if (conviction < config.hlSpotMinConviction) continue;
-
-          // ── Learned conviction floor for swing ──
-          const swingConvFloor = learned.hlSpotStyleConvictionFloors?.swing ?? learnedSpotConvFloor;
-          const effectiveSwingConvFloor = swingConvFloor * conf;
-          if (effectiveSwingConvFloor > 0 && conviction < effectiveSwingConvFloor) continue;
-
-          // ATR-based sizing for swing (scaled by learned size multiplier)
-          const swingSizeMult = learned.hlSpotStyleSizeMultipliers?.swing ?? learnedSpotSizeMult;
-          const maxPos = applyAdaptive(env.hlSpotMaxPositionUsd, swingSizeMult, conf);
-          const remaining = effectiveSpotMaxTotalUsd - spotTotalUsd;
-          const swingStopMult = learned.hlSpotStyleStopMultipliers?.swing ?? learnedSpotStopMult;
-          const effectiveSwingSL = applyAdaptive(env.hlSpotStopLossPct, swingStopMult, conf);
-          let sizeUsd: number;
-          if (taResult.atrPct > 0) {
-            const riskBudget = maxPos * conviction * (effectiveSwingSL / 100);
-            sizeUsd = Math.min(riskBudget / (effectiveSwingSL / 100), maxPos, remaining);
-          } else {
-            sizeUsd = Math.min(maxPos * conviction, maxPos, remaining);
-          }
-          if (sizeUsd < 10) continue;
-
-          const d: Decision = {
-            type: 'HL_SPOT_BUY',
-            reasoning:
-              `Swing spot BUY ${coin}: ${taResult.bias} (conviction ${(conviction * 100).toFixed(0)}%). ` +
-              `$${sizeUsd.toFixed(0)} swing hold. ADX=${taResult.adxValue.toFixed(0)}, ATR=${(taResult.atrPct * 100).toFixed(1)}%. ` +
-              `Indicators: ${taResult.reasoning.slice(0, 100)}`,
-            params: {
-              coin,
-              side: 'BUY',
-              sizeUsd,
-              signal: 'ta-swing',
-              conviction,
-              stopLossPct: effectiveSwingSL,
-              takeProfitPct: env.hlSpotTakeProfitPct * 1.5, // wider TP for swing
-              tradeStyle: 'swing',
-              taConviction: conviction,
-              taBias: taResult.bias,
-              atrPct: taResult.atrPct,
-              adxValue: taResult.adxValue,
-            },
-            urgency: 'low',
-            estimatedImpactUsd: sizeUsd,
-            intelUsed: ['ta', 'analyst'],
-            tier: 'AUTO',
-          };
-          d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
-          decisions.push(d);
-          spotDecisionCount++;
-          spotTotalUsd += sizeUsd;
-          logger.info(
-            `[CFO:Decision] Section N/Swing: BUY ${coin}-SPOT $${sizeUsd.toFixed(0)} ` +
-            `(conviction ${(conviction * 100).toFixed(0)}%, ADX=${taResult.adxValue.toFixed(0)})`,
-          );
-        } catch (err) {
-          logger.debug(`[CFO:Decision] Section N: Swing TA error for ${coin}:`, err);
+        // Sentiment blending
+        const scoutFresh = intel.scoutReceivedAt && (Date.now() - intel.scoutReceivedAt) < 4 * 3600_000;
+        if (scoutFresh) {
+          if (intel.scoutBullish === true) conviction = Math.min(1.0, conviction + 0.05);
+          else if (intel.scoutBullish === false) conviction *= 0.7;
         }
+        if (intel.marketCondition === 'bearish') conviction *= 0.8;
+        else if (intel.marketCondition === 'bullish') conviction = Math.min(1.0, conviction + 0.05);
+
+        if (conviction < config.hlSpotMinConviction) continue;
+
+        // Learned conviction floor
+        const dayConvFloor = learned.hlSpotStyleConvictionFloors?.day ?? learnedSpotConvFloor;
+        const effectiveDayConvFloor = dayConvFloor * conf;
+        if (effectiveDayConvFloor > 0 && conviction < effectiveDayConvFloor) continue;
+
+        // ATR-based dynamic sizing (scaled by learned size multiplier)
+        const daySizeMult = learned.hlSpotStyleSizeMultipliers?.day ?? learnedSpotSizeMult;
+        const maxPos = applyAdaptive(env.hlSpotMaxPositionUsd, daySizeMult, conf);
+        const remaining = effectiveSpotMaxTotalUsd - spotTotalUsd;
+        const dayStopMult = learned.hlSpotStyleStopMultipliers?.day ?? learnedSpotStopMult;
+        const effectiveDaySL = applyAdaptive(env.hlSpotStopLossPct, dayStopMult, conf);
+        let sizeUsd: number;
+        if (taResult.atrPct > 0) {
+          const riskBudget = maxPos * conviction * (effectiveDaySL / 100);
+          sizeUsd = Math.min(riskBudget / (effectiveDaySL / 100), maxPos, remaining);
+        } else {
+          sizeUsd = Math.min(maxPos * conviction, maxPos, remaining);
+        }
+        if (sizeUsd < 10) continue;
+
+        const d: Decision = {
+          type: 'HL_SPOT_BUY',
+          reasoning:
+            `TA-driven spot BUY ${coin}: ${taResult.bias} bias (conviction ${(conviction * 100).toFixed(0)}%). ` +
+            `$${sizeUsd.toFixed(0)} at spot price. ADX=${taResult.adxValue.toFixed(0)}, ATR=${(taResult.atrPct * 100).toFixed(1)}%. ` +
+            `Indicators: ${taResult.reasoning.slice(0, 100)}`,
+          params: {
+            coin,
+            side: 'BUY',
+            sizeUsd,
+            signal: 'ta-day',
+            conviction,
+            stopLossPct: effectiveDaySL,
+            takeProfitPct: env.hlSpotTakeProfitPct,
+            tradeStyle: 'day',
+            taConviction: conviction,
+            taBias: taResult.bias,
+            atrPct: taResult.atrPct,
+            adxValue: taResult.adxValue,
+          },
+          urgency: 'medium',
+          estimatedImpactUsd: sizeUsd,
+          intelUsed: ['ta', 'analyst'],
+          tier: 'AUTO',
+        };
+        d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
+        decisions.push(d);
+        spotDecisionCount++;
+        spotTotalUsd += sizeUsd;
+        acceptedCoins.add(coin);
+        logger.info(
+          `[CFO:Decision] Section N/TA: BUY ${coin}-SPOT $${sizeUsd.toFixed(0)} ` +
+          `(conviction ${(conviction * 100).toFixed(0)}%, ADX=${taResult.adxValue.toFixed(0)})`,
+        );
+      }
+
+      // ── Swing-style signals ───────────────────────────────────────────
+      for (const taResult of swingSignals) {
+        const coin = taResult.coin;
+        if (!swingEligible.has(coin)) continue;
+        if (taResult.bias !== 'LONG') continue;
+        if (taResult.regimeFiltered) continue;
+        if (acceptedCoins.has(coin)) continue; // day signal already accepted for this coin
+        if ((spotPositions.length + spotDecisionCount) >= effectiveSpotMaxPositions) break;
+        if (spotTotalUsd >= effectiveSpotMaxTotalUsd) break;
+
+        // Cross-asset correlation guard
+        const coinSector = SPOT_SECTOR_MAP[coin];
+        if (coinSector) {
+          const sectorHeld = spotPositions.some(b => SPOT_SECTOR_MAP[b.coin] === coinSector);
+          const sectorPending = decisions.some(
+            d => d.type === 'HL_SPOT_BUY' && SPOT_SECTOR_MAP[d.params.coin] === coinSector,
+          );
+          if (sectorHeld || sectorPending) continue;
+        }
+
+        let conviction = Math.min(1.0, taResult.conviction);
+
+        // Sentiment blending for swing
+        const scoutFresh = intel.scoutReceivedAt && (Date.now() - intel.scoutReceivedAt) < 4 * 3600_000;
+        if (scoutFresh && intel.scoutBullish === false) conviction *= 0.7;
+        if (scoutFresh && intel.scoutBullish === true) conviction = Math.min(1.0, conviction + 0.05);
+        if (intel.marketCondition === 'bearish') conviction *= 0.8;
+        if (intel.marketCondition === 'bullish') conviction = Math.min(1.0, conviction + 0.05);
+
+        if (conviction < config.hlSpotMinConviction) continue;
+
+        // Learned conviction floor for swing
+        const swingConvFloor = learned.hlSpotStyleConvictionFloors?.swing ?? learnedSpotConvFloor;
+        const effectiveSwingConvFloor = swingConvFloor * conf;
+        if (effectiveSwingConvFloor > 0 && conviction < effectiveSwingConvFloor) continue;
+
+        // ATR-based sizing for swing (scaled by learned size multiplier)
+        const swingSizeMult = learned.hlSpotStyleSizeMultipliers?.swing ?? learnedSpotSizeMult;
+        const maxPos = applyAdaptive(env.hlSpotMaxPositionUsd, swingSizeMult, conf);
+        const remaining = effectiveSpotMaxTotalUsd - spotTotalUsd;
+        const swingStopMult = learned.hlSpotStyleStopMultipliers?.swing ?? learnedSpotStopMult;
+        const effectiveSwingSL = applyAdaptive(env.hlSpotStopLossPct, swingStopMult, conf);
+        let sizeUsd: number;
+        if (taResult.atrPct > 0) {
+          const riskBudget = maxPos * conviction * (effectiveSwingSL / 100);
+          sizeUsd = Math.min(riskBudget / (effectiveSwingSL / 100), maxPos, remaining);
+        } else {
+          sizeUsd = Math.min(maxPos * conviction, maxPos, remaining);
+        }
+        if (sizeUsd < 10) continue;
+
+        const d: Decision = {
+          type: 'HL_SPOT_BUY',
+          reasoning:
+            `Swing spot BUY ${coin}: ${taResult.bias} (conviction ${(conviction * 100).toFixed(0)}%). ` +
+            `$${sizeUsd.toFixed(0)} swing hold. ADX=${taResult.adxValue.toFixed(0)}, ATR=${(taResult.atrPct * 100).toFixed(1)}%. ` +
+            `Indicators: ${taResult.reasoning.slice(0, 100)}`,
+          params: {
+            coin,
+            side: 'BUY',
+            sizeUsd,
+            signal: 'ta-swing',
+            conviction,
+            stopLossPct: effectiveSwingSL,
+            takeProfitPct: env.hlSpotTakeProfitPct * 1.5, // wider TP for swing
+            tradeStyle: 'swing',
+            taConviction: conviction,
+            taBias: taResult.bias,
+            atrPct: taResult.atrPct,
+            adxValue: taResult.adxValue,
+          },
+          urgency: 'low',
+          estimatedImpactUsd: sizeUsd,
+          intelUsed: ['ta', 'analyst'],
+          tier: 'AUTO',
+        };
+        d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
+        decisions.push(d);
+        spotDecisionCount++;
+        spotTotalUsd += sizeUsd;
+        acceptedCoins.add(coin);
+        logger.info(
+          `[CFO:Decision] Section N/Swing: BUY ${coin}-SPOT $${sizeUsd.toFixed(0)} ` +
+          `(conviction ${(conviction * 100).toFixed(0)}%, ADX=${taResult.adxValue.toFixed(0)})`,
+        );
       }
     }
 
