@@ -601,7 +601,7 @@ export class CFOAgent extends BaseAgent {
               feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
               metadata: { coin, side, leverage, signal: p.signal, conviction: p.conviction, reasoning: d.reasoning },
             });
-            logger.info(`[CFO] Persisted ${d.type}: ${side} ${coin} $${sizeUsd} @ ${leverage}x (conviction=${p.conviction})`);
+            logger.info(`[CFO] Persisted ${d.type}: ${side} ${coin} $${Number(sizeUsd).toFixed(2)} @ ${leverage}x (conviction=${p.conviction})`);
             break;
           }
 
