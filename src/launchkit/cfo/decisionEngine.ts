@@ -5899,8 +5899,9 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           success: result.success,
           txId: result.tokenId ?? result.txHash,  // tokenId for NFPM ops; txHash stored separately below
           txHash: result.txHash,                   // actual on-chain tx hash for records
+          actualDeployUsd: result.actualDeployUsd, // real minted value (may be << deployUsd)
           error: result.error,
-        } as DecisionResult & { txHash?: string };
+        } as DecisionResult & { txHash?: string; actualDeployUsd?: number };
       }
 
       case 'KRYSTAL_LP_INCREASE': {
@@ -5933,8 +5934,9 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           success: result.success,
           txId: existingPosId,                     // keep same posId for record updates
           txHash: result.txHash,
+          actualDeployUsd: result.actualDeployUsd, // real value added
           error: result.error,
-        } as DecisionResult & { txHash?: string };
+        } as DecisionResult & { txHash?: string; actualDeployUsd?: number };
       }
 
       case 'KRYSTAL_LP_REBALANCE': {
@@ -5979,7 +5981,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
             success: true,
             txId: openResult.tokenId ?? openResult.txHash,
             txHash: openResult.txHash,
-          } as DecisionResult & { txHash?: string };
+            actualDeployUsd: openResult.actualDeployUsd,
+          } as DecisionResult & { txHash?: string; actualDeployUsd?: number };
         }
 
         // Rebalance partially succeeded: close worked but reopen failed.

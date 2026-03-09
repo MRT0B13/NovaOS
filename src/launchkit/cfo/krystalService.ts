@@ -2312,11 +2312,18 @@ export async function openEvmLpPosition(
     ]);
 
     if (allowance0 < amount0Desired) {
+      // Reset to 0 first for non-standard tokens (e.g. USDT on ETH mainnet)
+      if (allowance0 > BigInt(0)) {
+        try { await (await token0Signer.approve(nfpmAddr, 0)).wait(); } catch { /* non-fatal */ }
+      }
       const approveTx = await token0Signer.approve(nfpmAddr, ethers.MaxUint256);
       await approveTx.wait();
       logger.info(`[Krystal] Approved ${sortedToken0.symbol} for NFPM`);
     }
     if (allowance1 < amount1Desired) {
+      if (allowance1 > BigInt(0)) {
+        try { await (await token1Signer.approve(nfpmAddr, 0)).wait(); } catch { /* non-fatal */ }
+      }
       const approveTx = await token1Signer.approve(nfpmAddr, ethers.MaxUint256);
       await approveTx.wait();
       logger.info(`[Krystal] Approved ${sortedToken1.symbol} for NFPM`);

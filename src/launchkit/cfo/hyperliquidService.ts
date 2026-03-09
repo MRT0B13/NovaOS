@@ -174,7 +174,7 @@ class RateLimiter {
   private queue: Array<() => void> = [];
   private draining = false;
   private lastRequestTime = 0;
-  private readonly minDelay = 500; // 500ms between requests = max 2/second
+  private readonly minDelay = 750; // 750ms between requests — HL rate limits are per-IP
   
   async throttle(): Promise<void> {
     return new Promise(resolve => {

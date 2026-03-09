@@ -1324,6 +1324,7 @@ export class CFOAgent extends BaseAgent {
             // If not closeOnly, the executor reopened a new position — persist it
             if (!p.closeOnly && r.txId) {
               const pool = p.pool ?? {};
+              const rebalActualUsd = (r as any).actualDeployUsd ?? p.deployUsd ?? 0;
               await this.persistEvmLpPosition({
                 posId: r.txId,
                 chainId: pool.chainId ?? `${p.chainName}@${p.chainNumericId}`,
@@ -1333,7 +1334,7 @@ export class CFOAgent extends BaseAgent {
                 poolAddress: pool.poolAddress ?? '',
                 token0Symbol: p.token0Symbol ?? '?',
                 token1Symbol: p.token1Symbol ?? '?',
-                entryUsd: p.deployUsd ?? 0,
+                entryUsd: rebalActualUsd,
                 openedAt: Date.now(),
               });
             }

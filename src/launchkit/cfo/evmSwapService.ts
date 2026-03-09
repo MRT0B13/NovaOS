@@ -501,6 +501,13 @@ async function executeViaUniswap(
     const swapRouterAddr = getSwapRouter(chainId);
     const allowance = await inToken.allowance(wallet.address, swapRouterAddr);
     if (allowance < amountInRaw) {
+      // Reset allowance to 0 first for non-standard tokens (USDT on ETH mainnet)
+      if (allowance > BigInt(0)) {
+        try {
+          const resetTx = await inToken.approve(swapRouterAddr, 0);
+          await resetTx.wait();
+        } catch { /* non-fatal */ }
+      }
       const approveTx = await inToken.approve(swapRouterAddr, ethers.MaxUint256);
       await approveTx.wait();
       logger.info(`[EvmSwap] Approved ${tokenInAddr.slice(0, 10)} for SwapRouter02`);
@@ -587,6 +594,15 @@ async function executeViaLifiSwap(
       const allowance = await inToken.allowance(wallet.address, txReq.to);
       const amountInBigInt = BigInt(amountInRaw);
       if (allowance < amountInBigInt) {
+        // Some tokens (notably USDT on Ethereum mainnet) require resetting
+        // allowance to 0 before setting a new non-zero value.
+        if (allowance > BigInt(0)) {
+          try {
+            const resetTx = await (new ethers.Contract(tokenInAddr, ERC20_ABI, wallet)).approve(txReq.to, 0);
+            await resetTx.wait();
+            logger.info(`[EvmSwap:LiFi] Reset approval to 0 for ${tokenInAddr.slice(0, 10)}`);
+          } catch { /* non-fatal — standard tokens don't need this */ }
+        }
         const approveTx = await (new ethers.Contract(tokenInAddr, ERC20_ABI, wallet)).approve(txReq.to, ethers.MaxUint256);
         await approveTx.wait();
         logger.info(`[EvmSwap:LiFi] Approved ${tokenInAddr.slice(0, 10)} for LI.FI router`);
