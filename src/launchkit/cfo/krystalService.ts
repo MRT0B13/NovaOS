@@ -1914,6 +1914,64 @@ export async function openEvmLpPosition(
           }
         }
       }
+
+      // Phase 2a: Also check USDT balance (e.g. from failed rebalance zap, or bridge deposit)
+      // Treat USDT the same as USDC — swap into whichever pool tokens we're missing.
+      const usdtAddr = WELL_KNOWN_USDT[chainNumericId];
+      if (usdtAddr) {
+        const usdtBal = await bridge.getEvmTokenBalance(chainNumericId, usdtAddr, wallet.address);
+        if (usdtBal > 1) {
+          const isToken0Usdt = pool.token0.address.toLowerCase() === usdtAddr.toLowerCase();
+          const isToken1Usdt = pool.token1.address.toLowerCase() === usdtAddr.toLowerCase();
+
+          // Re-read balances after any USDC swaps above
+          [bal0, bal1] = await Promise.all([
+            token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+            token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+          ]);
+          const held0Usd2 = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+          const held1Usd2 = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+          const halfTarget2 = deployUsd / 2;
+          const needSwapUsdt0 = !isToken0Usdt && held0Usd2 < halfTarget2 * 0.3 && usdtBal > 0.5;
+          const needSwapUsdt1 = !isToken1Usdt && held1Usd2 < halfTarget2 * 0.3 && usdtBal > 0.5;
+
+          if (needSwapUsdt0 || needSwapUsdt1) {
+            const neededUsd0 = needSwapUsdt0 ? Math.max(0, halfTarget2 - held0Usd2) : 0;
+            const neededUsd1 = needSwapUsdt1 ? Math.max(0, halfTarget2 - held1Usd2) : 0;
+            const totalNeeded = neededUsd0 + neededUsd1;
+            const scale = totalNeeded > 0 && usdtBal < totalNeeded ? usdtBal / totalNeeded : 1;
+            const swapPortion0 = neededUsd0 * scale;
+            const swapPortion1 = neededUsd1 * scale;
+            logger.info(`[Krystal] Phase 2a (USDT): bal=$${usdtBal.toFixed(2)}, need0=$${neededUsd0.toFixed(2)}, need1=$${neededUsd1.toFixed(2)} (scale=${scale.toFixed(2)})`);
+
+            if (needSwapUsdt0 && swapPortion0 > 2) {
+              const quote0 = await swap.quoteEvmSwap(chainNumericId, usdtAddr, pool.token0.address, swapPortion0, pool.feeTier);
+              if (quote0 && quote0.priceImpactPct > 3) {
+                logger.warn(`[Krystal] Swap USDT→${pool.token0.symbol} price impact ${quote0.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+              } else if (!quote0) {
+                logger.warn(`[Krystal] Swap $${swapPortion0.toFixed(2)} USDT→${pool.token0.symbol}: no quote (chain ${chainNumericId})`);
+              } else {
+                const swapResult = await swap.executeEvmSwap(chainNumericId, usdtAddr, pool.token0.address, swapPortion0, pool.feeTier);
+                if (swapResult.success) logger.info(`[Krystal] Swapped $${swapPortion0.toFixed(2)} USDT → ${pool.token0.symbol}`);
+                else logger.warn(`[Krystal] Swap USDT→${pool.token0.symbol} failed: ${swapResult.error}`);
+              }
+            }
+
+            if (needSwapUsdt1 && swapPortion1 > 2) {
+              const quote1 = await swap.quoteEvmSwap(chainNumericId, usdtAddr, pool.token1.address, swapPortion1, pool.feeTier);
+              if (quote1 && quote1.priceImpactPct > 3) {
+                logger.warn(`[Krystal] Swap USDT→${pool.token1.symbol} price impact ${quote1.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+              } else if (!quote1) {
+                logger.warn(`[Krystal] Swap $${swapPortion1.toFixed(2)} USDT→${pool.token1.symbol}: no quote (chain ${chainNumericId})`);
+              } else {
+                const swapResult = await swap.executeEvmSwap(chainNumericId, usdtAddr, pool.token1.address, swapPortion1, pool.feeTier);
+                if (swapResult.success) logger.info(`[Krystal] Swapped $${swapPortion1.toFixed(2)} USDT → ${pool.token1.symbol}`);
+                else logger.warn(`[Krystal] Swap USDT→${pool.token1.symbol} failed: ${swapResult.error}`);
+              }
+            }
+          }
+        }
+      }
     } catch (err) {
       logger.warn('[Krystal] Pre-position swap failed (non-fatal):', err);
     }

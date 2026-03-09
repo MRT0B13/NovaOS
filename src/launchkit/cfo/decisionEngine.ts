@@ -5982,8 +5982,26 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           } as DecisionResult & { txHash?: string };
         }
 
+        // Rebalance partially succeeded: close worked but reopen failed.
+        // Tokens recovered from close are now idle in the EVM wallet.
+        // The next LP-open cycle will automatically pick them up and redeploy.
+        const reopenErr = openResult?.error ?? 'unknown';
+        logger.warn(
+          `[CFO] KRYSTAL_LP_REBALANCE: close OK but reopen FAILED for posId=${posId} — ` +
+          `error: ${reopenErr}. Recovered funds are idle in EVM wallet and will be ` +
+          `redeployed on next LP-open cycle.`,
+        );
+        try {
+          const { notifyAdminForce } = await import('../services/adminNotify.ts');
+          await notifyAdminForce(
+            `⚠️ LP Rebalance partial: closed posId=${posId.slice(0, 8)}… ` +
+            `but reopen failed (${reopenErr}). Funds idle in EVM wallet — ` +
+            `will auto-redeploy next cycle.`,
+          );
+        } catch { /* non-fatal */ }
+
         markDecision('KRYSTAL_LP_REBALANCE');
-        return { ...base, executed: true, success: true, txId: closeResult.txHash };
+        return { ...base, executed: true, success: true, txId: closeResult.txHash, error: `Reopen failed: ${reopenErr}` };
       }
 
       case 'KRYSTAL_LP_CLAIM_FEES': {
