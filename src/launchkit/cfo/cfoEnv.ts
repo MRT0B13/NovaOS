@@ -89,7 +89,7 @@ export interface CFOEnv {
   hlSpotTakeProfitPct: number;                   // software TP % (default: 15)
   hlSpotCooldownMs: number;                      // cooldown between spot entries per coin (default: 4h)
   hlSpotMinConviction: number;                   // min conviction to trade (0-1, default: 0.4)
-  hlSpotAccumulationCoins: string[];             // coins for treasury accumulation (default: BTC,ETH,SOL)
+  hlSpotAccumulationCoins: string[];             // coins for treasury accumulation (default: HYPE,PURR — HL native tokens)
   hlSpotAccumulationMinConviction: number;       // lower bar for accumulation (default: 0.25)
   hlSpotAccumulationMaxPerCoin: number;          // max accumulation per coin (default: 300)
 
@@ -336,7 +336,7 @@ export function getCFOEnv(bust = false): CFOEnv {
     hlSpotTakeProfitPct: Number(process.env.CFO_HL_SPOT_TAKE_PROFIT_PCT ?? 15),
     hlSpotCooldownMs: Number(process.env.CFO_HL_SPOT_COOLDOWN_HOURS ?? 4) * 3600_000,
     hlSpotMinConviction: Math.max(0, Math.min(1, Number(process.env.CFO_HL_SPOT_MIN_CONVICTION ?? 0.4))),
-    hlSpotAccumulationCoins: (process.env.CFO_HL_SPOT_ACCUMULATION_COINS ?? 'BTC,ETH,SOL')
+    hlSpotAccumulationCoins: (process.env.CFO_HL_SPOT_ACCUMULATION_COINS ?? 'HYPE,PURR')
       .split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
     hlSpotAccumulationMinConviction: Math.max(0, Math.min(1, Number(process.env.CFO_HL_SPOT_ACCUMULATION_MIN_CONVICTION ?? 0.25))),
     hlSpotAccumulationMaxPerCoin: Number(process.env.CFO_HL_SPOT_ACCUMULATION_MAX_PER_COIN ?? 300),

@@ -4081,7 +4081,6 @@ export async function generateDecisions(
 
   if (config.hlSpotTradingEnabled && env.hyperliquidEnabled && !hlSpotGated) {
     const hl = await import('./hyperliquidService.ts');
-    const hlSpotCoins = new Set(await hl.getHLSpotListedCoins());
 
     // Learned params for spot — mirrors how perps use learned.hlPerp*
     const learnedSpotSizeMult = learned.hlSpotSizeMultiplier ?? 1.0;
@@ -4091,15 +4090,20 @@ export async function generateDecisions(
     const effectiveSpotMaxPositions = Math.max(1, env.hlSpotMaxPositions + Math.round(learnedSpotMaxPosAdj));
     const effectiveSpotMaxTotalUsd = env.hlSpotMaxTotalUsd * applyAdaptive(1.0, learnedSpotSizeMult, conf);
 
-    // Build dynamic spot universe — reuse shared _hlDynamicCoins, filtered against HL spot listing
+    // Build dynamic spot universe from HL's own volume data.
+    // HL spot is exclusively HyperEVM native tokens (PURR, HYPE, WOW, VORTX, etc.)
+    // — NOT mainstream L1s like BTC/ETH/SOL. So we discover tradeable pairs from
+    // HL's spotMetaAndAssetCtxs (24h volume) rather than analyst data.
     const spotUniverse = new Set<string>();
 
-    // 1. Dynamic coins from analyst/trending/movers (same source as perps)
-    for (const c of _hlDynamicCoins) {
-      if (hlSpotCoins.has(c)) spotUniverse.add(c);
+    // 1. Top spot pairs by 24h volume (>$10k) — the primary discovery mechanism
+    const topSpotPairs = await hl.getTopSpotByVolume(10_000, 25);
+    for (const p of topSpotPairs) {
+      spotUniverse.add(p.coin);
     }
 
-    // 2. Accumulation coins are always included
+    // 2. Accumulation coins — always included if they exist on HL spot
+    const hlSpotCoins = new Set(await hl.getHLSpotListedCoins());
     for (const c of env.hlSpotAccumulationCoins) {
       if (hlSpotCoins.has(c)) spotUniverse.add(c);
     }
@@ -4111,17 +4115,7 @@ export async function generateDecisions(
       if (hlSpotCoins.has(b.coin)) spotUniverse.add(b.coin);
     }
 
-    // 4. Fallback: if analyst data yielded 0 dynamic coins, use HL's own top spot pairs
-    //    This ensures spot never scans 0 coins even when analyst is stale.
-    if (spotUniverse.size === 0) {
-      const topSpot = ['BTC', 'ETH', 'SOL', 'HYPE'];
-      for (const c of topSpot) {
-        if (hlSpotCoins.has(c)) spotUniverse.add(c);
-      }
-      logger.debug('[CFO:Decision] Section N: analyst data empty — using fallback spot coins');
-    }
-
-    // Cap universe to avoid excessive TA scans (top coins by analyst data quality)
+    // Cap universe to avoid excessive TA scans
     const spotCoins = [...spotUniverse].slice(0, 25);
     if (spotCoins.length > 0) {
       logger.debug(
@@ -4168,15 +4162,21 @@ export async function generateDecisions(
       );
     }
 
-    // ── Cross-asset sector map (same as perps) for correlation guard ─────
+    // ── Cross-asset sector map — includes HL spot native tokens ────────
     const SPOT_SECTOR_MAP: Record<string, string> = {
+      // HyperEVM native tokens (main HL spot ecosystem)
+      HYPE: 'hl-eco', PURR: 'hl-eco', HFUN: 'hl-eco', JEFF: 'hl-eco',
+      WOW: 'hl-defi', VORTX: 'hl-defi', PRFI: 'hl-defi',
+      USOL: 'hl-wrapped', IZEC: 'hl-wrapped', UETH: 'hl-wrapped', UBTC: 'hl-wrapped',
+      TRUMP: 'hl-meme', PEPE: 'hl-meme', FARTCOIN: 'hl-meme',
+      // Legacy L1 sector mapping (for any that may appear)
       SOL: 'sol-eco', JUP: 'sol-eco', WIF: 'sol-eco', PYTH: 'sol-eco',
       BONK: 'sol-eco', RAY: 'sol-eco', JTO: 'sol-eco', TNSR: 'sol-eco',
       W: 'sol-eco', RENDER: 'sol-eco', HNT: 'sol-eco',
       BTC: 'btc', ORDI: 'btc', SATS: 'btc',
       ETH: 'eth-eco', ARB: 'eth-eco', OP: 'eth-eco', STRK: 'eth-eco',
       MATIC: 'eth-eco', MANTA: 'eth-eco',
-      DOGE: 'meme', SHIB: 'meme', PEPE: 'meme', FLOKI: 'meme',
+      DOGE: 'meme', SHIB: 'meme', FLOKI: 'meme',
       AVAX: 'alt-l1', SUI: 'alt-l1', APT: 'alt-l1', SEI: 'alt-l1',
       NEAR: 'alt-l1', INJ: 'alt-l1', TIA: 'alt-l1',
     };

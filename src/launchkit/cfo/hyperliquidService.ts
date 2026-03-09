@@ -912,12 +912,18 @@ export async function getSpotPairs(): Promise<HLSpotPair[]> {
 
     const pairs: HLSpotPair[] = [];
     for (const u of universe) {
-      const name: string = u.name; // e.g. "PURR/USDC"
+      const name: string = u.name; // e.g. "PURR/USDC" or "@107" (most pairs use @N index format)
       const pairIndex: number = u.index;
       const baseTokenIdx: number = u.tokens?.[0];
+      const quoteTokenIdx: number = u.tokens?.[1] ?? 0;
       const baseToken = tokens.find((t: any) => t.index === baseTokenIdx);
+      if (!baseToken) continue; // skip pairs with unknown base token
+      // Only include USDC-quoted pairs (quoteTokenIdx 0 = USDC)
+      if (quoteTokenIdx !== 0) continue;
       const szDecimals: number = baseToken?.szDecimals ?? 2;
-      const coin = name.split('/')[0]; // "PURR"
+      // Use the token name (e.g. "HYPE", "PURR", "TRUMP") not the pair name (@107)
+      const coin: string = baseToken.name;
+      if (!coin || coin === 'USDC') continue;
       pairs.push({ name, coin, index: pairIndex, szDecimals });
     }
 
@@ -932,11 +938,74 @@ export async function getSpotPairs(): Promise<HLSpotPair[]> {
 
 /**
  * Get list of coins available for spot trading on HL.
- * Returns base coin symbols (e.g. ['PURR', 'HYPE', 'BTC']).
+ * Returns base coin symbols (e.g. ['PURR', 'HYPE', 'TRUMP']).
+ * Note: HL spot does NOT have BTC/ETH/SOL — only HyperEVM native tokens.
  */
 export async function getHLSpotListedCoins(): Promise<string[]> {
   const pairs = await getSpotPairs();
   return pairs.map(p => p.coin);
+}
+
+/**
+ * Get top spot pairs by 24h volume — the dynamic universe for spot trading.
+ * Fetches spotMetaAndAssetCtxs in one call, filters by minimum volume,
+ * and returns sorted by descending volume.
+ * Cached for 10 minutes (same as spotMeta).
+ */
+let _topSpotCache: { coin: string; vol24h: number; midPx: number }[] = [];
+let _topSpotCacheTs = 0;
+
+export async function getTopSpotByVolume(
+  minVol24h: number = 10_000,
+  maxCoins: number = 25,
+): Promise<{ coin: string; vol24h: number; midPx: number }[]> {
+  if (_topSpotCache.length > 0 && Date.now() - _topSpotCacheTs < SPOT_PAIRS_TTL_MS) {
+    return _topSpotCache.filter(s => s.vol24h >= minVol24h).slice(0, maxCoins);
+  }
+  try {
+    const { info } = await loadHL();
+    const data = await withRetry(
+      () => info.spotMetaAndAssetCtxs(),
+      'getTopSpotByVolume',
+    );
+    // Response: [spotMeta, assetCtx[]]
+    const raw = data as any;
+    const meta = Array.isArray(raw) ? raw[0] : raw;
+    const ctxs: any[] = Array.isArray(raw) ? raw[1] : [];
+    const tokens: Record<number, string> = {};
+    for (const t of (meta?.tokens ?? [])) tokens[t.index] = t.name;
+
+    const universe = meta?.universe ?? [];
+    const items: { coin: string; vol24h: number; midPx: number }[] = [];
+
+    for (let i = 0; i < Math.min(universe.length, ctxs.length); i++) {
+      const u = universe[i];
+      const ctx = ctxs[i];
+      const baseIdx = u.tokens?.[0];
+      const quoteIdx = u.tokens?.[1] ?? -1;
+      if (quoteIdx !== 0) continue; // only USDC pairs
+      const coin = tokens[baseIdx];
+      if (!coin || coin === 'USDC') continue;
+      const vol24h = parseFloat(ctx?.dayNtlVlm ?? '0');
+      const midPx = parseFloat(ctx?.midPx ?? '0');
+      if (midPx <= 0) continue; // skip dead pairs
+      items.push({ coin, vol24h, midPx });
+    }
+
+    items.sort((a, b) => b.vol24h - a.vol24h);
+    _topSpotCache = items;
+    _topSpotCacheTs = Date.now();
+
+    const filtered = items.filter(s => s.vol24h >= minVol24h).slice(0, maxCoins);
+    logger.debug(
+      `[Hyperliquid] Top spot by volume: ${filtered.length} pairs with >$${(minVol24h / 1000).toFixed(0)}k vol ` +
+      `(top: ${filtered.slice(0, 5).map(s => `${s.coin}=$${(s.vol24h / 1000).toFixed(0)}k`).join(', ')})`,
+    );
+    return filtered;
+  } catch (err) {
+    logger.warn('[Hyperliquid] getTopSpotByVolume error:', err);
+    return _topSpotCache.filter(s => s.vol24h >= minVol24h).slice(0, maxCoins);
+  }
 }
 
 /**
