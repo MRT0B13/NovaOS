@@ -3306,6 +3306,27 @@ export async function generateDecisions(
     }
   }
 
+  // ── Build dynamic HL coin universe (shared by Section M perps + Section N spot) ──
+  // Single pass: analyst prices + movers + trending + existing positions.
+  // Each section filters against its own listing (perp vs spot).
+  const _hlDynamicCoins = new Set<string>();
+  if (intel.analystPrices) {
+    for (const sym of Object.keys(intel.analystPrices)) {
+      const upper = sym.toUpperCase();
+      if (!['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) _hlDynamicCoins.add(upper);
+    }
+  }
+  if (intel.analystMovers) {
+    for (const m of intel.analystMovers) {
+      const upper = m.symbol.toUpperCase();
+      if (!['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) _hlDynamicCoins.add(upper);
+    }
+  }
+  if (intel.analystTrending) {
+    for (const t of intel.analystTrending) _hlDynamicCoins.add(t.toUpperCase());
+  }
+  for (const pos of state.hlPositions) _hlDynamicCoins.add(pos.coin);
+
   // ── Section M) Signal-driven HL Perp Trading ─────────────────────────────
   // Phase 1: Directional trades based on scout sentiment + analyst price momentum.
   // Phase 2: Multi-asset universe — score each eligible coin by composite signals.
@@ -3342,34 +3363,10 @@ export async function generateDecisions(
       if (hlListedCoins.has(c)) baseCoins.add(c);
     }
 
-    // 2. Analyst-tracked coins that are HL-listed
-    if (intel.analystPrices) {
-      for (const sym of Object.keys(intel.analystPrices)) {
-        const upper = sym.toUpperCase();
-        if (['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) continue;
-        if (hlListedCoins.has(upper)) baseCoins.add(upper);
-      }
+    // 2. Dynamic coins from analyst/trending/movers (shared universe)
+    for (const c of _hlDynamicCoins) {
+      if (hlListedCoins.has(c)) baseCoins.add(c);
     }
-
-    // 3. Analyst top movers — only if HL-listed
-    if (intel.analystMovers) {
-      for (const m of intel.analystMovers) {
-        const upper = m.symbol.toUpperCase();
-        if (['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) continue;
-        if (hlListedCoins.has(upper)) baseCoins.add(upper);
-      }
-    }
-
-    // 4. CoinGecko trending — only if HL-listed
-    if (intel.analystTrending) {
-      for (const t of intel.analystTrending) {
-        const upper = t.toUpperCase();
-        if (hlListedCoins.has(upper)) baseCoins.add(upper);
-      }
-    }
-
-    // Also ensure existing HL positions are scored (they're definitely listed)
-    for (const pos of state.hlPositions) baseCoins.add(pos.coin);
 
     const perpCoins = [...baseCoins];
     if (perpCoins.length > env.hlPerpTradingCoins.length) {
@@ -4094,43 +4091,34 @@ export async function generateDecisions(
     const effectiveSpotMaxPositions = Math.max(1, env.hlSpotMaxPositions + Math.round(learnedSpotMaxPosAdj));
     const effectiveSpotMaxTotalUsd = env.hlSpotMaxTotalUsd * applyAdaptive(1.0, learnedSpotSizeMult, conf);
 
-    // Build dynamic spot universe (same pattern as perps — base coins + analyst + trending + movers)
+    // Build dynamic spot universe — reuse shared _hlDynamicCoins, filtered against HL spot listing
     const spotUniverse = new Set<string>();
 
-    // 1. Configured base coins (guaranteed — like hlPerpTradingCoins for perps)
-    for (const c of env.hlSpotTradingCoins) {
+    // 1. Dynamic coins from analyst/trending/movers (same source as perps)
+    for (const c of _hlDynamicCoins) {
       if (hlSpotCoins.has(c)) spotUniverse.add(c);
     }
 
-    // 2. Accumulation coins are also valid spot targets
+    // 2. Accumulation coins are always included
     for (const c of env.hlSpotAccumulationCoins) {
       if (hlSpotCoins.has(c)) spotUniverse.add(c);
     }
 
-    // 3. Analyst-tracked coins that are spot-listed
-    if (intel.analystPrices) {
-      for (const sym of Object.keys(intel.analystPrices)) {
-        const upper = sym.toUpperCase();
-        if (['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) continue;
-        if (hlSpotCoins.has(upper)) spotUniverse.add(upper);
-      }
+    // 3. Existing spot holdings should always be scanned (for exit signals)
+    const spotBalances = await hl.getSpotBalances();
+    const spotPositions = spotBalances.filter(b => b.coin !== 'USDC' && b.valueUsd >= 5);
+    for (const b of spotPositions) {
+      if (hlSpotCoins.has(b.coin)) spotUniverse.add(b.coin);
     }
 
-    // 4. Analyst top movers
-    if (intel.analystMovers) {
-      for (const m of intel.analystMovers) {
-        const upper = m.symbol.toUpperCase();
-        if (['USDC', 'USDT', 'DAI', 'BUSD'].includes(upper)) continue;
-        if (hlSpotCoins.has(upper)) spotUniverse.add(upper);
+    // 4. Fallback: if analyst data yielded 0 dynamic coins, use HL's own top spot pairs
+    //    This ensures spot never scans 0 coins even when analyst is stale.
+    if (spotUniverse.size === 0) {
+      const topSpot = ['BTC', 'ETH', 'SOL', 'HYPE'];
+      for (const c of topSpot) {
+        if (hlSpotCoins.has(c)) spotUniverse.add(c);
       }
-    }
-
-    // 5. CoinGecko trending
-    if (intel.analystTrending) {
-      for (const t of intel.analystTrending) {
-        const upper = t.toUpperCase();
-        if (hlSpotCoins.has(upper)) spotUniverse.add(upper);
-      }
+      logger.debug('[CFO:Decision] Section N: analyst data empty — using fallback spot coins');
     }
 
     // Cap universe to avoid excessive TA scans (top coins by analyst data quality)
@@ -4142,9 +4130,6 @@ export async function generateDecisions(
       );
     }
 
-    // Get current spot balances
-    const spotBalances = await hl.getSpotBalances();
-    const spotPositions = spotBalances.filter(b => b.coin !== 'USDC' && b.valueUsd >= 5);
     let spotTotalUsd = spotPositions.reduce((s, b) => s + b.valueUsd, 0);
     let spotDecisionCount = 0; // track decisions this cycle for slot accounting
 
