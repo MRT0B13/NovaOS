@@ -325,10 +325,10 @@ export function getCFOEnv(bust = false): CFOEnv {
     hlPerpSwingEnabled: process.env.CFO_HL_PERP_SWING_ENABLE !== 'false',
     hlPerpScalpCooldownMs: Number(process.env.CFO_HL_PERP_SCALP_COOLDOWN_MIN ?? 10) * 60_000,
 
-    // Spot trading
-    hlSpotTradingEnabled: process.env.CFO_HL_SPOT_TRADING_ENABLE === 'true',
-    hlSpotTaEnabled: process.env.CFO_HL_SPOT_TA_ENABLE !== 'false',        // default ON when spot enabled
-    hlSpotAccumulationEnabled: process.env.CFO_HL_SPOT_ACCUMULATION_ENABLE === 'true',
+    // Spot trading (accept both ENABLE and ENABLED suffixes)
+    hlSpotTradingEnabled: (process.env.CFO_HL_SPOT_TRADING_ENABLED ?? process.env.CFO_HL_SPOT_TRADING_ENABLE) === 'true',
+    hlSpotTaEnabled: (process.env.CFO_HL_SPOT_TA_ENABLED ?? process.env.CFO_HL_SPOT_TA_ENABLE) !== 'false',        // default ON when spot enabled
+    hlSpotAccumulationEnabled: (process.env.CFO_HL_SPOT_ACCUMULATION_ENABLED ?? process.env.CFO_HL_SPOT_ACCUMULATION_ENABLE) === 'true',
     hlSpotMaxPositionUsd: Number(process.env.CFO_HL_SPOT_MAX_POSITION_USD ?? 200),
     hlSpotMaxTotalUsd: Number(process.env.CFO_HL_SPOT_MAX_TOTAL_USD ?? 500),
     hlSpotMaxPositions: Number(process.env.CFO_HL_SPOT_MAX_POSITIONS ?? 5),
