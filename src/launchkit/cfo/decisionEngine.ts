@@ -4124,12 +4124,72 @@ export async function generateDecisions(
     // Get current spot balances
     const spotBalances = await hl.getSpotBalances();
     const spotPositions = spotBalances.filter(b => b.coin !== 'USDC' && b.valueUsd >= 5);
-    const spotTotalUsd = spotPositions.reduce((s, b) => s + b.valueUsd, 0);
+    let spotTotalUsd = spotPositions.reduce((s, b) => s + b.valueUsd, 0);
+    let spotDecisionCount = 0; // track decisions this cycle for slot accounting
+
+    // ── Spot circuit breaker (shared with perps) ────────────────────────
+    // If 3+ SL hits in 6h across perps+spot combined, halt ALL new entries.
+    const spotCircuitBreakerActive = _recentSLHits.length >= 3;
+    if (spotCircuitBreakerActive) {
+      logger.warn(
+        `[CFO:Decision] Section N: 🚫 Circuit breaker ACTIVE (${_recentSLHits.length} SL hits in 6h) — skipping all new spot entries`,
+      );
+    }
+
+    // ── Danger market gate — no new spot longs in danger mode ────────────
+    const spotDangerGate = intel.marketCondition === 'danger';
+    if (spotDangerGate) {
+      logger.warn('[CFO:Decision] Section N: ⚠️ DANGER market — no new spot buys');
+    }
+
+    // ── Portfolio heat — include spot + perp exposure in heat calc ────────
+    // Spot has no leverage but still contributes to total exposure.
+    // Use a conservative 5% risk factor for spot (SL distance default = 8%).
+    const spotHeatUsd = spotPositions.reduce((s, b) => s + b.valueUsd * 0.05, 0);
+    // Re-compute perp heat for the combined check (perps use 3% risk assumption)
+    let perpHeatForSpot = 0;
+    try {
+      const perpSummary = await hl.getAccountSummary();
+      for (const p of perpSummary.positions) perpHeatForSpot += p.sizeUsd * 0.03;
+    } catch { /* perps may not be enabled — that's fine */ }
+    const totalHeatUsd = perpHeatForSpot + spotHeatUsd;
+    const totalEquity = (state.hlEquity ?? 0) + spotTotalUsd;
+    const combinedHeatPct = totalEquity > 0 ? (totalHeatUsd / totalEquity) * 100 : 0;
+    const spotHeatExceeded = combinedHeatPct >= 8;
+    if (spotHeatExceeded) {
+      logger.warn(
+        `[CFO:Decision] Section N: 🔥 Combined portfolio heat ${combinedHeatPct.toFixed(1)}% >= 8% cap — no new spot entries`,
+      );
+    }
+
+    // ── Cross-asset sector map (same as perps) for correlation guard ─────
+    const SPOT_SECTOR_MAP: Record<string, string> = {
+      SOL: 'sol-eco', JUP: 'sol-eco', WIF: 'sol-eco', PYTH: 'sol-eco',
+      BONK: 'sol-eco', RAY: 'sol-eco', JTO: 'sol-eco', TNSR: 'sol-eco',
+      W: 'sol-eco', RENDER: 'sol-eco', HNT: 'sol-eco',
+      BTC: 'btc', ORDI: 'btc', SATS: 'btc',
+      ETH: 'eth-eco', ARB: 'eth-eco', OP: 'eth-eco', STRK: 'eth-eco',
+      MATIC: 'eth-eco', MANTA: 'eth-eco',
+      DOGE: 'meme', SHIB: 'meme', PEPE: 'meme', FLOKI: 'meme',
+      AVAX: 'alt-l1', SUI: 'alt-l1', APT: 'alt-l1', SEI: 'alt-l1',
+      NEAR: 'alt-l1', INJ: 'alt-l1', TIA: 'alt-l1',
+    };
+
+    // ── Time-of-day filter for spot — skip entries during dead zones ─────
+    // Not as critical as scalps but still: no new entries UTC 01:00-05:00
+    const spotUtcHour = new Date().getUTCHours();
+    const spotDeadZone = spotUtcHour >= 1 && spotUtcHour < 5;
+    if (spotDeadZone) {
+      logger.debug('[CFO:Decision] Section N: Dead zone (UTC 01-05) — skipping new spot entries');
+    }
+
+    // ── Global gate: skip all spot entries if any blocker is active ──────
+    const spotGlobalBlock = spotCircuitBreakerActive || spotDangerGate || spotHeatExceeded || spotDeadZone;
 
     // ── Sub-phase 1: TA-driven spot BUY signals ──────────────────────────
     // Use day + swing TA styles (5m scalps are not viable for spot due to fees).
     // Spot only buys on bullish signals — no shorting spot.
-    if (config.hlSpotTaEnabled && env.hlSpotTaEnabled) {
+    if (config.hlSpotTaEnabled && env.hlSpotTaEnabled && !spotGlobalBlock) {
       const ta = await import('./hlTechnicalAnalysis.ts');
 
       for (const coin of spotCoins) {
@@ -4141,12 +4201,24 @@ export async function generateDecisions(
         // Skip if already holding this coin in spot
         if (spotPositions.some(b => b.coin === coin)) continue;
 
-        // Position limits
-        if (spotPositions.length >= env.hlSpotMaxPositions) break;
+        // SL lockout — don't re-buy a coin that recently hit spot SL
+        if (isSLLockedOut(coin, 'LONG', 48 * 3600_000)) continue; // 48h lockout for spot
+
+        // Position limits (account for pending spot decisions this cycle)
+        if ((spotPositions.length + spotDecisionCount) >= env.hlSpotMaxPositions) break;
         if (spotTotalUsd >= env.hlSpotMaxTotalUsd) break;
 
-        // Run TA on "COIN/USDC" (spot candle format)
-        // Use day style (1h trigger, 1d filter) — best fit for spot holds
+        // ── Cross-asset correlation guard ────────────────────────────
+        const coinSector = SPOT_SECTOR_MAP[coin];
+        if (coinSector) {
+          const sectorHeld = spotPositions.some(b => SPOT_SECTOR_MAP[b.coin] === coinSector);
+          const sectorPending = decisions.some(
+            d => d.type === 'HL_SPOT_BUY' && SPOT_SECTOR_MAP[d.params.coin] === coinSector,
+          );
+          if (sectorHeld || sectorPending) continue; // max 1 spot position per sector
+        }
+
+        // Run TA — day style (1h trigger, 1d filter) — best fit for spot holds
         try {
           const taResult = await ta.analyseMultiTimeframe(coin, 'day');
           if (!taResult || taResult.bias === 'NEUTRAL') continue;
@@ -4154,20 +4226,51 @@ export async function generateDecisions(
           // Only BUY on bullish signals (no spot shorting)
           if (taResult.bias !== 'LONG') continue;
 
-          const conviction = Math.min(1.0, taResult.conviction);
+          // ── ADX regime filter — skip choppy markets ───────────────
+          if (taResult.regimeFiltered) {
+            logger.debug(`[CFO:Decision] Section N: ${coin} ADX regime filtered (choppy) — skip`);
+            continue;
+          }
+
+          let conviction = Math.min(1.0, taResult.conviction);
+
+          // ── Sentiment blending (same as perps) ────────────────────
+          // If scout/analyst sentiment agrees, boost conviction; if it disagrees, dampen.
+          const scoutFresh = intel.scoutReceivedAt && (Date.now() - intel.scoutReceivedAt) < 4 * 3600_000;
+          if (scoutFresh) {
+            if (intel.scoutBullish === true) {
+              conviction = Math.min(1.0, conviction + 0.05); // bullish scout boosts BUY
+            } else if (intel.scoutBullish === false) {
+              conviction *= 0.7; // bearish scout dampens BUY
+            }
+          }
+          if (intel.marketCondition === 'bearish') {
+            conviction *= 0.8; // bearish market dampens (but doesn't block like danger)
+          } else if (intel.marketCondition === 'bullish') {
+            conviction = Math.min(1.0, conviction + 0.05);
+          }
+
           if (conviction < config.hlSpotMinConviction) continue;
 
-          // Size: no leverage, so use conviction-scaled sizing
+          // ── ATR-based dynamic sizing ──────────────────────────────
+          // Volatile coins → smaller position, stable coins → larger.
           const maxPos = env.hlSpotMaxPositionUsd;
           const remaining = env.hlSpotMaxTotalUsd - spotTotalUsd;
-          const sizeUsd = Math.min(maxPos, remaining, maxPos * conviction);
+          let sizeUsd: number;
+          if (taResult.atrPct > 0) {
+            // Risk budget: conviction × maxPos × SL%
+            const riskBudget = maxPos * conviction * (env.hlSpotStopLossPct / 100);
+            sizeUsd = Math.min(riskBudget / (env.hlSpotStopLossPct / 100), maxPos, remaining);
+          } else {
+            sizeUsd = Math.min(maxPos * conviction, maxPos, remaining);
+          }
           if (sizeUsd < 10) continue;
 
           const d: Decision = {
             type: 'HL_SPOT_BUY',
             reasoning:
               `TA-driven spot BUY ${coin}: ${taResult.bias} bias (conviction ${(conviction * 100).toFixed(0)}%). ` +
-              `$${sizeUsd.toFixed(0)} at spot price. ` +
+              `$${sizeUsd.toFixed(0)} at spot price. ADX=${taResult.adxValue.toFixed(0)}, ATR=${(taResult.atrPct * 100).toFixed(1)}%. ` +
               `Indicators: ${taResult.reasoning.slice(0, 100)}`,
             params: {
               coin,
@@ -4180,6 +4283,8 @@ export async function generateDecisions(
               tradeStyle: 'day',
               taConviction: conviction,
               taBias: taResult.bias,
+              atrPct: taResult.atrPct,
+              adxValue: taResult.adxValue,
             },
             urgency: 'medium',
             estimatedImpactUsd: sizeUsd,
@@ -4188,9 +4293,11 @@ export async function generateDecisions(
           };
           d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
           decisions.push(d);
+          spotDecisionCount++;
+          spotTotalUsd += sizeUsd; // running total for limit checks
           logger.info(
             `[CFO:Decision] Section N/TA: BUY ${coin}-SPOT $${sizeUsd.toFixed(0)} ` +
-            `(conviction ${(conviction * 100).toFixed(0)}%)`,
+            `(conviction ${(conviction * 100).toFixed(0)}%, ADX=${taResult.adxValue.toFixed(0)})`,
           );
         } catch (err) {
           logger.debug(`[CFO:Decision] Section N: TA error for ${coin}:`, err);
@@ -4203,28 +4310,56 @@ export async function generateDecisions(
         if (hl.isHalted(coin)) continue;
         if (!checkCooldown(`HL_SPOT_SWING_${coin}`, config.hlSpotCooldownMs)) continue;
         if (spotPositions.some(b => b.coin === coin)) continue;
-        if (spotPositions.length >= env.hlSpotMaxPositions) break;
+        if (isSLLockedOut(coin, 'LONG', 72 * 3600_000)) continue; // 72h lockout for swing
+        if ((spotPositions.length + spotDecisionCount) >= env.hlSpotMaxPositions) break;
         if (spotTotalUsd >= env.hlSpotMaxTotalUsd) break;
         // Skip if we already generated a day-style signal for this coin
         if (decisions.some(d => d.type === 'HL_SPOT_BUY' && d.params.coin === coin)) continue;
 
+        // Cross-asset correlation guard for swing too
+        const coinSector = SPOT_SECTOR_MAP[coin];
+        if (coinSector) {
+          const sectorHeld = spotPositions.some(b => SPOT_SECTOR_MAP[b.coin] === coinSector);
+          const sectorPending = decisions.some(
+            d => d.type === 'HL_SPOT_BUY' && SPOT_SECTOR_MAP[d.params.coin] === coinSector,
+          );
+          if (sectorHeld || sectorPending) continue;
+        }
+
         try {
           const taResult = await ta.analyseMultiTimeframe(coin, 'swing');
           if (!taResult || taResult.bias !== 'LONG') continue;
+          if (taResult.regimeFiltered) continue; // ADX regime filter
 
-          const conviction = Math.min(1.0, taResult.conviction);
+          let conviction = Math.min(1.0, taResult.conviction);
+
+          // Sentiment blending for swing
+          const scoutFresh = intel.scoutReceivedAt && (Date.now() - intel.scoutReceivedAt) < 4 * 3600_000;
+          if (scoutFresh && intel.scoutBullish === false) conviction *= 0.7;
+          if (scoutFresh && intel.scoutBullish === true) conviction = Math.min(1.0, conviction + 0.05);
+          if (intel.marketCondition === 'bearish') conviction *= 0.8;
+          if (intel.marketCondition === 'bullish') conviction = Math.min(1.0, conviction + 0.05);
+
           if (conviction < config.hlSpotMinConviction) continue;
 
+          // ATR-based sizing for swing
           const maxPos = env.hlSpotMaxPositionUsd;
           const remaining = env.hlSpotMaxTotalUsd - spotTotalUsd;
-          const sizeUsd = Math.min(maxPos, remaining, maxPos * conviction);
+          let sizeUsd: number;
+          if (taResult.atrPct > 0) {
+            const sl = env.hlSpotStopLossPct;
+            const riskBudget = maxPos * conviction * (sl / 100);
+            sizeUsd = Math.min(riskBudget / (sl / 100), maxPos, remaining);
+          } else {
+            sizeUsd = Math.min(maxPos * conviction, maxPos, remaining);
+          }
           if (sizeUsd < 10) continue;
 
           const d: Decision = {
             type: 'HL_SPOT_BUY',
             reasoning:
               `Swing spot BUY ${coin}: ${taResult.bias} (conviction ${(conviction * 100).toFixed(0)}%). ` +
-              `$${sizeUsd.toFixed(0)} swing hold. ` +
+              `$${sizeUsd.toFixed(0)} swing hold. ADX=${taResult.adxValue.toFixed(0)}, ATR=${(taResult.atrPct * 100).toFixed(1)}%. ` +
               `Indicators: ${taResult.reasoning.slice(0, 100)}`,
             params: {
               coin,
@@ -4237,6 +4372,8 @@ export async function generateDecisions(
               tradeStyle: 'swing',
               taConviction: conviction,
               taBias: taResult.bias,
+              atrPct: taResult.atrPct,
+              adxValue: taResult.adxValue,
             },
             urgency: 'low',
             estimatedImpactUsd: sizeUsd,
@@ -4245,9 +4382,11 @@ export async function generateDecisions(
           };
           d.tier = classifyTier(d.type, d.urgency, d.estimatedImpactUsd, config, intel.marketCondition);
           decisions.push(d);
+          spotDecisionCount++;
+          spotTotalUsd += sizeUsd;
           logger.info(
             `[CFO:Decision] Section N/Swing: BUY ${coin}-SPOT $${sizeUsd.toFixed(0)} ` +
-            `(conviction ${(conviction * 100).toFixed(0)}%)`,
+            `(conviction ${(conviction * 100).toFixed(0)}%, ADX=${taResult.adxValue.toFixed(0)})`,
           );
         } catch (err) {
           logger.debug(`[CFO:Decision] Section N: Swing TA error for ${coin}:`, err);
@@ -4259,7 +4398,8 @@ export async function generateDecisions(
     // Lower conviction bar, BUY-only, for building long-term holdings of
     // specific high-conviction assets (BTC, ETH, SOL by default).
     // Uses sentiment signals (scout + analyst) rather than full TA.
-    if (config.hlSpotAccumulationEnabled && env.hlSpotAccumulationEnabled) {
+    // NOTE: Accumulation is allowed during danger (with heavy penalty) but NOT during circuit breaker.
+    if (config.hlSpotAccumulationEnabled && env.hlSpotAccumulationEnabled && !spotCircuitBreakerActive) {
       const accumCoins = env.hlSpotAccumulationCoins.filter(c => hlSpotCoins.has(c));
 
       for (const coin of accumCoins) {
@@ -4283,6 +4423,10 @@ export async function generateDecisions(
         if (scoutFresh && intel.scoutBullish === true) {
           accumConviction += 0.15;
           accumReasons.push('scout:bullish');
+        } else if (scoutFresh && intel.scoutBullish === false) {
+          // Bearish scout — heavy penalty for accumulation
+          accumConviction -= 0.10;
+          accumReasons.push('scout:bearish');
         }
 
         // Price momentum
@@ -4293,10 +4437,14 @@ export async function generateDecisions(
           if (change24h > 2) {
             accumConviction += 0.10;
             accumReasons.push(`momentum:+${change24h.toFixed(1)}%`);
-          } else if (change24h < -5) {
-            // Dip buying — slight positive signal for accumulation
+          } else if (change24h < -5 && change24h > -12) {
+            // Moderate dip buying — slight positive signal for accumulation
             accumConviction += 0.05;
             accumReasons.push(`dip-buy:${change24h.toFixed(1)}%`);
+          } else if (change24h <= -12) {
+            // Crash — DON'T accumulate, something is very wrong
+            accumConviction -= 0.20;
+            accumReasons.push(`crash:${change24h.toFixed(1)}%`);
           }
         }
 
@@ -4307,6 +4455,9 @@ export async function generateDecisions(
         } else if (intel.marketCondition === 'danger') {
           accumConviction -= 0.20; // don't accumulate in danger
           accumReasons.push('market:DANGER');
+        } else if (intel.marketCondition === 'bearish') {
+          accumConviction -= 0.05;
+          accumReasons.push('market:bearish');
         }
 
         // Trending
@@ -4315,8 +4466,15 @@ export async function generateDecisions(
           accumReasons.push('trending');
         }
 
+        // Guardian safety — don't accumulate unsafe tokens
+        const guardianToken = intel.guardianTokens?.find(t => t.ticker === coin);
+        if (guardianToken && !guardianToken.safe) {
+          accumConviction -= 0.15;
+          accumReasons.push('guardian:unsafe');
+        }
+
         if (accumConviction < env.hlSpotAccumulationMinConviction) continue;
-        if (accumReasons.length < 1) continue;
+        if (accumReasons.length < 2) continue; // require at least 2 supporting signals
 
         // Size: smaller DCA-style entries
         const maxAccum = env.hlSpotAccumulationMaxPerCoin - existingValueUsd;

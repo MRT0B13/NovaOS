@@ -2286,6 +2286,18 @@ export class CFOAgent extends BaseAgent {
           updateSpotStyle(coin, { highWaterPriceUsd: currentPrice });
         }
 
+        // ── Trailing stop ────────────────────────────────────────
+        // Once price has moved at least 50% of TP target, activate a trailing stop
+        // that locks in gains at the high-water mark minus a trail distance.
+        // Trail distance = max(SL%/2, 3%) — tighter than initial SL.
+        const tpTarget = info.takeProfitPct;
+        const hwm = Math.max(info.highWaterPriceUsd, currentPrice);
+        const hwmPnlPct = ((hwm - entryPrice) / entryPrice) * 100;
+        const trailActivation = tpTarget * 0.5; // trailing activates after 50% of TP
+        const trailDistance = Math.max(info.stopLossPct / 2, 3); // trail distance (% from high-water)
+        const trailingStopHit = hwmPnlPct >= trailActivation &&
+          ((hwm - currentPrice) / hwm * 100) >= trailDistance;
+
         // ── Stop-loss check ──────────────────────────────────────
         const stopHit = pnlPct < -info.stopLossPct;
 
@@ -2297,17 +2309,29 @@ export class CFOAgent extends BaseAgent {
         const holdMs = holdHours * 3600_000;
         const holdExpired = info.style !== 'accumulation' && (Date.now() - new Date(info.openedAt).getTime()) > holdMs;
 
-        if (stopHit || tpHit || holdExpired) {
+        if (stopHit || tpHit || holdExpired || trailingStopHit) {
           const reason = stopHit
             ? `SL hit (${pnlPct.toFixed(1)}%, limit=${info.stopLossPct}%)`
             : tpHit
               ? `TP hit (${pnlPct.toFixed(1)}%, target=${info.takeProfitPct}%)`
-              : `hold expired (${info.style}: ${holdHours}h)`;
+              : trailingStopHit
+                ? `trailing SL hit (price retreated ${trailDistance.toFixed(1)}% from HWM $${hwm.toFixed(2)}, PnL ${pnlPct.toFixed(1)}%)`
+                : `hold expired (${info.style}: ${holdHours}h)`;
 
           logger.info(`[CFO] Spot monitor: SELL ${coin}-SPOT — ${reason}`);
           const result = await hlMod.closeSpotPosition(coin);
           if (result.success) {
             clearSpotStyle(coin);
+
+            // Record SL hit for circuit breaker + direction lockout (shared with perps)
+            if (stopHit || trailingStopHit) {
+              const { recordSLHitForCircuitBreaker, recordSLClose } =
+                await import('../launchkit/cfo/decisionEngine.ts');
+              recordSLHitForCircuitBreaker();
+              recordSLClose(coin, 'LONG'); // spot is always LONG
+              logger.warn(`[CFO] Spot SL hit on ${coin} — recorded for circuit breaker + lockout`);
+            }
+
             const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
             await notifyAdminForce(
               `📊 [${info.style}] Sold ${coin}-SPOT: ${reason}\n` +
