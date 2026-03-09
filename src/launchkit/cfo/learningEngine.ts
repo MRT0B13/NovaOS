@@ -24,6 +24,8 @@
  *   - krystal_lp  → range width multiplier, chain preference, APR floor
  *   - kamino      → LTV target, borrow spread threshold
  *   - jito        → stake/unstake aggressiveness
+ *   - hl_spot     → spot conviction floor, size multiplier, SL multiplier
+ *   - hl_spot_swing / hl_spot_accumulation → per-style spot adaptations
  *
  * Refresh cadence: once per decision cycle (every 30 min by default).
  * The computation is cheap — a few SQL queries + arithmetic.
@@ -104,6 +106,16 @@ export interface AdaptiveParams {
   hlPerpStyleStopMultipliers: Record<string, number>;     // per-style SL multiplier
   hlPerpStyleConvictionFloors: Record<string, number>;    // per-style conviction floor
   hlPerpStyleLeverageMultipliers: Record<string, number>; // per-style leverage multiplier (scalp can go higher)
+
+  // Hyperliquid spot (signal-driven + accumulation)
+  hlSpotConvictionFloor: number;       // raise if too many losing spot trades at low conviction
+  hlSpotSizeMultiplier: number;        // scale spot position size based on outcomes
+  hlSpotStopLossMultiplier: number;    // tighter/wider SL for spot specifically
+  hlSpotMaxPositionsAdj: number;       // -N to +N adjustment on max simultaneous spot positions
+  // Per-style spot overrides (day/swing/accumulation learn independently)
+  hlSpotStyleSizeMultipliers: Record<string, number>;       // { day: 1.0, swing: 1.0, accumulation: 1.0 }
+  hlSpotStyleStopMultipliers: Record<string, number>;       // per-style SL multiplier
+  hlSpotStyleConvictionFloors: Record<string, number>;      // per-style conviction floor
 
   // LP (Orca + Krystal) — global
   lpRangeWidthMultiplier: number;  // wider/narrower ranges based on rebalance frequency
@@ -832,6 +844,84 @@ function computeAdaptiveParams(
     }
   }
 
+  // ── HL Spot adaptations (day/swing/accumulation) ────────────────
+  let spotConvFloor = 0;
+  let spotSizeMult = 1.0;
+  let spotStopMult = 1.0;
+  let spotMaxPosAdj = 0;
+  const spotSt = stats['hl_spot'];
+
+  if (spotSt && spotSt.totalTrades >= MIN_TRADES_FOR_CONFIDENCE) {
+    // If win rate is poor, raise conviction floor to filter out weak signals
+    if (spotSt.winRate < 0.35 && spotSt.totalPnlUsd < 0) {
+      spotConvFloor = Math.min(0.7, 0.3 + (0.35 - spotSt.winRate));
+    }
+
+    // If avg PnL is strongly negative, cut position sizes
+    if (spotSt.avgPnlUsd < -3) {
+      spotSizeMult = 0.6;
+    } else if (spotSt.avgPnlUsd > 3 && spotSt.sharpeApprox > 0.5) {
+      spotSizeMult = 1.3;
+    }
+
+    // If max drawdown is severe, tighten stops
+    if (spotSt.maxDrawdownUsd < -20 && Math.abs(spotSt.maxDrawdownUsd) > spotSt.avgPnlUsd * 3) {
+      spotStopMult = 0.7;
+    } else if (spotSt.winRate > 0.55 && spotSt.sharpeApprox > 0.3) {
+      spotStopMult = 1.15;
+    }
+
+    // If many losing trades, reduce max concurrent positions
+    if (spotSt.recentWinRate < 0.3 && spotSt.recentAvgPnlUsd < 0) {
+      spotMaxPosAdj = -1;
+    } else if (spotSt.recentWinRate > 0.6 && spotSt.recentAvgPnlUsd > 0) {
+      spotMaxPosAdj = 1;
+    }
+
+    // Regime shift: spot suddenly deteriorating
+    if (spotSt.recentAvgPnlUsd < -2 && spotSt.avgPnlUsd > 0) {
+      spotSizeMult *= 0.7;
+      spotStopMult *= 0.85;
+    }
+  }
+
+  // ── Per-style HL spot adaptations (day/swing/accumulation learn independently) ──
+  const spotStyleSizeMults: Record<string, number> = { day: 1.0, swing: 1.0, accumulation: 1.0 };
+  const spotStyleStopMults: Record<string, number> = { day: 1.0, swing: 1.0, accumulation: 1.0 };
+  const spotStyleConvFloors: Record<string, number> = { day: 0, swing: 0, accumulation: 0 };
+
+  for (const style of ['day', 'swing', 'accumulation'] as const) {
+    // hl_spot uses 'hl_spot' for day, 'hl_spot_swing' for swing, 'hl_spot_accumulation' for accum
+    const stratKey = style === 'day' ? 'hl_spot' : `hl_spot_${style}`;
+    const styleSt = stats[stratKey];
+    if (!styleSt || styleSt.totalTrades < MIN_TRADES_FOR_CONFIDENCE) continue;
+
+    // Size multiplier: cut if losing, lean in if profitable
+    if (styleSt.avgPnlUsd < -3) {
+      spotStyleSizeMults[style] = 0.6;
+    } else if (styleSt.avgPnlUsd > 3 && styleSt.sharpeApprox > 0.5) {
+      spotStyleSizeMults[style] = 1.3;
+    }
+
+    // SL multiplier
+    if (styleSt.maxDrawdownUsd < -20 && Math.abs(styleSt.maxDrawdownUsd) > styleSt.avgPnlUsd * 3) {
+      spotStyleStopMults[style] = 0.7;
+    } else if (styleSt.winRate > 0.55 && styleSt.sharpeApprox > 0.3) {
+      spotStyleStopMults[style] = 1.15;
+    }
+
+    // Conviction floor
+    if (styleSt.winRate < 0.35 && styleSt.totalPnlUsd < 0) {
+      spotStyleConvFloors[style] = Math.min(0.7, 0.3 + (0.35 - styleSt.winRate));
+    }
+
+    // Regime shift within style
+    if (styleSt.recentAvgPnlUsd < -2 && styleSt.avgPnlUsd > 0) {
+      spotStyleSizeMults[style] *= 0.7;
+      spotStyleStopMults[style] *= 0.85;
+    }
+  }
+
   // ── LP adaptations (Orca + Krystal) ─────────────────────────────
   let lpRangeMult = 1.0;
   let lpMinAprAdj = 0;
@@ -1053,6 +1143,25 @@ function computeAdaptiveParams(
       day: blend(perpStyleLevMults.day, prior?.hlPerpStyleLeverageMultipliers?.day),
       swing: blend(perpStyleLevMults.swing, prior?.hlPerpStyleLeverageMultipliers?.swing),
     },
+    hlSpotConvictionFloor: blend(spotConvFloor, prior?.hlSpotConvictionFloor),
+    hlSpotSizeMultiplier: blend(spotSizeMult, prior?.hlSpotSizeMultiplier),
+    hlSpotStopLossMultiplier: blend(spotStopMult, prior?.hlSpotStopLossMultiplier),
+    hlSpotMaxPositionsAdj: blend(spotMaxPosAdj, prior?.hlSpotMaxPositionsAdj),
+    hlSpotStyleSizeMultipliers: {
+      day: blend(spotStyleSizeMults.day, prior?.hlSpotStyleSizeMultipliers?.day),
+      swing: blend(spotStyleSizeMults.swing, prior?.hlSpotStyleSizeMultipliers?.swing),
+      accumulation: blend(spotStyleSizeMults.accumulation, prior?.hlSpotStyleSizeMultipliers?.accumulation),
+    },
+    hlSpotStyleStopMultipliers: {
+      day: blend(spotStyleStopMults.day, prior?.hlSpotStyleStopMultipliers?.day),
+      swing: blend(spotStyleStopMults.swing, prior?.hlSpotStyleStopMultipliers?.swing),
+      accumulation: blend(spotStyleStopMults.accumulation, prior?.hlSpotStyleStopMultipliers?.accumulation),
+    },
+    hlSpotStyleConvictionFloors: {
+      day: blend(spotStyleConvFloors.day, prior?.hlSpotStyleConvictionFloors?.day),
+      swing: blend(spotStyleConvFloors.swing, prior?.hlSpotStyleConvictionFloors?.swing),
+      accumulation: blend(spotStyleConvFloors.accumulation, prior?.hlSpotStyleConvictionFloors?.accumulation),
+    },
     lpRangeWidthMultiplier: blend(lpRangeMult, prior?.lpRangeWidthMultiplier),
     lpMinAprAdjustment: blend(lpMinAprAdj, prior?.lpMinAprAdjustment),
     lpRebalanceTriggerMultiplier: blend(lpRebalTriggerMult, prior?.lpRebalanceTriggerMultiplier),
@@ -1161,7 +1270,7 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
     const prior = await loadPrior(dbPool);
 
     // 2. Compute stats for each strategy
-    const strategies = ['polymarket', 'hyperliquid', 'hl_perp', 'hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing', 'kamino', 'jito', 'orca_lp', 'krystal_lp', 'evm_flash_arb'];
+    const strategies = ['polymarket', 'hyperliquid', 'hl_perp', 'hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing', 'hl_spot', 'hl_spot_swing', 'hl_spot_accumulation', 'kamino', 'jito', 'orca_lp', 'krystal_lp', 'evm_flash_arb'];
     const statsEntries = await Promise.all(
       strategies.map(async s => [s, await computeStrategyStats(dbPool, s)] as const),
     );
@@ -1223,6 +1332,8 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
       `perpSize×${params.hlPerpSizeMultiplier.toFixed(2)} | ` +
       `perpSL×${params.hlPerpStopLossMultiplier.toFixed(2)} | ` +
       `perpStyles: S×${params.hlPerpStyleSizeMultipliers?.scalp?.toFixed(2) ?? '1'} D×${params.hlPerpStyleSizeMultipliers?.day?.toFixed(2) ?? '1'} W×${params.hlPerpStyleSizeMultipliers?.swing?.toFixed(2) ?? '1'} | ` +
+      `spotSize×${params.hlSpotSizeMultiplier.toFixed(2)} spotSL×${params.hlSpotStopLossMultiplier.toFixed(2)} | ` +
+      `spotStyles: D×${params.hlSpotStyleSizeMultipliers?.day?.toFixed(2) ?? '1'} W×${params.hlSpotStyleSizeMultipliers?.swing?.toFixed(2) ?? '1'} A×${params.hlSpotStyleSizeMultipliers?.accumulation?.toFixed(2) ?? '1'} | ` +
       `lpRange×${params.lpRangeWidthMultiplier.toFixed(2)} | ` +
       `lpTiers: L×${params.lpTierRangeMultipliers.low?.toFixed(2) ?? '1'} M×${params.lpTierRangeMultipliers.medium?.toFixed(2) ?? '1'} H×${params.lpTierRangeMultipliers.high?.toFixed(2) ?? '1'} | ` +
       `arbMin×${params.evmArbMinProfitMultiplier.toFixed(2)} | ` +
@@ -1299,6 +1410,13 @@ export function getDefaultParams(): AdaptiveParams {
     hlPerpStyleStopMultipliers: { scalp: 1.0, day: 1.0, swing: 1.0 },
     hlPerpStyleConvictionFloors: { scalp: 0, day: 0, swing: 0 },
     hlPerpStyleLeverageMultipliers: { scalp: 1.0, day: 1.0, swing: 1.0 },
+    hlSpotConvictionFloor: 0,
+    hlSpotSizeMultiplier: 1.0,
+    hlSpotStopLossMultiplier: 1.0,
+    hlSpotMaxPositionsAdj: 0,
+    hlSpotStyleSizeMultipliers: { day: 1.0, swing: 1.0, accumulation: 1.0 },
+    hlSpotStyleStopMultipliers: { day: 1.0, swing: 1.0, accumulation: 1.0 },
+    hlSpotStyleConvictionFloors: { day: 0, swing: 0, accumulation: 0 },
     lpRangeWidthMultiplier: 1.0,
     lpMinAprAdjustment: 0,
     lpRebalanceTriggerMultiplier: 1.0,
@@ -1362,6 +1480,7 @@ export function formatLearningSummary(params: AdaptiveParams): string {
   const stratNameMap: Record<string, string> = {
     hyperliquid: 'HL Hedge', hl_perp: 'HL Perps',
     hl_perp_scalp: 'HL Scalp', hl_perp_day: 'HL Day', hl_perp_swing: 'HL Swing',
+    hl_spot: 'HL Spot', hl_spot_swing: 'HL Spot Swing', hl_spot_accumulation: 'HL Spot Accum',
     kamino: 'Kamino', jito: 'Jito Staking',
     orca_lp: 'Orca LP', krystal_lp: 'EVM LP', evm_flash_arb: 'Arb Scanner',
     polymarket: 'Polymarket',
@@ -1411,6 +1530,21 @@ export function formatLearningSummary(params: AdaptiveParams): string {
       }
     }
     if (styleAdj.length > 0) adj.push(`Perp styles: ${styleAdj.join(', ')}`);
+  }
+  // Per-style spot adjustments
+  if (params.hlSpotStyleSizeMultipliers) {
+    const spotAdj: string[] = [];
+    for (const [style, mult] of Object.entries(params.hlSpotStyleSizeMultipliers)) {
+      if (Math.abs(mult - 1) > 0.05) {
+        spotAdj.push(`${style} size ×${mult.toFixed(2)}`);
+      }
+    }
+    for (const [style, mult] of Object.entries(params.hlSpotStyleStopMultipliers ?? {})) {
+      if (Math.abs(mult - 1) > 0.05) {
+        spotAdj.push(`${style} SL ×${mult.toFixed(2)}`);
+      }
+    }
+    if (spotAdj.length > 0) adj.push(`Spot styles: ${spotAdj.join(', ')}`);
   }
   if (Math.abs(params.lpRangeWidthMultiplier - 1) > 0.05) {
     adj.push(`LP ranges ${params.lpRangeWidthMultiplier > 1 ? 'widened' : 'tightened'}`);

@@ -4076,6 +4076,8 @@ export async function generateDecisions(
   // ──────────────────────────────────────────────────────────────────────────
 
   const hlSpotGated = isStrategyGated('hl_spot');
+  const hlSpotSwingGated = isStrategyGated('hl_spot_swing');
+  const hlSpotAccumGated = isStrategyGated('hl_spot_accumulation');
   if (hlSpotGated) {
     logger.warn('[CFO:Decision] Section N: HL spot trading GATED by learning engine — skipping');
   }
@@ -4083,6 +4085,14 @@ export async function generateDecisions(
   if (config.hlSpotTradingEnabled && env.hyperliquidEnabled && !hlSpotGated) {
     const hl = await import('./hyperliquidService.ts');
     const hlSpotCoins = new Set(await hl.getHLSpotListedCoins());
+
+    // Learned params for spot — mirrors how perps use learned.hlPerp*
+    const learnedSpotSizeMult = learned.hlSpotSizeMultiplier ?? 1.0;
+    const learnedSpotStopMult = learned.hlSpotStopLossMultiplier ?? 1.0;
+    const learnedSpotConvFloor = learned.hlSpotConvictionFloor ?? 0;
+    const learnedSpotMaxPosAdj = learned.hlSpotMaxPositionsAdj ?? 0;
+    const effectiveSpotMaxPositions = Math.max(1, env.hlSpotMaxPositions + Math.round(learnedSpotMaxPosAdj));
+    const effectiveSpotMaxTotalUsd = env.hlSpotMaxTotalUsd * applyAdaptive(1.0, learnedSpotSizeMult, conf);
 
     // Build dynamic spot universe (same pattern as perps — analyst + trending + movers)
     const spotUniverse = new Set<string>();
@@ -4205,8 +4215,8 @@ export async function generateDecisions(
         if (isSLLockedOut(coin, 'LONG', 48 * 3600_000)) continue; // 48h lockout for spot
 
         // Position limits (account for pending spot decisions this cycle)
-        if ((spotPositions.length + spotDecisionCount) >= env.hlSpotMaxPositions) break;
-        if (spotTotalUsd >= env.hlSpotMaxTotalUsd) break;
+        if ((spotPositions.length + spotDecisionCount) >= effectiveSpotMaxPositions) break;
+        if (spotTotalUsd >= effectiveSpotMaxTotalUsd) break;
 
         // ── Cross-asset correlation guard ────────────────────────────
         const coinSector = SPOT_SECTOR_MAP[coin];
@@ -4252,15 +4262,23 @@ export async function generateDecisions(
 
           if (conviction < config.hlSpotMinConviction) continue;
 
-          // ── ATR-based dynamic sizing ──────────────────────────────
+          // ── Learned conviction floor (raised if past trades at low conviction keep losing) ──
+          const dayConvFloor = learned.hlSpotStyleConvictionFloors?.day ?? learnedSpotConvFloor;
+          const effectiveDayConvFloor = dayConvFloor * conf;
+          if (effectiveDayConvFloor > 0 && conviction < effectiveDayConvFloor) continue;
+
+          // ── ATR-based dynamic sizing (scaled by learned size multiplier) ────
           // Volatile coins → smaller position, stable coins → larger.
-          const maxPos = env.hlSpotMaxPositionUsd;
-          const remaining = env.hlSpotMaxTotalUsd - spotTotalUsd;
+          const daySizeMult = learned.hlSpotStyleSizeMultipliers?.day ?? learnedSpotSizeMult;
+          const maxPos = applyAdaptive(env.hlSpotMaxPositionUsd, daySizeMult, conf);
+          const remaining = effectiveSpotMaxTotalUsd - spotTotalUsd;
           let sizeUsd: number;
+          const dayStopMult = learned.hlSpotStyleStopMultipliers?.day ?? learnedSpotStopMult;
+          const effectiveDaySL = applyAdaptive(env.hlSpotStopLossPct, dayStopMult, conf);
           if (taResult.atrPct > 0) {
             // Risk budget: conviction × maxPos × SL%
-            const riskBudget = maxPos * conviction * (env.hlSpotStopLossPct / 100);
-            sizeUsd = Math.min(riskBudget / (env.hlSpotStopLossPct / 100), maxPos, remaining);
+            const riskBudget = maxPos * conviction * (effectiveDaySL / 100);
+            sizeUsd = Math.min(riskBudget / (effectiveDaySL / 100), maxPos, remaining);
           } else {
             sizeUsd = Math.min(maxPos * conviction, maxPos, remaining);
           }
@@ -4278,7 +4296,7 @@ export async function generateDecisions(
               sizeUsd,
               signal: 'ta-day',
               conviction,
-              stopLossPct: env.hlSpotStopLossPct,
+              stopLossPct: effectiveDaySL,
               takeProfitPct: env.hlSpotTakeProfitPct,
               tradeStyle: 'day',
               taConviction: conviction,
@@ -4311,10 +4329,12 @@ export async function generateDecisions(
         if (!checkCooldown(`HL_SPOT_SWING_${coin}`, config.hlSpotCooldownMs)) continue;
         if (spotPositions.some(b => b.coin === coin)) continue;
         if (isSLLockedOut(coin, 'LONG', 72 * 3600_000)) continue; // 72h lockout for swing
-        if ((spotPositions.length + spotDecisionCount) >= env.hlSpotMaxPositions) break;
-        if (spotTotalUsd >= env.hlSpotMaxTotalUsd) break;
+        if ((spotPositions.length + spotDecisionCount) >= effectiveSpotMaxPositions) break;
+        if (spotTotalUsd >= effectiveSpotMaxTotalUsd) break;
         // Skip if we already generated a day-style signal for this coin
         if (decisions.some(d => d.type === 'HL_SPOT_BUY' && d.params.coin === coin)) continue;
+        // Skip if swing style gated by learning engine (poor past performance)
+        if (hlSpotSwingGated) continue;
 
         // Cross-asset correlation guard for swing too
         const coinSector = SPOT_SECTOR_MAP[coin];
@@ -4342,14 +4362,21 @@ export async function generateDecisions(
 
           if (conviction < config.hlSpotMinConviction) continue;
 
-          // ATR-based sizing for swing
-          const maxPos = env.hlSpotMaxPositionUsd;
-          const remaining = env.hlSpotMaxTotalUsd - spotTotalUsd;
+          // ── Learned conviction floor for swing ──
+          const swingConvFloor = learned.hlSpotStyleConvictionFloors?.swing ?? learnedSpotConvFloor;
+          const effectiveSwingConvFloor = swingConvFloor * conf;
+          if (effectiveSwingConvFloor > 0 && conviction < effectiveSwingConvFloor) continue;
+
+          // ATR-based sizing for swing (scaled by learned size multiplier)
+          const swingSizeMult = learned.hlSpotStyleSizeMultipliers?.swing ?? learnedSpotSizeMult;
+          const maxPos = applyAdaptive(env.hlSpotMaxPositionUsd, swingSizeMult, conf);
+          const remaining = effectiveSpotMaxTotalUsd - spotTotalUsd;
+          const swingStopMult = learned.hlSpotStyleStopMultipliers?.swing ?? learnedSpotStopMult;
+          const effectiveSwingSL = applyAdaptive(env.hlSpotStopLossPct, swingStopMult, conf);
           let sizeUsd: number;
           if (taResult.atrPct > 0) {
-            const sl = env.hlSpotStopLossPct;
-            const riskBudget = maxPos * conviction * (sl / 100);
-            sizeUsd = Math.min(riskBudget / (sl / 100), maxPos, remaining);
+            const riskBudget = maxPos * conviction * (effectiveSwingSL / 100);
+            sizeUsd = Math.min(riskBudget / (effectiveSwingSL / 100), maxPos, remaining);
           } else {
             sizeUsd = Math.min(maxPos * conviction, maxPos, remaining);
           }
@@ -4367,7 +4394,7 @@ export async function generateDecisions(
               sizeUsd,
               signal: 'ta-swing',
               conviction,
-              stopLossPct: env.hlSpotStopLossPct,
+              stopLossPct: effectiveSwingSL,
               takeProfitPct: env.hlSpotTakeProfitPct * 1.5, // wider TP for swing
               tradeStyle: 'swing',
               taConviction: conviction,
@@ -4399,7 +4426,7 @@ export async function generateDecisions(
     // specific high-conviction assets (BTC, ETH, SOL by default).
     // Uses sentiment signals (scout + analyst) rather than full TA.
     // NOTE: Accumulation is allowed during danger (with heavy penalty) but NOT during circuit breaker.
-    if (config.hlSpotAccumulationEnabled && env.hlSpotAccumulationEnabled && !spotCircuitBreakerActive) {
+    if (config.hlSpotAccumulationEnabled && env.hlSpotAccumulationEnabled && !spotCircuitBreakerActive && !hlSpotAccumGated) {
       const accumCoins = env.hlSpotAccumulationCoins.filter(c => hlSpotCoins.has(c));
 
       for (const coin of accumCoins) {
@@ -4412,7 +4439,7 @@ export async function generateDecisions(
         if (existingValueUsd >= env.hlSpotAccumulationMaxPerCoin) continue;
 
         // Position & total limits
-        if (spotTotalUsd >= env.hlSpotMaxTotalUsd) break;
+        if (spotTotalUsd >= effectiveSpotMaxTotalUsd) break;
 
         // Accumulation uses lighter conviction: scout + momentum only
         let accumConviction = 0;
@@ -4476,12 +4503,20 @@ export async function generateDecisions(
         if (accumConviction < env.hlSpotAccumulationMinConviction) continue;
         if (accumReasons.length < 2) continue; // require at least 2 supporting signals
 
-        // Size: smaller DCA-style entries
+        // ── Learned conviction floor for accumulation ──
+        const accumConvFloor = learned.hlSpotStyleConvictionFloors?.accumulation ?? learnedSpotConvFloor;
+        const effectiveAccumConvFloor = accumConvFloor * conf;
+        if (effectiveAccumConvFloor > 0 && accumConviction < effectiveAccumConvFloor) continue;
+
+        // Size: smaller DCA-style entries (scaled by learned size multiplier)
+        const accumSizeMult = learned.hlSpotStyleSizeMultipliers?.accumulation ?? learnedSpotSizeMult;
         const maxAccum = env.hlSpotAccumulationMaxPerCoin - existingValueUsd;
+        const accumStopMult = learned.hlSpotStyleStopMultipliers?.accumulation ?? learnedSpotStopMult;
+        const effectiveAccumSL = applyAdaptive(env.hlSpotStopLossPct * 1.5, accumStopMult, conf); // wider SL for accumulation
         const sizeUsd = Math.min(
           maxAccum,
-          env.hlSpotMaxPositionUsd * 0.5, // half of max for DCA-style
-          env.hlSpotMaxTotalUsd - spotTotalUsd,
+          applyAdaptive(env.hlSpotMaxPositionUsd * 0.5, accumSizeMult, conf), // half of max for DCA-style
+          effectiveSpotMaxTotalUsd - spotTotalUsd,
         );
         if (sizeUsd < 10) continue;
 
@@ -4497,7 +4532,7 @@ export async function generateDecisions(
             sizeUsd,
             signal: 'accumulation',
             conviction: accumConviction,
-            stopLossPct: env.hlSpotStopLossPct * 1.5, // wider SL for accumulation (12% default)
+            stopLossPct: effectiveAccumSL,
             takeProfitPct: env.hlSpotTakeProfitPct * 2, // wider TP for accumulation (30% default)
             tradeStyle: 'accumulation',
           },
@@ -4555,6 +4590,17 @@ export async function generateDecisions(
           logger.debug(`[CFO:Decision] Section N: Exit TA error for ${coin}:`, err);
         }
       }
+    }
+
+    // ── Learned-params diagnostic ──
+    if (conf > 0) {
+      logger.debug(
+        `[CFO:Decision] Section N learned-params: ` +
+        `sizeMult=${learnedSpotSizeMult.toFixed(2)} stopMult=${learnedSpotStopMult.toFixed(2)} ` +
+        `convFloor=${learnedSpotConvFloor.toFixed(2)} maxPosAdj=${learnedSpotMaxPosAdj.toFixed(1)} ` +
+        `effMaxPos=${effectiveSpotMaxPositions} effMaxUsd=$${effectiveSpotMaxTotalUsd.toFixed(0)} ` +
+        `gates: swingGated=${hlSpotSwingGated} accumGated=${hlSpotAccumGated} conf=${conf.toFixed(2)}`,
+      );
     }
   }
 
