@@ -4094,10 +4094,20 @@ export async function generateDecisions(
     const effectiveSpotMaxPositions = Math.max(1, env.hlSpotMaxPositions + Math.round(learnedSpotMaxPosAdj));
     const effectiveSpotMaxTotalUsd = env.hlSpotMaxTotalUsd * applyAdaptive(1.0, learnedSpotSizeMult, conf);
 
-    // Build dynamic spot universe (same pattern as perps — analyst + trending + movers)
+    // Build dynamic spot universe (same pattern as perps — base coins + analyst + trending + movers)
     const spotUniverse = new Set<string>();
 
-    // Analyst-tracked coins that are spot-listed
+    // 1. Configured base coins (guaranteed — like hlPerpTradingCoins for perps)
+    for (const c of env.hlSpotTradingCoins) {
+      if (hlSpotCoins.has(c)) spotUniverse.add(c);
+    }
+
+    // 2. Accumulation coins are also valid spot targets
+    for (const c of env.hlSpotAccumulationCoins) {
+      if (hlSpotCoins.has(c)) spotUniverse.add(c);
+    }
+
+    // 3. Analyst-tracked coins that are spot-listed
     if (intel.analystPrices) {
       for (const sym of Object.keys(intel.analystPrices)) {
         const upper = sym.toUpperCase();
@@ -4106,7 +4116,7 @@ export async function generateDecisions(
       }
     }
 
-    // Analyst top movers
+    // 4. Analyst top movers
     if (intel.analystMovers) {
       for (const m of intel.analystMovers) {
         const upper = m.symbol.toUpperCase();
@@ -4115,7 +4125,7 @@ export async function generateDecisions(
       }
     }
 
-    // CoinGecko trending
+    // 5. CoinGecko trending
     if (intel.analystTrending) {
       for (const t of intel.analystTrending) {
         const upper = t.toUpperCase();

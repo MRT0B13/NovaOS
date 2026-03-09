@@ -82,6 +82,7 @@ export interface CFOEnv {
   hlSpotTradingEnabled: boolean;                 // master switch for spot trades (default: false)
   hlSpotTaEnabled: boolean;                      // enable TA-driven spot entries (default: true when spot on)
   hlSpotAccumulationEnabled: boolean;            // enable treasury accumulation mode (default: false)
+  hlSpotTradingCoins: string[];                  // base coins eligible for spot TA (default: BTC,ETH,SOL,HYPE)
   hlSpotMaxPositionUsd: number;                  // max single spot position (default: 200)
   hlSpotMaxTotalUsd: number;                     // max total spot exposure (default: 500)
   hlSpotMaxPositions: number;                    // max simultaneous spot positions (default: 5)
@@ -329,6 +330,8 @@ export function getCFOEnv(bust = false): CFOEnv {
     hlSpotTradingEnabled: (process.env.CFO_HL_SPOT_TRADING_ENABLED ?? process.env.CFO_HL_SPOT_TRADING_ENABLE) === 'true',
     hlSpotTaEnabled: (process.env.CFO_HL_SPOT_TA_ENABLED ?? process.env.CFO_HL_SPOT_TA_ENABLE) !== 'false',        // default ON when spot enabled
     hlSpotAccumulationEnabled: (process.env.CFO_HL_SPOT_ACCUMULATION_ENABLED ?? process.env.CFO_HL_SPOT_ACCUMULATION_ENABLE) === 'true',
+    hlSpotTradingCoins: (process.env.CFO_HL_SPOT_TRADING_COINS ?? 'BTC,ETH,SOL,HYPE')
+      .split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
     hlSpotMaxPositionUsd: Number(process.env.CFO_HL_SPOT_MAX_POSITION_USD ?? 200),
     hlSpotMaxTotalUsd: Number(process.env.CFO_HL_SPOT_MAX_TOTAL_USD ?? 500),
     hlSpotMaxPositions: Number(process.env.CFO_HL_SPOT_MAX_POSITIONS ?? 5),
