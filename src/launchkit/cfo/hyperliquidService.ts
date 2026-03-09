@@ -921,6 +921,79 @@ export async function cancelTriggerOrdersForCoin(coin: string): Promise<void> {
 }
 
 /**
+ * Update native HL trigger orders (TP/SL) for a coin.
+ * Called when the software monitor moves SL to breakeven, takes partial profit,
+ * or adjusts trailing stop — so the on-exchange safety net matches the software state.
+ *
+ * Cancels existing trigger orders and places new ones with the updated SL/TP prices.
+ */
+export async function updateNativeTpSl(params: {
+  coin: string;
+  isLong: boolean;
+  sizeCoin: number;
+  slPrice: number;
+  tpPrice: number;
+}): Promise<void> {
+  const { coin, isLong, sizeCoin, slPrice, tpPrice } = params;
+  try {
+    const { exchange, info, wallet } = await loadHL();
+
+    const meta = await info.meta();
+    const universe = (meta as any).universe ?? [];
+    const assetIdx = universe.findIndex((u: any) => u.name === coin);
+    if (assetIdx < 0) return;
+    const szDecimals: number = universe[assetIdx].szDecimals ?? 1;
+
+    // Cancel existing trigger orders first
+    const openOrders = await info.openOrders({ user: wallet.address });
+    const coinOrders = (openOrders || []).filter((o: any) => o.coin === coin);
+    for (const o of coinOrders) {
+      try {
+        await exchange.cancel({ cancels: [{ a: assetIdx, o: o.oid }] });
+      } catch { /* best-effort cancel */ }
+    }
+
+    // Round size to valid szDecimals
+    const szStep = Math.pow(10, szDecimals);
+    const sizeFmt = Math.floor(sizeCoin * szStep) / szStep;
+    if (sizeFmt <= 0) return;
+
+    const slPriceFmt = formatLimitPrice(slPrice, szDecimals);
+    const tpPriceFmt = formatLimitPrice(tpPrice, szDecimals);
+
+    await exchange.order({
+      orders: [
+        {
+          a: assetIdx,
+          b: !isLong,        // opposite side to close
+          p: slPriceFmt,
+          s: sizeFmt.toString(),
+          r: true,           // reduce-only
+          t: { trigger: { isMarket: true, triggerPx: slPriceFmt, tpsl: 'sl' as const } },
+        },
+        {
+          a: assetIdx,
+          b: !isLong,
+          p: tpPriceFmt,
+          s: sizeFmt.toString(),
+          r: true,
+          t: { trigger: { isMarket: true, triggerPx: tpPriceFmt, tpsl: 'tp' as const } },
+        },
+      ],
+      grouping: 'positionTpsl',
+    });
+
+    logger.info(
+      `[Hyperliquid] ${coin}-PERP native TP/SL updated: ` +
+      `SL=$${slPriceFmt}, TP=$${tpPriceFmt}, size=${sizeFmt}`,
+    );
+  } catch (err) {
+    // Non-fatal — software monitor is primary, native orders are safety net
+    logger.warn(`[Hyperliquid] Failed to update native TP/SL for ${coin}:`, err);
+  }
+}
+
+/**
  * Emergency close ALL open positions. Used by kill switch and Guardian alerts.
  */
 export async function closeAllPositions(): Promise<{ closed: number; errors: string[] }> {

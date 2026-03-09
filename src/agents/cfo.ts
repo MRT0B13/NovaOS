@@ -2151,6 +2151,26 @@ export class CFOAgent extends BaseAgent {
             `🔄 Reconciled ${rebuilt} perp position(s) after restart — ` +
             `trailing stops & BE protection now active`,
           );
+
+          // Sync native HL trigger orders for reconciled positions that are already past BE
+          const reconciledStyles = getTrackedTradeStyles();
+          for (const [key, rInfo] of reconciledStyles) {
+            if (!rInfo.movedToBreakeven) continue;
+            const [rCoin, rSide] = key.split('-') as [string, 'LONG' | 'SHORT'];
+            const rPos = summary.positions.find(p => p.coin === rCoin && p.side === rSide);
+            if (!rPos) continue;
+            const rIsLong = rSide === 'LONG';
+            const rSc = ta.getStyleConfig(rInfo.style);
+            const beSLPrice = rIsLong
+              ? rPos.entryPrice * (1 - 0.003)
+              : rPos.entryPrice * (1 + 0.003);
+            const tpPrice = rIsLong
+              ? rPos.entryPrice * (1 + rSc.takeProfitPct / 100)
+              : rPos.entryPrice * (1 - rSc.takeProfitPct / 100);
+            const sizeCoin = rPos.sizeUsd / rPos.markPrice;
+            await hlMod.updateNativeTpSl({ coin: rCoin, isLong: rIsLong, sizeCoin, slPrice: beSLPrice, tpPrice }).catch(() => {});
+            logger.info(`[CFO] Synced native TP/SL for ${rCoin} after reconcile (BE already set)`);
+          }
         }
       }
 
@@ -2177,9 +2197,21 @@ export class CFOAgent extends BaseAgent {
         // ── Move SL to breakeven at 50% of TP target ───────────────
         // Once in meaningful profit, protect the entry.
         const beThreshold = sc.takeProfitPct * 0.5;
+        const isLong = side === 'LONG';
         if (!info.movedToBreakeven && marginPct >= beThreshold) {
           updateTradeStyle(key, { movedToBreakeven: true, effectiveSLPct: 0 });
           logger.info(`[CFO] Position ${side} ${coin}: moved SL to breakeven (profit ${marginPct.toFixed(1)}% >= ${beThreshold.toFixed(1)}% threshold)`);
+
+          // Sync native HL trigger orders: move SL to breakeven (entry ± 0.3% buffer)
+          const beSLPrice = isLong
+            ? pos.entryPrice * (1 - 0.003)   // long: SL just below entry
+            : pos.entryPrice * (1 + 0.003);  // short: SL just above entry
+          const tpPrice = isLong
+            ? pos.entryPrice * (1 + sc.takeProfitPct / 100)
+            : pos.entryPrice * (1 - sc.takeProfitPct / 100);
+          const sizeCoin = pos.sizeUsd / pos.markPrice;
+          await hlMod.updateNativeTpSl({ coin, isLong, sizeCoin, slPrice: beSLPrice, tpPrice }).catch(() => {});
+
           const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
           await notifyAdminForce(`🛡️ [${info.style}] ${side} ${coin}: SL → breakeven (PnL +${marginPct.toFixed(1)}%)`);
         }
@@ -2194,6 +2226,17 @@ export class CFOAgent extends BaseAgent {
           const result = await hlMod.closePosition(coin, halfSize, isBuy);
           if (result.success) {
             updateTradeStyle(key, { partialTaken: true });
+
+            // Sync native HL trigger orders with reduced size
+            const remainingSize = halfSize; // ~50% of original
+            const beSLPrice = isLong
+              ? pos.entryPrice * (1 - 0.003)
+              : pos.entryPrice * (1 + 0.003);
+            const tpPrice = isLong
+              ? pos.entryPrice * (1 + sc.takeProfitPct / 100)
+              : pos.entryPrice * (1 - sc.takeProfitPct / 100);
+            await hlMod.updateNativeTpSl({ coin, isLong, sizeCoin: remainingSize, slPrice: beSLPrice, tpPrice }).catch(() => {});
+
             const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
             await notifyAdminForce(
               `💰 [${info.style}] Partial TP: closed 50% of ${side} ${coin}-PERP\n` +
