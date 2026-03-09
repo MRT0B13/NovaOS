@@ -3356,6 +3356,8 @@ export async function generateDecisions(
       taTakeProfitPct?: number;
       taMaxHoldHours?: number;
       taLeverage?: number;          // per-style leverage from StyleConfig × learned multiplier
+      taAtrPct?: number;            // ATR% on trigger TF (for dynamic stops/sizing)
+      taRegimeFiltered?: boolean;   // ADX < 20 = choppy market (already conviction-penalised in TA)
     };
 
     const signals: CoinSignal[] = [];
@@ -3547,6 +3549,8 @@ export async function generateDecisions(
             taTakeProfitPct: styleConfig.takeProfitPct,
             taMaxHoldHours: styleConfig.maxHoldHours,
             taLeverage: learnedStyleLev,
+            taAtrPct: taSig.atrPct,
+            taRegimeFiltered: taSig.regimeFiltered,
           });
         }
 
@@ -3623,19 +3627,87 @@ export async function generateDecisions(
         continue;
       }
 
+      // ── Cross-asset correlation guard ─────────────────────────────────
+      // Coins in the same ecosystem move together. Limit to 1 directional
+      // position per sector to avoid correlated losses.
+      {
+        const SECTOR_MAP: Record<string, string> = {
+          SOL: 'sol-eco', JUP: 'sol-eco', WIF: 'sol-eco', PYTH: 'sol-eco',
+          BONK: 'sol-eco', RAY: 'sol-eco', JTO: 'sol-eco', TNSR: 'sol-eco',
+          W: 'sol-eco', RENDER: 'sol-eco', HNT: 'sol-eco',
+          BTC: 'btc', ORDI: 'btc', SATS: 'btc',
+          ETH: 'eth-eco', ARB: 'eth-eco', OP: 'eth-eco', STRK: 'eth-eco',
+          MATIC: 'eth-eco', MANTA: 'eth-eco',
+          DOGE: 'meme', SHIB: 'meme', PEPE: 'meme', FLOKI: 'meme',
+          AVAX: 'alt-l1', SUI: 'alt-l1', APT: 'alt-l1', SEI: 'alt-l1',
+          NEAR: 'alt-l1', INJ: 'alt-l1', TIA: 'alt-l1',
+        };
+        const sector = SECTOR_MAP[sig.coin];
+        if (sector) {
+          // Check existing positions in this sector with the same direction
+          const sectorPositions = existingPerpPositions.filter(p => {
+            const posSector = SECTOR_MAP[p.coin];
+            return posSector === sector && p.side === sig.side;
+          });
+          const pendingSectorOpens = pendingOpens.filter(d => {
+            const dSector = SECTOR_MAP[d.params.coin];
+            return dSector === sector && d.params.side === sig.side;
+          });
+          if (sectorPositions.length + pendingSectorOpens.length >= 1) {
+            if (sig.tradeStyle) taRejects.duplicate++;
+            continue; // already have a same-direction position in this sector
+          }
+        }
+      }
+
       // ── Leverage: TA signals carry per-style leverage, sentiment uses default ──
       const effectiveLeverage = sig.taLeverage ?? env.hlPerpDefaultLeverage;
 
-      // ── Size: TA uses per-style learned multiplier, sentiment uses base ──
+      // ── ATR-based dynamic stop-loss ──────────────────────────────────────
+      // Instead of fixed % SL per style, use ATR to set a volatility-aware SL.
+      // SL = 2× ATR% (gives room for normal volatility, cuts on abnormal moves).
+      // Falls back to learned/fixed SL if ATR not available.
+      let effectiveSL: number;
+      if (sig.taAtrPct && sig.taAtrPct > 0) {
+        const atrBasedSL = sig.taAtrPct * 2 * 100; // ATR% is 0-1 fraction, convert to percentage
+        // Clamp ATR-based SL: min 0.5% (prevent too tight), max = style default × 1.5
+        const styleDefaultSL = sig.taStopLossPct ?? learnedPerpSL;
+        effectiveSL = Math.max(0.5, Math.min(atrBasedSL, styleDefaultSL * 1.5));
+      } else {
+        effectiveSL = sig.taStopLossPct ?? learnedPerpSL;
+      }
+      const effectiveTP = sig.taTakeProfitPct ?? learnedPerpTP;
+
+      // ── ATR-based position sizing ────────────────────────────────────────
+      // Risk a fixed $ amount per trade, then compute size from ATR:
+      //   riskBudget = maxPosUsd × conviction × sizeMult
+      //   sizeUsd = riskBudget / (effectiveSL% / 100)
+      // This means: volatile coins → smaller size, stable coins → larger size.
+      // Falls back to old sizing if ATR not available.
       const effectiveSizeMult = sig.tradeStyle
         ? (learned.hlPerpStyleSizeMultipliers?.[sig.tradeStyle] ?? 1.0)
         : 1.0;
       const effectiveMaxPosUsd = applyAdaptive(maxPosUsd, effectiveSizeMult, conf);
-      const sizeUsd = Math.min(
-        effectiveMaxPosUsd * sig.conviction,
-        maxTotalUsd - openUsd,
-        state.hlAvailableMargin * effectiveLeverage * 0.8,
-      );
+
+      let sizeUsd: number;
+      if (sig.taAtrPct && sig.taAtrPct > 0) {
+        // Risk budget = fraction of max position based on conviction
+        const riskBudgetUsd = effectiveMaxPosUsd * sig.conviction * (effectiveSL / 100);
+        // Position size to risk exactly riskBudget at effectiveSL distance
+        sizeUsd = Math.min(
+          riskBudgetUsd / (effectiveSL / 100),
+          effectiveMaxPosUsd,                        // hard cap at max position
+          maxTotalUsd - openUsd,
+          state.hlAvailableMargin * effectiveLeverage * 0.8,
+        );
+      } else {
+        // Fallback: old conviction-based sizing for sentiment signals
+        sizeUsd = Math.min(
+          effectiveMaxPosUsd * sig.conviction,
+          maxTotalUsd - openUsd,
+          state.hlAvailableMargin * effectiveLeverage * 0.8,
+        );
+      }
 
       if (sizeUsd < 10) {
         if (sig.tradeStyle) taRejects.tooSmall++;
@@ -3643,8 +3715,6 @@ export async function generateDecisions(
       }
 
       // ── Build decision ──────────────────────────────────────────────────
-      const effectiveSL = sig.taStopLossPct ?? learnedPerpSL;
-      const effectiveTP = sig.taTakeProfitPct ?? learnedPerpTP;
 
       const d: Decision = {
         type: 'HL_PERP_OPEN',
@@ -3652,7 +3722,7 @@ export async function generateDecisions(
           `${sig.side} ${sig.coin}-PERP: conviction ${(sig.conviction * 100).toFixed(0)}% ` +
           `[${sig.reasoning}]. ` +
           `Size: $${sizeUsd.toFixed(0)} at ${effectiveLeverage}x. ` +
-          `SL: ${effectiveSL.toFixed(1)}% / TP: ${effectiveTP}%.` +
+          `SL: ${effectiveSL.toFixed(1)}%${sig.taAtrPct ? `(ATR:${(sig.taAtrPct*100).toFixed(2)}%)` : ''} / TP: ${effectiveTP}%.` +
           `${sig.taMaxHoldHours ? ` maxHold: ${sig.taMaxHoldHours}h.` : ''} ` +
           `HL margin: $${state.hlAvailableMargin.toFixed(0)}. ` +
           `Perp positions: ${existingPerpCount}/${maxPositions}, total: $${existingPerpTotalUsd.toFixed(0)}/$${maxTotalUsd}.`,

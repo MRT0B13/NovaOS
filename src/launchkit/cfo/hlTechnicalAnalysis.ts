@@ -49,6 +49,20 @@ export interface TimeframeSignal {
   volumeRatio: number;   // current vol / 20-bar avg vol
   lastClose: number;     // latest close price
   strength: number;      // 0-1 signal strength
+  // Advanced indicators
+  adx: number;           // ADX value (>25 = trending, <20 = choppy)
+  plusDI: number;        // +DI (directional indicator)
+  minusDI: number;       // -DI
+  atrPct: number;        // ATR as % of price (volatility)
+  macdHistogram: number; // MACD histogram value
+  macdHistIncreasing: boolean; // histogram increasing in trade direction
+  bbPercentB: number;    // Bollinger %B (0 = lower band, 1 = upper band)
+  bbSqueeze: boolean;    // Bollinger Band squeeze detected
+  bbBandwidth: number;   // BB bandwidth (low = squeeze, expanding = breakout)
+  nearestResistancePct: number; // distance to nearest resistance above (%)
+  nearestSupportPct: number;    // distance to nearest support below (%)
+  bullishDivergence: boolean;   // RSI bullish divergence
+  bearishDivergence: boolean;   // RSI bearish divergence
 }
 
 export interface MTFSignal {
@@ -63,6 +77,9 @@ export interface MTFSignal {
   stopLossPct: number;
   takeProfitPct: number;
   leverage: number;               // style-specific base leverage
+  atrPct: number;                 // ATR% on trigger TF (for dynamic stops/sizing)
+  adxValue: number;               // ADX on filter TF (for regime detection)
+  regimeFiltered: boolean;        // true if ADX < 20 on filter TF (choppy)
 }
 
 /** Configuration per trade style */
@@ -197,6 +214,332 @@ function volumeRatio(volumes: number[], lookback = 20): number {
 }
 
 // ============================================================================
+// Advanced indicators — ADX, ATR, MACD, Bollinger Bands, S/R
+// ============================================================================
+
+/**
+ * Average True Range (ATR) — measures volatility.
+ * Returns an array of ATR values (first `period` values are approximate).
+ */
+function atr(candles: Candle[], period = 14): number[] {
+  if (candles.length < 2) return candles.map(() => 0);
+  const trueRanges: number[] = [candles[0].h - candles[0].l];
+  for (let i = 1; i < candles.length; i++) {
+    const high = candles[i].h;
+    const low = candles[i].l;
+    const prevClose = candles[i - 1].c;
+    trueRanges.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
+  }
+  // Wilder smoothing
+  const result: number[] = [];
+  let sum = 0;
+  for (let i = 0; i < trueRanges.length; i++) {
+    if (i < period) {
+      sum += trueRanges[i];
+      result.push(sum / (i + 1));
+    } else if (i === period) {
+      sum += trueRanges[i];
+      result.push(sum / period);
+    } else {
+      result.push((result[i - 1] * (period - 1) + trueRanges[i]) / period);
+    }
+  }
+  return result;
+}
+
+/**
+ * ATR as a percentage of the current price.
+ * Useful for volatility-normalized stop-losses and sizing.
+ */
+function atrPercent(candles: Candle[], period = 14): number {
+  const atrVals = atr(candles, period);
+  const lastAtr = atrVals[atrVals.length - 1];
+  const lastClose = candles[candles.length - 1]?.c ?? 1;
+  return lastClose > 0 ? (lastAtr / lastClose) * 100 : 0;
+}
+
+/**
+ * Average Directional Index (ADX) with +DI / -DI.
+ * ADX > 25 = trending, ADX < 20 = ranging/choppy.
+ * Returns { adx, plusDI, minusDI } for latest bar.
+ */
+function adx(candles: Candle[], period = 14): { adx: number; plusDI: number; minusDI: number } {
+  if (candles.length < period + 1) return { adx: 0, plusDI: 0, minusDI: 0 };
+
+  const plusDMs: number[] = [];
+  const minusDMs: number[] = [];
+  const trueRanges: number[] = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const upMove = candles[i].h - candles[i - 1].h;
+    const downMove = candles[i - 1].l - candles[i].l;
+    plusDMs.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDMs.push(downMove > upMove && downMove > 0 ? downMove : 0);
+
+    const high = candles[i].h;
+    const low = candles[i].l;
+    const prevClose = candles[i - 1].c;
+    trueRanges.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
+  }
+
+  // Wilder smoothing for +DM, -DM, TR
+  const smooth = (vals: number[]): number[] => {
+    const result: number[] = [];
+    let sum = 0;
+    for (let i = 0; i < vals.length; i++) {
+      if (i < period) {
+        sum += vals[i];
+        result.push(sum);
+      } else if (i === period - 1) {
+        result[i] = sum;
+      } else {
+        result.push(result[i - 1] - result[i - 1] / period + vals[i]);
+      }
+    }
+    return result;
+  };
+
+  const smoothPlusDM = smooth(plusDMs);
+  const smoothMinusDM = smooth(minusDMs);
+  const smoothTR = smooth(trueRanges);
+
+  // +DI and -DI series
+  const plusDISeries: number[] = [];
+  const minusDISeries: number[] = [];
+  const dxSeries: number[] = [];
+
+  for (let i = 0; i < smoothTR.length; i++) {
+    const tr = smoothTR[i];
+    if (tr === 0) {
+      plusDISeries.push(0);
+      minusDISeries.push(0);
+      dxSeries.push(0);
+      continue;
+    }
+    const pdi = (smoothPlusDM[i] / tr) * 100;
+    const mdi = (smoothMinusDM[i] / tr) * 100;
+    plusDISeries.push(pdi);
+    minusDISeries.push(mdi);
+    const diSum = pdi + mdi;
+    dxSeries.push(diSum > 0 ? (Math.abs(pdi - mdi) / diSum) * 100 : 0);
+  }
+
+  // ADX = smoothed DX (Wilder's)
+  let adxVal = 0;
+  if (dxSeries.length >= period) {
+    adxVal = dxSeries.slice(0, period).reduce((s, v) => s + v, 0) / period;
+    for (let i = period; i < dxSeries.length; i++) {
+      adxVal = (adxVal * (period - 1) + dxSeries[i]) / period;
+    }
+  }
+
+  return {
+    adx: adxVal,
+    plusDI: plusDISeries[plusDISeries.length - 1] ?? 0,
+    minusDI: minusDISeries[minusDISeries.length - 1] ?? 0,
+  };
+}
+
+/**
+ * MACD (12, 26, 9) — momentum oscillator.
+ * Returns { macdLine, signalLine, histogram } for latest bar.
+ * histogram > 0 and increasing = bullish momentum.
+ */
+function macd(closes: number[], fastPeriod = 12, slowPeriod = 26, signalPeriod = 9): {
+  macdLine: number; signalLine: number; histogram: number;
+  prevHistogram: number; histogramIncreasing: boolean;
+} {
+  const neutral = { macdLine: 0, signalLine: 0, histogram: 0, prevHistogram: 0, histogramIncreasing: false };
+  if (closes.length < slowPeriod + signalPeriod) return neutral;
+
+  const emaFastArr = ema(closes, fastPeriod);
+  const emaSlowArr = ema(closes, slowPeriod);
+
+  // MACD line = fast EMA - slow EMA
+  const macdLineArr: number[] = [];
+  for (let i = 0; i < closes.length; i++) {
+    macdLineArr.push(emaFastArr[i] - emaSlowArr[i]);
+  }
+
+  // Signal line = EMA of MACD line
+  const signalLineArr = ema(macdLineArr, signalPeriod);
+
+  // Histogram
+  const histArr: number[] = [];
+  for (let i = 0; i < macdLineArr.length; i++) {
+    histArr.push(macdLineArr[i] - signalLineArr[i]);
+  }
+
+  const lastHist = histArr[histArr.length - 1];
+  const prevHist = histArr.length > 1 ? histArr[histArr.length - 2] : 0;
+
+  return {
+    macdLine: macdLineArr[macdLineArr.length - 1],
+    signalLine: signalLineArr[signalLineArr.length - 1],
+    histogram: lastHist,
+    prevHistogram: prevHist,
+    histogramIncreasing: lastHist > prevHist,
+  };
+}
+
+/**
+ * Bollinger Bands (20, 2).
+ * Returns { upper, middle, lower, bandwidth, percentB, squeeze }.
+ * squeeze = true when bandwidth is in the lowest 20% of recent history (25 bars).
+ */
+function bollingerBands(closes: number[], period = 20, stdDevMult = 2): {
+  upper: number; middle: number; lower: number;
+  bandwidth: number; percentB: number; squeeze: boolean;
+} {
+  const neutral = { upper: 0, middle: 0, lower: 0, bandwidth: 0, percentB: 0.5, squeeze: false };
+  if (closes.length < period) return neutral;
+
+  const slice = closes.slice(-period);
+  const middle = slice.reduce((s, v) => s + v, 0) / period;
+
+  const variance = slice.reduce((s, v) => s + Math.pow(v - middle, 2), 0) / period;
+  const stdDev = Math.sqrt(variance);
+
+  const upper = middle + stdDevMult * stdDev;
+  const lower = middle - stdDevMult * stdDev;
+  const bandwidth = middle > 0 ? (upper - lower) / middle : 0;
+  const lastClose = closes[closes.length - 1];
+  const percentB = (upper - lower) > 0 ? (lastClose - lower) / (upper - lower) : 0.5;
+
+  // Squeeze detection: compare current bandwidth to recent history
+  let squeeze = false;
+  if (closes.length >= period + 25) {
+    const recentBWs: number[] = [];
+    for (let i = closes.length - 25; i <= closes.length; i++) {
+      if (i < period) continue;
+      const s = closes.slice(i - period, i);
+      const m = s.reduce((sum, v) => sum + v, 0) / period;
+      const v = s.reduce((sum, val) => sum + Math.pow(val - m, 2), 0) / period;
+      const sd = Math.sqrt(v);
+      const u = m + stdDevMult * sd;
+      const l = m - stdDevMult * sd;
+      recentBWs.push(m > 0 ? (u - l) / m : 0);
+    }
+    if (recentBWs.length >= 10) {
+      const sortedBWs = [...recentBWs].sort((a, b) => a - b);
+      const percentile20 = sortedBWs[Math.floor(sortedBWs.length * 0.2)];
+      squeeze = bandwidth <= percentile20;
+    }
+  }
+
+  return { upper, middle, lower, bandwidth, percentB, squeeze };
+}
+
+/**
+ * Detect recent swing highs and swing lows (support/resistance levels).
+ * A swing high = bar whose high is higher than `lookback` bars on each side.
+ * Returns the nearest resistance (above) and support (below) relative to last close.
+ */
+function detectSwingLevels(candles: Candle[], lookback = 5): {
+  nearestResistance: number | null;
+  nearestSupport: number | null;
+  distToResistancePct: number;  // >0, how far above current price
+  distToSupportPct: number;     // >0, how far below current price
+} {
+  const result = { nearestResistance: null as number | null, nearestSupport: null as number | null, distToResistancePct: Infinity, distToSupportPct: Infinity };
+  if (candles.length < lookback * 2 + 1) return result;
+
+  const lastClose = candles[candles.length - 1].c;
+  const swingHighs: number[] = [];
+  const swingLows: number[] = [];
+
+  // Don't check the last `lookback` candles (need right-side confirmation)
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    const h = candles[i].h;
+    const l = candles[i].l;
+    let isSwingHigh = true;
+    let isSwingLow = true;
+    for (let j = 1; j <= lookback; j++) {
+      if (candles[i - j].h >= h || candles[i + j].h >= h) isSwingHigh = false;
+      if (candles[i - j].l <= l || candles[i + j].l <= l) isSwingLow = false;
+    }
+    if (isSwingHigh) swingHighs.push(h);
+    if (isSwingLow) swingLows.push(l);
+  }
+
+  // Nearest resistance = closest swing high ABOVE current price
+  for (const sh of swingHighs) {
+    if (sh > lastClose) {
+      const dist = ((sh - lastClose) / lastClose) * 100;
+      if (dist < result.distToResistancePct) {
+        result.nearestResistance = sh;
+        result.distToResistancePct = dist;
+      }
+    }
+  }
+
+  // Nearest support = closest swing low BELOW current price
+  for (const sl of swingLows) {
+    if (sl < lastClose) {
+      const dist = ((lastClose - sl) / lastClose) * 100;
+      if (dist < result.distToSupportPct) {
+        result.nearestSupport = sl;
+        result.distToSupportPct = dist;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * RSI divergence detection.
+ * Bullish divergence: price makes lower low but RSI makes higher low.
+ * Bearish divergence: price makes higher high but RSI makes lower high.
+ * Checks the last `window` candles for divergence patterns.
+ */
+function detectRSIDivergence(closes: number[], rsiArr: number[], window = 30): {
+  bullishDivergence: boolean;
+  bearishDivergence: boolean;
+} {
+  const result = { bullishDivergence: false, bearishDivergence: false };
+  if (closes.length < window || rsiArr.length < window) return result;
+
+  const startIdx = closes.length - window;
+  const endIdx = closes.length - 1;
+
+  // Find local lows and highs in the window
+  const priceLows: { idx: number; val: number }[] = [];
+  const priceHighs: { idx: number; val: number }[] = [];
+
+  for (let i = startIdx + 2; i < endIdx - 1; i++) {
+    if (closes[i] <= closes[i - 1] && closes[i] <= closes[i - 2] &&
+        closes[i] <= closes[i + 1] && closes[i] <= closes[i + 2]) {
+      priceLows.push({ idx: i, val: closes[i] });
+    }
+    if (closes[i] >= closes[i - 1] && closes[i] >= closes[i - 2] &&
+        closes[i] >= closes[i + 1] && closes[i] >= closes[i + 2]) {
+      priceHighs.push({ idx: i, val: closes[i] });
+    }
+  }
+
+  // Bullish divergence: price lower low, RSI higher low
+  if (priceLows.length >= 2) {
+    const recent = priceLows[priceLows.length - 1];
+    const prev = priceLows[priceLows.length - 2];
+    if (recent.val < prev.val && rsiArr[recent.idx] > rsiArr[prev.idx]) {
+      result.bullishDivergence = true;
+    }
+  }
+
+  // Bearish divergence: price higher high, RSI lower high
+  if (priceHighs.length >= 2) {
+    const recent = priceHighs[priceHighs.length - 1];
+    const prev = priceHighs[priceHighs.length - 2];
+    if (recent.val > prev.val && rsiArr[recent.idx] < rsiArr[prev.idx]) {
+      result.bearishDivergence = true;
+    }
+  }
+
+  return result;
+}
+
+// ============================================================================
 // Candle fetching (cached)
 // ============================================================================
 
@@ -316,6 +659,11 @@ function analyseTimeframe(candles: Candle[], interval: CandleInterval): Timefram
     emaFast: 0, emaSlow: 0, ema50: 0,
     rsi: 50, volumeRatio: 1,
     lastClose: 0, strength: 0,
+    adx: 0, plusDI: 0, minusDI: 0,
+    atrPct: 0, macdHistogram: 0, macdHistIncreasing: false,
+    bbPercentB: 0.5, bbSqueeze: false, bbBandwidth: 0,
+    nearestResistancePct: Infinity, nearestSupportPct: Infinity,
+    bullishDivergence: false, bearishDivergence: false,
   };
 
   if (candles.length < 21) return neutral; // need at least 21 candles for EMA 21
@@ -330,6 +678,14 @@ function analyseTimeframe(candles: Candle[], interval: CandleInterval): Timefram
   const rsiArr = rsi(closes, 14);
   const volRatio = volumeRatio(volumes, 20);
 
+  // Advanced indicators
+  const adxResult = adx(candles, 14);
+  const atrPctResult = atrPercent(candles, 14);
+  const macdResult = macd(closes, 12, 26, 9);
+  const bbResult = bollingerBands(closes, 20, 2);
+  const srLevels = detectSwingLevels(candles, 5);
+  const rsiDivergence = detectRSIDivergence(closes, rsiArr, 30);
+
   const lastEmaFast = emaFastArr[emaFastArr.length - 1];
   const lastEmaSlow = emaSlowArr[emaSlowArr.length - 1];
   const lastEma50 = ema50Arr[ema50Arr.length - 1];
@@ -341,20 +697,21 @@ function analyseTimeframe(candles: Candle[], interval: CandleInterval): Timefram
   const prevEmaSlow = emaSlowArr.length > 1 ? emaSlowArr[emaSlowArr.length - 2] : lastEmaSlow;
 
   // ── Determine bias ──
+  // Scoring system: max ~10 points possible per side (was 5.5 — now richer)
   let bullPoints = 0;
   let bearPoints = 0;
   let strength = 0;
 
-  // 1. EMA 8/21 crossover (most important)
+  // 1. EMA 8/21 crossover (most important — directional backbone)
   const emaCrossUp = prevEmaFast <= prevEmaSlow && lastEmaFast > lastEmaSlow;
   const emaCrossDown = prevEmaFast >= prevEmaSlow && lastEmaFast < lastEmaSlow;
   const emaAbove = lastEmaFast > lastEmaSlow;
   const emaBelow = lastEmaFast < lastEmaSlow;
 
-  if (emaCrossUp) { bullPoints += 3; } // fresh cross = strong signal
-  else if (emaAbove) { bullPoints += 2; } // already trending up
-  if (emaCrossDown) { bearPoints += 3; }
-  else if (emaBelow) { bearPoints += 2; }
+  if (emaCrossUp) { bullPoints += 2.5; }
+  else if (emaAbove) { bullPoints += 1.5; }
+  if (emaCrossDown) { bearPoints += 2.5; }
+  else if (emaBelow) { bearPoints += 1.5; }
 
   // 2. Price relative to EMA 50 (trend filter)
   if (lastClose > lastEma50) bullPoints += 1;
@@ -362,30 +719,65 @@ function analyseTimeframe(candles: Candle[], interval: CandleInterval): Timefram
 
   // 3. RSI zones
   if (lastRsi > 70) {
-    // Overbought — bearish for scalp (reversal), but bullish momentum for swing
-    bearPoints += 1; // slight caution
+    bearPoints += 1;
   } else if (lastRsi < 30) {
-    bullPoints += 1; // oversold bounce potential
+    bullPoints += 1;
   } else if (lastRsi > 55) {
-    bullPoints += 0.5; // mild bullish
+    bullPoints += 0.5;
   } else if (lastRsi < 45) {
-    bearPoints += 0.5; // mild bearish
+    bearPoints += 0.5;
   }
 
   // 4. Volume confirmation
   if (volRatio > 1.5) {
-    // High volume confirms the current direction
     if (bullPoints > bearPoints) bullPoints += 1;
     else if (bearPoints > bullPoints) bearPoints += 1;
   }
 
-  const maxPoints = 5.5; // theoretical max: cross(3) + ema50(1) + rsi(1) + vol(1) − partials
+  // 5. MACD histogram — momentum confirmation (NEW)
+  // Histogram increasing in the direction of the bias = momentum agreement
+  if (macdResult.histogram > 0 && macdResult.histogramIncreasing) {
+    bullPoints += 1.5; // bullish momentum accelerating
+  } else if (macdResult.histogram < 0 && !macdResult.histogramIncreasing) {
+    bearPoints += 1.5; // bearish momentum accelerating (histogram decreasing = more negative)
+  }
+  // MACD cross (histogram flipping sign) is a strong signal
+  if (macdResult.histogram > 0 && macdResult.prevHistogram <= 0) {
+    bullPoints += 0.5; // MACD bullish cross
+  } else if (macdResult.histogram < 0 && macdResult.prevHistogram >= 0) {
+    bearPoints += 0.5; // MACD bearish cross
+  }
+
+  // 6. Bollinger Bands — mean reversion + breakout (NEW)
+  if (bbResult.percentB > 1.0) {
+    // Price above upper band — overbought (reversal risk for shorts)
+    bearPoints += 0.5;
+  } else if (bbResult.percentB < 0.0) {
+    // Price below lower band — oversold (bounce potential)
+    bullPoints += 0.5;
+  }
+
+  // 7. RSI divergence — powerful reversal signal (NEW)
+  if (rsiDivergence.bullishDivergence) {
+    bullPoints += 1.5; // price making lower lows but RSI making higher lows
+  }
+  if (rsiDivergence.bearishDivergence) {
+    bearPoints += 1.5; // price making higher highs but RSI making lower highs
+  }
+
+  // 8. ADX directional agreement — +DI/-DI confirms bias (NEW)
+  if (adxResult.adx > 20) {
+    if (adxResult.plusDI > adxResult.minusDI) bullPoints += 0.5;
+    else if (adxResult.minusDI > adxResult.plusDI) bearPoints += 0.5;
+  }
+
+  const maxPoints = 10.0; // theoretical max: EMA(2.5) + EMA50(1) + RSI(1) + Vol(1) + MACD(2) + BB(0.5) + Div(1.5) + ADX(0.5)
   const net = bullPoints - bearPoints;
   strength = Math.min(1.0, Math.abs(net) / maxPoints);
 
   let bias: TrendBias = 'NEUTRAL';
-  if (net > 0.5) bias = 'LONG';
-  else if (net < -0.5) bias = 'SHORT';
+  if (net > 1.0) bias = 'LONG';   // higher threshold to reduce noise (was 0.5)
+  else if (net < -1.0) bias = 'SHORT';
 
   return {
     interval,
@@ -397,6 +789,19 @@ function analyseTimeframe(candles: Candle[], interval: CandleInterval): Timefram
     volumeRatio: volRatio,
     lastClose,
     strength,
+    adx: adxResult.adx,
+    plusDI: adxResult.plusDI,
+    minusDI: adxResult.minusDI,
+    atrPct: atrPctResult,
+    macdHistogram: macdResult.histogram,
+    macdHistIncreasing: macdResult.histogramIncreasing,
+    bbPercentB: bbResult.percentB,
+    bbSqueeze: bbResult.squeeze,
+    bbBandwidth: bbResult.bandwidth,
+    nearestResistancePct: srLevels.distToResistancePct,
+    nearestSupportPct: srLevels.distToSupportPct,
+    bullishDivergence: rsiDivergence.bullishDivergence,
+    bearishDivergence: rsiDivergence.bearishDivergence,
   };
 }
 
@@ -479,11 +884,45 @@ export async function analyseMultiTimeframe(
   if (conviction < 0.2) return null; // too weak
 
   // ── RSI guard — avoid entries into extreme zones ──
-  // Don't go LONG if RSI > 80 on trigger TF (overbought) — for scalps especially
   if (style === 'scalp') {
     if (bias === 'LONG' && triggerTf.rsi > 75) return null;
     if (bias === 'SHORT' && triggerTf.rsi < 25) return null;
   }
+
+  // ── ADX regime filter — avoid choppy/range-bound markets ──
+  const adxValue = filterTf.adx;
+  const regimeFiltered = adxValue < 20; // ADX < 20 = no trend, market is choppy
+  if (regimeFiltered) {
+    // In choppy markets, dampen conviction heavily — only accept very strong signals
+    conviction *= 0.4;
+    if (conviction < 0.35) return null; // too weak after choppy penalty
+  }
+
+  // ── S/R proximity guard — don't enter into nearby resistance/support ──
+  if (bias === 'LONG' && triggerTf.nearestResistancePct < 0.8) {
+    // Resistance is < 0.8% away — limited upside, skip or dampen
+    conviction *= 0.5;
+    if (conviction < 0.3) return null;
+  }
+  if (bias === 'SHORT' && triggerTf.nearestSupportPct < 0.8) {
+    // Support is < 0.8% away — limited downside, skip or dampen
+    conviction *= 0.5;
+    if (conviction < 0.3) return null;
+  }
+
+  // ── BB squeeze boost — volatility expansion breakout ──
+  if (triggerTf.bbSqueeze) {
+    // Low volatility compression → breakout imminent
+    // If bias aligns with BB %B direction, boost conviction
+    if (bias === 'LONG' && triggerTf.bbPercentB > 0.5) {
+      conviction = Math.min(1.0, conviction * 1.1);
+    } else if (bias === 'SHORT' && triggerTf.bbPercentB < 0.5) {
+      conviction = Math.min(1.0, conviction * 1.1);
+    }
+  }
+
+  // ── ATR for dynamic stop/size (trigger TF) ──
+  const atrPct = triggerTf.atrPct;
 
   // ── Build reasoning string ──
   const emaCrossLabel = triggerTf.emaFast > triggerTf.emaSlow
@@ -491,6 +930,11 @@ export async function analyseMultiTimeframe(
   const trendLabel = triggerTf.lastClose > triggerTf.ema50 ? 'above-EMA50' : 'below-EMA50';
   const volLabel = triggerTf.volumeRatio > 1.5 ? '🔊 high-vol' : triggerTf.volumeRatio < 0.5 ? '🔇 low-vol' : '';
   const rsiLabel = `RSI:${triggerTf.rsi.toFixed(0)}`;
+  const adxLabel = `ADX:${adxValue.toFixed(0)}${regimeFiltered ? '⚠choppy' : ''}`;
+  const macdLabel = triggerTf.macdHistIncreasing ? 'MACD↑' : 'MACD↓';
+  const atrLabel = `ATR:${(atrPct * 100).toFixed(2)}%`;
+  const divLabel = triggerTf.bullishDivergence ? '🐂div' : triggerTf.bearishDivergence ? '🐻div' : '';
+  const srLabel = `R:${(triggerTf.nearestResistancePct * 100).toFixed(1)}%/S:${(triggerTf.nearestSupportPct * 100).toFixed(1)}%`;
 
   const reasoning = [
     `${style}:${bias}`,
@@ -499,7 +943,12 @@ export async function analyseMultiTimeframe(
     `${cfg.filterInterval} filter:${filterTf.bias}`,
     trendLabel,
     rsiLabel,
+    adxLabel,
+    macdLabel,
+    atrLabel,
+    srLabel,
     volLabel,
+    divLabel,
     `conviction:${(conviction * 100).toFixed(0)}%`,
   ].filter(Boolean).join(', ');
 
@@ -515,6 +964,9 @@ export async function analyseMultiTimeframe(
     stopLossPct: cfg.stopLossPct,
     takeProfitPct: cfg.takeProfitPct,
     leverage: cfg.defaultLeverage,
+    atrPct,
+    adxValue,
+    regimeFiltered,
   };
 }
 
