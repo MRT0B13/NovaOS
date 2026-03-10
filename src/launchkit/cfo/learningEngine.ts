@@ -184,6 +184,10 @@ export function setLearningPool(pool: any): void {
 
 /**
  * Query closed positions for a strategy and compute stats.
+ * For aggregate strategies (hl_perp, hl_spot) — includes all sub-strategies
+ * (e.g. hl_perp also includes hl_perp_scalp, hl_perp_day, hl_perp_swing)
+ * so the generic learning engine adapts from the full trade history.
+ * Per-style stats (hl_perp_scalp etc.) still use exact match for fine-tuning.
  */
 async function computeStrategyStats(
   pool: any,
@@ -199,16 +203,24 @@ async function computeStrategyStats(
   };
 
   try {
+    // For aggregate strategy keys, include all sub-strategies so the
+    // generic HL perp/spot learning engine sees the full trade corpus.
+    // e.g. 'hl_perp' → LIKE 'hl_perp%' matches hl_perp, hl_perp_scalp, hl_perp_day, hl_perp_swing
+    const AGGREGATE_STRATEGIES = ['hl_perp', 'hl_spot'];
+    const isAggregate = AGGREGATE_STRATEGIES.includes(strategy);
+    const whereClause = isAggregate ? `strategy LIKE $1` : `strategy = $1`;
+    const paramValue = isAggregate ? `${strategy}%` : strategy;
+
     // All closed positions for this strategy within lookback
     const res = await pool.query(
       `SELECT realized_pnl_usd, cost_basis_usd,
               EXTRACT(EPOCH FROM (closed_at - opened_at)) / 3600 AS hold_hours,
               closed_at
        FROM cfo_positions
-       WHERE strategy = $1 AND status = 'CLOSED'
+       WHERE ${whereClause} AND status = 'CLOSED'
          AND closed_at > NOW() - INTERVAL '${LOOKBACK_DAYS} days'
        ORDER BY closed_at DESC`,
-      [strategy],
+      [paramValue],
     );
 
     const rows = res.rows;
@@ -1130,7 +1142,12 @@ function computeAdaptiveParams(
   }
 
   // ── Confidence level (based on total sample size) ───────────────
-  const totalSamples = Object.values(stats).reduce((s, st) => s + st.totalTrades, 0);
+  // Skip sub-strategies from total to avoid double-counting: hl_perp already
+  // aggregates hl_perp_scalp/day/swing, and hl_spot aggregates hl_spot_swing/accumulation.
+  const SUB_STRATEGIES = new Set(['hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing', 'hl_spot_swing', 'hl_spot_accumulation']);
+  const totalSamples = Object.entries(stats)
+    .filter(([name]) => !SUB_STRATEGIES.has(name))
+    .reduce((s, [, st]) => s + st.totalTrades, 0);
   const confidence = Math.min(1, totalSamples / 50);
 
   // ── Execution failure rates ─────────────────────────────────────
@@ -1509,7 +1526,11 @@ export function applyAdaptive(
 export function formatLearningSummary(params: AdaptiveParams): string {
   if (params.lastComputed === 0) return '🧠 <b>Learning:</b> No data yet — need 5+ closed trades to start adapting.';
 
-  const totalSamples = Object.values(params.sampleSizes).reduce((s, n) => s + n, 0);
+  // Skip sub-strategies from total — they're already included in their parent aggregates
+  const _subStrats = new Set(['hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing', 'hl_spot_swing', 'hl_spot_accumulation']);
+  const totalSamples = Object.entries(params.sampleSizes)
+    .filter(([name]) => !_subStrats.has(name))
+    .reduce((s, [, n]) => s + n, 0);
   const L: string[] = [];
 
   // Header with overall confidence
@@ -1549,6 +1570,16 @@ export function formatLearningSummary(params: AdaptiveParams): string {
         L.push(`   Worst strategy: ${worstName} (score ${worst[1].toFixed(0)}/100, ${worstTrades} trades)`);
       }
     }
+  }
+
+  // Per-style HL perp breakdown (if any style-tagged trades exist)
+  const perpStyleBreakdown = ['scalp', 'day', 'swing']
+    .map(s => ({ style: s, n: params.sampleSizes[`hl_perp_${s}`] ?? 0 }))
+    .filter(s => s.n > 0);
+  if (perpStyleBreakdown.length > 0) {
+    const perpTotal = params.sampleSizes['hl_perp'] ?? 0;
+    const breakdown = perpStyleBreakdown.map(s => `${s.style}=${s.n}`).join(' · ');
+    L.push(`   HL Perps: ${perpTotal} total (${breakdown})`);
   }
 
   // Active adjustments — explained in plain English
