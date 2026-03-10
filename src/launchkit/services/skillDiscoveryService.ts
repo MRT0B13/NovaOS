@@ -148,10 +148,10 @@ export class SkillDiscoveryService {
   private async restoreLastRunAt(): Promise<void> {
     try {
       const res = await this.pool.query(
-        `SELECT value FROM kv_store WHERE key = 'skill_discovery_last_run' LIMIT 1`,
+        `SELECT data FROM kv_store WHERE key = 'skill_discovery_last_run' LIMIT 1`,
       );
       if (res.rows.length > 0) {
-        this.lastRunAt = Number(res.rows[0].value) || 0;
+        this.lastRunAt = Number(res.rows[0].data?.ts) || 0;
         const agoH = ((Date.now() - this.lastRunAt) / 3_600_000).toFixed(1);
         logger.info(`[SkillDiscovery] Restored lastRunAt from DB (${agoH}h ago)`);
       }
@@ -161,9 +161,9 @@ export class SkillDiscoveryService {
   private async persistLastRunAt(): Promise<void> {
     try {
       await this.pool.query(
-        `INSERT INTO kv_store (key, value) VALUES ('skill_discovery_last_run', $1)
-         ON CONFLICT (key) DO UPDATE SET value = $1`,
-        [String(this.lastRunAt)],
+        `INSERT INTO kv_store (key, data) VALUES ('skill_discovery_last_run', $1)
+         ON CONFLICT (key) DO UPDATE SET data = $1, updated_at = NOW()`,
+        [JSON.stringify({ ts: this.lastRunAt })],
       );
     } catch { /* non-fatal */ }
   }
