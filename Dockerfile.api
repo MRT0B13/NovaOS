@@ -1,0 +1,52 @@
+############################
+# NovaVerse API — Standalone Fastify server
+# For Railway: create a new service pointing to
+# this Dockerfile (Settings → Dockerfile Path → Dockerfile.api)
+############################
+
+FROM node:20-slim AS base
+ENV PATH="/root/.bun/bin:/home/node/.bun/bin:$PATH"
+
+############################
+# Builder
+############################
+FROM base AS builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential curl git python3 make g++ && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g bun
+
+WORKDIR /app
+
+COPY package.json bun.lock* ./
+COPY scripts/postinstall-patches.cjs ./scripts/
+RUN bun install --frozen-lockfile
+
+COPY . .
+
+############################
+# Runtime
+############################
+FROM base AS runtime
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+RUN npm install -g bun
+RUN mkdir -p /app/data && chown -R node:node /app /home/node
+
+COPY --from=builder --chown=node:node /app/package.json /app/bun.lock* ./
+COPY --from=builder --chown=node:node /app/node_modules ./node_modules
+COPY --from=builder --chown=node:node /app/src ./src
+COPY --from=builder --chown=node:node /app/tsconfig.json ./tsconfig.json
+COPY --from=builder --chown=node:node /app/tsconfig.build.json ./tsconfig.build.json
+
+USER node
+
+# Railway injects PORT automatically
+EXPOSE 8787
+
+CMD ["bun", "run", "src/api/index.ts"]
