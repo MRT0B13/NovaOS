@@ -1325,6 +1325,10 @@ export class CFOAgent extends BaseAgent {
             if (!p.closeOnly && r.txId) {
               const pool = p.pool ?? {};
               const rebalActualUsd = (r as any).actualDeployUsd ?? p.deployUsd ?? 0;
+              // Preserve the ORIGINAL entryUsd so future rebalances target the same
+              // position size. If we saved actualDeployUsd instead, IL+slippage would
+              // cause the position to shrink on every rebalance cycle.
+              const preservedEntryUsd = (p.entryUsd && p.entryUsd > 1) ? p.entryUsd : rebalActualUsd;
               await this.persistEvmLpPosition({
                 posId: r.txId,
                 chainId: pool.chainId ?? `${p.chainName}@${p.chainNumericId}`,
@@ -1334,7 +1338,7 @@ export class CFOAgent extends BaseAgent {
                 poolAddress: pool.poolAddress ?? '',
                 token0Symbol: p.token0Symbol ?? '?',
                 token1Symbol: p.token1Symbol ?? '?',
-                entryUsd: rebalActualUsd,
+                entryUsd: preservedEntryUsd,
                 openedAt: Date.now(),
               });
             }
@@ -1360,6 +1364,7 @@ export class CFOAgent extends BaseAgent {
             // If reopened, track new position
             if (!p.closeOnly && r.txId) {
               const rebalChain = mapEvmChain(p.chainName ?? '');
+              const newActualUsd = (r as any).actualDeployUsd ?? p.deployUsd ?? 0;
               await this.repo.upsertPosition({
                 id: `krystal-lp-${r.txId}`,
                 strategy: 'krystal_lp',
@@ -1368,9 +1373,9 @@ export class CFOAgent extends BaseAgent {
                 chain: rebalChain,
                 status: 'OPEN',
                 entryPrice: 1, currentPrice: 1,
-                sizeUnits: p.deployUsd ?? 0,
-                costBasisUsd: p.deployUsd ?? 0,
-                currentValueUsd: p.deployUsd ?? 0,
+                sizeUnits: newActualUsd,
+                costBasisUsd: newActualUsd,
+                currentValueUsd: newActualUsd,
                 realizedPnlUsd: 0, unrealizedPnlUsd: 0,
                 entryTxHash: r.txId, externalId: r.txId,
                 metadata: { chainName: p.chainName, chainNumericId: p.chainNumericId, nfpmTokenId: r.txId, riskTier: p.riskTier ?? 'medium' },

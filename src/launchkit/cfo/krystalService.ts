@@ -2180,10 +2180,14 @@ export async function openEvmLpPosition(
 
     if (amt0Ratio > NEGLIGIBLE_PCT && amt1Ratio < NEGLIGIBLE_PCT) {
       // Have token0 only → swap half into token1
+      // IMPORTANT: swap half of the WALLET balance (bal0), not half of the capped
+      // amount0Desired. The cap limits each side to deployUsd/2, but when all value
+      // is in one token the cap leaves excess tokens stranded in the wallet.
+      // Swapping half of bal0 distributes the full wallet value across both tokens.
       logger.info(`[Krystal] Zap: have ${pool.token0.symbol} (${amt0Ratio}% of target) but ${pool.token1.symbol} negligible (${amt1Ratio}%) — swapping half into ${pool.token1.symbol}`);
       try {
         const swap = await import('./evmSwapService.ts');
-        const halfAmt0 = amount0Desired / BigInt(2);
+        const halfAmt0 = bal0 / BigInt(2);
         const halfHumanAmt = Number(ethers.formatUnits(halfAmt0, dec0)); // human token amount (NOT USD)
         const halfUsdVal = halfHumanAmt * usdPerToken0; // for logging only
         if (halfUsdVal > 0.5) {
@@ -2209,10 +2213,12 @@ export async function openEvmLpPosition(
 
     } else if (amt1Ratio > NEGLIGIBLE_PCT && amt0Ratio < NEGLIGIBLE_PCT) {
       // Have token1 only → swap half into token0
+      // IMPORTANT: swap half of the WALLET balance (bal1), not half of the capped
+      // amount1Desired — same reasoning as the token0 branch above.
       logger.info(`[Krystal] Zap: have ${pool.token1.symbol} (${amt1Ratio}% of target) but ${pool.token0.symbol} negligible (${amt0Ratio}%) — swapping half into ${pool.token0.symbol}`);
       try {
         const swap = await import('./evmSwapService.ts');
-        const halfAmt1 = amount1Desired / BigInt(2);
+        const halfAmt1 = bal1 / BigInt(2);
         const halfHumanAmt = Number(ethers.formatUnits(halfAmt1, dec1)); // human token amount (NOT USD)
         const halfUsdVal = halfHumanAmt * usdPerToken1; // for logging only
         if (halfUsdVal > 0.5) {
