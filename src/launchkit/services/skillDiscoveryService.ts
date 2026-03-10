@@ -224,9 +224,19 @@ export class SkillDiscoveryService {
 
     // 3. Evaluate each with Claude
     const evaluated: EvaluatedSkill[] = [];
+    let consecutiveErrors = 0;
     for (const candidate of novel.slice(0, 20)) { // cap at 20 per run
       const result = await this.evaluateCandidate(candidate);
-      if (result) evaluated.push(result);
+      if (result) {
+        evaluated.push(result);
+        consecutiveErrors = 0;
+      } else {
+        consecutiveErrors++;
+        if (consecutiveErrors >= 3) {
+          logger.warn(`[SkillDiscovery] 3 consecutive evaluation failures — likely API issue, stopping early`);
+          break;
+        }
+      }
       await new Promise(r => setTimeout(r, 500)); // rate limit between evaluations
     }
 
@@ -489,7 +499,8 @@ Respond ONLY with JSON in this exact format:
       });
 
       if (!res.ok) {
-        logger.warn(`[SkillDiscovery] Claude API error: ${res.status}`);
+        const errBody = await res.text().catch(() => '');
+        logger.warn(`[SkillDiscovery] Claude API error: ${res.status} — ${errBody.slice(0, 200)}`);
         return null;
       }
 
