@@ -586,6 +586,71 @@ export class Supervisor extends BaseAgent {
       }
     });
 
+    // ── Yield Scout Intel ──
+    this.handlers.set('nova-yield-scout:intel', async (msg) => {
+      const { type, summary, found, spikeCount } = msg.payload;
+      if (type === 'yield_scan') {
+        logger.info(`[supervisor] Yield Scout: ${summary?.slice(0, 200) || `${found} opportunities found`}`);
+      } else if (type === 'yield_spike') {
+        logger.warn(`[supervisor] Yield Scout APY SPIKE: ${summary || `${spikeCount} spikes detected`}`);
+      }
+    });
+
+    // ── Yield Scout Alerts ──
+    this.handlers.set('nova-yield-scout:alert', async (msg) => {
+      logger.info(`[supervisor] Yield Scout alert: ${msg.payload.summary?.slice(0, 200) || 'yield alert'}`);
+    });
+
+    // ── Whale Tracker Alerts ──
+    this.handlers.set('nova-whale-tracker:alert', async (msg) => {
+      const { summary, alerts } = msg.payload;
+      logger.warn(`[supervisor] Whale Tracker: ${summary?.slice(0, 200) || `${alerts?.length || 0} whale movements`}`);
+      // Whale alerts are operationally significant — notify admin
+      if (this.callbacks.onPostToAdmin && msg.priority === 'high') {
+        await this.callbacks.onPostToAdmin(`🐋 ${summary?.slice(0, 500) || 'Whale movement detected'}`);
+      }
+    });
+
+    // ── Whale Tracker Intel ──
+    this.handlers.set('nova-whale-tracker:intel', async (msg) => {
+      logger.info(`[supervisor] Whale Tracker intel: ${msg.payload.summary?.slice(0, 200) || 'whale activity'}`);
+    });
+
+    // ── Arb Scanner Alerts ──
+    this.handlers.set('nova-arb-scanner:alert', async (msg) => {
+      const { summary, opportunity } = msg.payload;
+      logger.info(`[supervisor] Arb Scanner: ${summary?.slice(0, 200) || 'arb opportunity'}`);
+      // High-value arb opps — notify admin (CFO may want to execute)
+      if (this.callbacks.onPostToAdmin && opportunity?.estimatedProfitUsd >= 20) {
+        await this.callbacks.onPostToAdmin(`⚡ ${summary?.slice(0, 500) || 'Arb opportunity detected'}`);
+      }
+    });
+
+    // ── Arb Scanner Reports ──
+    this.handlers.set('nova-arb-scanner:report', async (msg) => {
+      logger.debug(`[supervisor] Arb Scanner report: ${msg.payload.summary?.slice(0, 200) || 'scan summary'}`);
+    });
+
+    // ── Portfolio Watchdog Alerts ──
+    this.handlers.set('nova-portfolio-watchdog:alert', async (msg) => {
+      const { summary } = msg.payload;
+      logger.warn(`[supervisor] Portfolio Watchdog: ${summary?.slice(0, 200) || 'portfolio alert'}`);
+      // Portfolio alerts are always admin-relevant
+      if (this.callbacks.onPostToAdmin) {
+        await this.callbacks.onPostToAdmin(`📊 ${summary?.slice(0, 500) || 'Portfolio alert'}`);
+      }
+    });
+
+    // ── Portfolio Watchdog Intel ──
+    this.handlers.set('nova-portfolio-watchdog:intel', async (msg) => {
+      logger.info(`[supervisor] Portfolio Watchdog: ${msg.payload.summary?.slice(0, 200) || 'portfolio warning'}`);
+    });
+
+    // ── Portfolio Watchdog Reports ──
+    this.handlers.set('nova-portfolio-watchdog:report', async (msg) => {
+      logger.info(`[supervisor] Portfolio health: ${msg.payload.summary?.slice(0, 200) || 'health report'}`);
+    });
+
     // ── CFO Reports ──
     this.handlers.set('nova-cfo:report', async (msg) => {
       const { source, summary } = msg.payload;

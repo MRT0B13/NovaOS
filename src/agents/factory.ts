@@ -32,7 +32,10 @@ export type CapabilityType =
   | 'kol_scanning'
   | 'safety_scanning'
   | 'narrative_tracking'
-  | 'social_trending';
+  | 'social_trending'
+  | 'yield_monitoring'
+  | 'arb_scanning'
+  | 'portfolio_monitoring';
 
 export type AgentSpecStatus = 'pending' | 'approved' | 'running' | 'stopped' | 'rejected';
 
@@ -110,6 +113,27 @@ export const CAPABILITY_TEMPLATES: Record<CapabilityType, CapabilityTemplate> = 
     defaultSchedule: 'every 20 minutes',
     requiresConfig: [],
     optionalConfig: ['subreddits', 'minScore'],
+  },
+  yield_monitoring: {
+    description: 'Monitor DeFi yields across Krystal (EVM multi-chain), Orca, Kamino, and Jito (Solana)',
+    keywords: ['yield', 'apy', 'apr', 'farming', 'defi yields', 'staking', 'liquidity', 'lp rewards', 'krystal', 'orca', 'kamino', 'jito'],
+    defaultSchedule: 'every 15 minutes',
+    requiresConfig: [],
+    optionalConfig: ['minApy', 'minTvl', 'chains'],
+  },
+  arb_scanning: {
+    description: 'Scan cross-DEX arbitrage opportunities on EVM (Uniswap, Camelot, PancakeSwap, Balancer)',
+    keywords: ['arb', 'arbitrage', 'flash loan', 'cross-dex', 'price gap', 'spread', 'mev'],
+    defaultSchedule: 'every 2 minutes',
+    requiresConfig: [],
+    optionalConfig: ['minProfitUsd'],
+  },
+  portfolio_monitoring: {
+    description: 'Monitor portfolio health across Solana + EVM — PnL alerts, drawdown warnings, rebalance signals',
+    keywords: ['portfolio', 'pnl', 'drawdown', 'positions', 'balance', 'rebalance', 'exposure', 'risk'],
+    defaultSchedule: 'every 10 minutes',
+    requiresConfig: [],
+    optionalConfig: ['drawdownThreshold', 'positionLossThreshold'],
   },
 };
 
@@ -314,9 +338,69 @@ export class AgentFactory {
         });
         await sentinel.start();
         spec.status = 'running';
-        spec.config._sentinelInstance = sentinel; // Track for stop()
+        spec.config._agentInstance = sentinel;
         this.specs.set(specId, spec);
         logger.info(`[factory] Spawned social_trending agent: ${spec.name}`);
+        return true;
+      }
+
+      if (spec.capabilities.includes('whale_tracking')) {
+        // Spawn a Whale Tracker — monitors Solana + EVM wallet movements
+        const { WhaleTrackerAgent } = await import('./whale-tracker.ts');
+        const tracker = new WhaleTrackerAgent(this.pool, {
+          minTransferUsd: spec.config.minTransferSol ? spec.config.minTransferSol * 150 : undefined,
+          watchAddresses: spec.config.watchAddresses,
+        });
+        await tracker.start();
+        spec.status = 'running';
+        spec.config._agentInstance = tracker;
+        this.specs.set(specId, spec);
+        logger.info(`[factory] Spawned whale_tracking agent: ${spec.name}`);
+        return true;
+      }
+
+      if (spec.capabilities.includes('yield_monitoring')) {
+        // Spawn a Yield Scout — multi-chain DeFi yield radar
+        const { YieldScoutAgent } = await import('./yield-scout.ts');
+        const scout = new YieldScoutAgent(this.pool, {
+          minApy: spec.config.minApy,
+          minTvl: spec.config.minTvl,
+          chains: spec.config.chains,
+        });
+        await scout.start();
+        spec.status = 'running';
+        spec.config._agentInstance = scout;
+        this.specs.set(specId, spec);
+        logger.info(`[factory] Spawned yield_monitoring agent: ${spec.name}`);
+        return true;
+      }
+
+      if (spec.capabilities.includes('arb_scanning')) {
+        // Spawn an Arb Scanner — cross-DEX opportunity detection on EVM
+        const { ArbScannerAgent } = await import('./arb-scanner.ts');
+        const scanner = new ArbScannerAgent(this.pool, {
+          minProfitUsd: spec.config.minProfitUsd,
+        });
+        await scanner.start();
+        spec.status = 'running';
+        spec.config._agentInstance = scanner;
+        this.specs.set(specId, spec);
+        logger.info(`[factory] Spawned arb_scanning agent: ${spec.name}`);
+        return true;
+      }
+
+      if (spec.capabilities.includes('portfolio_monitoring')) {
+        // Spawn a Portfolio Watchdog — multi-chain portfolio health monitoring
+        const { PortfolioWatchdogAgent } = await import('./portfolio-watchdog.ts');
+        const watchdog = new PortfolioWatchdogAgent(this.pool, {
+          drawdownThreshold: spec.config.drawdownThreshold,
+          positionLossThreshold: spec.config.positionLossThreshold,
+        });
+        await watchdog.start();
+        spec.status = 'running';
+        spec.config._agentInstance = watchdog;
+        this.specs.set(specId, spec);
+        logger.info(`[factory] Spawned portfolio_monitoring agent: ${spec.name}`);
         return true;
       }
 
@@ -338,6 +422,16 @@ export class AgentFactory {
 
     if (spec.capabilities.includes('token_monitoring') && spec.config.tokenAddress) {
       await supervisor.deactivateChild(spec.config.tokenAddress);
+    }
+
+    // Stop standalone agent instances
+    if (spec.config._agentInstance && typeof spec.config._agentInstance.stop === 'function') {
+      try {
+        await spec.config._agentInstance.stop();
+        logger.info(`[factory] Stopped agent instance for ${spec.name}`);
+      } catch (err: any) {
+        logger.warn(`[factory] Failed to stop agent instance: ${err.message}`);
+      }
     }
 
     spec.status = 'stopped';
@@ -404,7 +498,7 @@ export class AgentFactory {
     const capNames = spec.capabilities.map(c => c.replace(/_/g, ' ')).join(', ');
 
     const userConfig = { ...spec.config };
-    delete userConfig._sentinelInstance;
+    delete userConfig._agentInstance;
     const hasConfig = Object.keys(userConfig).length > 0;
 
     const lines = [

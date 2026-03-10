@@ -9,6 +9,10 @@
  *     ├── Launcher  — pump.fun token creation, deploy, graduation tracking
  *     ├── Community — TG management, X engagement, community health
  *     ├── SocialSentinel — Reddit + Google Trends social trending → launch pipeline
+ *     ├── YieldScout — Multi-chain DeFi yield monitoring (Krystal EVM + Solana)
+ *     ├── WhaleTracker — Solana + EVM whale movement detection
+ *     ├── ArbScanner — Cross-DEX arbitrage opportunity scanning (EVM)
+ *     ├── PortfolioWatchdog — Multi-chain portfolio health + PnL alerts
  *     ├── TokenChild — Per-token monitoring (DexScreener metrics, auto-deactivation)
  *     └── Health    — Self-healing, auto-repair, swarm monitoring (external)
  *
@@ -28,6 +32,10 @@ export { LauncherAgent } from './launcher.ts';
 export { CommunityAgent } from './community-agent.ts';
 export { CFOAgent } from './cfo.ts';
 export { SocialSentinelAgent } from './social-sentinel.ts';
+export { YieldScoutAgent } from './yield-scout.ts';
+export { WhaleTrackerAgent } from './whale-tracker.ts';
+export { ArbScannerAgent } from './arb-scanner.ts';
+export { PortfolioWatchdogAgent } from './portfolio-watchdog.ts';
 export { TokenChildAgent, type TokenChildConfig } from './token-child.ts';
 export { AgentFactory, type AgentSpec, type CapabilityType, type AgentSpecStatus } from './factory.ts';
 

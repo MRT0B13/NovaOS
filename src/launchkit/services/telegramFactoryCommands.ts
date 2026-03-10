@@ -91,9 +91,12 @@ export async function registerFactoryCommands(
         if (!spec) {
           await ctx.reply(
             '❌ Could not understand your request. Try to include keywords like:\n' +
-            '• whale, wallet — whale tracking\n• token, price, volume — token monitoring\n' +
+            '• whale, wallet — whale tracking (Solana + EVM)\n• token, price, volume — token monitoring\n' +
             '• rug, safety, scan — safety scanning\n• KOL, twitter, influencer — KOL scanning\n' +
-            '• narrative, sentiment — narrative tracking\n• social, trending, memes, viral, reddit — social trending',
+            '• narrative, sentiment — narrative tracking\n• social, trending, memes, viral, reddit — social trending\n' +
+            '• yield, apy, farming, krystal, orca, kamino — yield monitoring\n' +
+            '• arb, arbitrage, flash loan, cross-dex — arb scanning\n' +
+            '• portfolio, pnl, drawdown, positions — portfolio monitoring',
           );
           return;
         }
