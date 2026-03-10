@@ -2181,6 +2181,23 @@ export class CFOAgent extends BaseAgent {
         const [coin, side] = key.split('-') as [string, 'LONG' | 'SHORT'];
         const pos = summary.positions.find(p => p.coin === coin && p.side === side);
         if (!pos) {
+          // Position vanished from HL — native TP/SL trigger likely fired between polls.
+          // Close the DB position so the learning engine counts it.
+          if (this.positionManager) {
+            const perpStrategies: PositionStrategy[] = ['hl_perp', 'hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing'];
+            for (const strat of perpStrategies) {
+              const openPerps = await this.repo!.getOpenPositions(strat);
+              const dbPos = openPerps.find(pp =>
+                (pp.metadata as any)?.coin === coin && (pp.metadata as any)?.side === side,
+              );
+              if (dbPos) {
+                // No HL position, so PnL is unknown — use 0 (better than leaving OPEN forever)
+                await this.positionManager.closePosition(dbPos.id, 0, 'native-trigger', dbPos.currentValueUsd ?? 0);
+                logger.info(`[CFO] Closed vanished perp in DB: ${side} ${coin} (native HL trigger or manual close)`);
+                break;
+              }
+            }
+          }
           clearTradeStyle(key);
           continue;
         }
@@ -2288,6 +2305,25 @@ export class CFOAgent extends BaseAgent {
             clearTradeStyle(key);
             // Cancel stale native TP/SL trigger orders so they don't fire on next position
             await hlMod.cancelTriggerOrdersForCoin(coin).catch(() => {});
+
+            // ── Persist close to cfo_positions for learning engine ──
+            if (this.positionManager) {
+              const perpStrategies: PositionStrategy[] = ['hl_perp', 'hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing'];
+              for (const strat of perpStrategies) {
+                const openPerps = await this.repo!.getOpenPositions(strat);
+                const dbPos = openPerps.find(pp =>
+                  (pp.metadata as any)?.coin === coin && (pp.metadata as any)?.side === side,
+                );
+                if (dbPos) {
+                  // Use HL's ground-truth unrealizedPnl from the position snapshot
+                  const hlPnl = pos.unrealizedPnlUsd;
+                  await this.positionManager.closePosition(dbPos.id, pos.markPrice, reason, pos.sizeUsd, hlPnl);
+                  logger.info(`[CFO] Persisted monitor close: ${side} ${coin} PnL $${hlPnl.toFixed(2)} (${reason})`);
+                  break;
+                }
+              }
+            }
+
             const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
             await notifyAdminForce(
               `📊 [${info.style}] Closed ${side} ${coin}-PERP: ${reason}\n` +
