@@ -60,7 +60,7 @@ async function main() {
   server.get('/api/health', async () => ({ status: 'ok', ts: new Date().toISOString() }));
 
   // ── Start ─────────────────────────────────────────────
-  const port = Number(process.env.API_PORT) || 4000;
+  const port = Number(process.env.PORT || process.env.API_PORT) || 4000;
   await server.listen({ port, host: '0.0.0.0' });
   console.log(`NovaVerse API listening on :${port}`);
 }
