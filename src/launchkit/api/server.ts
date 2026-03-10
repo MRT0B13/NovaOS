@@ -29,6 +29,10 @@ const KNOWN_BOT_COMMANDS = new Set([
   '/scan', '/children',                            // scan commands
   '/request_agent', '/approve_agent',              // factory commands
   '/reject_agent', '/my_agents', '/stop_agent',
+  '/agent_guide',                                  // factory guide
+  '/configure_wallet', '/wallet_key',              // wallet commands
+  '/remove_wallet',
+  '/attach_skill',                                 // skill attachment
   '/cfo',                                          // CFO command
   '/skill', '/skills',                             // skill management
   '/help',                                         // help / command list

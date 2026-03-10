@@ -32,6 +32,10 @@ const KNOWN_BOT_COMMANDS = new Set([
   '/scan', '/children',
   '/request_agent', '/approve_agent',
   '/reject_agent', '/my_agents', '/stop_agent',
+  '/agent_guide',
+  '/configure_wallet', '/wallet_key',
+  '/remove_wallet',
+  '/attach_skill',
   '/cfo', '/help',
   '/skill', '/skills',
 ]);
@@ -56,6 +60,11 @@ const COMMAND_DESCRIPTIONS: Record<string, string> = {
   reject_agent:   'Reject a pending agent request',
   my_agents:      'List your agents',
   stop_agent:     'Stop a running child agent',
+  agent_guide:    'Agent factory setup guide (all 9 types)',
+  configure_wallet: 'Attach wallet to an agent',
+  wallet_key:     'Provide encrypted private key',
+  remove_wallet:  'Remove wallet from an agent',
+  attach_skill:   'Attach a pool skill to an agent',
   // ── CFO ──
   cfo:            'CFO commands (status, approve, pause, resume)',
   // ── Skills ──
@@ -291,8 +300,10 @@ export async function registerBanCommands(runtime: IAgentRuntime): Promise<boole
         const cats: Record<string, string[]> = {
           '🛡 Moderation': ['ban', 'kick', 'roseban', 'banned'],
           '🔧 System': ['health', 'errors', 'repairs', 'scan', 'children'],
-          '🤖 Agents': ['request_agent', 'approve_agent', 'reject_agent', 'my_agents', 'stop_agent'],
+          '🤖 Agents': ['agent_guide', 'request_agent', 'approve_agent', 'reject_agent', 'my_agents', 'stop_agent'],
+          '💼 Wallet': ['configure_wallet', 'wallet_key', 'remove_wallet'],
           '💰 CFO': ['cfo'],
+          '🧩 Skills': ['skill', 'skills', 'attach_skill'],
         };
         for (const [cat, cmds] of Object.entries(cats)) {
           lines.push(`<b>${cat}</b>`);
