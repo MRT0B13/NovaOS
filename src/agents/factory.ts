@@ -378,27 +378,22 @@ export class AgentFactory {
       rejected: '❌',
     };
 
+    const capNames = spec.capabilities.map(c => c.replace(/_/g, ' ')).join(', ');
+
     const lines = [
       `${statusEmoji[spec.status]} <b>${spec.name}</b>`,
-      `ID: <code>${spec.id}</code>`,
-      `Capabilities: ${spec.capabilities.map(c => c.replace(/_/g, ' ')).join(', ')}`,
-      `Schedule: ${spec.schedule}`,
-      `Status: ${spec.status}`,
+      ``,
+      `📌 <b>Type:</b> ${capNames}`,
+      `⏱ <b>Schedule:</b> ${spec.schedule}`,
+      `📊 <b>Status:</b> ${spec.status}`,
+      `🆔 <code>${spec.id}</code>`,
     ];
 
     if (spec.config.tokenAddress) {
-      lines.push(`Token: <code>${spec.config.tokenAddress.slice(0, 8)}...</code>`);
+      lines.push(`💰 <b>Token:</b> <code>${spec.config.tokenAddress.slice(0, 8)}...</code>`);
     }
     if (spec.config.tokenSymbol) {
-      lines.push(`Symbol: $${spec.config.tokenSymbol}`);
-    }
-
-    // Only show config if there are user-facing keys
-    const userConfig = { ...spec.config };
-    delete userConfig._sentinelInstance; // internal
-    const configKeys = Object.keys(userConfig);
-    if (configKeys.length > 0) {
-      lines.push(`Config: ${JSON.stringify(userConfig)}`);
+      lines.push(`🏷 <b>Symbol:</b> $${spec.config.tokenSymbol}`);
     }
 
     return lines.join('\n');
@@ -406,23 +401,36 @@ export class AgentFactory {
 
   // Format a pending spec as an approval request
   formatApprovalRequest(spec: AgentSpec): string {
+    const capNames = spec.capabilities.map(c => c.replace(/_/g, ' ')).join(', ');
+
     const userConfig = { ...spec.config };
     delete userConfig._sentinelInstance;
-    const configStr = Object.keys(userConfig).length > 0 ? JSON.stringify(userConfig) : 'None required';
+    const hasConfig = Object.keys(userConfig).length > 0;
 
-    return [
+    const lines = [
       `🏭 <b>New Agent Request</b>`,
       ``,
-      `From user: ${spec.createdBy}`,
-      `Request: "${spec.description.slice(0, 200)}"`,
+      `👤 <b>From:</b> ${spec.createdBy}`,
+      `💬 <b>Request:</b> "${spec.description.slice(0, 200)}"`,
       ``,
-      `Resolved capabilities: ${spec.capabilities.map(c => c.replace(/_/g, ' ')).join(', ')}`,
-      `Schedule: ${spec.schedule}`,
-      `Config: ${configStr}`,
+      `📌 <b>Capabilities:</b> ${capNames}`,
+      `⏱ <b>Schedule:</b> ${spec.schedule}`,
+    ];
+
+    if (hasConfig) {
+      lines.push(`⚙️ <b>Config:</b> ${JSON.stringify(userConfig)}`);
+    }
+
+    lines.push(
       ``,
-      `To approve: /approve_agent <code>${spec.id}</code>`,
-      `To reject: /reject_agent <code>${spec.id}</code>`,
-    ].join('\n');
+      `✅ Approve:`,
+      `<code>/approve_agent ${spec.id}</code>`,
+      ``,
+      `❌ Reject:`,
+      `<code>/reject_agent ${spec.id}</code>`,
+    );
+
+    return lines.join('\n');
   }
 
   // ── Internal Helpers ──────────────────────────────────────────

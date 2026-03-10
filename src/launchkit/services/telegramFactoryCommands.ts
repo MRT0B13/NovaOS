@@ -100,7 +100,7 @@ export async function registerFactoryCommands(
 
         // Reply to user
         await ctx.reply(
-          `✅ <b>Agent Request Created</b>\n\n${_factory!.formatSpecForTelegram(spec)}\n\nAn admin will review your request.`,
+          `✅ <b>Agent Request Created</b>\n\n${_factory!.formatSpecForTelegram(spec)}\n\n🔍 An admin will review your request shortly.`,
           { parse_mode: 'HTML' },
         );
 
