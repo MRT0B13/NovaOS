@@ -37,6 +37,7 @@
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent } from './types.ts';
+import type { WalletConfig } from './wallet-utils.ts';
 
 // ============================================================================
 // Configuration
@@ -98,6 +99,7 @@ export class PortfolioWatchdogAgent extends BaseAgent {
   private totalAlerts = 0;
   private lastReportAt = 0;
   private previousState: PortfolioState | null = null;
+  private walletConfig?: WalletConfig;
   private allTimeHigh = 0; // Track portfolio ATH for drawdown calc
 
   constructor(pool: Pool, opts?: {
@@ -117,6 +119,7 @@ export class PortfolioWatchdogAgent extends BaseAgent {
     this.positionLossThreshold = opts?.positionLossThreshold ?? DEFAULT_POSITION_LOSS_THRESHOLD;
     this.concentrationThreshold = opts?.concentrationThreshold ?? DEFAULT_CONCENTRATION_THRESHOLD;
     this.tpSignalThreshold = DEFAULT_TP_SIGNAL_THRESHOLD;
+    this.walletConfig = opts?.wallet as WalletConfig | undefined;
   }
 
   protected async onStart(): Promise<void> {
@@ -361,11 +364,23 @@ export class PortfolioWatchdogAgent extends BaseAgent {
       // Add Krystal LP positions
       try {
         const { fetchKrystalPositions } = await import('../launchkit/cfo/krystalService.ts');
-        const { getCFOEnv } = await import('../launchkit/cfo/cfoEnv.ts');
-        const env = getCFOEnv();
-        if (env.evmPrivateKey) {
-          const ethers = await import('ethers' as string);
-          const walletAddress = ethers.computeAddress(env.evmPrivateKey);
+
+        // Prefer user wallet config, fall back to system CFO env
+        let walletAddress: string | null = null;
+        if (this.walletConfig?.address && (this.walletConfig.chain === 'evm' || this.walletConfig.chain === 'both')) {
+          walletAddress = this.walletConfig.address;
+        } else {
+          try {
+            const { getCFOEnv } = await import('../launchkit/cfo/cfoEnv.ts');
+            const env = getCFOEnv();
+            if (env.evmPrivateKey) {
+              const ethers = await import('ethers' as string);
+              walletAddress = ethers.computeAddress(env.evmPrivateKey);
+            }
+          } catch { /* no CFO env */ }
+        }
+
+        if (walletAddress) {
           const positions = await fetchKrystalPositions(walletAddress) as any[];
           if (positions && Array.isArray(positions)) {
             for (const pos of positions) {

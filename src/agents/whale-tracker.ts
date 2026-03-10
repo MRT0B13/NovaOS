@@ -33,6 +33,7 @@
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent } from './types.ts';
+import type { WalletConfig } from './wallet-utils.ts';
 
 // ============================================================================
 // Configuration
@@ -109,6 +110,7 @@ export class WhaleTrackerAgent extends BaseAgent {
   private balanceChangePct: number;
   private watchedWallets: Map<string, WalletSnapshot> = new Map(); // address → last snapshot
   private userWatchList: string[] = []; // User-added addresses
+  private walletConfig?: WalletConfig;
   private cycleCount = 0;
   private totalAlerts = 0;
 
@@ -127,6 +129,7 @@ export class WhaleTrackerAgent extends BaseAgent {
     this.minTransferUsd = opts?.minTransferUsd ?? DEFAULT_MIN_TRANSFER_USD;
     this.balanceChangePct = DEFAULT_BALANCE_CHANGE_THRESHOLD_PCT;
     this.userWatchList = opts?.watchAddresses ?? [];
+    this.walletConfig = opts?.wallet as WalletConfig | undefined;
   }
 
   protected async onStart(): Promise<void> {

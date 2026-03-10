@@ -28,6 +28,7 @@
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent } from './types.ts';
+import type { WalletConfig } from './wallet-utils.ts';
 
 // ============================================================================
 // Configuration
@@ -82,6 +83,7 @@ export class YieldScoutAgent extends BaseAgent {
   private pollIntervalMs: number;
   private minApy: number;
   private minTvl: number;
+  private walletConfig?: WalletConfig;
   private cycleCount = 0;
   private totalOppsReported = 0;
   private lastSnapshot: YieldSnapshot | null = null;
@@ -102,6 +104,7 @@ export class YieldScoutAgent extends BaseAgent {
     this.pollIntervalMs = opts?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.minApy = opts?.minApy ?? DEFAULT_MIN_APY;
     this.minTvl = opts?.minTvl ?? DEFAULT_MIN_TVL;
+    this.walletConfig = opts?.wallet as WalletConfig | undefined;
   }
 
   protected async onStart(): Promise<void> {

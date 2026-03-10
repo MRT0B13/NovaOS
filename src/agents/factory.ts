@@ -171,6 +171,51 @@ export class AgentFactory {
     this.pool = pool;
   }
 
+  /**
+   * Restore previously persisted specs from agent_registry.
+   * Call once after construction to survive restarts.
+   */
+  async restoreSpecs(): Promise<number> {
+    try {
+      const res = await this.pool.query(
+        `SELECT agent_name, config, enabled, start_command FROM agent_registry
+         WHERE agent_type = 'factory-spawned' AND start_command LIKE 'factory:%'`,
+      );
+      let restored = 0;
+      for (const row of res.rows) {
+        try {
+          const data = typeof row.config === 'string' ? JSON.parse(row.config) : row.config;
+          if (!data?.specId) continue;
+
+          const spec: AgentSpec = {
+            id: data.specId,
+            name: row.agent_name,
+            description: data.description || '',
+            capabilities: data.capabilities || [],
+            schedule: data.schedule || 'unknown',
+            outputChannel: data.outputChannel || 'telegram',
+            createdBy: data.createdBy || 'unknown',
+            createdAt: new Date(data.createdAt || Date.now()),
+            status: row.enabled ? 'approved' : 'stopped',
+            approvedBy: data.approvedBy,
+            config: data.config || {},
+            resourceLimit: data.resourceLimit || { ...DEFAULT_RESOURCE_LIMIT },
+            wallet: data.wallet,
+          };
+          this.specs.set(spec.id, spec);
+          restored++;
+        } catch { /* skip malformed row */ }
+      }
+      if (restored > 0) {
+        logger.info(`[factory] Restored ${restored} specs from agent_registry`);
+      }
+      return restored;
+    } catch (err) {
+      logger.debug('[factory] Could not restore specs (table may not exist yet):', err);
+      return 0;
+    }
+  }
+
   // ── Parse natural language request into AgentSpec ──────────────
 
   /**
@@ -533,7 +578,8 @@ export class AgentFactory {
       lines.push(`🏷 <b>Symbol:</b> $${spec.config.tokenSymbol}`);
     }
     if (spec.wallet) {
-      lines.push(`💼 <b>Wallet:</b> ${spec.wallet.chain} (${spec.wallet.permissions.join(', ')})`);
+      lines.push(`💼 <b>Wallet:</b> ${spec.wallet.chain} | <code>${spec.wallet.address.slice(0, 6)}...${spec.wallet.address.slice(-4)}</code>`);
+      lines.push(`🔑 <b>Permissions:</b> ${spec.wallet.permissions.join(', ')}${spec.wallet.encryptedKey ? ' 🔐' : ' (read-only)'}`);
     }
     if (spec.suggestedSkills && spec.suggestedSkills.length > 0) {
       lines.push(`📦 <b>Skills:</b> ${spec.suggestedSkills.length} suggested`);
@@ -622,11 +668,15 @@ export class AgentFactory {
 
   private async persistSpec(spec: AgentSpec): Promise<void> {
     try {
+      // Sanitize config — strip runtime-only fields
+      const persistConfig = { ...spec.config };
+      delete persistConfig._agentInstance;
+
       await this.pool.query(
         `INSERT INTO agent_registry (agent_name, agent_type, enabled, auto_restart, max_memory_mb, start_command, config)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (agent_name) DO UPDATE SET
-           enabled = $3, config = $7`,
+           enabled = $3, config = $7, updated_at = NOW()`,
         [
           spec.name,
           'factory-spawned',
@@ -638,7 +688,19 @@ export class AgentFactory {
             specId: spec.id,
             capabilities: spec.capabilities,
             createdBy: spec.createdBy,
-            config: spec.config,
+            createdAt: spec.createdAt,
+            approvedBy: spec.approvedBy,
+            description: spec.description,
+            schedule: spec.schedule,
+            outputChannel: spec.outputChannel,
+            resourceLimit: spec.resourceLimit,
+            config: persistConfig,
+            wallet: spec.wallet ? {
+              chain: spec.wallet.chain,
+              address: spec.wallet.address,
+              encryptedKey: spec.wallet.encryptedKey,
+              permissions: spec.wallet.permissions,
+            } : undefined,
           }),
         ]
       );

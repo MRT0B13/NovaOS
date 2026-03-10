@@ -38,6 +38,7 @@ export { ArbScannerAgent } from './arb-scanner.ts';
 export { PortfolioWatchdogAgent } from './portfolio-watchdog.ts';
 export { TokenChildAgent, type TokenChildConfig } from './token-child.ts';
 export { AgentFactory, type AgentSpec, type CapabilityType, type AgentSpecStatus } from './factory.ts';
+export { encryptWalletKey, decryptWalletKey, hasPermission, supportsChain, getPrivateKeyForAction, type WalletConfig } from './wallet-utils.ts';
 
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';

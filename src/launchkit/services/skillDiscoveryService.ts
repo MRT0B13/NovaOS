@@ -268,7 +268,7 @@ export class SkillDiscoveryService {
     }
 
     // 5. Build admin report (with queue IDs for approve/reject commands)
-    const report = await this.buildReport(evaluated, candidates.length);
+    const report = await this.buildReport(evaluated, candidates.length, pooledCount);
     logger.info(`[SkillDiscovery] Queued ${queued} proposals`);
 
     return report;
@@ -663,12 +663,13 @@ Respond ONLY with JSON in this exact format:
 
   // ── Reporting ───────────────────────────────────────────────
 
-  private async buildReport(evaluated: EvaluatedSkill[], totalCandidates: number): Promise<string> {
+  private async buildReport(evaluated: EvaluatedSkill[], totalCandidates: number, pooledCount = 0): Promise<string> {
     const lines = [
       `🔍 <b>Skill Discovery Report</b>`,
       ``,
       `Scanned: ${totalCandidates} candidates`,
       `Relevant: ${evaluated.length}`,
+      `Pooled: ${pooledCount} (available for factory agents via /skill pool)`,
       ``,
     ];
 

@@ -28,6 +28,7 @@
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import { BaseAgent } from './types.ts';
+import type { WalletConfig } from './wallet-utils.ts';
 
 // ============================================================================
 // Configuration
@@ -76,6 +77,7 @@ interface ArbOppSummary {
 export class ArbScannerAgent extends BaseAgent {
   private scanIntervalMs: number;
   private minProfitUsd: number;
+  private walletConfig?: WalletConfig;
   private cycleCount = 0;
   private totalOppsFound = 0;
   private consecutiveEmptyScans = 0;
@@ -94,6 +96,7 @@ export class ArbScannerAgent extends BaseAgent {
     });
     this.scanIntervalMs = opts?.scanIntervalMs ?? DEFAULT_SCAN_INTERVAL_MS;
     this.minProfitUsd = opts?.minProfitUsd ?? DEFAULT_MIN_PROFIT_USD;
+    this.walletConfig = opts?.wallet as WalletConfig | undefined;
   }
 
   protected async onStart(): Promise<void> {

@@ -41,6 +41,7 @@ export async function registerFactoryCommands(
 
     // Initialize the factory
     _factory = new AgentFactory(pool);
+    await _factory.restoreSpecs();
 
     const ownerChatId = process.env.ADMIN_CHAT_ID;
     const adminIds = (getEnv().TELEGRAM_ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -161,6 +162,15 @@ export async function registerFactoryCommands(
         } else {
           await ctx.reply(`✅ Agent <b>${approved.name}</b> approved but could not be spawned yet (capability not fully supported in MVP).`, { parse_mode: 'HTML' });
         }
+
+        // Notify the requesting user
+        try {
+          await bot.telegram.sendMessage(
+            approved.createdBy,
+            `🎉 <b>Agent Approved!</b>\n\nYour agent <b>${approved.name}</b> has been approved${spawned ? ' and is now running' : ''}.\n\nUse /my_agents to see your agents.`,
+            { parse_mode: 'HTML' },
+          );
+        } catch { /* user may have blocked bot or be in group context */ }
       } catch (err: any) {
         logger.warn('[factory-tg] /approve_agent error:', err.message);
         await ctx.reply('❌ Error approving agent.').catch(() => {});
@@ -189,6 +199,18 @@ export async function registerFactoryCommands(
         const rejected = _factory!.reject(specId, reason);
         if (rejected) {
           await ctx.reply(`❌ Agent request <code>${specId}</code> rejected.${reason ? ` Reason: ${reason}` : ''}`, { parse_mode: 'HTML' });
+
+          // Notify the requesting user
+          const spec = _factory!.getSpec(specId);
+          if (spec) {
+            try {
+              await bot.telegram.sendMessage(
+                spec.createdBy,
+                `❌ <b>Agent Request Rejected</b>\n\nYour agent request <code>${specId}</code> was not approved.${reason ? `\nReason: ${reason}` : ''}\n\nFeel free to submit a new request with /request_agent.`,
+                { parse_mode: 'HTML' },
+              );
+            } catch { /* silent */ }
+          }
         } else {
           await ctx.reply(`Could not reject <code>${specId}</code> — not found or not pending.`, { parse_mode: 'HTML' });
         }
@@ -795,6 +817,41 @@ export async function registerFactoryCommands(
       } catch (err: any) {
         logger.warn('[factory-tg] /wallet_key error:', err.message);
         await ctx.reply('❌ Error storing key.').catch(() => {});
+      }
+    });
+
+    // ── /remove_wallet <agent_id> — remove wallet config from an agent ──
+    bot.command('remove_wallet', async (ctx: any) => {
+      try {
+        const agentId = (ctx.message?.text || '').replace(/^\/remove_wallet\s*/i, '').trim();
+        if (!agentId) {
+          await ctx.reply('Usage: <code>/remove_wallet &lt;agent_id&gt;</code>', { parse_mode: 'HTML' });
+          return;
+        }
+
+        const userId = String(ctx.from?.id || ctx.chat.id);
+        const spec = _factory?.getSpec(agentId);
+        if (!spec) {
+          await ctx.reply(`❌ Agent <code>${agentId}</code> not found.`, { parse_mode: 'HTML' });
+          return;
+        }
+        if (spec.createdBy !== userId && !isAdmin(ctx.chat.id)) {
+          await ctx.reply('❌ You can only remove wallets from your own agents.');
+          return;
+        }
+        if (!spec.wallet) {
+          await ctx.reply('ℹ️ No wallet configured for this agent.');
+          return;
+        }
+
+        const oldChain = spec.wallet.chain;
+        spec.wallet = undefined;
+
+        await ctx.reply(`✅ Wallet removed from <b>${spec.name}</b> (was: ${oldChain})`, { parse_mode: 'HTML' });
+        logger.info(`[factory-tg] User ${userId} removed wallet from agent ${spec.name}`);
+      } catch (err: any) {
+        logger.warn('[factory-tg] /remove_wallet error:', err.message);
+        await ctx.reply('❌ Error removing wallet.').catch(() => {});
       }
     });
 
