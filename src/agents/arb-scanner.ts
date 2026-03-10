@@ -85,6 +85,7 @@ export class ArbScannerAgent extends BaseAgent {
   constructor(pool: Pool, opts?: {
     scanIntervalMs?: number;
     minProfitUsd?: number;
+    wallet?: { chain: string; address: string; encryptedKey?: string; permissions: string[] };
   }) {
     super({
       agentId: 'nova-arb-scanner',

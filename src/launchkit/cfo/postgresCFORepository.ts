@@ -240,9 +240,30 @@ async function ensureCFOSchema(pool: Pool): Promise<void> {
     );
   `);
 
+  // ── Skill Pool — stores low-relevance or unclaimed discovered skills for factory suggestions ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS skill_pool (
+      id SERIAL PRIMARY KEY,
+      skill_id VARCHAR(100) NOT NULL UNIQUE,
+      name VARCHAR(200) NOT NULL,
+      description TEXT NOT NULL,
+      content TEXT NOT NULL,
+      source_url TEXT NOT NULL,
+      relevance_scores JSONB NOT NULL DEFAULT '{}',
+      max_relevance NUMERIC(3,2) NOT NULL DEFAULT 0.0,
+      suggested_capabilities TEXT[] NOT NULL DEFAULT '{}',
+      reasoning TEXT NOT NULL DEFAULT '',
+      times_suggested INTEGER NOT NULL DEFAULT 0,
+      times_attached INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_agent_skills_status ON agent_skills(status);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_skill_assignments_role ON agent_skill_assignments(agent_role);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_discovery_queue_status ON skill_discovery_queue(status);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_skill_pool_capabilities ON skill_pool USING GIN(suggested_capabilities);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_skill_pool_relevance ON skill_pool(max_relevance DESC);`);
 
   logger.info('[CFORepository] Schema ensured');
 }

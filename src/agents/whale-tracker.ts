@@ -116,6 +116,7 @@ export class WhaleTrackerAgent extends BaseAgent {
     pollIntervalMs?: number;
     minTransferUsd?: number;
     watchAddresses?: string[];
+    wallet?: { chain: string; address: string; encryptedKey?: string; permissions: string[] };
   }) {
     super({
       agentId: 'nova-whale-tracker',

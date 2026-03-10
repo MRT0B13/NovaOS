@@ -105,6 +105,7 @@ export class PortfolioWatchdogAgent extends BaseAgent {
     drawdownThreshold?: number;
     positionLossThreshold?: number;
     concentrationThreshold?: number;
+    wallet?: { chain: string; address: string; encryptedKey?: string; permissions: string[] };
   }) {
     super({
       agentId: 'nova-portfolio-watchdog',

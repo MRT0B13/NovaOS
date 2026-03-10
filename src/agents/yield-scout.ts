@@ -92,6 +92,7 @@ export class YieldScoutAgent extends BaseAgent {
     minApy?: number;
     minTvl?: number;
     chains?: string[];
+    wallet?: { chain: string; address: string; encryptedKey?: string; permissions: string[] };
   }) {
     super({
       agentId: 'nova-yield-scout',

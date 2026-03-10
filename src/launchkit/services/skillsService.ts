@@ -33,6 +33,19 @@ export interface SkillListEntry {
   assignedTo: string[];
 }
 
+export interface PoolSkillEntry {
+  id: number;
+  skillId: string;
+  name: string;
+  description: string;
+  maxRelevance: number;
+  suggestedCapabilities: string[];
+  reasoning: string;
+  sourceUrl: string;
+  timesSuggested: number;
+  timesAttached: number;
+}
+
 // ============================================================================
 // In-memory cache
 // ============================================================================
@@ -319,6 +332,109 @@ export class SkillsService {
       ['rejected', queueId],
     );
     logger.info(`[SkillsService] Rejected skill queue id ${queueId}`);
+  }
+
+  // ── Skill Pool (factory-facing) ────────────────────────────────
+
+  /** Query skill pool for skills matching a set of factory capabilities. */
+  async getPoolSkillsForCapabilities(capabilities: string[], limit = 10): Promise<PoolSkillEntry[]> {
+    try {
+      const res = await this.pool.query<PoolSkillEntry>(
+        `SELECT
+           id,
+           skill_id AS "skillId",
+           name,
+           description,
+           max_relevance AS "maxRelevance",
+           suggested_capabilities AS "suggestedCapabilities",
+           reasoning,
+           source_url AS "sourceUrl",
+           times_suggested AS "timesSuggested",
+           times_attached AS "timesAttached"
+         FROM skill_pool
+         WHERE suggested_capabilities && $1
+         ORDER BY max_relevance DESC, times_attached DESC
+         LIMIT $2`,
+        [capabilities, limit],
+      );
+      return res.rows;
+    } catch (err) {
+      logger.warn('[SkillsService] Failed to query skill pool:', err);
+      return [];
+    }
+  }
+
+  /** Browse the entire skill pool (for admin /skill pool command). */
+  async listPoolSkills(limit = 25): Promise<PoolSkillEntry[]> {
+    try {
+      const res = await this.pool.query<PoolSkillEntry>(
+        `SELECT
+           id,
+           skill_id AS "skillId",
+           name,
+           description,
+           max_relevance AS "maxRelevance",
+           suggested_capabilities AS "suggestedCapabilities",
+           reasoning,
+           source_url AS "sourceUrl",
+           times_suggested AS "timesSuggested",
+           times_attached AS "timesAttached"
+         FROM skill_pool
+         ORDER BY max_relevance DESC
+         LIMIT $1`,
+        [limit],
+      );
+      return res.rows;
+    } catch (err) {
+      logger.warn('[SkillsService] Failed to list skill pool:', err);
+      return [];
+    }
+  }
+
+  /** Attach a pool skill to a factory agent — promotes it to agent_skills and assigns it. */
+  async attachPoolSkill(poolSkillId: number, agentRole: string): Promise<string> {
+    // Fetch from pool
+    const res = await this.pool.query(
+      'SELECT * FROM skill_pool WHERE id = $1',
+      [poolSkillId],
+    );
+    if (res.rows.length === 0) throw new Error(`Pool skill ${poolSkillId} not found`);
+
+    const pooled = res.rows[0];
+
+    // Insert into the main agent_skills registry
+    await this.upsertSkill({
+      skillId: pooled.skill_id,
+      name: pooled.name,
+      description: pooled.description,
+      content: pooled.content,
+      category: 'pool-attached',
+      source: 'skill-pool',
+      sourceUrl: pooled.source_url,
+    });
+
+    // Assign to the agent role
+    await this.assignSkill(agentRole, pooled.skill_id);
+
+    // Increment attachment counter
+    await this.pool.query(
+      'UPDATE skill_pool SET times_attached = times_attached + 1 WHERE id = $1',
+      [poolSkillId],
+    );
+
+    logger.info(`[SkillsService] Attached pool skill ${pooled.skill_id} to ${agentRole}`);
+    return pooled.skill_id;
+  }
+
+  /** Increment the "times suggested" counter for pool skills shown to users. */
+  async markPoolSkillsSuggested(poolSkillIds: number[]): Promise<void> {
+    if (poolSkillIds.length === 0) return;
+    try {
+      await this.pool.query(
+        'UPDATE skill_pool SET times_suggested = times_suggested + 1 WHERE id = ANY($1)',
+        [poolSkillIds],
+      );
+    } catch { /* non-fatal */ }
   }
 
   /** List pending discoveries awaiting admin review. */

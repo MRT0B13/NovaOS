@@ -74,7 +74,8 @@ export async function registerFactoryCommands(
             '`/request_agent track whale wallets on solana`\n' +
             '`/request_agent monitor $TOKEN price and volume`\n' +
             '`/request_agent scan tokens for rugs`\n\n' +
-            'Capabilities: whale tracking, token monitoring, KOL scanning, safety scanning, narrative tracking',
+            'Capabilities: whale tracking, token monitoring, KOL scanning, safety scanning, narrative tracking, yield monitoring, arb scanning, portfolio monitoring\n\n' +
+            'After creating, use `/configure_wallet` to attach your wallet for on-chain trading.',
             { parse_mode: 'Markdown' },
           );
           return;
@@ -501,6 +502,22 @@ export async function registerFactoryCommands(
             break;
           }
 
+          case 'pool': {
+            const poolSkills = await svc.listPoolSkills(15);
+            if (poolSkills.length === 0) {
+              await ctx.reply('🏊 <b>Skill Pool is empty.</b>\n\nThe discovery service will populate it every 24h with skills that scored below the 70% agent threshold but above 20%.', { parse_mode: 'HTML' });
+              return;
+            }
+            const poolLines = poolSkills.map(ps =>
+              `📦 <b>${ps.name}</b> (pool #${ps.id})\n` +
+              `   Score: ${Math.round(ps.maxRelevance * 100)}% | Caps: ${ps.suggestedCapabilities.join(', ')}\n` +
+              `   Used: ${ps.timesAttached}x attached, ${ps.timesSuggested}x suggested\n` +
+              `   <code>/attach_skill &lt;agent_id&gt; ${ps.id}</code>`
+            );
+            await ctx.reply(`🏊 <b>Skill Pool</b> (${poolSkills.length} available)\n\nThese skills were discovered but scored below the 70% threshold for core agents. Use <code>/attach_skill</code> to add them to factory-created agents.\n\n${poolLines.join('\n\n')}`, { parse_mode: 'HTML' });
+            break;
+          }
+
           case 'approve': {
             const queueId = parseInt(parts[1]);
             if (!queueId) { await ctx.reply('Usage: /skill approve <queue_id>'); return; }
@@ -543,8 +560,10 @@ export async function registerFactoryCommands(
               '<code>/skill enable &lt;id&gt;</code> — Enable skill\n' +
               '<code>/skill disable &lt;id&gt;</code> — Disable skill\n' +
               '<code>/skill pending</code> — View pending discoveries\n' +
+              '<code>/skill pool</code> — Browse skill pool (factory suggestions)\n' +
               '<code>/skill approve &lt;queue_id&gt;</code> — Approve discovery\n' +
-              '<code>/skill reject &lt;queue_id&gt;</code> — Reject discovery',
+              '<code>/skill reject &lt;queue_id&gt;</code> — Reject discovery\n' +
+              '<code>/attach_skill &lt;agent_id&gt; &lt;pool_id&gt;</code> — Attach pool skill to agent',
               { parse_mode: 'HTML' }
             );
         }
@@ -579,6 +598,203 @@ export async function registerFactoryCommands(
       } catch (err: any) {
         logger.warn('[factory-tg] /skills error:', err.message);
         await ctx.reply('❌ Error processing skill command.').catch(() => {});
+      }
+    });
+
+    // ── /attach_skill <agent_id> <pool_skill_id> — attach pool skill to factory agent ──
+    bot.command('attach_skill', async (ctx: any) => {
+      try {
+        if (!isAdmin(ctx.chat.id)) {
+          await ctx.reply('🔒 Admin only.').catch(() => {});
+          return;
+        }
+
+        const text = (ctx.message?.text || '').replace(/^\/attach_skill\s*/i, '').trim();
+        const parts = text.split(/\s+/);
+        const agentId = parts[0];
+        const poolId = parseInt(parts[1]);
+
+        if (!agentId || !poolId) {
+          await ctx.reply('Usage: <code>/attach_skill &lt;agent_id&gt; &lt;pool_skill_id&gt;</code>\n\nUse <code>/skill pool</code> to browse available pool skills.', { parse_mode: 'HTML' });
+          return;
+        }
+
+        // Verify agent exists in factory
+        const spec = _factory?.getSpec(agentId);
+        if (!spec) {
+          await ctx.reply(`❌ Agent <code>${agentId}</code> not found.`, { parse_mode: 'HTML' });
+          return;
+        }
+
+        const { getSkillsService } = await import('./skillsService.ts');
+        const svc = getSkillsService();
+        if (!svc) {
+          await ctx.reply('⚠️ Skills service not initialized.').catch(() => {});
+          return;
+        }
+
+        const skillId = await svc.attachPoolSkill(poolId, spec.name);
+        await ctx.reply(`✅ Pool skill <code>${skillId}</code> attached to <b>${spec.name}</b>.\nIt will load on next agent cycle.`, { parse_mode: 'HTML' });
+      } catch (err: any) {
+        logger.warn('[factory-tg] /attach_skill error:', err.message);
+        await ctx.reply(`❌ Error: ${err.message}`).catch(() => {});
+      }
+    });
+
+    // ── /configure_wallet <agent_id> — set user wallet for agent trading ──
+    bot.command('configure_wallet', async (ctx: any) => {
+      try {
+        const text = (ctx.message?.text || '').replace(/^\/configure_wallet\s*/i, '').trim();
+        const parts = text.split(/\s+/);
+        const agentId = parts[0];
+        const chain = (parts[1] || '').toLowerCase() as 'solana' | 'evm' | 'both';
+        const address = parts[2];
+        const permStr = parts[3] || 'read';
+
+        if (!agentId || !chain || !address || !['solana', 'evm', 'both'].includes(chain)) {
+          await ctx.reply(
+            '💼 <b>Configure Wallet for Agent</b>\n\n' +
+            'Usage:\n' +
+            '<code>/configure_wallet &lt;agent_id&gt; &lt;solana|evm|both&gt; &lt;address&gt; [permissions]</code>\n\n' +
+            'Permissions (comma-separated):\n' +
+            '  • <b>read</b> — monitor only (default)\n' +
+            '  • <b>trade</b> — can execute swaps\n' +
+            '  • <b>lp</b> — can open/close LP positions\n\n' +
+            'Example:\n' +
+            '<code>/configure_wallet swift-fox solana 7xKX...3nPq read,trade</code>\n\n' +
+            '⚠️ For trade/LP permissions, DM the bot with your private key (never share in groups). The key is encrypted at rest.',
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+
+        const userId = String(ctx.from?.id || ctx.chat.id);
+
+        // Verify agent exists and user owns it (or is admin)
+        const spec = _factory?.getSpec(agentId);
+        if (!spec) {
+          await ctx.reply(`❌ Agent <code>${agentId}</code> not found.`, { parse_mode: 'HTML' });
+          return;
+        }
+        if (spec.createdBy !== userId && !isAdmin(ctx.chat.id)) {
+          await ctx.reply('❌ You can only configure wallets for your own agents.');
+          return;
+        }
+
+        // Parse permissions
+        const validPerms = ['read', 'trade', 'lp'] as const;
+        const permissions = permStr.split(',')
+          .map((p: string) => p.trim().toLowerCase())
+          .filter((p: string) => (validPerms as readonly string[]).includes(p)) as ('read' | 'trade' | 'lp')[];
+        if (permissions.length === 0) permissions.push('read');
+
+        // Validate address format
+        const isSolana = chain === 'solana' || chain === 'both';
+        const isEvm = chain === 'evm' || chain === 'both';
+        if (isSolana && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
+          await ctx.reply('❌ Invalid Solana address format.');
+          return;
+        }
+        if (isEvm && !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+          await ctx.reply('❌ Invalid EVM address format (expected 0x...).');
+          return;
+        }
+
+        // Set wallet on spec
+        spec.wallet = {
+          chain,
+          address,
+          permissions,
+        };
+        // The spec is already in the factory's Map via reference
+
+        const permDisplay = permissions.join(', ');
+        const needsKey = permissions.includes('trade') || permissions.includes('lp');
+
+        let msg = `✅ Wallet configured for <b>${spec.name}</b>\n\n` +
+          `🔗 Chain: ${chain}\n` +
+          `📬 Address: <code>${address.slice(0, 8)}...${address.slice(-4)}</code>\n` +
+          `🔑 Permissions: ${permDisplay}`;
+
+        if (needsKey) {
+          msg += `\n\n⚠️ Trade/LP permissions require a private key.\nDM me with:\n<code>/wallet_key ${agentId} &lt;private_key&gt;</code>\n\n🔒 Keys are encrypted at rest and never logged.`;
+        }
+
+        await ctx.reply(msg, { parse_mode: 'HTML' });
+
+        // Notify admin if wallet has trade permissions
+        if (needsKey && ownerChatId) {
+          try {
+            await bot.telegram.sendMessage(
+              ownerChatId,
+              `⚠️ <b>Wallet Config Alert</b>\n\nUser ${userId} configured trade/LP wallet for agent <b>${spec.name}</b>\nChain: ${chain}\nAddress: <code>${address}</code>\nPermissions: ${permDisplay}\n\nAdmin approval recommended before spawning.`,
+              { parse_mode: 'HTML' },
+            );
+          } catch { /* silent */ }
+        }
+      } catch (err: any) {
+        logger.warn('[factory-tg] /configure_wallet error:', err.message);
+        await ctx.reply('❌ Error configuring wallet.').catch(() => {});
+      }
+    });
+
+    // ── /wallet_key <agent_id> <key> — securely provide private key (DM only) ──
+    bot.command('wallet_key', async (ctx: any) => {
+      try {
+        // Only allow in private chat (DM)
+        if (ctx.chat.type !== 'private') {
+          // Delete the message immediately to prevent key exposure
+          try { await ctx.deleteMessage(); } catch { /* may lack permissions */ }
+          await ctx.reply('🚫 <b>SECURITY:</b> Never share private keys in group chats!\nPlease DM me directly with this command.', { parse_mode: 'HTML' });
+          return;
+        }
+
+        const text = (ctx.message?.text || '').replace(/^\/wallet_key\s*/i, '').trim();
+        const parts = text.split(/\s+/);
+        const agentId = parts[0];
+        const privateKey = parts[1];
+
+        if (!agentId || !privateKey) {
+          await ctx.reply('Usage: <code>/wallet_key &lt;agent_id&gt; &lt;private_key&gt;</code>\n\n🔒 Only use in DM. Keys are encrypted at rest.', { parse_mode: 'HTML' });
+          return;
+        }
+
+        const userId = String(ctx.from?.id || ctx.chat.id);
+        const spec = _factory?.getSpec(agentId);
+        if (!spec || spec.createdBy !== userId) {
+          await ctx.reply('❌ Agent not found or not yours.');
+          return;
+        }
+        if (!spec.wallet) {
+          await ctx.reply('❌ Configure wallet first with <code>/configure_wallet</code>.', { parse_mode: 'HTML' });
+          return;
+        }
+
+        // Encrypt the key before storing (using a simple reversible encryption)
+        // In production, use proper KMS / hardware security module
+        const { createCipheriv, randomBytes } = await import('crypto');
+        const encKey = process.env.WALLET_ENCRYPTION_KEY || 'nova-default-encryption-key-32b!';
+        const iv = randomBytes(16);
+        const cipher = createCipheriv('aes-256-cbc', Buffer.from(encKey.padEnd(32, '0').slice(0, 32)), iv);
+        let encrypted = cipher.update(privateKey, 'utf8', 'hex');
+        encrypted += cipher.final('hex');
+        spec.wallet.encryptedKey = iv.toString('hex') + ':' + encrypted;
+
+        await ctx.reply('✅ Private key encrypted and stored.\n🔒 The agent can now execute trades on your behalf when approved.');
+
+        // Notify admin
+        if (ownerChatId) {
+          try {
+            await bot.telegram.sendMessage(
+              ownerChatId,
+              `🔐 <b>Wallet Key Provided</b>\n\nUser ${userId} provided encrypted private key for agent <b>${spec.name}</b>.\nChain: ${spec.wallet.chain}\nPermissions: ${spec.wallet.permissions.join(', ')}\n\n⚠️ Review carefully before approving this agent.`,
+              { parse_mode: 'HTML' },
+            );
+          } catch { /* silent */ }
+        }
+      } catch (err: any) {
+        logger.warn('[factory-tg] /wallet_key error:', err.message);
+        await ctx.reply('❌ Error storing key.').catch(() => {});
       }
     });
 

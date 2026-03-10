@@ -226,6 +226,7 @@ export class SkillDiscoveryService {
     const evaluated: EvaluatedSkill[] = [];
     let consecutiveApiErrors = 0;
     let lowRelevanceCount = 0;
+    let pooledCount = 0;
     for (const candidate of novel.slice(0, 20)) { // cap at 20 per run
       const result = await this.evaluateCandidate(candidate);
       if (result === 'api-error') {
@@ -238,6 +239,10 @@ export class SkillDiscoveryService {
         // Low relevance — not an error
         lowRelevanceCount++;
         consecutiveApiErrors = 0;
+      } else if (result === 'pooled') {
+        // Below threshold but stored in skill pool for factory suggestions
+        pooledCount++;
+        consecutiveApiErrors = 0;
       } else {
         evaluated.push(result);
         consecutiveApiErrors = 0;
@@ -246,6 +251,9 @@ export class SkillDiscoveryService {
     }
     if (lowRelevanceCount > 0) {
       logger.info(`[SkillDiscovery] ${lowRelevanceCount} candidates scored below relevance threshold (0.70)`);
+    }
+    if (pooledCount > 0) {
+      logger.info(`[SkillDiscovery] ${pooledCount} candidates added to skill pool (below agent threshold, available for factory)`);
     }
 
     if (evaluated.length === 0) {
@@ -440,7 +448,9 @@ export class SkillDiscoveryService {
       const res = await this.pool.query(
         `SELECT source_url FROM skill_discovery_queue
          UNION
-         SELECT source_url FROM agent_skills WHERE source_url IS NOT NULL`,
+         SELECT source_url FROM agent_skills WHERE source_url IS NOT NULL
+         UNION
+         SELECT source_url FROM skill_pool`,
       );
       const knownUrls = new Set(res.rows.map(r => r.source_url).filter(Boolean));
       return candidates.filter(c => !knownUrls.has(c.sourceUrl));
@@ -451,7 +461,7 @@ export class SkillDiscoveryService {
 
   // ── Claude evaluation ───────────────────────────────────────
 
-  private async evaluateCandidate(candidate: SkillCandidate): Promise<EvaluatedSkill | null | 'api-error'> {
+  private async evaluateCandidate(candidate: SkillCandidate): Promise<EvaluatedSkill | null | 'api-error' | 'pooled'> {
     try {
       const profileList = Object.entries(AGENT_PROFILES).map(([role, profile]) =>
         `${role}:\n${profile}`,
@@ -526,7 +536,14 @@ Respond ONLY with JSON in this exact format:
         .filter(([, score]) => Number(score) >= 0.70)
         .map(([role]) => role);
 
-      if (maxRelevance < 0.70 || relevantRoles.length === 0) return null;
+      if (maxRelevance < 0.70 || relevantRoles.length === 0) {
+        // Below threshold for existing agents — store in skill pool for factory suggestions
+        if (maxRelevance >= 0.20) {
+          await this.addToSkillPool(candidate, scores, maxRelevance, parsed.reasoning || '');
+          return 'pooled' as const;
+        }
+        return null; // truly irrelevant (< 0.20) — discard
+      }
 
       return {
         skillId: candidate.skillId,
@@ -559,6 +576,88 @@ Respond ONLY with JSON in this exact format:
       );
     } catch (err) {
       logger.warn(`[SkillDiscovery] Failed to queue proposal ${ev.skillId}:`, err);
+    }
+  }
+
+  // ── Skill Pool (low-relevance skills for factory agents) ──────
+
+  /**
+   * Map relevance scores to factory capability types.
+   * Uses keyword analysis of the skill name/description to suggest which
+   * factory capabilities this skill could enhance.
+   */
+  private inferCapabilities(candidate: SkillCandidate, scores: Record<string, number>): string[] {
+    const text = `${candidate.name} ${candidate.description}`.toLowerCase();
+    const caps: string[] = [];
+
+    const capKeywords: Record<string, string[]> = {
+      whale_tracking: ['whale', 'wallet', 'transfer', 'flow', 'exchange'],
+      token_monitoring: ['token', 'price', 'volume', 'dex', 'chart', 'holder'],
+      kol_scanning: ['kol', 'twitter', 'influencer', 'social', 'x.com'],
+      safety_scanning: ['rug', 'safety', 'audit', 'scam', 'honeypot', 'security'],
+      narrative_tracking: ['narrative', 'sentiment', 'trend', 'alpha', 'meta'],
+      social_trending: ['reddit', 'meme', 'viral', 'trend', 'buzz', 'pop culture'],
+      yield_monitoring: ['yield', 'apy', 'apr', 'farming', 'staking', 'liquidity', 'lp', 'defi'],
+      arb_scanning: ['arb', 'arbitrage', 'flash', 'mev', 'spread', 'cross-dex'],
+      portfolio_monitoring: ['portfolio', 'pnl', 'drawdown', 'risk', 'position', 'balance'],
+    };
+
+    for (const [cap, keywords] of Object.entries(capKeywords)) {
+      if (keywords.some(kw => text.includes(kw))) {
+        caps.push(cap);
+      }
+    }
+
+    // Also map from high agent role scores
+    const roleCapMap: Record<string, string[]> = {
+      'nova-cfo': ['yield_monitoring', 'portfolio_monitoring', 'arb_scanning'],
+      'nova-scout': ['kol_scanning', 'narrative_tracking', 'social_trending'],
+      'nova-analyst': ['token_monitoring', 'narrative_tracking', 'portfolio_monitoring'],
+      'nova-guardian': ['safety_scanning', 'whale_tracking'],
+      'nova-launcher': ['token_monitoring', 'social_trending'],
+      'nova-community': ['social_trending', 'narrative_tracking'],
+      'nova-supervisor': [],
+    };
+
+    for (const [role, score] of Object.entries(scores)) {
+      if (Number(score) >= 0.40) {
+        const roleCaps = roleCapMap[role] || [];
+        for (const c of roleCaps) {
+          if (!caps.includes(c)) caps.push(c);
+        }
+      }
+    }
+
+    return caps.length > 0 ? caps : ['token_monitoring']; // fallback
+  }
+
+  private async addToSkillPool(
+    candidate: SkillCandidate,
+    scores: Record<string, number>,
+    maxRelevance: number,
+    reasoning: string,
+  ): Promise<void> {
+    try {
+      const capabilities = this.inferCapabilities(candidate, scores);
+      await this.pool.query(
+        `INSERT INTO skill_pool
+           (skill_id, name, description, content, source_url, relevance_scores, max_relevance, suggested_capabilities, reasoning)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (skill_id) DO UPDATE SET
+           relevance_scores = $6,
+           max_relevance = $7,
+           suggested_capabilities = $8,
+           reasoning = $9`,
+        [
+          candidate.skillId, candidate.name, candidate.description,
+          candidate.content, candidate.sourceUrl,
+          JSON.stringify(scores), maxRelevance,
+          capabilities, reasoning,
+        ],
+      );
+      logger.debug(`[SkillDiscovery] Added to skill pool: ${candidate.name} (relevance: ${(maxRelevance * 100).toFixed(0)}%, caps: ${capabilities.join(', ')})`);
+    } catch (err) {
+      logger.warn(`[SkillDiscovery] Failed to add to skill pool: ${candidate.name}`, err);
     }
   }
 

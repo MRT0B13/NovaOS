@@ -21,6 +21,7 @@
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
 import type { Supervisor } from './supervisor.ts';
+import type { PoolSkillEntry } from '../launchkit/services/skillsService.ts';
 
 // ============================================================================
 // Types
@@ -56,6 +57,15 @@ export interface AgentSpec {
     maxMemoryMb: number;
     maxCpuPercent: number;
     maxApiCallsPerHour: number;
+  };
+  /** Pool skills suggested for this agent's capabilities */
+  suggestedSkills?: PoolSkillEntry[];
+  /** User-provided wallet config for on-chain agent trading */
+  wallet?: {
+    chain: 'solana' | 'evm' | 'both';
+    address: string;                    // Public address (always stored)
+    encryptedKey?: string;              // Encrypted private key (optional — enables trading)
+    permissions: ('read' | 'trade' | 'lp')[];
   };
 }
 
@@ -233,7 +243,36 @@ export class AgentFactory {
 
     this.specs.set(id, spec);
     logger.info(`[factory] Created spec "${name}" (${matched.join(', ')}) for user ${userId}`);
+
+    // Asynchronously load pool skill suggestions (non-blocking)
+    this.loadSkillSuggestions(spec).catch(() => {});
+
     return spec;
+  }
+
+  /**
+   * Load skill suggestions from the skill pool for a spec's capabilities.
+   * Called automatically after parseRequest; results available before approval.
+   */
+  async loadSkillSuggestions(spec: AgentSpec): Promise<PoolSkillEntry[]> {
+    try {
+      const { getSkillsService } = await import('../launchkit/services/skillsService.ts');
+      const svc = getSkillsService();
+      if (!svc) return [];
+
+      const poolSkills = await svc.getPoolSkillsForCapabilities(spec.capabilities, 5);
+      if (poolSkills.length > 0) {
+        spec.suggestedSkills = poolSkills;
+        this.specs.set(spec.id, spec);
+        // Track suggestion metrics
+        await svc.markPoolSkillsSuggested(poolSkills.map(s => s.id));
+        logger.info(`[factory] Suggested ${poolSkills.length} pool skills for "${spec.name}"`);
+      }
+      return poolSkills;
+    } catch (err) {
+      logger.debug(`[factory] Skill suggestion lookup failed (non-fatal):`, err);
+      return [];
+    }
   }
 
   // ── Approval Flow ─────────────────────────────────────────────
@@ -350,6 +389,7 @@ export class AgentFactory {
         const tracker = new WhaleTrackerAgent(this.pool, {
           minTransferUsd: spec.config.minTransferSol ? spec.config.minTransferSol * 150 : undefined,
           watchAddresses: spec.config.watchAddresses,
+          wallet: spec.wallet,
         });
         await tracker.start();
         spec.status = 'running';
@@ -366,6 +406,7 @@ export class AgentFactory {
           minApy: spec.config.minApy,
           minTvl: spec.config.minTvl,
           chains: spec.config.chains,
+          wallet: spec.wallet,
         });
         await scout.start();
         spec.status = 'running';
@@ -380,6 +421,7 @@ export class AgentFactory {
         const { ArbScannerAgent } = await import('./arb-scanner.ts');
         const scanner = new ArbScannerAgent(this.pool, {
           minProfitUsd: spec.config.minProfitUsd,
+          wallet: spec.wallet,
         });
         await scanner.start();
         spec.status = 'running';
@@ -395,6 +437,7 @@ export class AgentFactory {
         const watchdog = new PortfolioWatchdogAgent(this.pool, {
           drawdownThreshold: spec.config.drawdownThreshold,
           positionLossThreshold: spec.config.positionLossThreshold,
+          wallet: spec.wallet,
         });
         await watchdog.start();
         spec.status = 'running';
@@ -489,6 +532,12 @@ export class AgentFactory {
     if (spec.config.tokenSymbol) {
       lines.push(`🏷 <b>Symbol:</b> $${spec.config.tokenSymbol}`);
     }
+    if (spec.wallet) {
+      lines.push(`💼 <b>Wallet:</b> ${spec.wallet.chain} (${spec.wallet.permissions.join(', ')})`);
+    }
+    if (spec.suggestedSkills && spec.suggestedSkills.length > 0) {
+      lines.push(`📦 <b>Skills:</b> ${spec.suggestedSkills.length} suggested`);
+    }
 
     return lines.join('\n');
   }
@@ -513,6 +562,22 @@ export class AgentFactory {
 
     if (hasConfig) {
       lines.push(`⚙️ <b>Config:</b> ${JSON.stringify(userConfig)}`);
+    }
+
+    if (spec.wallet) {
+      lines.push(`💼 <b>Wallet:</b> ${spec.wallet.chain} | ${spec.wallet.address.slice(0, 8)}...${spec.wallet.address.slice(-4)}`);
+      lines.push(`🔑 <b>Permissions:</b> ${spec.wallet.permissions.join(', ')}`);
+      if (spec.wallet.encryptedKey) {
+        lines.push(`⚠️ <b>Private key provided</b> — trading enabled`);
+      }
+    }
+
+    if (spec.suggestedSkills && spec.suggestedSkills.length > 0) {
+      lines.push(``, `📦 <b>Suggested Skills from Pool:</b>`);
+      for (const skill of spec.suggestedSkills) {
+        const relevance = Math.round(skill.maxRelevance * 100);
+        lines.push(`  • ${skill.name} (${relevance}%) — <code>/attach_skill ${spec.id} ${skill.id}</code>`);
+      }
     }
 
     lines.push(
