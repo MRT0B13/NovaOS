@@ -436,7 +436,8 @@ export class AgentFactory {
   // ── Internal Helpers ──────────────────────────────────────────
 
   private generateId(): string {
-    return `af-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    // Short 4-char hex ID — easy to type/copy in Telegram
+    return Math.random().toString(16).slice(2, 6);
   }
 
   private deriveAgentName(capabilities: CapabilityType[], tokenSymbol?: string): string {
