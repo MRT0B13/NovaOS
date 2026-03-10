@@ -224,20 +224,28 @@ export class SkillDiscoveryService {
 
     // 3. Evaluate each with Claude
     const evaluated: EvaluatedSkill[] = [];
-    let consecutiveErrors = 0;
+    let consecutiveApiErrors = 0;
+    let lowRelevanceCount = 0;
     for (const candidate of novel.slice(0, 20)) { // cap at 20 per run
       const result = await this.evaluateCandidate(candidate);
-      if (result) {
-        evaluated.push(result);
-        consecutiveErrors = 0;
-      } else {
-        consecutiveErrors++;
-        if (consecutiveErrors >= 3) {
-          logger.warn(`[SkillDiscovery] 3 consecutive evaluation failures — likely API issue, stopping early`);
+      if (result === 'api-error') {
+        consecutiveApiErrors++;
+        if (consecutiveApiErrors >= 3) {
+          logger.warn(`[SkillDiscovery] 3 consecutive API errors — stopping early`);
           break;
         }
+      } else if (result === null) {
+        // Low relevance — not an error
+        lowRelevanceCount++;
+        consecutiveApiErrors = 0;
+      } else {
+        evaluated.push(result);
+        consecutiveApiErrors = 0;
       }
       await new Promise(r => setTimeout(r, 500)); // rate limit between evaluations
+    }
+    if (lowRelevanceCount > 0) {
+      logger.info(`[SkillDiscovery] ${lowRelevanceCount} candidates scored below relevance threshold (0.70)`);
     }
 
     if (evaluated.length === 0) {
@@ -443,7 +451,7 @@ export class SkillDiscoveryService {
 
   // ── Claude evaluation ───────────────────────────────────────
 
-  private async evaluateCandidate(candidate: SkillCandidate): Promise<EvaluatedSkill | null> {
+  private async evaluateCandidate(candidate: SkillCandidate): Promise<EvaluatedSkill | null | 'api-error'> {
     try {
       const profileList = Object.entries(AGENT_PROFILES).map(([role, profile]) =>
         `${role}:\n${profile}`,
@@ -501,7 +509,7 @@ Respond ONLY with JSON in this exact format:
       if (!res.ok) {
         const errBody = await res.text().catch(() => '');
         logger.warn(`[SkillDiscovery] Claude API error: ${res.status} — ${errBody.slice(0, 200)}`);
-        return null;
+        return 'api-error' as const;
       }
 
       const data: { content: Array<{ text: string }> } = await res.json();
@@ -532,7 +540,7 @@ Respond ONLY with JSON in this exact format:
       };
     } catch (err) {
       logger.warn(`[SkillDiscovery] Evaluation failed for ${candidate.name}:`, err);
-      return null;
+      return 'api-error' as const;
     }
   }
 
