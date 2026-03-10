@@ -289,15 +289,13 @@ export class AgentFactory {
     this.specs.set(id, spec);
     logger.info(`[factory] Created spec "${name}" (${matched.join(', ')}) for user ${userId}`);
 
-    // Asynchronously load pool skill suggestions (non-blocking)
-    this.loadSkillSuggestions(spec).catch(() => {});
-
     return spec;
   }
 
   /**
    * Load skill suggestions from the skill pool for a spec's capabilities.
-   * Called automatically after parseRequest; results available before approval.
+   * Matches by capability overlap, then re-ranks by description relevance.
+   * Call after parseRequest() and await before displaying to user/admin.
    */
   async loadSkillSuggestions(spec: AgentSpec): Promise<PoolSkillEntry[]> {
     try {
@@ -305,15 +303,31 @@ export class AgentFactory {
       const svc = getSkillsService();
       if (!svc) return [];
 
-      const poolSkills = await svc.getPoolSkillsForCapabilities(spec.capabilities, 5);
-      if (poolSkills.length > 0) {
-        spec.suggestedSkills = poolSkills;
-        this.specs.set(spec.id, spec);
-        // Track suggestion metrics
-        await svc.markPoolSkillsSuggested(poolSkills.map(s => s.id));
-        logger.info(`[factory] Suggested ${poolSkills.length} pool skills for "${spec.name}"`);
-      }
-      return poolSkills;
+      const poolSkills = await svc.getPoolSkillsForCapabilities(spec.capabilities, 15);
+      if (poolSkills.length === 0) return [];
+
+      // Re-rank by description relevance: score each pool skill against spec description
+      const descWords = spec.description.toLowerCase().split(/\W+/).filter(w => w.length > 2);
+      const ranked = poolSkills.map(skill => {
+        const skillText = `${skill.name} ${skill.description}`.toLowerCase();
+        // Count how many description words appear in the skill text
+        const matchCount = descWords.filter(w => skillText.includes(w)).length;
+        const descRelevance = descWords.length > 0 ? matchCount / descWords.length : 0;
+        // Composite: 60% capability relevance (maxRelevance), 40% description match
+        const compositeScore = (skill.maxRelevance * 0.6) + (descRelevance * 0.4);
+        return { skill, compositeScore };
+      });
+
+      ranked.sort((a, b) => b.compositeScore - a.compositeScore);
+      const topSkills = ranked.slice(0, 5).map(r => r.skill);
+
+      spec.suggestedSkills = topSkills;
+      this.specs.set(spec.id, spec);
+
+      // Track suggestion metrics
+      await svc.markPoolSkillsSuggested(topSkills.map(s => s.id));
+      logger.info(`[factory] Suggested ${topSkills.length} pool skills for "${spec.name}" (from ${poolSkills.length} candidates)`);
+      return topSkills;
     } catch (err) {
       logger.debug(`[factory] Skill suggestion lookup failed (non-fatal):`, err);
       return [];

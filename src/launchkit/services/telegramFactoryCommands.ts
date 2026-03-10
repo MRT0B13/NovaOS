@@ -62,6 +62,89 @@ export async function registerFactoryCommands(
       return adminIds.map(normalizeTgId).includes(id);
     };
 
+    // ── /agent_guide — comprehensive setup guide for all agent types ──
+    bot.command('agent_guide', async (ctx: any) => {
+      const guide = [
+        `🏭 <b>Nova Agent Factory — Setup Guide</b>`,
+        ``,
+        `Create custom AI agents that monitor, alert, and trade on your behalf.`,
+        ``,
+        `<b>━━━ Available Agent Types ━━━</b>`,
+        ``,
+        `🐋 <b>Whale Tracking</b>`,
+        `Monitor large wallet movements on Solana + EVM.`,
+        `<code>/request_agent track whale wallets on solana</code>`,
+        `Optional: <i>watchAddresses, minTransferSol</i>`,
+        ``,
+        `📊 <b>Token Monitoring</b>`,
+        `Track token price, volume, and holder changes (DexScreener).`,
+        `<code>/request_agent monitor $SOL price and volume</code>`,
+        `Required: <i>token address or $SYMBOL</i>`,
+        ``,
+        `🔍 <b>KOL Scanning</b>`,
+        `Monitor X/Twitter influencers and alert on relevant posts.`,
+        `<code>/request_agent watch KOL posts about AI tokens</code>`,
+        `Optional: <i>targetAccounts, keywords</i>`,
+        ``,
+        `🛡 <b>Safety Scanning</b>`,
+        `Continuous RugCheck scans on specified tokens.`,
+        `<code>/request_agent scan 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU for rugs</code>`,
+        `Required: <i>token address</i>`,
+        ``,
+        `📈 <b>Narrative Tracking</b>`,
+        `Track sentiment shifts across social media and KOLs.`,
+        `<code>/request_agent track AI narrative sentiment</code>`,
+        `Optional: <i>focusTopics, excludeTopics</i>`,
+        ``,
+        `🔥 <b>Social Trending</b>`,
+        `Monitor Reddit + Google Trends for viral memeable topics.`,
+        `<code>/request_agent scan reddit for trending memes</code>`,
+        `Optional: <i>subreddits, minScore</i>`,
+        ``,
+        `💰 <b>Yield Monitoring</b>`,
+        `DeFi yields across Krystal (EVM), Orca, Kamino, Jito (Solana).`,
+        `<code>/request_agent monitor defi yields above 20% apy</code>`,
+        `Optional: <i>minApy, minTvl, chains</i>`,
+        ``,
+        `⚡ <b>Arb Scanning</b>`,
+        `Cross-DEX arbitrage opportunities on EVM chains.`,
+        `<code>/request_agent scan cross-dex arbitrage on ethereum</code>`,
+        `Optional: <i>minProfitUsd</i>`,
+        ``,
+        `📋 <b>Portfolio Monitoring</b>`,
+        `Multi-chain portfolio health, PnL alerts, drawdown warnings.`,
+        `<code>/request_agent monitor my portfolio for drawdowns</code>`,
+        `Optional: <i>drawdownThreshold, positionLossThreshold</i>`,
+        ``,
+        `<b>━━━ Setup Flow ━━━</b>`,
+        ``,
+        `1️⃣ <code>/request_agent &lt;description&gt;</code> — describe what you need`,
+        `2️⃣ Admin reviews and approves your request`,
+        `3️⃣ (Optional) <code>/configure_wallet &lt;agent_id&gt; &lt;chain&gt; &lt;address&gt;</code>`,
+        `4️⃣ (Optional) <code>/wallet_key &lt;agent_id&gt; &lt;private_key&gt;</code> — for trading`,
+        `5️⃣ Agent starts running on its schedule`,
+        ``,
+        `<b>━━━ Management Commands ━━━</b>`,
+        ``,
+        `<code>/my_agents</code> — list your agents + status`,
+        `<code>/stop_agent &lt;id&gt;</code> — stop a running agent`,
+        `<code>/remove_wallet &lt;id&gt;</code> — remove wallet from agent`,
+        `<code>/skill pool</code> — browse available skills`,
+        `<code>/attach_skill &lt;agent_id&gt; &lt;skill_id&gt;</code> — add a skill`,
+        ``,
+        `<b>━━━ Wallet Permissions ━━━</b>`,
+        ``,
+        `• <b>read</b> — monitor balances (no key needed)`,
+        `• <b>trade</b> — execute swaps (requires private key)`,
+        `• <b>lp</b> — manage LP positions (requires private key)`,
+        ``,
+        `🔐 Keys are encrypted with AES-256-CBC. Use DMs for <code>/wallet_key</code>`,
+        ``,
+        `<i>Max 3 agents per user. Agents last 7 days by default.</i>`,
+      ];
+      await ctx.reply(guide.join('\n'), { parse_mode: 'HTML' }).catch(() => {});
+    });
+
     // ── /request_agent <description> — request a new agent ─────────
     bot.command('request_agent', async (ctx: any) => {
       try {
@@ -103,11 +186,16 @@ export async function registerFactoryCommands(
           return;
         }
 
+        // Load relevant skill suggestions (await so they appear in approval msg)
+        await _factory!.loadSkillSuggestions(spec);
+
         // Reply to user
-        await ctx.reply(
-          `✅ <b>Agent Request Created</b>\n\n${_factory!.formatSpecForTelegram(spec)}\n\n🔍 An admin will review your request shortly.`,
-          { parse_mode: 'HTML' },
-        );
+        const userMsg = [`✅ <b>Agent Request Created</b>`, ``, _factory!.formatSpecForTelegram(spec)];
+        if (spec.suggestedSkills && spec.suggestedSkills.length > 0) {
+          userMsg.push(``, `💡 <b>${spec.suggestedSkills.length} relevant skill(s)</b> found — admin can attach them during approval.`);
+        }
+        userMsg.push(``, `🔍 An admin will review your request shortly.`);
+        await ctx.reply(userMsg.join('\n'), { parse_mode: 'HTML' });
 
         // Notify admins
         if (ownerChatId) {
