@@ -574,6 +574,18 @@ export class Supervisor extends BaseAgent {
       logger.info(`[supervisor] Launcher report: enabled=${enabled}, dryRun=${dryRun}, launches=${totalLaunches}, today=${launchesToday}${pnl ? `, PnL=${pnl.totalPnl?.toFixed(4)} SOL` : ''}${lastError ? `, lastErr=${lastError}` : ''}`);
     });
 
+    // ── Social Sentinel Intel ──
+    this.handlers.set('nova-social-sentinel:intel', async (msg) => {
+      const { action, summary, trends, totalPushedLifetime, cycle } = msg.payload;
+      if (action === 'social_trends_detected') {
+        logger.info(`[supervisor] Social Sentinel cycle #${cycle}: ${summary}`);
+        // Log trend topics for the intel buffer (they'll show up in briefings automatically)
+        if (trends?.length) {
+          logger.info(`[supervisor] Social trends: ${trends.join(' | ')}`);
+        }
+      }
+    });
+
     // ── CFO Reports ──
     this.handlers.set('nova-cfo:report', async (msg) => {
       const { source, summary } = msg.payload;

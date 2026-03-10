@@ -28,7 +28,7 @@ import * as trendPool from './trendPool.ts';
  */
 
 export interface TrendSignal {
-  source: 'twitter' | 'news' | 'manual' | 'pump_fun' | 'dexscreener' | 'coingecko' | 'cryptonews';
+  source: 'twitter' | 'news' | 'manual' | 'pump_fun' | 'dexscreener' | 'coingecko' | 'cryptonews' | 'reddit' | 'google_trends';
   topic: string;
   score: number;        // 0-100 confidence score
   context: string;      // Why this is trending

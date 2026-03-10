@@ -20,7 +20,7 @@ import { logger } from '@elizaos/core';
 // Agent Types
 // ============================================================================
 
-export type AgentType = 'scout' | 'guardian' | 'analyst' | 'launcher' | 'community' | 'health' | 'supervisor' | 'cfo';
+export type AgentType = 'scout' | 'guardian' | 'analyst' | 'launcher' | 'community' | 'health' | 'supervisor' | 'cfo' | 'social_sentinel';
 
 export type MessagePriority = 'low' | 'medium' | 'high' | 'critical';
 

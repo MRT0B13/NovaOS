@@ -1028,11 +1028,33 @@ async function executeReactiveLaunch(trend: TrendSignal): Promise<void> {
   // Generate idea with trend context
   const usedTickers = await getUsedTickers();
   
+  // Enrich trendContext for social sources — include extra context from pool metadata
+  let trendContext = trend.topic;
+  if (trend.source === 'reddit' || trend.source === 'google_trends') {
+    try {
+      const { getTrendById } = await import('./trendPool.ts');
+      const pooled = getTrendById(trend.id || trend.topic);
+      if (pooled?.metadata) {
+        const parts = [trend.topic];
+        if (pooled.context) parts.push(pooled.context);
+        // Reddit: include subreddit + engagement
+        if (pooled.metadata.subreddit) parts.push(`(viral on r/${pooled.metadata.subreddit})`);
+        if (pooled.metadata.upvotes) parts.push(`${pooled.metadata.upvotes} upvotes`);
+        // Google Trends: include related articles
+        const articles = pooled.metadata.articles as { title: string }[] | undefined;
+        if (articles?.length) parts.push(`Headlines: ${articles.map(a => a.title).join('; ').slice(0, 120)}`);
+        const related = pooled.metadata.relatedQueries as string[] | undefined;
+        if (related?.length) parts.push(`Related: ${related.slice(0, 3).join(', ')}`);
+        trendContext = parts.join(' | ');
+      }
+    } catch { /* pool not available, use plain topic */ }
+  }
+  
   const idea = await generateBestIdea({
     agentName: 'Nova',
     agentPersonality: 'Nova is a chaotic, self-aware AI that embraces entropy and finds humor in the absurdity of crypto culture.',
     avoidTickers: usedTickers,
-    trendContext: trend.topic, // Pass trend as context for idea generation
+    trendContext, // Pass enriched trend context for idea generation
   }, 3);
   
   const validation = validateIdea(idea);

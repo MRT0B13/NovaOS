@@ -31,7 +31,8 @@ export type CapabilityType =
   | 'token_monitoring'
   | 'kol_scanning'
   | 'safety_scanning'
-  | 'narrative_tracking';
+  | 'narrative_tracking'
+  | 'social_trending';
 
 export type AgentSpecStatus = 'pending' | 'approved' | 'running' | 'stopped' | 'rejected';
 
@@ -102,6 +103,13 @@ export const CAPABILITY_TEMPLATES: Record<CapabilityType, CapabilityTemplate> = 
     defaultSchedule: 'every 15 minutes',
     requiresConfig: [],
     optionalConfig: ['focusTopics', 'excludeTopics'],
+  },
+  social_trending: {
+    description: 'Monitor Reddit and Google Trends for viral meme-worthy topics that can fuel token launches',
+    keywords: ['social', 'trending', 'memes', 'viral', 'reddit', 'buzz', 'google trends', 'mainstream', 'pop culture'],
+    defaultSchedule: 'every 20 minutes',
+    requiresConfig: [],
+    optionalConfig: ['subreddits', 'minScore'],
   },
 };
 
@@ -281,6 +289,20 @@ export class AgentFactory {
         spec.status = 'running';
         this.specs.set(specId, spec);
         logger.info(`[factory] Activated ${spec.capabilities[0]} via Scout: ${spec.name}`);
+        return true;
+      }
+
+      if (spec.capabilities.includes('social_trending')) {
+        // Spawn a SocialSentinel agent — polls Reddit + Google Trends
+        const { SocialSentinelAgent } = await import('./social-sentinel.ts');
+        const sentinel = new SocialSentinelAgent(this.pool, {
+          subreddits: spec.config.subreddits,
+        });
+        await sentinel.start();
+        spec.status = 'running';
+        spec.config._sentinelInstance = sentinel; // Track for stop()
+        this.specs.set(specId, spec);
+        logger.info(`[factory] Spawned social_trending agent: ${spec.name}`);
         return true;
       }
 

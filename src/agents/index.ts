@@ -8,6 +8,7 @@
  *     ├── Analyst   — DeFiLlama data, on-chain metrics, narrative scoring
  *     ├── Launcher  — pump.fun token creation, deploy, graduation tracking
  *     ├── Community — TG management, X engagement, community health
+ *     ├── SocialSentinel — Reddit + Google Trends social trending → launch pipeline
  *     ├── TokenChild — Per-token monitoring (DexScreener metrics, auto-deactivation)
  *     └── Health    — Self-healing, auto-repair, swarm monitoring (external)
  *
@@ -26,6 +27,7 @@ export { AnalystAgent } from './analyst.ts';
 export { LauncherAgent } from './launcher.ts';
 export { CommunityAgent } from './community-agent.ts';
 export { CFOAgent } from './cfo.ts';
+export { SocialSentinelAgent } from './social-sentinel.ts';
 export { TokenChildAgent, type TokenChildConfig } from './token-child.ts';
 export { AgentFactory, type AgentSpec, type CapabilityType, type AgentSpecStatus } from './factory.ts';
 
