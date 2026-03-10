@@ -99,7 +99,7 @@ export const CAPABILITY_TEMPLATES: Record<CapabilityType, CapabilityTemplate> = 
   },
   narrative_tracking: {
     description: 'Track narrative/sentiment shifts across KOL posts and social media',
-    keywords: ['narrative', 'sentiment', 'trend', 'meta', 'alpha', 'what\'s hot'],
+    keywords: ['narrative', 'sentiment', 'meta', 'alpha', 'what\'s hot'],
     defaultSchedule: 'every 15 minutes',
     requiresConfig: [],
     optionalConfig: ['focusTopics', 'excludeTopics'],
@@ -146,12 +146,26 @@ export class AgentFactory {
   parseRequest(userMessage: string, userId: string): AgentSpec | null {
     const lower = userMessage.toLowerCase();
 
-    // Detect capabilities by keyword matching
+    // Detect capabilities by keyword matching (word-boundary aware)
     const matched: CapabilityType[] = [];
     for (const [capType, template] of Object.entries(CAPABILITY_TEMPLATES)) {
-      if (template.keywords.some(kw => lower.includes(kw))) {
-        matched.push(capType as CapabilityType);
-      }
+      const hit = template.keywords.some(kw => {
+        // Multi-word keywords (e.g. 'google trends') use simple includes
+        if (kw.includes(' ')) return lower.includes(kw);
+        // Single-word keywords use word-boundary match to avoid partial hits
+        // e.g. 'trend' should NOT match 'trending' (that's social_trending's keyword)
+        const re = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`);
+        return re.test(lower);
+      });
+      if (hit) matched.push(capType as CapabilityType);
+    }
+
+    // If social_trending matched, make it the primary (first) capability
+    // so the agent name reflects the user's intent
+    const socialIdx = matched.indexOf('social_trending');
+    if (socialIdx > 0) {
+      matched.splice(socialIdx, 1);
+      matched.unshift('social_trending');
     }
 
     if (matched.length === 0) {
@@ -367,7 +381,7 @@ export class AgentFactory {
     const lines = [
       `${statusEmoji[spec.status]} *${spec.name}*`,
       `ID: \`${spec.id}\``,
-      `Capabilities: ${spec.capabilities.join(', ')}`,
+      `Capabilities: ${spec.capabilities.map(c => c.replace(/_/g, ' ')).join(', ')}`,
       `Schedule: ${spec.schedule}`,
       `Status: ${spec.status}`,
     ];
@@ -390,7 +404,7 @@ export class AgentFactory {
       `From user: ${spec.createdBy}`,
       `Request: "${spec.description.slice(0, 200)}"`,
       ``,
-      `Resolved capabilities: ${spec.capabilities.join(', ')}`,
+      `Resolved capabilities: ${spec.capabilities.map(c => c.replace(/_/g, ' ')).join(', ')}`,
       `Schedule: ${spec.schedule}`,
       `Config: ${JSON.stringify(spec.config)}`,
       ``,
