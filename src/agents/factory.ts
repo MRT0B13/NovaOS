@@ -365,7 +365,7 @@ export class AgentFactory {
     };
 
     const lines = [
-      `${statusEmoji[spec.status]} **${spec.name}**`,
+      `${statusEmoji[spec.status]} *${spec.name}*`,
       `ID: \`${spec.id}\``,
       `Capabilities: ${spec.capabilities.join(', ')}`,
       `Schedule: ${spec.schedule}`,
@@ -385,7 +385,7 @@ export class AgentFactory {
   // Format a pending spec as an approval request
   formatApprovalRequest(spec: AgentSpec): string {
     return [
-      `🏭 **New Agent Request**`,
+      `🏭 *New Agent Request*`,
       ``,
       `From user: ${spec.createdBy}`,
       `Request: "${spec.description.slice(0, 200)}"`,
@@ -394,8 +394,8 @@ export class AgentFactory {
       `Schedule: ${spec.schedule}`,
       `Config: ${JSON.stringify(spec.config)}`,
       ``,
-      `To approve: /approve_agent ${spec.id}`,
-      `To reject: /reject_agent ${spec.id}`,
+      `To approve: /approve\_agent \`${spec.id}\``,
+      `To reject: /reject\_agent \`${spec.id}\``,
     ].join('\n');
   }
 
