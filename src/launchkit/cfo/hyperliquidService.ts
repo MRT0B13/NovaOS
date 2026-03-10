@@ -174,7 +174,7 @@ class RateLimiter {
   private queue: Array<() => void> = [];
   private draining = false;
   private lastRequestTime = 0;
-  private readonly minDelay = 750; // 750ms between requests — HL rate limits are per-IP
+  private readonly minDelay = 200; // 200ms between requests — HL allows 1200/min, this caps at ~300/min
   
   async throttle(): Promise<void> {
     return new Promise(resolve => {
@@ -318,10 +318,17 @@ function markOICapped(coin: string): void {
 }
 
 // ============================================================================
-// Account info
+// Account info (cached 30s — called 6-8× per decision cycle)
 // ============================================================================
 
-export async function getAccountSummary(): Promise<HLAccountSummary> {
+let _accountSummaryCache: HLAccountSummary | null = null;
+let _accountSummaryCacheTs = 0;
+const ACCOUNT_SUMMARY_TTL_MS = 30_000; // 30 seconds
+
+export async function getAccountSummary(forceRefresh = false): Promise<HLAccountSummary> {
+  if (!forceRefresh && _accountSummaryCache && Date.now() - _accountSummaryCacheTs < ACCOUNT_SUMMARY_TTL_MS) {
+    return _accountSummaryCache;
+  }
   try {
     const { info, wallet } = await loadHL();
     const state = await withRetry(
@@ -356,14 +363,18 @@ export async function getAccountSummary(): Promise<HLAccountSummary> {
         };
       });
 
-    return {
+    const result: HLAccountSummary = {
       equity,
       availableMargin,
       totalPnl: positions.reduce((s, p) => s + p.unrealizedPnlUsd, 0),
       positions,
     };
+    _accountSummaryCache = result;
+    _accountSummaryCacheTs = Date.now();
+    return result;
   } catch (err) {
     logger.warn('[Hyperliquid] getAccountSummary error:', err);
+    if (_accountSummaryCache) return _accountSummaryCache; // return stale on error
     return { equity: 0, availableMargin: 0, totalPnl: 0, positions: [] };
   }
 }
@@ -1004,7 +1015,7 @@ export async function closeAllPositions(): Promise<{ closed: number; errors: str
     // Cancel any open (resting) orders first — they use margin and could interfere
     await cancelAllOpenOrders().catch(e => errors.push(`cancelOrders: ${(e as Error).message}`));
 
-    const summary = await getAccountSummary();
+    const summary = await getAccountSummary(true); // force-refresh for emergency close
     for (const pos of summary.positions) {
       const isBuy = pos.side === 'SHORT'; // to close a short, we buy
       const sizeInCoin = pos.sizeUsd / pos.markPrice; // closePosition handles szDecimals rounding
@@ -1157,8 +1168,16 @@ export async function getTopSpotByVolume(
 /**
  * Get spot token balances from HL's spot clearinghouse.
  * Returns non-zero balances with current USD value.
+ * Cached 30s to avoid 429s — called 2-3× per decision cycle.
  */
-export async function getSpotBalances(): Promise<HLSpotBalance[]> {
+let _spotBalancesCache: HLSpotBalance[] = [];
+let _spotBalancesCacheTs = 0;
+const SPOT_BALANCES_TTL_MS = 30_000; // 30 seconds
+
+export async function getSpotBalances(forceRefresh = false): Promise<HLSpotBalance[]> {
+  if (!forceRefresh && _spotBalancesCache.length > 0 && Date.now() - _spotBalancesCacheTs < SPOT_BALANCES_TTL_MS) {
+    return _spotBalancesCache;
+  }
   try {
     const { info, wallet } = await loadHL();
     const state = await withRetry(
@@ -1194,18 +1213,20 @@ export async function getSpotBalances(): Promise<HLSpotBalance[]> {
       });
     }
 
+    _spotBalancesCache = balances;
+    _spotBalancesCacheTs = Date.now();
     return balances;
   } catch (err) {
     logger.warn('[Hyperliquid] getSpotBalances error:', err);
-    return [];
+    return _spotBalancesCache.length > 0 ? _spotBalancesCache : []; // return stale on error
   }
 }
 
 /**
  * Get total USDC balance in the spot account (available for spot buys).
  */
-export async function getSpotUsdcBalance(): Promise<number> {
-  const balances = await getSpotBalances();
+export async function getSpotUsdcBalance(forceRefresh = false): Promise<number> {
+  const balances = await getSpotBalances(forceRefresh);
   const usdc = balances.find(b => b.coin === 'USDC');
   return usdc?.available ?? 0;
 }
@@ -1288,11 +1309,11 @@ export async function openSpotTrade(params: SpotTradeParams): Promise<HLOrderRes
 
     // Check USDC balance for buys
     if (isBuy) {
-      const spotUsdc = await getSpotUsdcBalance();
+      const spotUsdc = await getSpotUsdcBalance(true); // force-refresh for trade execution
       if (spotUsdc < sizeUsd * 1.005) { // 0.5% buffer for fees
         // Try auto-transfer from perp account
         const shortfall = sizeUsd * 1.005 - spotUsdc;
-        const perp = await getAccountSummary();
+        const perp = await getAccountSummary(true); // force-refresh for accurate margin check
         
         // Dynamic reserve: keep at least 5% of equity or $5, whichever is larger
         const minReserve = Math.max(perp.equity * 0.05, 5);
@@ -1322,7 +1343,7 @@ export async function openSpotTrade(params: SpotTradeParams): Promise<HLOrderRes
 
     // For sells, check we have enough of the base token
     if (!isBuy) {
-      const balances = await getSpotBalances();
+      const balances = await getSpotBalances(true); // force-refresh for trade execution
       const tokenBal = balances.find(b => b.coin === coin);
       if (!tokenBal || tokenBal.available < sizeFmt) {
         return { success: false, error: `Insufficient ${coin} balance: have ${tokenBal?.available?.toFixed(szDecimals) ?? '0'}, need ${sizeFmt}` };
@@ -1390,7 +1411,7 @@ export async function openSpotTrade(params: SpotTradeParams): Promise<HLOrderRes
  * Close a spot position (sell all holdings of a coin).
  */
 export async function closeSpotPosition(coin: string, sizeInCoin?: number): Promise<HLOrderResult> {
-  const balances = await getSpotBalances();
+  const balances = await getSpotBalances(true); // force-refresh for trade execution
   const bal = balances.find(b => b.coin === coin);
   if (!bal || bal.available <= 0) {
     return { success: false, error: `No ${coin} balance to sell` };
@@ -1420,7 +1441,7 @@ export async function closeSpotPosition(coin: string, sizeInCoin?: number): Prom
  */
 export async function checkRisk(): Promise<{ atRisk: HLPosition[]; warning?: string }> {
   try {
-    const summary = await getAccountSummary();
+    const summary = await getAccountSummary(true); // force-refresh for risk check
     const atRisk = summary.positions.filter((p) => {
       if (!p.liquidationPrice || p.liquidationPrice === 0) return false;
       const distancePct = Math.abs(p.markPrice - p.liquidationPrice) / p.markPrice;
