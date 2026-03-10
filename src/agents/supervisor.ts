@@ -103,10 +103,20 @@ export class Supervisor extends BaseAgent {
     this.checkAgentStatuses(); // immediate first check
     this.addInterval(() => this.checkAgentStatuses(), 5 * 60 * 1000); // every 5 min
     // Periodic swarm briefing — digest of all agent activity
-    this.addInterval(() => this.publishBriefing(), this.briefingIntervalMs);
+    // Schedule first briefing based on how long since last one (survive restarts),
+    // then every 4h after that. Without this, setInterval waits a full 4h from boot.
+    const sinceLastBriefing = this.lastBriefingAt > 0 ? Date.now() - this.lastBriefingAt : Infinity;
+    const firstBriefingDelay = sinceLastBriefing >= this.briefingIntervalMs
+      ? 2 * 60 * 1000   // overdue: fire after 2min warmup
+      : Math.max(2 * 60 * 1000, this.briefingIntervalMs - sinceLastBriefing);
+    setTimeout(() => {
+      this.publishBriefing();
+      // After first fire, start the regular interval
+      this.addInterval(() => this.publishBriefing(), this.briefingIntervalMs);
+    }, firstBriefingDelay);
     // Periodic DB cleanup — prune stale kv_store entries and old agent_messages
     this.addInterval(() => this.cleanupStaleData(), 6 * 60 * 60 * 1000); // every 6 hours
-    logger.info(`[supervisor] Polling every ${this.pollIntervalMs}ms, briefing every ${this.briefingIntervalMs / 3600000}h`);
+    logger.info(`[supervisor] Polling every ${this.pollIntervalMs}ms, briefing every ${this.briefingIntervalMs / 3600000}h (first in ${Math.round(firstBriefingDelay / 60000)}min)`);
   }
 
   /**

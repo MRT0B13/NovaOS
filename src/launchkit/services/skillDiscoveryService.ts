@@ -141,6 +141,31 @@ export class SkillDiscoveryService {
   constructor(pool: Pool) {
     this.pool = pool;
     this.anthropicApiKey = process.env.ANTHROPIC_API_KEY || null;
+    // Restore last run timestamp from DB so we don't re-run on every restart
+    this.restoreLastRunAt();
+  }
+
+  private async restoreLastRunAt(): Promise<void> {
+    try {
+      const res = await this.pool.query(
+        `SELECT value FROM kv_store WHERE key = 'skill_discovery_last_run' LIMIT 1`,
+      );
+      if (res.rows.length > 0) {
+        this.lastRunAt = Number(res.rows[0].value) || 0;
+        const agoH = ((Date.now() - this.lastRunAt) / 3_600_000).toFixed(1);
+        logger.info(`[SkillDiscovery] Restored lastRunAt from DB (${agoH}h ago)`);
+      }
+    } catch { /* table may not exist yet */ }
+  }
+
+  private async persistLastRunAt(): Promise<void> {
+    try {
+      await this.pool.query(
+        `INSERT INTO kv_store (key, value) VALUES ('skill_discovery_last_run', $1)
+         ON CONFLICT (key) DO UPDATE SET value = $1`,
+        [String(this.lastRunAt)],
+      );
+    } catch { /* non-fatal */ }
   }
 
   /** Should be called from the supervisor's briefing cadence. Self-throttles. */
@@ -163,6 +188,7 @@ export class SkillDiscoveryService {
 
     this.running = true;
     this.lastRunAt = now;
+    await this.persistLastRunAt();
 
     try {
       const t0 = Date.now();
