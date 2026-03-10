@@ -78,7 +78,7 @@ export const CAPABILITY_TEMPLATES: Record<CapabilityType, CapabilityTemplate> = 
   },
   token_monitoring: {
     description: 'Track a specific token price, volume, and holder changes via DexScreener',
-    keywords: ['token', 'price', 'volume', 'holders', 'monitor', 'track', 'watch'],
+    keywords: ['token', 'price', 'volume', 'holders'],
     defaultSchedule: 'every 10 minutes',
     requiresConfig: ['tokenAddress'],
     optionalConfig: ['tokenSymbol', 'alertOnPriceChange', 'alertOnVolumeSpike'],
@@ -379,18 +379,26 @@ export class AgentFactory {
     };
 
     const lines = [
-      `${statusEmoji[spec.status]} *${spec.name}*`,
-      `ID: \`${spec.id}\``,
+      `${statusEmoji[spec.status]} <b>${spec.name}</b>`,
+      `ID: <code>${spec.id}</code>`,
       `Capabilities: ${spec.capabilities.map(c => c.replace(/_/g, ' ')).join(', ')}`,
       `Schedule: ${spec.schedule}`,
       `Status: ${spec.status}`,
     ];
 
     if (spec.config.tokenAddress) {
-      lines.push(`Token: \`${spec.config.tokenAddress.slice(0, 8)}...\``);
+      lines.push(`Token: <code>${spec.config.tokenAddress.slice(0, 8)}...</code>`);
     }
     if (spec.config.tokenSymbol) {
       lines.push(`Symbol: $${spec.config.tokenSymbol}`);
+    }
+
+    // Only show config if there are user-facing keys
+    const userConfig = { ...spec.config };
+    delete userConfig._sentinelInstance; // internal
+    const configKeys = Object.keys(userConfig);
+    if (configKeys.length > 0) {
+      lines.push(`Config: ${JSON.stringify(userConfig)}`);
     }
 
     return lines.join('\n');
@@ -398,18 +406,22 @@ export class AgentFactory {
 
   // Format a pending spec as an approval request
   formatApprovalRequest(spec: AgentSpec): string {
+    const userConfig = { ...spec.config };
+    delete userConfig._sentinelInstance;
+    const configStr = Object.keys(userConfig).length > 0 ? JSON.stringify(userConfig) : 'None required';
+
     return [
-      `🏭 *New Agent Request*`,
+      `🏭 <b>New Agent Request</b>`,
       ``,
       `From user: ${spec.createdBy}`,
       `Request: "${spec.description.slice(0, 200)}"`,
       ``,
       `Resolved capabilities: ${spec.capabilities.map(c => c.replace(/_/g, ' ')).join(', ')}`,
       `Schedule: ${spec.schedule}`,
-      `Config: ${JSON.stringify(spec.config)}`,
+      `Config: ${configStr}`,
       ``,
-      `To approve: /approve\_agent \`${spec.id}\``,
-      `To reject: /reject\_agent \`${spec.id}\``,
+      `To approve: /approve_agent <code>${spec.id}</code>`,
+      `To reject: /reject_agent <code>${spec.id}</code>`,
     ].join('\n');
   }
 

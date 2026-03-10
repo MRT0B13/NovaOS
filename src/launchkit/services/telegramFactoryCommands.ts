@@ -91,16 +91,17 @@ export async function registerFactoryCommands(
         if (!spec) {
           await ctx.reply(
             '❌ Could not understand your request. Try to include keywords like:\n' +
-            '• whale, wallet, track\n• token, price, volume, monitor\n' +
-            '• rug, safety, scan\n• KOL, twitter, influencer\n• narrative, sentiment, trend',
+            '• whale, wallet — whale tracking\n• token, price, volume — token monitoring\n' +
+            '• rug, safety, scan — safety scanning\n• KOL, twitter, influencer — KOL scanning\n' +
+            '• narrative, sentiment — narrative tracking\n• social, trending, memes, viral, reddit — social trending',
           );
           return;
         }
 
         // Reply to user
         await ctx.reply(
-          `✅ *Agent Request Created*\n\n${_factory!.formatSpecForTelegram(spec)}\n\nAn admin will review your request.`,
-          { parse_mode: 'Markdown' },
+          `✅ <b>Agent Request Created</b>\n\n${_factory!.formatSpecForTelegram(spec)}\n\nAn admin will review your request.`,
+          { parse_mode: 'HTML' },
         );
 
         // Notify admins
@@ -109,7 +110,7 @@ export async function registerFactoryCommands(
             await bot.telegram.sendMessage(
               ownerChatId,
               _factory!.formatApprovalRequest(spec),
-              { parse_mode: 'Markdown' },
+              { parse_mode: 'HTML' },
             );
           } catch {
             // Silent — admin notification is best-effort
@@ -139,22 +140,22 @@ export async function registerFactoryCommands(
             return;
           }
           const list = pending.map(s => _factory!.formatSpecForTelegram(s)).join('\n\n');
-          await ctx.reply(`⏳ *Pending Requests*\n\n${list}`, { parse_mode: 'Markdown' });
+          await ctx.reply(`⏳ <b>Pending Requests</b>\n\n${list}`, { parse_mode: 'HTML' });
           return;
         }
 
         const approved = await _factory!.approve(specId, String(ctx.from?.id || 'admin'));
         if (!approved) {
-          await ctx.reply(`❌ Could not approve \`${specId}\` — not found or not pending.`, { parse_mode: 'Markdown' });
+          await ctx.reply(`❌ Could not approve <code>${specId}</code> — not found or not pending.`, { parse_mode: 'HTML' });
           return;
         }
 
         // Spawn the agent
         const spawned = await _factory!.spawn(specId, supervisor);
         if (spawned) {
-          await ctx.reply(`✅ Agent *${approved.name}* approved and spawned!`, { parse_mode: 'Markdown' });
+          await ctx.reply(`✅ Agent <b>${approved.name}</b> approved and spawned!`, { parse_mode: 'HTML' });
         } else {
-          await ctx.reply(`✅ Agent *${approved.name}* approved but could not be spawned yet (capability not fully supported in MVP).`, { parse_mode: 'Markdown' });
+          await ctx.reply(`✅ Agent <b>${approved.name}</b> approved but could not be spawned yet (capability not fully supported in MVP).`, { parse_mode: 'HTML' });
         }
       } catch (err: any) {
         logger.warn('[factory-tg] /approve_agent error:', err.message);
@@ -177,15 +178,15 @@ export async function registerFactoryCommands(
         const reason = parts.slice(1).join(' ') || undefined;
 
         if (!specId) {
-          await ctx.reply('Usage: `/reject_agent <id> [reason]`', { parse_mode: 'Markdown' });
+          await ctx.reply('Usage: /reject_agent &lt;id&gt; [reason]', { parse_mode: 'HTML' });
           return;
         }
 
         const rejected = _factory!.reject(specId, reason);
         if (rejected) {
-          await ctx.reply(`❌ Agent request \`${specId}\` rejected.${reason ? ` Reason: ${reason}` : ''}`, { parse_mode: 'Markdown' });
+          await ctx.reply(`❌ Agent request <code>${specId}</code> rejected.${reason ? ` Reason: ${reason}` : ''}`, { parse_mode: 'HTML' });
         } else {
-          await ctx.reply(`Could not reject \`${specId}\` — not found or not pending.`, { parse_mode: 'Markdown' });
+          await ctx.reply(`Could not reject <code>${specId}</code> — not found or not pending.`, { parse_mode: 'HTML' });
         }
       } catch (err: any) {
         logger.warn('[factory-tg] /reject_agent error:', err.message);
@@ -200,12 +201,12 @@ export async function registerFactoryCommands(
         const specs = _factory!.listSpecs(userId);
 
         if (specs.length === 0) {
-          await ctx.reply('You have no agent requests. Use `/request_agent` to create one.', { parse_mode: 'Markdown' });
+          await ctx.reply('You have no agent requests. Use /request_agent to create one.');
           return;
         }
 
         const list = specs.map(s => _factory!.formatSpecForTelegram(s)).join('\n\n');
-        await ctx.reply(`🤖 *Your Agents*\n\n${list}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`🤖 <b>Your Agents</b>\n\n${list}`, { parse_mode: 'HTML' });
       } catch (err: any) {
         logger.warn('[factory-tg] /my_agents error:', err.message);
         await ctx.reply('❌ Error listing agents.').catch(() => {});
@@ -217,7 +218,7 @@ export async function registerFactoryCommands(
       try {
         const specId = ctx.message?.text?.replace(/^\/stop_agent\s*/i, '').trim();
         if (!specId) {
-          await ctx.reply('Usage: `/stop_agent <id>`', { parse_mode: 'Markdown' });
+          await ctx.reply('Usage: /stop_agent &lt;id&gt;', { parse_mode: 'HTML' });
           return;
         }
 
@@ -232,9 +233,9 @@ export async function registerFactoryCommands(
 
         const stopped = await _factory!.stop(specId, supervisor);
         if (stopped) {
-          await ctx.reply(`⛔ Agent \`${specId}\` stopped.`, { parse_mode: 'Markdown' });
+          await ctx.reply(`⛔ Agent <code>${specId}</code> stopped.`, { parse_mode: 'HTML' });
         } else {
-          await ctx.reply(`Could not stop \`${specId}\` — not running.`, { parse_mode: 'Markdown' });
+          await ctx.reply(`Could not stop <code>${specId}</code> — not running.`, { parse_mode: 'HTML' });
         }
       } catch (err: any) {
         logger.warn('[factory-tg] /stop_agent error:', err.message);
