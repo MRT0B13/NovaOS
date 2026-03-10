@@ -435,9 +435,24 @@ export class AgentFactory {
 
   // ── Internal Helpers ──────────────────────────────────────────
 
+  private static readonly ADJECTIVES = [
+    'swift', 'bold', 'calm', 'dark', 'fast', 'gold', 'keen', 'loud',
+    'neon', 'pure', 'rare', 'slim', 'warm', 'wild', 'cool', 'deep',
+    'fair', 'glad', 'half', 'iron', 'jade', 'kind', 'lazy', 'mint',
+    'pale', 'rich', 'safe', 'tall', 'vast', 'wise', 'blue', 'gray',
+  ];
+
+  private static readonly ANIMALS = [
+    'fox', 'owl', 'bee', 'cat', 'dog', 'elk', 'emu', 'ant',
+    'bat', 'cod', 'cow', 'fly', 'hen', 'jay', 'ram', 'yak',
+    'ape', 'bug', 'cub', 'doe', 'eel', 'gnu', 'hog', 'koi',
+    'pug', 'rat', 'ray', 'roc', 'tit', 'wren', 'lynx', 'wolf',
+  ];
+
   private generateId(): string {
-    // Short 4-char hex ID — easy to type/copy in Telegram
-    return Math.random().toString(16).slice(2, 6);
+    const adj = AgentFactory.ADJECTIVES[Math.floor(Math.random() * AgentFactory.ADJECTIVES.length)];
+    const animal = AgentFactory.ANIMALS[Math.floor(Math.random() * AgentFactory.ANIMALS.length)];
+    return `${adj}-${animal}`;
   }
 
   private deriveAgentName(capabilities: CapabilityType[], tokenSymbol?: string): string {
