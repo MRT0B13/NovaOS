@@ -83,6 +83,45 @@ module.exports = {
     },
 
     // ─────────────────────────────────────────────────────────────
+    // NovaVerse API — Fastify REST + WebSocket server
+    //
+    // Exposes existing agent data for the NovaVerse frontend.
+    // Runs on API_PORT (default 4000). Does NOT modify agent code.
+    // ─────────────────────────────────────────────────────────────
+    {
+      name: 'nova-api',
+      script: 'bun',
+      args: 'run src/api/index.ts',
+      cwd: __dirname,
+      instances: 1,
+      exec_mode: 'fork',
+
+      // Restart policy
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      restart_delay: 3000,
+      max_memory_restart: '256M',
+
+      kill_timeout: 5000,
+
+      // Logging
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      error_file: './data/logs/nova-api-error.log',
+      out_file: './data/logs/nova-api-out.log',
+      merge_logs: true,
+
+      env: {
+        NODE_ENV: 'production',
+        LOG_LEVEL: 'info',
+      },
+      env_development: {
+        NODE_ENV: 'development',
+        LOG_LEVEL: 'debug',
+      },
+    },
+
+    // ─────────────────────────────────────────────────────────────
     // Nova Health Monitor — External watchdog (optional)
     //
     // Runs independently to catch cases where nova-main itself is

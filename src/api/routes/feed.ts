@@ -6,26 +6,30 @@ import { FastifyInstance } from 'fastify';
 import { requireAuth } from '../middleware/auth.js';
 
 // Map agent message types to UI display properties
+// Actual DB message types: intel, alert, report, command
+// Plus future NovaVerse types for frontend display
 function translateMessage(row: any) {
-  const typeMap: Record<string, { icon: string; color: string }> = {
-    TRADE_OPENED:    { icon: '💹', color: '#00ff88' },
-    TRADE_CLOSED:    { icon: '💹', color: '#00ff88' },
-    LP_OPENED:       { icon: '💹', color: '#00ff88' },
-    LP_REBALANCED:   { icon: '💹', color: '#00ff88' },
-    LP_CLOSED:       { icon: '💹', color: '#00ff88' },
-    YIELD_UPDATE:    { icon: '🏦', color: '#00ff88' },
-    INTEL_SIGNAL:    { icon: '📡', color: '#00c8ff' },
-    NARRATIVE_ALERT: { icon: '📡', color: '#00c8ff' },
-    HEALTH_CHECK:    { icon: '🛡️', color: '#ff9500' },
-    SECURITY_ALERT:  { icon: '🛡️', color: '#ff4444' },
-    GOVERNANCE_VOTE: { icon: '🗳️', color: '#c084fc' },
-    APPROVAL_NEEDED: { icon: '⚠️', color: '#ff9500' },
-    CFO_DECISION:    { icon: '💹', color: '#00ff88' },
-    SCOUT_INTEL:     { icon: '📡', color: '#00c8ff' },
-    SUPERVISOR_CMD:  { icon: '⚙️', color: '#888' },
+  const typeMap: Record<string, { icon: string; color: string; label: string }> = {
+    // === Actual DB message types (intel, alert, report, command) ===
+    intel:           { icon: '📡', color: '#00c8ff', label: 'Intel Signal' },
+    alert:           { icon: '🛡️', color: '#ff9500', label: 'Alert' },
+    report:          { icon: '📊', color: '#00ff88', label: 'Report' },
+    command:         { icon: '⚙️', color: '#888',    label: 'Command' },
+    // === Future NovaVerse types ===
+    TRADE_OPENED:    { icon: '💹', color: '#00ff88', label: 'Trade Opened' },
+    TRADE_CLOSED:    { icon: '💹', color: '#00ff88', label: 'Trade Closed' },
+    LP_OPENED:       { icon: '💹', color: '#00ff88', label: 'LP Opened' },
+    LP_REBALANCED:   { icon: '💹', color: '#00ff88', label: 'LP Rebalanced' },
+    LP_CLOSED:       { icon: '💹', color: '#00ff88', label: 'LP Closed' },
+    YIELD_UPDATE:    { icon: '🏦', color: '#00ff88', label: 'Yield Update' },
+    HEALTH_CHECK:    { icon: '🛡️', color: '#ff9500', label: 'Health Check' },
+    SECURITY_ALERT:  { icon: '🛡️', color: '#ff4444', label: 'Security Alert' },
+    GOVERNANCE_VOTE: { icon: '🗳️', color: '#c084fc', label: 'Governance Vote' },
+    GOVERNANCE_DEBATE: { icon: '🗳️', color: '#c084fc', label: 'Debate' },
+    APPROVAL_NEEDED: { icon: '⚠️', color: '#ff9500', label: 'Approval Needed' },
   };
 
-  const meta = typeMap[row.message_type] ?? { icon: '🤖', color: '#888' };
+  const meta = typeMap[row.message_type] ?? { icon: '🤖', color: '#888', label: row.message_type };
 
   return {
     id: row.id,
@@ -34,10 +38,29 @@ function translateMessage(row: any) {
     agent: row.from_agent.replace('nova-', '').toUpperCase(),
     icon: meta.icon,
     color: meta.color,
-    msg: row.summary ?? row.message_type,
-    detail: row.detail ?? '',
+    msg: row.summary ?? meta.label,
+    detail: row.detail ?? buildDetailFromPayload(row.payload, row.message_type),
     raw: row.payload,
   };
+}
+
+// Extract a human-readable detail line from the JSONB payload
+function buildDetailFromPayload(payload: any, type: string): string {
+  if (!payload) return '';
+  try {
+    if (type === 'intel' && payload.movers) {
+      const top = payload.movers.slice(0, 3).map((m: any) =>
+        `${m.symbol} ${m.change24hPct > 0 ? '+' : ''}${m.change24hPct?.toFixed(1)}%`
+      ).join(', ');
+      return `Top movers: ${top}`;
+    }
+    if (type === 'alert' && payload.message) return payload.message;
+    if (type === 'report' && payload.summary) return payload.summary;
+    if (type === 'command' && payload.action) return `Action: ${payload.action}`;
+    if (payload.text) return payload.text;
+    if (payload.summary) return payload.summary;
+  } catch { /* ignore */ }
+  return '';
 }
 
 export async function feedRoutes(server: FastifyInstance) {
