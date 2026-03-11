@@ -250,6 +250,30 @@ const EnvSchema = z.object({
   // Buffer around scheduled launch time (don't reactive launch within X hours)
   AUTONOMOUS_SCHEDULED_BUFFER_HOURS: z.coerce.number().default(1),
   
+  // ==========================================
+  // Meme Token Burn Ecosystem
+  // ==========================================
+  // Master toggle for burn functionality
+  BURN_ENABLE: z.enum(['true', 'false']).default('false'),
+  // Log-only mode — compute burns but don't execute on-chain (safe default)
+  BURN_LOG_ONLY: z.enum(['true', 'false']).default('true'),
+  // Distribution splits (must sum to 100)
+  BURN_SPLIT_TREASURY: z.coerce.number().default(40),   // Infrastructure, dev, liquidity
+  BURN_SPLIT_STAKING: z.coerce.number().default(30),    // Distributed to NOVA stakers
+  BURN_SPLIT_REWARDS: z.coerce.number().default(20),    // Community rewards pool
+  BURN_SPLIT_BUYBACK: z.coerce.number().default(10),    // NOVA buyback & burn
+  // Credits per SOL burned (1 SOL = 100 credits by default)
+  BURN_CREDITS_PER_SOL: z.coerce.number().default(100),
+  // Max slippage on Jupiter swap (bps)
+  BURN_MAX_SLIPPAGE_BPS: z.coerce.number().default(300),
+  // Max price impact on Jupiter swap (bps)
+  BURN_MAX_PRICE_IMPACT_BPS: z.coerce.number().default(300),
+  // Pool wallet addresses (optional — defaults to DB-tracked only)
+  BURN_TREASURY_WALLET: z.string().optional(),
+  BURN_STAKING_WALLET: z.string().optional(),
+  BURN_REWARDS_WALLET: z.string().optional(),
+  BURN_BUYBACK_WALLET: z.string().optional(),
+  
   // Reactive Launch Time Windows (HH:MM in UTC)
   // Quiet hours - NO reactive launches allowed (e.g., after midnight reset)
   AUTONOMOUS_REACTIVE_QUIET_START: z.string().default('00:00'),

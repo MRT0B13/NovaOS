@@ -20,6 +20,7 @@ import { learningRoutes } from './routes/learning.js';
 import { healthRoutes } from './routes/health.js';
 import { launchesRoutes } from './routes/launches.js';
 import { transactionsRoutes } from './routes/transactions.js';
+import { burnRoutes } from './routes/burn.js';
 import { registerLiveStream } from './ws/liveStream.js';
 
 async function main() {
@@ -74,6 +75,7 @@ async function main() {
   server.register(healthRoutes,     { prefix: '/api' });
   server.register(launchesRoutes,   { prefix: '/api' });
   server.register(transactionsRoutes, { prefix: '/api' });
+  server.register(burnRoutes,         { prefix: '/api' });
 
   // ── WebSocket ─────────────────────────────────────────
   registerLiveStream(server);
