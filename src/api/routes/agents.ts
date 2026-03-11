@@ -136,25 +136,29 @@ export async function agentsRoutes(server: FastifyInstance) {
     reply.send({ agentId, agentNumber, status: 'running' });
   });
 
-  // PATCH /api/agents/pause — pause active agent
-  server.patch('/agents/pause', { preHandler: requireAuth }, async (req, reply) => {
+  // PATCH/POST /api/agents/pause — pause active agent
+  const pauseHandler = async (req: any, reply: any) => {
     const { address } = req.user as { address: string };
     await server.pg.query(
       `UPDATE user_agents SET status = 'paused' WHERE wallet_address = $1 AND active = true`,
       [address]
     );
     reply.send({ ok: true });
-  });
+  };
+  server.patch('/agents/pause', { preHandler: requireAuth }, pauseHandler);
+  server.post('/agents/pause', { preHandler: requireAuth }, pauseHandler);
 
-  // PATCH /api/agents/resume
-  server.patch('/agents/resume', { preHandler: requireAuth }, async (req, reply) => {
+  // PATCH/POST /api/agents/resume
+  const resumeHandler = async (req: any, reply: any) => {
     const { address } = req.user as { address: string };
     await server.pg.query(
       `UPDATE user_agents SET status = 'running' WHERE wallet_address = $1 AND active = true`,
       [address]
     );
     reply.send({ ok: true });
-  });
+  };
+  server.patch('/agents/resume', { preHandler: requireAuth }, resumeHandler);
+  server.post('/agents/resume', { preHandler: requireAuth }, resumeHandler);
 
   // GET /api/agents/me — current agent info
   server.get('/agents/me', { preHandler: requireAuth }, async (req, reply) => {

@@ -47,9 +47,9 @@ export async function skillsRoutes(server: FastifyInstance) {
     reply.send(rows.rows);
   });
 
-  // PATCH /api/skills/:skillId — toggle a skill on or off
+  // PATCH/POST /api/skills/:skillId/toggle — toggle a skill on or off
   // Body: { enabled: boolean }
-  server.patch('/skills/:skillId', { preHandler: requireAuth }, async (req, reply) => {
+  const toggleHandler = async (req: any, reply: any) => {
     const { address } = req.user as { address: string };
     const { skillId } = req.params as { skillId: string };
     const { enabled } = req.body as { enabled: boolean };
@@ -68,7 +68,9 @@ export async function skillsRoutes(server: FastifyInstance) {
     );
 
     reply.send({ ok: true });
-  });
+  };
+  server.patch('/skills/:skillId', { preHandler: requireAuth }, toggleHandler);
+  server.post('/skills/:skillId/toggle', { preHandler: requireAuth }, toggleHandler);
 
   // GET /api/skills/registry — all available skills
   server.get('/skills/registry', { preHandler: requireAuth }, async (req, reply) => {
