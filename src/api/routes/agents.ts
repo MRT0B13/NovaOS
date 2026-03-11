@@ -176,18 +176,30 @@ export async function agentsRoutes(server: FastifyInstance) {
 
   // PATCH/POST /api/agents/pause — pause active agent
   const pauseHandler = async (req: any, reply: any) => {
-    const { address } = req.user as { address: string };
-    const ok = await orchestrator.pause(address);
-    reply.send({ ok });
+    try {
+      const { address } = req.user as { address: string };
+      const ok = await orchestrator.pause(address);
+      if (!ok) return reply.status(404).send({ error: 'No active agent found to pause' });
+      reply.send({ ok });
+    } catch (err: any) {
+      server.log.error({ err }, 'Pause failed');
+      reply.status(500).send({ error: 'Pause failed: ' + (err.message || 'unknown') });
+    }
   };
   server.patch('/agents/pause', { preHandler: requireAuth }, pauseHandler);
   server.post('/agents/pause', { preHandler: requireAuth }, pauseHandler);
 
   // PATCH/POST /api/agents/resume
   const resumeHandler = async (req: any, reply: any) => {
-    const { address } = req.user as { address: string };
-    const ok = await orchestrator.resume(address);
-    reply.send({ ok });
+    try {
+      const { address } = req.user as { address: string };
+      const ok = await orchestrator.resume(address);
+      if (!ok) return reply.status(404).send({ error: 'No agent found to resume' });
+      reply.send({ ok });
+    } catch (err: any) {
+      server.log.error({ err }, 'Resume failed');
+      reply.status(500).send({ error: 'Resume failed: ' + (err.message || 'unknown') });
+    }
   };
   server.patch('/agents/resume', { preHandler: requireAuth }, resumeHandler);
   server.post('/agents/resume', { preHandler: requireAuth }, resumeHandler);

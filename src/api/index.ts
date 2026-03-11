@@ -20,6 +20,17 @@ import { registerLiveStream } from './ws/liveStream.js';
 async function main() {
   const server = Fastify({ logger: true });
 
+  // Handle empty JSON bodies gracefully (pause/resume send no body)
+  server.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+    try {
+      const str = body as string;
+      done(null, str && str.length > 0 ? JSON.parse(str) : {});
+    } catch (err: any) {
+      err.statusCode = 400;
+      done(err, undefined);
+    }
+  });
+
   // ── Plugins ───────────────────────────────────────────
   await server.register(cors, {
     origin: process.env.FRONTEND_URL || 'http://localhost:3000',
