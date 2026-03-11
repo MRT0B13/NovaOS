@@ -8,6 +8,29 @@ import { requireAuth } from '../middleware/auth.js';
 // Map agent message types to UI display properties
 // Actual DB message types: intel, alert, report, command
 // Plus future NovaVerse types for frontend display
+// Agent ID → display name map
+const AGENT_DISPLAY: Record<string, string> = {
+  'nova-cfo':              'Nova CFO',
+  'nova-scout':            'Nova Scout',
+  'nova-guardian':         'Nova Guardian',
+  'nova-supervisor':       'Nova Supervisor',
+  'nova-analyst':          'Nova Analyst',
+  'nova-launcher':         'Nova Launcher',
+  'nova-community':        'Nova Community',
+  'nova-social-sentinel':  'Nova Sentinel',
+};
+
+function resolveAgentName(raw: string): string {
+  if (!raw) return 'System';
+  // Already a known slug
+  if (AGENT_DISPLAY[raw]) return AGENT_DISPLAY[raw];
+  // nova-* slug not in map — title-case it
+  if (raw.startsWith('nova-')) return raw.replace('nova-', 'Nova ').replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  // Raw UUID — return shortened form
+  if (raw.length > 20) return 'Agent ' + raw.slice(0, 8).toUpperCase();
+  return raw.toUpperCase();
+}
+
 function translateMessage(row: any) {
   const typeMap: Record<string, { icon: string; color: string; label: string }> = {
     // === Actual DB message types (intel, alert, report, command) ===
@@ -35,7 +58,8 @@ function translateMessage(row: any) {
     id: row.id,
     time: new Date(row.created_at).toLocaleTimeString('en-GB', { hour12: false }),
     type: row.message_type,
-    agent: row.from_agent.replace('nova-', '').toUpperCase(),
+    agent: resolveAgentName(row.from_agent),
+    agentSlug: row.from_agent,
     icon: meta.icon,
     color: meta.color,
     msg: row.summary ?? meta.label,

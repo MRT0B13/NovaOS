@@ -334,6 +334,46 @@ export async function burnRoutes(server: FastifyInstance) {
     });
   });
 
+  // ── GET /api/burn/wallet-tokens — SPL token balances for user's wallet ──
+  server.get('/burn/wallet-tokens', { preHandler: requireAuth }, async (req, reply) => {
+    const { address } = req.user as { address: string };
+    const walletAddress = (req.query as any).wallet || address;
+
+    const rpcUrl = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+    try {
+      const res = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1,
+          method: 'getTokenAccountsByOwner',
+          params: [
+            walletAddress,
+            { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' },
+            { encoding: 'jsonParsed' }
+          ]
+        })
+      });
+      const data = await res.json() as any;
+
+      const tokens = (data.result?.value ?? [])
+        .map((acc: any) => {
+          const info = acc.account.data.parsed.info;
+          return {
+            mint: info.mint,
+            balance: parseFloat(info.tokenAmount.uiAmountString ?? '0'),
+            decimals: info.tokenAmount.decimals,
+          };
+        })
+        .filter((t: any) => t.balance > 0);
+
+      return reply.send({ tokens });
+    } catch (err: any) {
+      server.log.error({ err, walletAddress }, 'Failed to fetch SPL token accounts');
+      return reply.status(502).send({ error: 'Failed to fetch wallet tokens: ' + (err.message || 'unknown') });
+    }
+  });
+
   // ── GET /api/burn/:id — get a specific burn record ──
   server.get<{ Params: { id: string } }>('/burn/:id', { preHandler: requireAuth }, async (req, reply) => {
     const { id } = req.params as { id: string };

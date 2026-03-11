@@ -48,6 +48,10 @@ export async function transactionsRoutes(server: FastifyInstance) {
         conditions.push(`wallet_address = $${paramIdx++}`);
         params.push(walletRow.rows[0].wallet_address);
       }
+    } else {
+      // No agent — fallback: match transactions by wallet_address directly
+      conditions.push(`(wallet_address = $${paramIdx++} OR wallet_address IS NULL)`);
+      params.push(address);
     }
 
     if (query.strategy) {

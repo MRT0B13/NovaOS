@@ -457,6 +457,36 @@ export async function agentsRoutes(server: FastifyInstance) {
 
   // ── Social Config ──
 
+  // GET /api/agents/social/all — all agents' social configs for this user
+  server.get('/agents/social/all', { preHandler: requireAuth }, async (req, reply) => {
+    const { address } = req.user as { address: string };
+
+    // Get all agent IDs for this wallet (active or not)
+    const agentRows = await server.pg.query(
+      `SELECT agent_id, display_name, template_id, status, active
+       FROM user_agents WHERE wallet_address = $1`,
+      [address]
+    );
+
+    const results: any[] = [];
+    for (const row of agentRows.rows) {
+      const kv = await server.pg.query(
+        `SELECT data FROM kv_store WHERE key = $1`,
+        [`agent:${row.agent_id}:social_config`]
+      );
+      results.push({
+        agentId: row.agent_id,
+        displayName: row.display_name,
+        templateId: row.template_id,
+        status: row.status,
+        active: row.active,
+        ...(kv.rows.length ? kv.rows[0].data : {}),
+      });
+    }
+
+    return reply.send({ agents: results });
+  });
+
   // GET /api/agents/social — retrieve social config
   server.get('/agents/social', { preHandler: requireAuth }, async (req, reply) => {
     const { address } = req.user as { address: string };

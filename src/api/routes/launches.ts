@@ -35,7 +35,7 @@ export async function launchesRoutes(server: FastifyInstance) {
               agent_id,
               created_at
        FROM launch_packs
-       WHERE owner_wallet = $1
+       WHERE (owner_wallet = $1 OR owner_wallet IS NULL)
        ORDER BY created_at DESC`,
       [address]
     );
