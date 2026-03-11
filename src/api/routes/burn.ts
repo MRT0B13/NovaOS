@@ -32,6 +32,45 @@ function getService(server: FastifyInstance): BurnService {
   return burnService;
 }
 
+// ── Price cache: pump.fun prices in kv_store with 60s TTL ──
+const PRICE_CACHE_TTL_MS = 60_000;
+
+async function getPumpPrice(server: FastifyInstance, mint: string) {
+  const cacheKey = `pump:price:${mint}`;
+  try {
+    const cached = await server.pg.query(
+      `SELECT data, updated_at FROM kv_store WHERE key = $1`,
+      [cacheKey]
+    );
+    if (cached.rows.length) {
+      const age = Date.now() - new Date(cached.rows[0].updated_at).getTime();
+      if (age < PRICE_CACHE_TTL_MS) return cached.rows[0].data;
+    }
+  } catch { /* kv_store may not exist yet */ }
+
+  try {
+    const resp = await fetch(`https://frontend-api.pump.fun/coins/${mint}`);
+    if (!resp.ok) return null;
+    const coin = await resp.json() as any;
+    const data = {
+      priceUsd: coin.price ?? coin.usd_price ?? null,
+      marketCap: coin.usd_market_cap ?? coin.market_cap ?? null,
+      isGraduated: coin.complete === true || coin.is_graduated === true,
+    };
+    try {
+      await server.pg.query(
+        `INSERT INTO kv_store (key, data, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = NOW()`,
+        [cacheKey, JSON.stringify(data)]
+      );
+    } catch { /* non-fatal */ }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
 export async function burnRoutes(server: FastifyInstance) {
 
   // ── GET /api/burn/eligible — tokens that can be burned ──
@@ -39,21 +78,15 @@ export async function burnRoutes(server: FastifyInstance) {
     const service = getService(server);
     const tokens = await service.getEligibleTokens();
 
-    // Enrich with current price from pump.fun
+    // Enrich with cached pump.fun prices (60s TTL)
     const enriched = await Promise.all(tokens.map(async (t) => {
-      try {
-        const resp = await fetch(`https://frontend-api.pump.fun/coins/${t.mint}`);
-        if (resp.ok) {
-          const coin = await resp.json() as any;
-          return {
-            ...t,
-            priceUsd: coin.price ?? coin.usd_price ?? null,
-            marketCap: coin.usd_market_cap ?? coin.market_cap ?? null,
-            isGraduated: coin.complete === true || coin.is_graduated === true,
-          };
-        }
-      } catch {}
-      return { ...t, priceUsd: null, marketCap: null, isGraduated: false };
+      const price = await getPumpPrice(server, t.mint);
+      return {
+        ...t,
+        priceUsd: price?.priceUsd ?? null,
+        marketCap: price?.marketCap ?? null,
+        isGraduated: price?.isGraduated ?? false,
+      };
     }));
 
     reply.send(enriched);
@@ -236,6 +269,7 @@ export async function burnRoutes(server: FastifyInstance) {
 
   // ── GET /api/burn/leaderboard — top burners by credits ──
   server.get('/burn/leaderboard', { preHandler: requireAuth }, async (req, reply) => {
+    const { address } = req.user as { address: string };
     const { limit = '25', sortBy = 'credits' } = req.query as {
       limit?: string; sortBy?: 'credits' | 'sol' | 'burns';
     };
@@ -263,6 +297,15 @@ export async function burnRoutes(server: FastifyInstance) {
     );
     const t = totals.rows[0] || {};
 
+    // Get the requesting user's rank even if they're outside top N
+    const userRank = await server.pg.query(
+      `SELECT wallet_address, total_earned, total_redeemed, total_burns, total_sol_value,
+              (SELECT COUNT(*) + 1 FROM burn_credits b2 WHERE b2.${orderCol} > bc.${orderCol}) AS rank
+       FROM burn_credits bc
+       WHERE wallet_address = $1`,
+      [address]
+    );
+
     reply.send({
       leaderboard: rows.map((r: any, i: number) => ({
         rank: i + 1,
@@ -279,6 +322,13 @@ export async function burnRoutes(server: FastifyInstance) {
         totalSolBurned: Number(t.total_sol ?? 0),
         totalBurns: Number(t.total_burns ?? 0),
       },
+      yourRank: userRank.rows.length ? {
+        rank: Number(userRank.rows[0].rank),
+        wallet: userRank.rows[0].wallet_address,
+        credits: Number(userRank.rows[0].total_earned ?? 0),
+        burns: Number(userRank.rows[0].total_burns ?? 0),
+        totalSol: Number(userRank.rows[0].total_sol_value ?? 0),
+      } : null,
       limit: cap,
       sortBy,
     });

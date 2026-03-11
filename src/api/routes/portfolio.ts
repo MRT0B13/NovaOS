@@ -36,10 +36,26 @@ export async function portfolioRoutes(server: FastifyInstance) {
       [agentId]
     );
 
-    // Portfolio summary from kv_store
-    const summary = await server.pg.query(
-      `SELECT data FROM kv_store WHERE key = 'cfo:portfolio_summary'`
+    // Portfolio summary — try agent-scoped key first, fall back to global
+    const agentSummaryKey = `agent:${agentId}:portfolio_summary`;
+    let summary = await server.pg.query(
+      `SELECT data FROM kv_store WHERE key = $1`,
+      [agentSummaryKey]
     );
+    // Fall back to global only if agent has no summary yet
+    if (!summary.rows.length) {
+      summary = await server.pg.query(
+        `SELECT data FROM kv_store WHERE key = 'cfo:portfolio_summary'`
+      );
+    }
+
+    // Compute live summary from open positions as final fallback
+    const liveSummary = positions.rows.length > 0 ? {
+      total_value_usd: positions.rows.reduce((sum: number, p: any) =>
+        sum + Number(p.amount_usd || 0), 0),
+      position_count: positions.rows.length,
+      computed: true,
+    } : null;
 
     // NOVA token balance
     const nova = await server.pg.query(
@@ -49,7 +65,7 @@ export async function portfolioRoutes(server: FastifyInstance) {
 
     reply.send({
       positions: positions.rows,
-      summary: summary.rows[0]?.data ?? null,
+      summary: summary.rows[0]?.data ?? liveSummary ?? null,
       nova: nova.rows[0] ?? { balance: 0, earned_month: 0 },
     });
   });

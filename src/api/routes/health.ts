@@ -16,6 +16,25 @@ import { requireAuth } from '../middleware/auth.js';
 
 export async function healthRoutes(server: FastifyInstance) {
 
+  // ── Migrations — ensure tables exist ──
+  await server.pg.query(`
+    CREATE TABLE IF NOT EXISTS code_repairs (
+      id            SERIAL PRIMARY KEY,
+      agent_name    TEXT NOT NULL,
+      file_path     TEXT,
+      error_type    TEXT,
+      error_message TEXT,
+      diagnosis     TEXT,
+      repair_category TEXT,
+      requires_approval BOOLEAN DEFAULT FALSE,
+      approved      BOOLEAN,
+      applied       BOOLEAN DEFAULT FALSE,
+      test_passed   BOOLEAN,
+      rolled_back   BOOLEAN DEFAULT FALSE,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
   // GET /api/health/overview — compact swarm health summary
   server.get('/health/overview', { preHandler: requireAuth }, async (_req, reply) => {
     // Agent statuses — separate ecosystem vs user

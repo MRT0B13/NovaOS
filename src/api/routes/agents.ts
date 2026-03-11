@@ -102,6 +102,12 @@ export async function agentsRoutes(server: FastifyInstance) {
   });
   const orchestrator = new AgentOrchestrator(pool);
 
+  // ── Migrations ──
+  // Fix any agents stuck in 'deploying' status (no background process transitions them)
+  try {
+    await pool.query(`UPDATE user_agents SET status = 'running' WHERE status = 'deploying'`);
+  } catch { /* constraint may not have deploying — ignore */ }
+
   // GET /api/agents/templates — list available templates
   server.get('/agents/templates', async (_req, reply) => {
     reply.send(Object.entries(TEMPLATES).map(([id, t]) => ({
@@ -406,7 +412,8 @@ export async function agentsRoutes(server: FastifyInstance) {
 
     reply.send({
       ...agent,
-      hasWallet: wallet != null,
+      hasWallet: !!(wallet?.address),
+      hasCharacter: !!character,
       capabilities,
       wallet: wallet ?? null,
       character: character ? {

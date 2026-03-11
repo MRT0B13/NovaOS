@@ -81,9 +81,15 @@ export async function governanceRoutes(server: FastifyInstance) {
   // Body: { title: string, description: string }
   server.post('/governance/propose', { preHandler: requireAuth }, async (req, reply) => {
     const { address } = req.user as { address: string };
-    const { title, description } = req.body as { title: string; description: string };
+    const { title, description, durationDays } = req.body as {
+      title: string; description: string; durationDays?: number;
+    };
 
     if (!title?.trim()) return reply.status(400).send({ error: 'Title required' });
+
+    // Duration: 3, 5, or 7 days only — default to 5
+    const allowedDays = [3, 5, 7];
+    const days = allowedDays.includes(durationDays as number) ? durationDays : 5;
 
     // Minimum NOVA to submit proposal
     const minNova = Number(process.env.GOVERNANCE_MIN_NOVA ?? 100);
@@ -97,9 +103,9 @@ export async function governanceRoutes(server: FastifyInstance) {
 
     const result = await server.pg.query(
       `INSERT INTO governance_proposals (title, description, proposed_by, status, ends_at, created_at)
-       VALUES ($1, $2, $3, 'active', NOW() + INTERVAL '7 days', NOW())
+       VALUES ($1, $2, $3, 'active', NOW() + ($4 || ' days')::INTERVAL, NOW())
        RETURNING id`,
-      [title.trim(), description?.trim() ?? '', address]
+      [title.trim(), description?.trim() ?? '', address, String(days)]
     );
 
     reply.send({ proposalId: result.rows[0].id });

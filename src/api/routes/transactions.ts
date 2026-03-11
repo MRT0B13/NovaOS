@@ -26,14 +26,13 @@ export async function transactionsRoutes(server: FastifyInstance) {
       offset?: string;
       strategy?: string;
       chain?: string;
-      agent_id?: string;
     };
 
     const limit = Math.min(Number(query.limit) || 50, 500);
     const offset = Number(query.offset) || 0;
 
-    // Scope to agent if available
-    const agentId = query.agent_id || await resolveAgentId(address);
+    // Always resolve from authenticated wallet — never accept agent_id from request
+    const agentId = await resolveAgentId(address);
 
     const conditions: string[] = [];
     const params: any[] = [];
