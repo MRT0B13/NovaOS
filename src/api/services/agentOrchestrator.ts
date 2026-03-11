@@ -174,6 +174,8 @@ export class AgentOrchestrator {
     const roleMap: Record<string, string> = {
       'full-nova': 'nova-cfo', 'cfo-agent': 'nova-cfo',
       'scout-agent': 'nova-scout', 'lp-specialist': 'nova-cfo',
+      'governance-agent': 'nova-supervisor', 'community-agent': 'nova-community',
+      'analyst-agent': 'nova-analyst',
     };
     const runnerConfig: UserAgentConfig = {
       agentId,
@@ -266,6 +268,8 @@ export class AgentOrchestrator {
       const roleMap: Record<string, string> = {
         'full-nova': 'nova-cfo', 'cfo-agent': 'nova-cfo',
         'scout-agent': 'nova-scout', 'lp-specialist': 'nova-cfo',
+        'governance-agent': 'nova-supervisor', 'community-agent': 'nova-community',
+        'analyst-agent': 'nova-analyst',
       };
       try {
         const runner = new UserAgentRunner(this.pool, {
@@ -386,6 +390,9 @@ export class AgentOrchestrator {
       'cfo-agent': 'novaverse-cfo',
       'scout-agent': 'novaverse-scout',
       'lp-specialist': 'novaverse-lp',
+      'governance-agent': 'novaverse-governance',
+      'community-agent': 'novaverse-community',
+      'analyst-agent': 'novaverse-analyst',
     };
     return map[templateId] ?? 'novaverse-custom';
   }
@@ -414,8 +421,10 @@ export class AgentOrchestrator {
       }
 
       // ── 2. Deactivate old user_agents record ──
+      // NOTE: status CHECK constraint only allows deploying|running|paused|error
+      // so we use 'paused' + active=false to indicate replaced
       await this.pool.query(
-        `UPDATE user_agents SET active = false, status = 'replaced'
+        `UPDATE user_agents SET active = false, status = 'paused'
          WHERE wallet_address = $1 AND active = true`,
         [walletAddress]
       );

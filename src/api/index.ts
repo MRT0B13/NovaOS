@@ -15,6 +15,9 @@ import { skillsRoutes } from './routes/skills.js';
 import { governanceRoutes } from './routes/governance.js';
 import { agentsRoutes } from './routes/agents.js';
 import { authRoutes } from './routes/auth.js';
+import { supervisorRoutes } from './routes/supervisor.js';
+import { learningRoutes } from './routes/learning.js';
+import { healthRoutes } from './routes/health.js';
 import { registerLiveStream } from './ws/liveStream.js';
 
 async function main() {
@@ -64,6 +67,9 @@ async function main() {
   server.register(skillsRoutes,     { prefix: '/api' });
   server.register(governanceRoutes, { prefix: '/api' });
   server.register(agentsRoutes,     { prefix: '/api' });
+  server.register(supervisorRoutes, { prefix: '/api' });
+  server.register(learningRoutes,   { prefix: '/api' });
+  server.register(healthRoutes,     { prefix: '/api' });
 
   // ── WebSocket ─────────────────────────────────────────
   registerLiveStream(server);

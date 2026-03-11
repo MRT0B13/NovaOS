@@ -12,7 +12,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { AgentOrchestrator } from '../services/agentOrchestrator.js';
 import { Pool } from 'pg';
 
-const TEMPLATES: Record<string, { agents: string[]; defaultSkills: string[]; description: string }> = {
+const TEMPLATES: Record<string, { agents: string[]; defaultSkills: string[]; description: string; requiresNova?: boolean }> = {
   'full-nova': {
     agents: ['nova-cfo', 'nova-scout', 'nova-guardian', 'nova-supervisor'],
     defaultSkills: ['risk-framework', 'hyperliquid-trader', 'polymarket-edge',
@@ -34,6 +34,22 @@ const TEMPLATES: Record<string, { agents: string[]; defaultSkills: string[]; des
     agents: ['nova-cfo'],
     defaultSkills: ['risk-framework', 'orca-lp', 'krystal-lp'],
     description: 'LP specialist: concentrated liquidity on Orca, Kamino, Krystal',
+  },
+  'governance-agent': {
+    agents: ['nova-supervisor'],
+    defaultSkills: ['governance-strategy', 'risk-framework'],
+    description: 'Governance strategist: proposes improvements, coordinates voting, tracks outcomes',
+    requiresNova: true,
+  },
+  'community-agent': {
+    agents: ['nova-community'],
+    defaultSkills: ['community-engagement', 'sentiment-analysis'],
+    description: 'Community specialist: engagement metrics, sentiment tracking, social health',
+  },
+  'analyst-agent': {
+    agents: ['nova-analyst'],
+    defaultSkills: ['defi-analytics', 'market-pulse', 'scout-intel-scoring'],
+    description: 'DeFi analyst: TVL tracking, price alerts, DEX volumes, market narratives',
   },
 };
 
@@ -85,6 +101,7 @@ export async function agentsRoutes(server: FastifyInstance) {
       agents: t.agents,
       skillCount: t.defaultSkills.length,
       defaultSkills: t.defaultSkills,
+      requiresNova: t.requiresNova ?? false,
     })));
   });
 
@@ -108,6 +125,19 @@ export async function agentsRoutes(server: FastifyInstance) {
 
     if (!TEMPLATES[body.templateId]) return reply.status(400).send({ error: 'Unknown template' });
     if (!RISK_CONFIGS[body.riskLevel]) return reply.status(400).send({ error: 'Invalid risk level' });
+
+    // NOVA token gate for governance template
+    const tmpl = TEMPLATES[body.templateId];
+    if (tmpl.requiresNova) {
+      const minNova = Number(process.env.GOVERNANCE_MIN_NOVA ?? 100);
+      const novaRow = await server.pg.query(
+        `SELECT balance FROM nova_balances WHERE wallet_address = $1`,
+        [address]
+      );
+      if ((novaRow.rows[0]?.balance ?? 0) < minNova) {
+        return reply.status(403).send({ error: `Minimum ${minNova} NOVA required for governance template` });
+      }
+    }
 
     // Check user doesn't already have an active agent
     const existing = await server.pg.query(
@@ -341,6 +371,9 @@ export async function agentsRoutes(server: FastifyInstance) {
                    WHEN 'cfo-agent' THEN 'nova-cfo'
                    WHEN 'scout-agent' THEN 'nova-scout'
                    WHEN 'lp-specialist' THEN 'nova-cfo'
+                   WHEN 'governance-agent' THEN 'nova-supervisor'
+                   WHEN 'community-agent' THEN 'nova-community'
+                   WHEN 'analyst-agent' THEN 'nova-analyst'
                    ELSE 'nova-cfo'
                  END
                )) AS active_skills,
