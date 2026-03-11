@@ -5,8 +5,10 @@
  * and user customisation, then produces a fully configured ElizaOS Character object
  * that can be spawned as an independent agent runtime.
  *
- * This bridges the gap between the NovaVerse dashboard (deploy a template)
- * and the actual ElizaOS agent runtime (Character + plugins).
+ * Agents use the NovaVerse Skill system instead of ElizaOS plugins.
+ * Skills are rich decision-framework documents stored in agent_skills and
+ * assigned via agent_skill_assignments. The character references skill IDs
+ * so the runtime knows which skills to load from the DB at boot.
  */
 
 // ============================================================================
@@ -31,7 +33,7 @@ export interface GeneratedCharacter {
   username: string;
   bio: string;
   system: string;
-  plugins: string[];
+  skills: string[];      // NovaVerse skill IDs (from agent_skills table)
   settings: Record<string, any>;
   style: {
     all: string[];
@@ -49,7 +51,7 @@ const TEMPLATE_PERSONAS: Record<string, {
   bio: string;
   systemCore: string;
   style: { all: string[]; chat: string[]; post: string[] };
-  plugins: string[];
+  skills: string[];       // NovaVerse skill IDs loaded from agent_skills at boot
   capabilities: string[];
 }> = {
   'full-nova': {
@@ -67,7 +69,8 @@ Your mandate:
       chat: ['Provide actionable briefs', 'Include confidence percentages', 'Summarize positions concisely'],
       post: ['Share intel with context', 'Highlight risk/reward ratios', 'Use bullet points for clarity'],
     },
-    plugins: ['@elizaos/plugin-bootstrap', '@elizaos/plugin-sql'],
+    skills: ['risk-framework', 'hyperliquid-trader', 'polymarket-edge',
+             'kamino-yield', 'orca-lp', 'krystal-lp', 'scout-intel-scoring', 'nova-voice'],
     capabilities: ['treasury', 'intel', 'safety', 'yield', 'trading', 'lp'],
   },
 
@@ -86,7 +89,7 @@ Your mandate:
       chat: ['Lead with PnL summary', 'Flag positions approaching risk limits', 'Suggest next actions with rationale'],
       post: ['Report realized PnL', 'Highlight best/worst performers', 'Keep it quantitative'],
     },
-    plugins: ['@elizaos/plugin-bootstrap', '@elizaos/plugin-sql'],
+    skills: ['risk-framework', 'hyperliquid-trader', 'kamino-yield', 'orca-lp', 'krystal-lp'],
     capabilities: ['treasury', 'yield', 'trading', 'lp'],
   },
 
@@ -105,7 +108,7 @@ Your mandate:
       chat: ['Start with "SIGNAL:" or "NOISE:" prefix', 'Include source links', 'Group by narrative theme'],
       post: ['Highlight contrarian signals', 'Track narrative momentum', 'Use emojis for quick scanning'],
     },
-    plugins: ['@elizaos/plugin-bootstrap', '@elizaos/plugin-sql'],
+    skills: ['scout-intel-scoring'],
     capabilities: ['intel', 'social'],
   },
 
@@ -124,7 +127,7 @@ Your mandate:
       chat: ['Summarize positions: pool, range, fees_earned, IL%', 'Rank pools by net APY after IL', 'Suggest range adjustments'],
       post: ['Share best-performing pools', 'Track weekly yield performance', 'Compare fee tiers'],
     },
-    plugins: ['@elizaos/plugin-bootstrap', '@elizaos/plugin-sql'],
+    skills: ['risk-framework', 'orca-lp', 'krystal-lp'],
     capabilities: ['yield', 'lp'],
   },
 };
@@ -192,8 +195,15 @@ export function buildCharacter(config: AgentCharacterConfig): GeneratedCharacter
     system += `\n\nOperator Custom Instructions:\n${config.customSystemPrompt}`;
   }
 
-  // Build plugins list
-  const plugins = [...template.plugins];
+  // Skills — loaded from agent_skills table at runtime
+  const skills = [...template.skills];
+
+  // If user specified additional skills, merge them
+  if (config.enabledSkills?.length) {
+    for (const s of config.enabledSkills) {
+      if (!skills.includes(s)) skills.push(s);
+    }
+  }
 
   // Model provider config
   const settings: Record<string, any> = {
@@ -210,10 +220,6 @@ export function buildCharacter(config: AgentCharacterConfig): GeneratedCharacter
     };
   }
 
-  if (config.enabledSkills?.length) {
-    settings.enabledSkills = config.enabledSkills;
-  }
-
   // Message examples based on capabilities
   const messageExamples = buildExamplesForCapabilities(template.capabilities, config.displayName);
 
@@ -222,7 +228,7 @@ export function buildCharacter(config: AgentCharacterConfig): GeneratedCharacter
     username,
     bio: config.customBio || template.bio,
     system,
-    plugins,
+    skills,
     settings,
     style: template.style,
     messageExamples,
