@@ -65,11 +65,43 @@ export async function authRoutes(server: FastifyInstance) {
       // ── Solana verification (tweetnacl ed25519) ──
       try {
         const msgBytes = new TextEncoder().encode(message);
-        const sigBytes = bs58.decode(signature);
         const pubkeyBytes = bs58.decode(address);
+
+        // Accept signature as base58 OR hex (some wallets/adapters use hex)
+        let sigBytes: Uint8Array;
+        if (signature.startsWith('0x')) {
+          // Hex-encoded signature
+          const hex = signature.slice(2);
+          sigBytes = new Uint8Array(hex.match(/.{1,2}/g)!.map(b => parseInt(b, 16)));
+        } else {
+          try {
+            sigBytes = bs58.decode(signature);
+          } catch {
+            // Might be raw hex without 0x prefix
+            sigBytes = new Uint8Array(signature.match(/.{1,2}/g)!.map(b => parseInt(b, 16)));
+          }
+        }
+
+        server.log.info({
+          solanaVerify: true,
+          addressLen: address.length,
+          sigLen: sigBytes.length,
+          pubkeyLen: pubkeyBytes.length,
+          msgLen: msgBytes.length,
+          sigPrefix: signature.substring(0, 20),
+        }, 'Solana verify attempt');
+
         valid = nacl.sign.detached.verify(msgBytes, sigBytes, pubkeyBytes);
+
+        if (!valid) {
+          server.log.warn({
+            address,
+            sigLen: sigBytes.length,
+            msgPreview: message.substring(0, 80),
+          }, 'Solana signature did not verify');
+        }
       } catch (e) {
-        server.log.warn({ err: e }, 'Solana signature verification error');
+        server.log.warn({ err: e, address, sigPreview: signature?.substring(0, 30) }, 'Solana signature verification error');
         return reply.status(401).send({ error: 'Invalid Solana signature format' });
       }
     }
