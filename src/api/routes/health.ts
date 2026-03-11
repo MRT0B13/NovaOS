@@ -18,7 +18,7 @@ export async function healthRoutes(server: FastifyInstance) {
 
   // GET /api/health/overview — compact swarm health summary
   server.get('/health/overview', { preHandler: requireAuth }, async (_req, reply) => {
-    // Agent statuses
+    // Agent statuses — separate ecosystem vs user
     const agents = await server.pg.query(
       `SELECT
          COUNT(*) AS total,
@@ -26,6 +26,8 @@ export async function healthRoutes(server: FastifyInstance) {
          COUNT(*) FILTER (WHERE status = 'degraded') AS degraded,
          COUNT(*) FILTER (WHERE status = 'dead') AS dead,
          COUNT(*) FILTER (WHERE status = 'disabled') AS disabled,
+         COUNT(*) FILTER (WHERE agent_category = 'ecosystem' OR agent_category IS NULL) AS ecosystem_count,
+         COUNT(*) FILTER (WHERE agent_category = 'user') AS user_count,
          SUM(memory_mb) AS total_memory_mb,
          SUM(error_count_last_5min) AS total_errors_5min
        FROM agent_heartbeats`
@@ -75,6 +77,8 @@ export async function healthRoutes(server: FastifyInstance) {
         degraded: Number(a.degraded ?? 0),
         dead: Number(a.dead ?? 0),
         disabled: Number(a.disabled ?? 0),
+        ecosystem: Number(a.ecosystem_count ?? 0),
+        user: Number(a.user_count ?? 0),
         totalMemoryMb: Number(a.total_memory_mb ?? 0),
         totalErrors5min: Number(a.total_errors_5min ?? 0),
       },
@@ -96,10 +100,22 @@ export async function healthRoutes(server: FastifyInstance) {
   });
 
   // GET /api/health/agents — detailed per-agent health
-  server.get('/health/agents', { preHandler: requireAuth }, async (_req, reply) => {
+  // Query params: ?category=ecosystem|user to filter by agent category
+  server.get('/health/agents', { preHandler: requireAuth }, async (req, reply) => {
+    const { category } = req.query as { category?: string };
+
+    let whereClause = '';
+    const params: any[] = [];
+    if (category === 'ecosystem' || category === 'user') {
+      whereClause = `WHERE (h.agent_category = $1 OR (h.agent_category IS NULL AND $1 = 'ecosystem'))`;
+      params.push(category);
+    }
+
     const rows = await server.pg.query(
       `SELECT
          h.agent_name,
+         h.display_name,
+         h.agent_category,
          h.status,
          h.last_beat,
          h.uptime_started,
@@ -116,13 +132,17 @@ export async function healthRoutes(server: FastifyInstance) {
          r.agent_type
        FROM agent_heartbeats h
        LEFT JOIN agent_registry r ON r.agent_name = h.agent_name
-       ORDER BY h.agent_name`
+       ${whereClause}
+       ORDER BY h.agent_category ASC, h.agent_name`,
+      params
     );
 
     reply.send(rows.rows.map((r: any) => {
       const uptimeSec = Number(r.uptime_seconds ?? 0);
       return {
         name: r.agent_name,
+        displayName: r.display_name || r.agent_name,
+        category: r.agent_category || 'ecosystem',
         status: r.status,
         lastBeat: r.last_beat,
         secondsSinceBeat: Math.round(Number(r.seconds_since_beat ?? 0)),
@@ -138,6 +158,47 @@ export async function healthRoutes(server: FastifyInstance) {
         alive: Number(r.seconds_since_beat) < 120,
       };
     }));
+  });
+
+  // DELETE /api/health/agents/:name — manually remove a stale heartbeat entry
+  server.delete('/health/agents/:name', { preHandler: requireAuth }, async (req, reply) => {
+    const { name } = req.params as { name: string };
+    const result = await server.pg.query(
+      `DELETE FROM agent_heartbeats WHERE agent_name = $1 RETURNING agent_name`,
+      [name]
+    );
+    if (result.rowCount === 0) {
+      return reply.status(404).send({ error: 'Agent not found in heartbeats' });
+    }
+    reply.send({ deleted: name });
+  });
+
+  // DELETE /api/health/agents — bulk cleanup: remove all disabled/dead agents
+  // Query params: ?status=disabled|dead&category=user|ecosystem
+  server.delete('/health/agents', { preHandler: requireAuth }, async (req, reply) => {
+    const { status = 'disabled', category } = req.query as { status?: string; category?: string };
+
+    const validStatuses = ['disabled', 'dead'];
+    if (!validStatuses.includes(status)) {
+      return reply.status(400).send({ error: `status must be one of: ${validStatuses.join(', ')}` });
+    }
+
+    let query = `DELETE FROM agent_heartbeats WHERE status = $1`;
+    const params: any[] = [status];
+
+    if (category === 'ecosystem' || category === 'user') {
+      query += ` AND (agent_category = $2 OR (agent_category IS NULL AND $2 = 'ecosystem'))`;
+      params.push(category);
+    }
+
+    // Never clean up health-monitor
+    query += ` AND agent_name NOT IN ('health-monitor', 'health-agent')`;
+
+    const result = await server.pg.query(query + ' RETURNING agent_name', params);
+    reply.send({
+      deleted: result.rowCount,
+      agents: result.rows.map((r: any) => r.agent_name),
+    });
   });
 
   // GET /api/health/errors — recent error log

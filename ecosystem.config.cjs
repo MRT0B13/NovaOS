@@ -16,7 +16,7 @@
  * The swarm (Scout, Guardian, Analyst, Launcher, Community, TokenChild agents)
  * runs inside nova-main via initSwarm(). This PM2 config handles:
  *   - Process restart on crash (max 10 restarts, 5s delay)
- *   - Memory limit auto-restart (512MB default)
+ *   - Memory limit auto-restart (1GB default)
  *   - Log rotation
  *   - Environment variable injection
  *   - Graceful shutdown signals
@@ -47,7 +47,7 @@ module.exports = {
       max_restarts: 10,
       min_uptime: '30s',           // Must run 30s to count as "started"
       restart_delay: 5000,         // 5s delay between restart attempts
-      max_memory_restart: '512M',  // Restart if memory exceeds 512MB
+      max_memory_restart: '1G',    // Restart if memory exceeds 1GB
 
       // Graceful shutdown
       kill_timeout: 15000,         // 15s for graceful shutdown (agent cleanup)

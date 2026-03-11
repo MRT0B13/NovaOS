@@ -33,18 +33,22 @@ export class HealthDB {
 
   async upsertHeartbeat(heartbeat: Partial<AgentHeartbeat> & { agentName: string }): Promise<void> {
     await this.pool.query(
-      `INSERT INTO agent_heartbeats (agent_name, status, last_beat, memory_mb, cpu_percent, error_count_last_5min, current_task, version)
-       VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7)
+      `INSERT INTO agent_heartbeats (agent_name, display_name, agent_category, status, last_beat, memory_mb, cpu_percent, error_count_last_5min, current_task, version)
+       VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9)
        ON CONFLICT (agent_name) DO UPDATE SET
-         status = COALESCE($2, agent_heartbeats.status),
+         display_name = COALESCE($2, agent_heartbeats.display_name),
+         agent_category = COALESCE($3, agent_heartbeats.agent_category),
+         status = COALESCE($4, agent_heartbeats.status),
          last_beat = NOW(),
-         memory_mb = COALESCE($3, agent_heartbeats.memory_mb),
-         cpu_percent = COALESCE($4, agent_heartbeats.cpu_percent),
-         error_count_last_5min = COALESCE($5, agent_heartbeats.error_count_last_5min),
-         current_task = $6,
-         version = COALESCE($7, agent_heartbeats.version)`,
+         memory_mb = COALESCE($5, agent_heartbeats.memory_mb),
+         cpu_percent = COALESCE($6, agent_heartbeats.cpu_percent),
+         error_count_last_5min = COALESCE($7, agent_heartbeats.error_count_last_5min),
+         current_task = $8,
+         version = COALESCE($9, agent_heartbeats.version)`,
       [
         heartbeat.agentName,
+        heartbeat.displayName || heartbeat.agentName,
+        heartbeat.agentCategory || 'ecosystem',
         heartbeat.status || 'alive',
         heartbeat.memoryMb || 0,
         heartbeat.cpuPercent || 0,
@@ -57,8 +61,8 @@ export class HealthDB {
 
   async getAllHeartbeats(): Promise<AgentHeartbeat[]> {
     const { rows } = await this.pool.query(
-      `SELECT agent_name, status, last_beat, uptime_started, memory_mb, cpu_percent,
-              error_count_last_5min, current_task, version
+      `SELECT agent_name, display_name, agent_category, status, last_beat, uptime_started,
+              memory_mb, cpu_percent, error_count_last_5min, current_task, version
        FROM agent_heartbeats ORDER BY agent_name`
     );
     return rows.map(this.mapHeartbeat);
@@ -66,8 +70,8 @@ export class HealthDB {
 
   async getStaleAgents(deadThresholdMs: number, warnThresholdMs: number): Promise<AgentHeartbeat[]> {
     const { rows } = await this.pool.query(
-      `SELECT agent_name, status, last_beat, uptime_started, memory_mb, cpu_percent,
-              error_count_last_5min, current_task, version
+      `SELECT agent_name, display_name, agent_category, status, last_beat, uptime_started,
+              memory_mb, cpu_percent, error_count_last_5min, current_task, version
        FROM agent_heartbeats
        WHERE status != 'disabled'
          AND last_beat < NOW() - INTERVAL '${warnThresholdMs} milliseconds'
@@ -291,6 +295,17 @@ export class HealthDB {
     return rows;
   }
 
+  async getRecentRepairs(agentName: string, limit: number = 5): Promise<any[]> {
+    const { rows } = await this.pool.query(
+      `SELECT * FROM code_repairs
+       WHERE agent_name = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [agentName, limit]
+    );
+    return rows;
+  }
+
   // ============================================================
   // HEALTH REPORTS
   // ============================================================
@@ -431,6 +446,8 @@ export class HealthDB {
   private mapHeartbeat(row: any): AgentHeartbeat {
     return {
       agentName: row.agent_name,
+      displayName: row.display_name || row.agent_name,
+      agentCategory: row.agent_category || 'ecosystem',
       status: row.status,
       lastBeat: new Date(row.last_beat),
       uptimeStarted: new Date(row.uptime_started),

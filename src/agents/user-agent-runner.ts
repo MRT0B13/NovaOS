@@ -71,6 +71,8 @@ export class UserAgentRunner extends BaseAgent {
       pool,
       agentId: `user-agent-${config.agentId}`,
       agentType: 'cfo',  // Closest match in AgentType union
+      displayName: config.displayName,
+      agentCategory: 'user',
     });
     this.userConfig = config;
     this.skillsService = new SkillsService(pool);

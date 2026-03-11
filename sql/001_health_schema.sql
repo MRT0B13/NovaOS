@@ -7,6 +7,9 @@
 -- ============================================================
 CREATE TABLE IF NOT EXISTS agent_heartbeats (
   agent_name        TEXT PRIMARY KEY,
+  display_name      TEXT,
+  agent_category    TEXT NOT NULL DEFAULT 'ecosystem'
+                    CHECK (agent_category IN ('ecosystem', 'user')),
   status            TEXT NOT NULL DEFAULT 'alive'
                     CHECK (status IN ('alive', 'degraded', 'dead', 'disabled')),
   last_beat         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -19,6 +22,10 @@ CREATE TABLE IF NOT EXISTS agent_heartbeats (
   state_json        JSONB DEFAULT '{}',
   created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Migration: add display_name + agent_category if upgrading
+ALTER TABLE agent_heartbeats ADD COLUMN IF NOT EXISTS display_name TEXT;
+ALTER TABLE agent_heartbeats ADD COLUMN IF NOT EXISTS agent_category TEXT NOT NULL DEFAULT 'ecosystem';
 
 -- ============================================================
 -- 2. AGENT ERRORS — error log with stack traces

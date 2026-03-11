@@ -10,6 +10,7 @@ import { HealthMonitor } from './monitor';
 export { HealthMonitor } from './monitor';
 export { HealthDB } from './db';
 export { CodeRepairEngine } from './code-repair';
+export { SelfHealEngine } from './self-heal';
 export { HeartbeatClient } from './heartbeat-client';
 export * from './types';
 

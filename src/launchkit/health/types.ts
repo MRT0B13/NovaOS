@@ -25,6 +25,12 @@ export interface HealthConfig {
   memoryThresholdMb: number;
   cpuThresholdPercent: number;
 
+  // Dynamic memory scaling
+  memoryScaleEnabled: boolean;          // Allow health agent to increase memory limits
+  memoryScaleStepMb: number;            // How much to add each escalation (e.g. 256MB)
+  memoryScaleCeilingMb: number;         // Absolute max memory limit (won't scale beyond this)
+  memoryScaleMinFreeSystemMb: number;   // Don't scale if system free RAM is below this
+
   // API health checks
   apiCheckIntervalMs: number;
   apiSlowThresholdMs: number;
@@ -49,7 +55,7 @@ export const DEFAULT_HEALTH_CONFIG: HealthConfig = {
   heartbeatDeadThresholdMs: 180_000,    // 3 minutes
   heartbeatWarnThresholdMs: 120_000,    // 2 minutes
 
-  maxRestartsPerHour: 3,
+  maxRestartsPerHour: 5,
   restartCooldownMs: 60_000,            // 1 minute
   escalateAfterFailures: 3,
 
@@ -71,6 +77,11 @@ export const DEFAULT_HEALTH_CONFIG: HealthConfig = {
 
   memoryThresholdMb: 512,
   cpuThresholdPercent: 80,
+
+  memoryScaleEnabled: true,
+  memoryScaleStepMb: 256,
+  memoryScaleCeilingMb: 4096,
+  memoryScaleMinFreeSystemMb: 512,
 
   apiCheckIntervalMs: 60_000,
   apiSlowThresholdMs: 3_000,
@@ -121,8 +132,12 @@ export type RepairCategory =
   | 'retry_logic'
   | 'other';
 
+export type AgentCategory = 'ecosystem' | 'user';
+
 export interface AgentHeartbeat {
   agentName: string;
+  displayName: string;
+  agentCategory: AgentCategory;
   status: AgentStatus;
   lastBeat: Date;
   uptimeStarted: Date;
@@ -239,14 +254,19 @@ export const DEGRADATION_RULES: Record<string, DegradationRule> = {
     message: '🚨 Database connection lost. Attempting reconnection.',
   },
   restart_loop: {
-    action: 'disable_agent',
+    action: 'scale_memory_or_disable',
     notify: true,
     message: '🚨 {agentName} failed to restart {count} times. Disabled. Manual intervention needed.',
   },
   memory_exceeded: {
-    action: 'restart_agent',
+    action: 'scale_memory_or_restart',
     notify: true,
     message: '⚠️ {agentName} exceeded memory limit ({memoryMb}MB). Restarting.',
+  },
+  memory_scaled: {
+    action: 'scale_memory',
+    notify: true,
+    message: '📈 {agentName} memory limit increased: {oldLimit}MB → {newLimit}MB (usage was {memoryMb}MB)',
   },
 };
 

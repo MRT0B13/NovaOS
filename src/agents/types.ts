@@ -46,12 +46,18 @@ export interface AgentMessage {
   created_at?: Date;
 }
 
+export type AgentCategory = 'ecosystem' | 'user';
+
 export interface AgentConfig {
   agentId: string;
   agentType: AgentType;
   pool: Pool;
   scanIntervalMs?: number;
   enabled?: boolean;
+  /** Friendly display name (shown in dashboard instead of agentId) */
+  displayName?: string;
+  /** Agent category — 'ecosystem' for core swarm agents, 'user' for NovaVerse user-deployed */
+  agentCategory?: AgentCategory;
 }
 
 // ============================================================================
@@ -62,6 +68,8 @@ export abstract class BaseAgent {
   protected pool: Pool;
   protected agentId: string;
   protected agentType: AgentType;
+  protected displayName: string;
+  protected agentCategory: AgentCategory;
   protected running = false;
   protected intervals: NodeJS.Timeout[] = [];
   private _stateColumnEnsured = false;
@@ -76,6 +84,8 @@ export abstract class BaseAgent {
     this.pool = config.pool;
     this.agentId = config.agentId;
     this.agentType = config.agentType;
+    this.displayName = config.displayName ?? config.agentId;
+    this.agentCategory = config.agentCategory ?? 'ecosystem';
   }
 
   /** Get this agent's unique identifier */
@@ -119,6 +129,9 @@ export abstract class BaseAgent {
          SET agent_type = $2, enabled = true, updated_at = NOW()`,
         [this.agentId, this.agentType, JSON.stringify({ startedAt: new Date().toISOString() })],
       );
+      // Ensure display_name + agent_category columns exist (idempotent migration)
+      await this.pool.query(`ALTER TABLE agent_heartbeats ADD COLUMN IF NOT EXISTS display_name TEXT`).catch(() => {});
+      await this.pool.query(`ALTER TABLE agent_heartbeats ADD COLUMN IF NOT EXISTS agent_category TEXT NOT NULL DEFAULT 'ecosystem'`).catch(() => {});
     } catch (err) {
       logger.warn(`[${this.agentId}] Registration failed (non-fatal):`, err);
     }
@@ -134,11 +147,13 @@ export abstract class BaseAgent {
           : 'alive'));  // researching, analyzing, idle, gathering, active → alive
     try {
       await this.pool.query(
-        `INSERT INTO agent_heartbeats (agent_name, status, current_task, last_beat)
-         VALUES ($1, $2, $3, NOW())
+        `INSERT INTO agent_heartbeats (agent_name, display_name, agent_category, status, current_task, last_beat)
+         VALUES ($1, $2, $3, $4, $5, NOW())
          ON CONFLICT (agent_name) DO UPDATE
-         SET status = $2, current_task = $3, last_beat = NOW()`,
-        [this.agentId, dbStatus, status],
+         SET display_name = COALESCE($2, agent_heartbeats.display_name),
+             agent_category = $3,
+             status = $4, current_task = $5, last_beat = NOW()`,
+        [this.agentId, this.displayName, this.agentCategory, dbStatus, status],
       );
     } catch (err) {
       // Silent — health agent will notice missing heartbeats
