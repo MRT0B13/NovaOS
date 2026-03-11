@@ -26,6 +26,7 @@ import { Pool } from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 import { buildCharacter, serializeCharacter, type AgentCharacterConfig, type GeneratedCharacter } from './agentCharacterBuilder.js';
 import { encryptWalletKey, type WalletConfig } from '../../agents/wallet-utils.js';
+import { UserAgentRunner, type UserAgentConfig } from '../../agents/user-agent-runner.js';
 
 // ============================================================================
 // Types
@@ -64,6 +65,8 @@ export interface AgentInstance {
 
 export class AgentOrchestrator {
   private pool: Pool;
+  /** Running user agent instances — keyed by agentId */
+  private runners: Map<string, UserAgentRunner> = new Map();
 
   constructor(pool: Pool) {
     this.pool = pool;
@@ -167,6 +170,28 @@ export class AgentOrchestrator {
       [finalName]
     );
 
+    // ── 8. Spawn the agent runner immediately (starts executing now) ──
+    const roleMap: Record<string, string> = {
+      'full-nova': 'nova-cfo', 'cfo-agent': 'nova-cfo',
+      'scout-agent': 'nova-scout', 'lp-specialist': 'nova-cfo',
+    };
+    const runnerConfig: UserAgentConfig = {
+      agentId,
+      displayName: finalName,
+      templateId: req.templateId,
+      riskLevel: req.riskLevel,
+      ownerWallet: req.walletAddress,
+      agentRole: roleMap[req.templateId] || 'nova-cfo',
+    };
+    try {
+      const runner = new UserAgentRunner(this.pool, runnerConfig);
+      await runner.start();
+      this.runners.set(agentId, runner);
+    } catch (err) {
+      // Non-fatal — agent will be picked up on next boot
+      console.warn(`[orchestrator] Failed to start runner for ${finalName}:`, err);
+    }
+
     return {
       agentId,
       displayName: finalName,
@@ -204,6 +229,13 @@ export class AgentOrchestrator {
       [agent.display_name]
     );
 
+    // Stop the in-memory runner if it's running
+    const runner = this.runners.get(agent.agent_id);
+    if (runner) {
+      try { await runner.stop(); } catch { /* already stopped */ }
+      this.runners.delete(agent.agent_id);
+    }
+
     return true;
   }
 
@@ -228,6 +260,28 @@ export class AgentOrchestrator {
       `UPDATE agent_heartbeats SET status = 'idle', last_beat = NOW() WHERE agent_name = $1`,
       [agent.display_name]
     );
+
+    // Re-spawn the runner if not already running
+    if (!this.runners.has(agent.agent_id)) {
+      const roleMap: Record<string, string> = {
+        'full-nova': 'nova-cfo', 'cfo-agent': 'nova-cfo',
+        'scout-agent': 'nova-scout', 'lp-specialist': 'nova-cfo',
+      };
+      try {
+        const runner = new UserAgentRunner(this.pool, {
+          agentId: agent.agent_id,
+          displayName: agent.display_name,
+          templateId: agent.template_id,
+          riskLevel: 'balanced',
+          ownerWallet: walletAddress,
+          agentRole: roleMap[agent.template_id] || 'nova-cfo',
+        });
+        await runner.start();
+        this.runners.set(agent.agent_id, runner);
+      } catch (err) {
+        console.warn(`[orchestrator] Failed to restart runner for ${agent.display_name}:`, err);
+      }
+    }
 
     return true;
   }

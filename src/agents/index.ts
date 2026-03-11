@@ -39,6 +39,7 @@ export { PortfolioWatchdogAgent } from './portfolio-watchdog.ts';
 export { TokenChildAgent, type TokenChildConfig } from './token-child.ts';
 export { AgentFactory, type AgentSpec, type CapabilityType, type AgentSpecStatus } from './factory.ts';
 export { encryptWalletKey, decryptWalletKey, hasPermission, supportsChain, getPrivateKeyForAction, type WalletConfig } from './wallet-utils.ts';
+export { UserAgentRunner, discoverUserAgents, startUserAgents, type UserAgentConfig } from './user-agent-runner.ts';
 
 import { Pool } from 'pg';
 import { logger } from '@elizaos/core';
@@ -49,6 +50,7 @@ import { AnalystAgent } from './analyst.ts';
 import { LauncherAgent } from './launcher.ts';
 import { CommunityAgent } from './community-agent.ts';
 import { CFOAgent } from './cfo.ts';
+import { UserAgentRunner, startUserAgents } from './user-agent-runner.ts';
 
 // ============================================================================
 // Swarm Bootstrap
@@ -62,6 +64,8 @@ export interface SwarmHandle {
   launcher: LauncherAgent;
   community: CommunityAgent;
   cfo: CFOAgent;
+  /** User-deployed agents discovered from agent_registry */
+  userAgents: UserAgentRunner[];
 }
 
 /**
@@ -111,9 +115,20 @@ export async function initSwarm(
     }
   }
 
-  logger.info(`[swarm] ✅ ${agents.length} agents started (Scout, Guardian, Analyst, Launcher, Community, CFO + Supervisor)`);
+  logger.info(`[swarm] ✅ ${agents.length} core agents started (Scout, Guardian, Analyst, Launcher, Community, CFO + Supervisor)`);
 
-  return { supervisor, scout, guardian, analyst, launcher, community, cfo };
+  // ── Discover & start user-deployed agents ──
+  let userAgents: UserAgentRunner[] = [];
+  try {
+    userAgents = await startUserAgents(pool);
+    if (userAgents.length) {
+      logger.info(`[swarm] ✅ ${userAgents.length} user agent(s) started from agent_registry`);
+    }
+  } catch (err) {
+    logger.warn('[swarm] User agent discovery failed (non-fatal):', err);
+  }
+
+  return { supervisor, scout, guardian, analyst, launcher, community, cfo, userAgents };
 }
 
 /**
@@ -131,6 +146,15 @@ export async function stopSwarm(swarm: SwarmHandle): Promise<void> {
     swarm.scout,
     swarm.supervisor, // Stop supervisor last
   ];
+
+  // Stop user agents first
+  for (const ua of swarm.userAgents ?? []) {
+    try {
+      await ua.stop();
+    } catch (err) {
+      logger.warn(`[swarm] Error stopping user agent:`, err);
+    }
+  }
 
   for (const agent of agents) {
     try {
