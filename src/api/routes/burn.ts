@@ -13,6 +13,7 @@
  *   GET  /api/burn/stats              — ecosystem burn statistics
  *   GET  /api/burn/wallet/:address    — wallet burn history + credits
  *   GET  /api/burn/config             — current splits + config
+ *   GET  /api/burn/leaderboard        — top burners leaderboard
  *   GET  /api/burn/history            — global burn history (paginated)
  *   GET  /api/burn/:id                — get a specific burn record
  */
@@ -233,8 +234,58 @@ export async function burnRoutes(server: FastifyInstance) {
     });
   });
 
+  // ── GET /api/burn/leaderboard — top burners by credits ──
+  server.get('/burn/leaderboard', { preHandler: requireAuth }, async (req, reply) => {
+    const { limit = '25', sortBy = 'credits' } = req.query as {
+      limit?: string; sortBy?: 'credits' | 'sol' | 'burns';
+    };
+
+    const cap = Math.min(Number(limit) || 25, 100);
+
+    const orderCol = sortBy === 'sol' ? 'total_sol_value' : sortBy === 'burns' ? 'total_burns' : 'total_earned';
+
+    const { rows } = await server.pg.query(
+      `SELECT wallet_address, total_earned, total_redeemed,
+              total_burns, total_sol_value, updated_at
+       FROM burn_credits
+       ORDER BY ${orderCol} DESC
+       LIMIT $1`,
+      [cap]
+    );
+
+    // Also get totals for the entire ecosystem
+    const totals = await server.pg.query(
+      `SELECT COUNT(*) AS burners,
+              COALESCE(SUM(total_earned), 0) AS total_credits,
+              COALESCE(SUM(total_sol_value), 0) AS total_sol,
+              COALESCE(SUM(total_burns), 0) AS total_burns
+       FROM burn_credits`
+    );
+    const t = totals.rows[0] || {};
+
+    reply.send({
+      leaderboard: rows.map((r: any, i: number) => ({
+        rank: i + 1,
+        wallet: r.wallet_address,
+        credits: Number(r.total_earned ?? 0),
+        creditsRedeemed: Number(r.total_redeemed ?? 0),
+        burns: Number(r.total_burns ?? 0),
+        totalSol: Number(r.total_sol_value ?? 0),
+        lastActive: r.updated_at,
+      })),
+      ecosystem: {
+        uniqueBurners: Number(t.burners ?? 0),
+        totalCredits: Number(t.total_credits ?? 0),
+        totalSolBurned: Number(t.total_sol ?? 0),
+        totalBurns: Number(t.total_burns ?? 0),
+      },
+      limit: cap,
+      sortBy,
+    });
+  });
+
   // ── GET /api/burn/:id — get a specific burn record ──
-  server.get('/burn/:id', { preHandler: requireAuth }, async (req, reply) => {
+  server.get<{ Params: { id: string } }>('/burn/:id', { preHandler: requireAuth }, async (req, reply) => {
     const { id } = req.params as { id: string };
 
     const row = await server.pg.query(

@@ -67,7 +67,10 @@ export class LauncherAgent extends BaseAgent {
   }
 
   protected async onStart(): Promise<void> {
-    // Restore persisted counters from DB (survive restarts)
+    // Bootstrap real counts from DB (ground truth — survives restarts, resets, crashes)
+    await this.bootstrapFromDB();
+
+    // Then overlay any persisted runtime state (e.g. lastLaunchAt, lastError)
     await this.restorePersistedState();
 
     this.startHeartbeat(60_000);
@@ -116,6 +119,7 @@ export class LauncherAgent extends BaseAgent {
         this.launchCount += newLaunches;
         this.lastLaunchAt = Date.now();
 
+        await this.persistState();
         await this.reportToSupervisor('status', 'high', {
           event: 'launched',
           tokenName: status.pendingIdea?.name || 'Unknown',
@@ -151,6 +155,7 @@ export class LauncherAgent extends BaseAgent {
           const mint = pack?.launch?.mint;
           if (pack?.launch?.graduated && mint && !this.reportedGraduations.has(mint)) {
             this.reportedGraduations.add(mint);
+            await this.persistState();
             await this.reportToSupervisor('status', 'high', {
               event: 'graduated',
               tokenName: pack.brand?.name,
@@ -255,7 +260,55 @@ export class LauncherAgent extends BaseAgent {
     });
   }
 
-  // ── State Persistence (survive restarts) ─────────────────────────
+  // ── State Bootstrap & Persistence ────────────────────────────────
+
+  /**
+   * Bootstrap launch/graduation counts from the actual DB tables.
+   * This is ground truth — survives restarts, state resets, and crashes.
+   */
+  private async bootstrapFromDB(): Promise<void> {
+    try {
+      // Count launched tokens from launch_packs table
+      const launchResult = await this.pool.query(
+        `SELECT COUNT(*) AS cnt FROM launch_packs WHERE launch_status = 'launched'`,
+      );
+      const dbLaunchCount = parseInt(launchResult.rows[0]?.cnt || '0', 10);
+
+      // Count graduated tokens from kv_store (same source monitorGraduations uses)
+      let dbGradCount = 0;
+      const graduatedMints: string[] = [];
+      try {
+        const tableCheck = await this.pool.query(
+          `SELECT 1 FROM information_schema.tables WHERE table_name = 'kv_store' LIMIT 1`,
+        );
+        if (tableCheck.rows.length > 0) {
+          const kvResult = await this.pool.query(
+            `SELECT data FROM kv_store WHERE key LIKE 'launchpack:%'`,
+          );
+          for (const row of kvResult.rows) {
+            try {
+              const pack = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+              const mint = pack?.launch?.mint;
+              if (pack?.launch?.graduated && mint) {
+                dbGradCount++;
+                graduatedMints.push(mint);
+              }
+            } catch { /* skip malformed */ }
+          }
+        }
+      } catch { /* kv_store may not exist */ }
+
+      // Use DB counts as ground truth (always >= in-memory)
+      this.launchCount = Math.max(this.launchCount, dbLaunchCount);
+      for (const mint of graduatedMints) {
+        this.reportedGraduations.add(mint);
+      }
+
+      logger.info(`[launcher] Bootstrapped from DB: ${dbLaunchCount} launches, ${dbGradCount} graduated`);
+    } catch (err) {
+      logger.warn('[launcher] DB bootstrap failed (non-fatal):', err);
+    }
+  }
 
   private async persistState(): Promise<void> {
     await this.saveState({
@@ -272,9 +325,12 @@ export class LauncherAgent extends BaseAgent {
       reportedGraduations?: string[];
     }>();
     if (!s) return;
-    if (s.launchCount)           this.launchCount = s.launchCount;
+    // Use Math.max so DB bootstrap (ground truth) isn't overwritten by stale persisted state
+    if (s.launchCount != null)   this.launchCount = Math.max(this.launchCount, s.launchCount);
     if (s.lastLaunchAt)          this.lastLaunchAt = s.lastLaunchAt;
-    if (s.reportedGraduations)   this.reportedGraduations = new Set(s.reportedGraduations);
+    if (s.reportedGraduations)   {
+      for (const mint of s.reportedGraduations) this.reportedGraduations.add(mint);
+    }
     logger.info(`[launcher] Restored: ${this.launchCount} launches, ${this.reportedGraduations.size} graduations`);
   }
 
