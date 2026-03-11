@@ -51,6 +51,16 @@ const TEMPLATES: Record<string, { agents: string[]; defaultSkills: string[]; des
     defaultSkills: ['defi-analytics', 'market-pulse', 'scout-intel-scoring'],
     description: 'DeFi analyst: TVL tracking, price alerts, DEX volumes, market narratives',
   },
+  'launcher-agent': {
+    agents: ['nova-launcher'],
+    defaultSkills: ['pump-launcher', 'community-engagement'],
+    description: 'Token launcher: generates launch packs, deploys to pump.fun, manages community',
+  },
+  'social-agent': {
+    agents: ['nova-social-sentinel'],
+    defaultSkills: ['social-trending', 'reddit-polling', 'google-trends'],
+    description: 'Social sentinel: polls Reddit & Google Trends for viral culture, feeds trend pool for reactive launches',
+  },
 };
 
 // Risk level → initial config values
@@ -437,6 +447,66 @@ export async function agentsRoutes(server: FastifyInstance) {
   };
   server.patch('/agents/config', { preHandler: requireAuth }, configHandler);
   server.post('/agents/config', { preHandler: requireAuth }, configHandler);
+
+  // ── Social Config ──
+
+  // GET /api/agents/social — retrieve social config
+  server.get('/agents/social', { preHandler: requireAuth }, async (req, reply) => {
+    const { address } = req.user as { address: string };
+    const agentRow = await server.pg.query(
+      `SELECT agent_id FROM user_agents WHERE wallet_address = $1 AND active = true`,
+      [address]
+    );
+    if (!agentRow.rows.length) return reply.status(404).send({ error: 'No agent' });
+
+    const agentId = agentRow.rows[0].agent_id;
+    const row = await server.pg.query(
+      `SELECT data FROM kv_store WHERE key = $1`,
+      [`agent:${agentId}:social_config`]
+    );
+
+    reply.send(row.rows[0]?.data ?? {});
+  });
+
+  // PATCH /api/agents/social — update social config
+  // Body: { x_handle?, telegram_group?, custom_bio?, posting_frequency? }
+  const socialHandler = async (req: any, reply: any) => {
+    const { address } = req.user as { address: string };
+    const body = req.body as {
+      x_handle?: string;
+      telegram_group?: string;
+      custom_bio?: string;
+      posting_frequency?: string;
+    };
+
+    const agentRow = await server.pg.query(
+      `SELECT agent_id FROM user_agents WHERE wallet_address = $1 AND active = true`,
+      [address]
+    );
+    if (!agentRow.rows.length) return reply.status(404).send({ error: 'No agent' });
+
+    const agentId = agentRow.rows[0].agent_id;
+    const kvKey = `agent:${agentId}:social_config`;
+
+    // Merge with existing config
+    const existing = await server.pg.query(
+      `SELECT data FROM kv_store WHERE key = $1`,
+      [kvKey]
+    );
+    const current = existing.rows[0]?.data ?? {};
+    const merged = { ...current, ...body, updated_at: new Date().toISOString() };
+
+    await server.pg.query(
+      `INSERT INTO kv_store (key, data, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = NOW()`,
+      [kvKey, JSON.stringify(merged)]
+    );
+
+    reply.send({ ok: true, social_config: merged });
+  };
+  server.patch('/agents/social', { preHandler: requireAuth }, socialHandler);
+  server.post('/agents/social', { preHandler: requireAuth }, socialHandler);
 
   // ── Agent Destroy/Teardown ──
   // Frontend tries: POST /destroy → POST /teardown → DELETE /:agentId

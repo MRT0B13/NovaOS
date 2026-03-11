@@ -175,7 +175,8 @@ export class AgentOrchestrator {
       'full-nova': 'nova-cfo', 'cfo-agent': 'nova-cfo',
       'scout-agent': 'nova-scout', 'lp-specialist': 'nova-cfo',
       'governance-agent': 'nova-supervisor', 'community-agent': 'nova-community',
-      'analyst-agent': 'nova-analyst',
+      'analyst-agent': 'nova-analyst', 'launcher-agent': 'nova-launcher',
+      'social-agent': 'nova-social-sentinel',
     };
     const runnerConfig: UserAgentConfig = {
       agentId,
@@ -269,7 +270,8 @@ export class AgentOrchestrator {
         'full-nova': 'nova-cfo', 'cfo-agent': 'nova-cfo',
         'scout-agent': 'nova-scout', 'lp-specialist': 'nova-cfo',
         'governance-agent': 'nova-supervisor', 'community-agent': 'nova-community',
-        'analyst-agent': 'nova-analyst',
+        'analyst-agent': 'nova-analyst', 'launcher-agent': 'nova-launcher',
+        'social-agent': 'nova-social-sentinel',
       };
       try {
         const runner = new UserAgentRunner(this.pool, {
@@ -393,6 +395,8 @@ export class AgentOrchestrator {
       'governance-agent': 'novaverse-governance',
       'community-agent': 'novaverse-community',
       'analyst-agent': 'novaverse-analyst',
+      'launcher-agent': 'novaverse-launcher',
+      'social-agent': 'novaverse-social',
     };
     return map[templateId] ?? 'novaverse-custom';
   }
