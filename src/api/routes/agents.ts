@@ -204,6 +204,84 @@ export async function agentsRoutes(server: FastifyInstance) {
   server.patch('/agents/resume', { preHandler: requireAuth }, resumeHandler);
   server.post('/agents/resume', { preHandler: requireAuth }, resumeHandler);
 
+  // POST /api/agents/redeploy — tear down existing agent and deploy fresh
+  // Body: { templateId, name?, riskLevel, wallet?, customBio?, customSystemPrompt? }
+  // Works for both pre-existing agents (no character) and current agents.
+  server.post('/agents/redeploy', { preHandler: requireAuth }, async (req, reply) => {
+    const { address } = req.user as { address: string };
+    const body = req.body as {
+      templateId: string;
+      name?: string;
+      riskLevel: 'conservative' | 'balanced' | 'aggressive';
+      wallet?: {
+        chain: 'solana' | 'evm' | 'both';
+        address: string;
+        privateKey?: string;
+        permissions: ('read' | 'trade' | 'lp')[];
+      };
+      customBio?: string;
+      customSystemPrompt?: string;
+    };
+
+    if (!TEMPLATES[body.templateId]) return reply.status(400).send({ error: 'Unknown template' });
+    if (!RISK_CONFIGS[body.riskLevel]) return reply.status(400).send({ error: 'Invalid risk level' });
+
+    try {
+      const instance = await orchestrator.redeploy(address, {
+        walletAddress: address,
+        templateId: body.templateId,
+        displayName: body.name || '',
+        riskLevel: body.riskLevel,
+        wallet: body.wallet,
+        customBio: body.customBio,
+        customSystemPrompt: body.customSystemPrompt,
+      });
+
+      // Assign default skills
+      const template = TEMPLATES[body.templateId];
+      const primaryRole = template.agents[0];
+      for (const skillName of template.defaultSkills) {
+        const skill = await server.pg.query(
+          `SELECT skill_id FROM agent_skills WHERE skill_id = $1 OR name = $1`,
+          [skillName]
+        );
+        if (skill.rows.length) {
+          await server.pg.query(
+            `INSERT INTO agent_skill_assignments (agent_role, skill_id, priority, assigned_at)
+             VALUES ($1, $2, 50, NOW())
+             ON CONFLICT (agent_role, skill_id) DO NOTHING`,
+            [primaryRole, skill.rows[0].skill_id]
+          );
+        }
+      }
+
+      // Write risk configs
+      for (const [key, val] of Object.entries(RISK_CONFIGS[body.riskLevel])) {
+        await server.pg.query(
+          `INSERT INTO kv_store (key, data, updated_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = NOW()`,
+          [`agent:${instance.agentId}:config:${key}`, JSON.stringify(val)]
+        );
+      }
+
+      reply.send({
+        agentId: instance.agentId,
+        displayName: instance.displayName,
+        templateId: instance.templateId,
+        riskLevel: instance.riskLevel,
+        status: instance.status,
+        hasCharacter: true,
+        hasWallet: !!instance.wallet,
+        capabilities: instance.character.settings.capabilities,
+        redeployed: true,
+      });
+    } catch (err: any) {
+      server.log.error({ err }, 'Agent redeploy failed');
+      reply.status(500).send({ error: 'Redeploy failed: ' + (err.message || 'unknown') });
+    }
+  });
+
   // POST /api/agents/wallet — attach or update wallet on agent
   // Body: { chain: 'solana'|'evm'|'both', address: string, privateKey?: string, permissions: string[] }
   server.post('/agents/wallet', { preHandler: requireAuth }, async (req, reply) => {

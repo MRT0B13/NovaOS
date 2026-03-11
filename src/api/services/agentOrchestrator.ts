@@ -389,4 +389,51 @@ export class AgentOrchestrator {
     };
     return map[templateId] ?? 'novaverse-custom';
   }
+
+  /**
+   * Redeploy an agent — tears down the old instance and deploys a fresh one.
+   *
+   * 1. Stop the running runner (if any)
+   * 2. Deactivate old user_agents record (preserves history)
+   * 3. Clean up old kv_store entries
+   * 4. Disable old agent_registry entry
+   * 5. Deploy a brand new agent via the full deploy() pipeline
+   *
+   * The old agent’s positions and messages are NOT deleted —
+   * they remain for audit. The new agent gets a fresh agent_id.
+   */
+  async redeploy(walletAddress: string, req: DeployRequest): Promise<AgentInstance> {
+    const oldAgent = await this.getUserAgent(walletAddress);
+
+    if (oldAgent) {
+      // ── 1. Stop the runner ──
+      const runner = this.runners.get(oldAgent.agent_id);
+      if (runner) {
+        try { await runner.stop(); } catch { /* already stopped */ }
+        this.runners.delete(oldAgent.agent_id);
+      }
+
+      // ── 2. Deactivate old user_agents record ──
+      await this.pool.query(
+        `UPDATE user_agents SET active = false, status = 'replaced'
+         WHERE wallet_address = $1 AND active = true`,
+        [walletAddress]
+      );
+
+      // ── 3. Disable old agent_registry entry ──
+      await this.pool.query(
+        `UPDATE agent_registry SET enabled = false WHERE agent_name = $1`,
+        [oldAgent.display_name]
+      );
+
+      // ── 4. Mark old heartbeat as dead ──
+      await this.pool.query(
+        `UPDATE agent_heartbeats SET status = 'disabled' WHERE agent_name = $1`,
+        [oldAgent.display_name]
+      );
+    }
+
+    // ── 5. Deploy fresh via the full pipeline ──
+    return this.deploy(req);
+  }
 }
