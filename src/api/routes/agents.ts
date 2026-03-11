@@ -99,7 +99,7 @@ export async function agentsRoutes(server: FastifyInstance) {
     await server.pg.query(
       `INSERT INTO user_agents (id, agent_id, wallet_address, template_id, display_name,
                                 risk_level, status, active, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, 'deploying', true, NOW())`,
+       VALUES ($1, $2, $3, $4, $5, $6, 'running', true, NOW())`,
       [uuidv4(), agentId, address, templateId,
        name || `Nova CFO #${agentNumber}`, riskLevel]
     );
@@ -133,7 +133,7 @@ export async function agentsRoutes(server: FastifyInstance) {
       );
     }
 
-    reply.send({ agentId, agentNumber, status: 'deploying' });
+    reply.send({ agentId, agentNumber, status: 'running' });
   });
 
   // PATCH /api/agents/pause — pause active agent

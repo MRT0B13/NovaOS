@@ -31,7 +31,7 @@ export async function portfolioRoutes(server: FastifyInstance) {
               entry_price, current_price, status,
               asset AS pool_name
        FROM cfo_positions
-       WHERE (agent_id = $1 OR agent_id IS NULL) AND status = 'OPEN'
+       WHERE agent_id = $1 AND status = 'OPEN'
        ORDER BY cost_basis_usd DESC`,
       [agentId]
     );
@@ -64,16 +64,7 @@ export async function portfolioRoutes(server: FastifyInstance) {
       `SELECT agent_id FROM user_agents WHERE wallet_address = $1 AND active = true`,
       [address]
     );
-    if (!agentRow.rows.length) {
-      // Fall back to cfo_daily_snapshots (shared, no agent_id)
-      const rows = await server.pg.query(
-        `SELECT date AS ts, total_portfolio_usd AS total_value_usd
-         FROM cfo_daily_snapshots
-         WHERE date > NOW() - INTERVAL '${days} days'
-         ORDER BY date ASC`
-      );
-      return reply.send(rows.rows);
-    }
+    if (!agentRow.rows.length) return reply.send([]);
 
     const agentId = agentRow.rows[0].agent_id;
 
@@ -86,17 +77,6 @@ export async function portfolioRoutes(server: FastifyInstance) {
        ORDER BY ts ASC`,
       [agentId]
     );
-
-    // Fall back to daily snapshots if no hourly data
-    if (!rows.rows.length) {
-      const daily = await server.pg.query(
-        `SELECT date AS ts, total_portfolio_usd AS total_value_usd
-         FROM cfo_daily_snapshots
-         WHERE date > NOW() - INTERVAL '${days} days'
-         ORDER BY date ASC`
-      );
-      return reply.send(daily.rows);
-    }
 
     reply.send(rows.rows);
   });
