@@ -87,6 +87,17 @@ export async function feedRoutes(server: FastifyInstance) {
          LIMIT $2`,
         [agentId, limit]
       );
+
+      // New agent with no messages yet — fall back to global feed
+      if (!rows.rows.length) {
+        rows = await server.pg.query(
+          `SELECT id, from_agent, to_agent, message_type, summary, detail, payload, created_at
+           FROM agent_messages
+           ORDER BY created_at DESC
+           LIMIT $1`,
+          [limit]
+        );
+      }
     } else {
       // No agent assigned — show all recent messages (shared view)
       rows = await server.pg.query(
