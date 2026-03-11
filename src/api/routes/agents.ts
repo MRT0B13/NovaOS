@@ -434,18 +434,26 @@ export async function agentsRoutes(server: FastifyInstance) {
   server.patch('/agents/config', { preHandler: requireAuth }, configHandler);
   server.post('/agents/config', { preHandler: requireAuth }, configHandler);
 
-  // DELETE /api/agents/:agentId — permanently deactivate an agent
-  server.delete('/agents/:agentId', { preHandler: requireAuth }, async (req, reply) => {
+  // ── Agent Destroy/Teardown ──
+  // Frontend tries: POST /destroy → POST /teardown → DELETE /:agentId
+  // Support all three so the waterfall succeeds on first try.
+  const destroyHandler = async (req: any, reply: any) => {
     const { address } = req.user as { address: string };
-    const { agentId } = req.params as { agentId: string };
+    // agentId from params (DELETE /:agentId) or body (POST destroy/teardown)
+    const agentId = (req.params as any)?.agentId
+      || (req.body as any)?.agentId
+      || (req.body as any)?.agent_id;
 
     try {
-      const ok = await orchestrator.destroy(address, agentId);
+      const ok = await orchestrator.destroy(address, agentId || undefined);
       if (!ok) return reply.status(404).send({ error: 'Agent not found or not owned by you' });
-      reply.send({ ok: true, deleted: agentId });
+      reply.send({ ok: true, deleted: agentId ?? 'active-agent' });
     } catch (err: any) {
-      server.log.error({ err }, 'Agent delete failed');
-      reply.status(500).send({ error: 'Delete failed: ' + (err.message || 'unknown') });
+      server.log.error({ err }, 'Agent destroy failed');
+      reply.status(500).send({ error: 'Destroy failed: ' + (err.message || 'unknown') });
     }
-  });
+  };
+  server.post('/agents/destroy', { preHandler: requireAuth }, destroyHandler);
+  server.post('/agents/teardown', { preHandler: requireAuth }, destroyHandler);
+  server.delete('/agents/:agentId', { preHandler: requireAuth }, destroyHandler);
 }
