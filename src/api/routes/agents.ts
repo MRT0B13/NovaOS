@@ -392,13 +392,17 @@ export async function agentsRoutes(server: FastifyInstance) {
     // Attach character summary
     const character = await orchestrator.getCharacter(agent.agent_id);
 
+    const capabilities: string[] = character?.settings?.capabilities ?? [];
+
     reply.send({
       ...agent,
+      hasWallet: wallet != null,
+      capabilities,
       wallet: wallet ?? null,
       character: character ? {
         name: character.name,
         bio: character.bio,
-        capabilities: character.settings?.capabilities ?? [],
+        capabilities,
         model: character.settings?.model ?? null,
         riskLevel: character.settings?.riskLevel ?? null,
       } : null,
