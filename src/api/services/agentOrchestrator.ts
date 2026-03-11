@@ -165,8 +165,8 @@ export class AgentOrchestrator {
     // ── 7. Write initial heartbeat (agent is alive) ──
     await this.pool.query(
       `INSERT INTO agent_heartbeats (agent_name, status, state_json, last_beat)
-       VALUES ($1, 'idle', '{}', NOW())
-       ON CONFLICT (agent_name) DO UPDATE SET status = 'idle', last_beat = NOW()`,
+       VALUES ($1, 'alive', '{}', NOW())
+       ON CONFLICT (agent_name) DO UPDATE SET status = 'alive', last_beat = NOW()`,
       [finalName]
     );
 
@@ -227,7 +227,7 @@ export class AgentOrchestrator {
 
     // Update heartbeat
     await this.pool.query(
-      `UPDATE agent_heartbeats SET status = 'paused' WHERE agent_name = $1`,
+      `UPDATE agent_heartbeats SET status = 'disabled' WHERE agent_name = $1`,
       [agent.display_name]
     );
 
@@ -259,7 +259,7 @@ export class AgentOrchestrator {
     );
 
     await this.pool.query(
-      `UPDATE agent_heartbeats SET status = 'idle', last_beat = NOW() WHERE agent_name = $1`,
+      `UPDATE agent_heartbeats SET status = 'alive', last_beat = NOW() WHERE agent_name = $1`,
       [agent.display_name]
     );
 
