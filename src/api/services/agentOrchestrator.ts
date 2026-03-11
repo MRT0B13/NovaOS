@@ -445,4 +445,57 @@ export class AgentOrchestrator {
     // ── 5. Deploy fresh via the full pipeline ──
     return this.deploy(req);
   }
+
+  /**
+   * Destroy an agent — permanently deactivates it.
+   *
+   * Stops the runner, deactivates user_agents, disables in agent_registry,
+   * marks heartbeat dead. Does NOT delete historical data (positions, messages)
+   * so audit trail is preserved.
+   *
+   * Can look up agent by wallet address OR by agent ID directly.
+   */
+  async destroy(walletAddress: string, agentId?: string): Promise<boolean> {
+    // Find the agent either by wallet or by explicit agentId
+    let agent: any;
+    if (agentId) {
+      const row = await this.pool.query(
+        `SELECT agent_id, display_name, template_id, status
+         FROM user_agents WHERE agent_id = $1 AND wallet_address = $2`,
+        [agentId, walletAddress]
+      );
+      agent = row.rows[0] ?? null;
+    } else {
+      agent = await this.getUserAgent(walletAddress);
+    }
+    if (!agent) return false;
+
+    // 1. Stop live runner
+    const runner = this.runners.get(agent.agent_id);
+    if (runner) {
+      try { await runner.stop(); } catch { /* already stopped */ }
+      this.runners.delete(agent.agent_id);
+    }
+
+    // 2. Deactivate user_agents
+    await this.pool.query(
+      `UPDATE user_agents SET active = false, status = 'paused'
+       WHERE agent_id = $1 AND wallet_address = $2`,
+      [agent.agent_id, walletAddress]
+    );
+
+    // 3. Disable in agent_registry
+    await this.pool.query(
+      `UPDATE agent_registry SET enabled = false WHERE agent_name = $1`,
+      [agent.display_name]
+    );
+
+    // 4. Mark heartbeat dead
+    await this.pool.query(
+      `UPDATE agent_heartbeats SET status = 'dead' WHERE agent_name = $1`,
+      [agent.display_name]
+    );
+
+    return true;
+  }
 }

@@ -433,4 +433,19 @@ export async function agentsRoutes(server: FastifyInstance) {
   };
   server.patch('/agents/config', { preHandler: requireAuth }, configHandler);
   server.post('/agents/config', { preHandler: requireAuth }, configHandler);
+
+  // DELETE /api/agents/:agentId — permanently deactivate an agent
+  server.delete('/agents/:agentId', { preHandler: requireAuth }, async (req, reply) => {
+    const { address } = req.user as { address: string };
+    const { agentId } = req.params as { agentId: string };
+
+    try {
+      const ok = await orchestrator.destroy(address, agentId);
+      if (!ok) return reply.status(404).send({ error: 'Agent not found or not owned by you' });
+      reply.send({ ok: true, deleted: agentId });
+    } catch (err: any) {
+      server.log.error({ err }, 'Agent delete failed');
+      reply.status(500).send({ error: 'Delete failed: ' + (err.message || 'unknown') });
+    }
+  });
 }
