@@ -1,29 +1,39 @@
 /**
- * Agents routes — deploy, pause, resume, configure agent instances
- * Uses user_agents, agent_skills, agent_skill_assignments, kv_store tables
+ * Agents routes — deploy, pause, resume, configure, wallet attachment
+ *
+ * Uses AgentOrchestrator for real agent lifecycle management:
+ * - Builds ElizaOS Character from template + user config
+ * - Registers in agent_registry (swarm integration)
+ * - Stores character + wallet config in kv_store
+ * - Links user wallet → agent via user_agents
  */
 import { FastifyInstance } from 'fastify';
 import { requireAuth } from '../middleware/auth.js';
-import { v4 as uuidv4 } from 'uuid';
+import { AgentOrchestrator } from '../services/agentOrchestrator.js';
+import { Pool } from 'pg';
 
-const TEMPLATES: Record<string, { agents: string[]; defaultSkills: string[] }> = {
+const TEMPLATES: Record<string, { agents: string[]; defaultSkills: string[]; description: string }> = {
   'full-nova': {
     agents: ['nova-cfo', 'nova-scout', 'nova-guardian', 'nova-supervisor'],
     defaultSkills: ['risk-framework', 'hyperliquid-trader', 'polymarket-edge',
                     'kamino-yield', 'orca-lp', 'krystal-lp'],
+    description: 'Full-spectrum DeFi operations: trading, intel, safety, yield, LP management',
   },
   'cfo-agent': {
     agents: ['nova-cfo', 'nova-guardian'],
     defaultSkills: ['risk-framework', 'hyperliquid-trader', 'kamino-yield',
                     'orca-lp', 'krystal-lp'],
+    description: 'Autonomous CFO: portfolio management, yield strategies, risk control',
   },
   'scout-agent': {
     agents: ['nova-scout'],
     defaultSkills: ['intel-framework', 'kol-monitoring'],
+    description: 'Market intelligence: KOL tracking, narrative detection, alpha signals',
   },
   'lp-specialist': {
     agents: ['nova-cfo'],
     defaultSkills: ['risk-framework', 'orca-lp', 'krystal-lp'],
+    description: 'LP specialist: concentrated liquidity on Orca, Kamino, Krystal',
   },
 };
 
@@ -57,12 +67,21 @@ const EDITABLE_KEYS = [
 ];
 
 export async function agentsRoutes(server: FastifyInstance) {
+  // Create orchestrator with a Pool from the same connection string
+  const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || '';
+  const pool = new Pool({
+    connectionString: dbUrl,
+    ssl: dbUrl.includes('sslmode=require') || process.env.PGSSLMODE === 'require'
+      ? { rejectUnauthorized: false } : undefined,
+  });
+  const orchestrator = new AgentOrchestrator(pool);
 
   // GET /api/agents/templates — list available templates
   server.get('/agents/templates', async (_req, reply) => {
     reply.send(Object.entries(TEMPLATES).map(([id, t]) => ({
       id,
       name: id.replace(/-/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase()),
+      description: t.description,
       agents: t.agents,
       skillCount: t.defaultSkills.length,
       defaultSkills: t.defaultSkills,
@@ -70,18 +89,25 @@ export async function agentsRoutes(server: FastifyInstance) {
   });
 
   // POST /api/agents/deploy
-  // Body: { templateId: string, name: string, riskLevel: 'conservative'|'balanced'|'aggressive' }
+  // Body: { templateId, name?, riskLevel, wallet?, customBio?, customSystemPrompt? }
   server.post('/agents/deploy', { preHandler: requireAuth }, async (req, reply) => {
     const { address } = req.user as { address: string };
-    const { templateId, name, riskLevel } = req.body as {
+    const body = req.body as {
       templateId: string;
-      name: string;
+      name?: string;
       riskLevel: 'conservative' | 'balanced' | 'aggressive';
+      wallet?: {
+        chain: 'solana' | 'evm' | 'both';
+        address: string;
+        privateKey?: string;
+        permissions: ('read' | 'trade' | 'lp')[];
+      };
+      customBio?: string;
+      customSystemPrompt?: string;
     };
 
-    const template = TEMPLATES[templateId];
-    if (!template) return reply.status(400).send({ error: 'Unknown template' });
-    if (!RISK_CONFIGS[riskLevel]) return reply.status(400).send({ error: 'Invalid risk level' });
+    if (!TEMPLATES[body.templateId]) return reply.status(400).send({ error: 'Unknown template' });
+    if (!RISK_CONFIGS[body.riskLevel]) return reply.status(400).send({ error: 'Invalid risk level' });
 
     // Check user doesn't already have an active agent
     const existing = await server.pg.query(
@@ -92,58 +118,67 @@ export async function agentsRoutes(server: FastifyInstance) {
       return reply.status(409).send({ error: 'Agent already deployed. Pause it before deploying a new one.' });
     }
 
-    const agentId = uuidv4();
-    const agentNumber = Math.floor(1000 + Math.random() * 9000);
+    try {
+      // Deploy via orchestrator — builds character, registers in swarm, creates records
+      const instance = await orchestrator.deploy({
+        walletAddress: address,
+        templateId: body.templateId,
+        displayName: body.name || '',
+        riskLevel: body.riskLevel,
+        wallet: body.wallet,
+        customBio: body.customBio,
+        customSystemPrompt: body.customSystemPrompt,
+      });
 
-    // Create user_agents record
-    await server.pg.query(
-      `INSERT INTO user_agents (id, agent_id, wallet_address, template_id, display_name,
-                                risk_level, status, active, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, 'running', true, NOW())`,
-      [uuidv4(), agentId, address, templateId,
-       name || `Nova CFO #${agentNumber}`, riskLevel]
-    );
+      // Also assign default skills (retained from original flow)
+      const template = TEMPLATES[body.templateId];
+      const primaryRole = template.agents[0];
+      for (const skillName of template.defaultSkills) {
+        const skill = await server.pg.query(
+          `SELECT skill_id FROM agent_skills WHERE skill_id = $1 OR name = $1`,
+          [skillName]
+        );
+        if (skill.rows.length) {
+          await server.pg.query(
+            `INSERT INTO agent_skill_assignments (agent_role, skill_id, priority, assigned_at)
+             VALUES ($1, $2, 50, NOW())
+             ON CONFLICT (agent_role, skill_id) DO NOTHING`,
+            [primaryRole, skill.rows[0].skill_id]
+          );
+        }
+      }
 
-    // Assign default skills via agent_skill_assignments (uses agent_role, skill_id)
-    const primaryRole = template.agents[0]; // e.g. 'nova-cfo'
-    for (const skillName of template.defaultSkills) {
-      // Check skill exists in registry
-      const skill = await server.pg.query(
-        `SELECT skill_id FROM agent_skills WHERE skill_id = $1 OR name = $1`,
-        [skillName]
-      );
-      if (skill.rows.length) {
+      // Write risk configs
+      for (const [key, val] of Object.entries(RISK_CONFIGS[body.riskLevel])) {
         await server.pg.query(
-          `INSERT INTO agent_skill_assignments (agent_role, skill_id, priority, assigned_at)
-           VALUES ($1, $2, 50, NOW())
-           ON CONFLICT (agent_role, skill_id) DO NOTHING`,
-          [primaryRole, skill.rows[0].skill_id]
+          `INSERT INTO kv_store (key, data, updated_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = NOW()`,
+          [`agent:${instance.agentId}:config:${key}`, JSON.stringify(val)]
         );
       }
-    }
 
-    // Write initial kv_store config based on risk level
-    // kv_store uses key TEXT PRIMARY KEY, data JSONB
-    for (const [key, val] of Object.entries(RISK_CONFIGS[riskLevel])) {
-      await server.pg.query(
-        `INSERT INTO kv_store (key, data, updated_at)
-         VALUES ($1, $2, NOW())
-         ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = NOW()`,
-        [`config:${key}`, JSON.stringify(val)]
-      );
+      reply.send({
+        agentId: instance.agentId,
+        displayName: instance.displayName,
+        templateId: instance.templateId,
+        riskLevel: instance.riskLevel,
+        status: instance.status,
+        hasCharacter: true,
+        hasWallet: !!instance.wallet,
+        capabilities: instance.character.settings.capabilities,
+      });
+    } catch (err: any) {
+      server.log.error({ err }, 'Agent deploy failed');
+      reply.status(500).send({ error: 'Deploy failed: ' + (err.message || 'unknown') });
     }
-
-    reply.send({ agentId, agentNumber, status: 'running' });
   });
 
   // PATCH/POST /api/agents/pause — pause active agent
   const pauseHandler = async (req: any, reply: any) => {
     const { address } = req.user as { address: string };
-    await server.pg.query(
-      `UPDATE user_agents SET status = 'paused' WHERE wallet_address = $1 AND active = true`,
-      [address]
-    );
-    reply.send({ ok: true });
+    const ok = await orchestrator.pause(address);
+    reply.send({ ok });
   };
   server.patch('/agents/pause', { preHandler: requireAuth }, pauseHandler);
   server.post('/agents/pause', { preHandler: requireAuth }, pauseHandler);
@@ -151,16 +186,60 @@ export async function agentsRoutes(server: FastifyInstance) {
   // PATCH/POST /api/agents/resume
   const resumeHandler = async (req: any, reply: any) => {
     const { address } = req.user as { address: string };
-    await server.pg.query(
-      `UPDATE user_agents SET status = 'running' WHERE wallet_address = $1 AND active = true`,
-      [address]
-    );
-    reply.send({ ok: true });
+    const ok = await orchestrator.resume(address);
+    reply.send({ ok });
   };
   server.patch('/agents/resume', { preHandler: requireAuth }, resumeHandler);
   server.post('/agents/resume', { preHandler: requireAuth }, resumeHandler);
 
-  // GET /api/agents/me — current agent info
+  // POST /api/agents/wallet — attach or update wallet on agent
+  // Body: { chain: 'solana'|'evm'|'both', address: string, privateKey?: string, permissions: string[] }
+  server.post('/agents/wallet', { preHandler: requireAuth }, async (req, reply) => {
+    const { address } = req.user as { address: string };
+    const wallet = req.body as {
+      chain: 'solana' | 'evm' | 'both';
+      address: string;
+      privateKey?: string;
+      permissions: ('read' | 'trade' | 'lp')[];
+    };
+
+    if (!wallet.address || !wallet.chain) {
+      return reply.status(400).send({ error: 'chain and address are required' });
+    }
+    if (!wallet.permissions?.length) {
+      wallet.permissions = ['read']; // default to read-only
+    }
+
+    const ok = await orchestrator.attachWallet(address, wallet);
+    if (!ok) return reply.status(404).send({ error: 'No active agent found' });
+    reply.send({ ok: true });
+  });
+
+  // GET /api/agents/wallet — get agent's wallet config (no private keys)
+  server.get('/agents/wallet', { preHandler: requireAuth }, async (req, reply) => {
+    const { address } = req.user as { address: string };
+    const agentRow = await server.pg.query(
+      `SELECT agent_id FROM user_agents WHERE wallet_address = $1 AND active = true`,
+      [address]
+    );
+    if (!agentRow.rows.length) return reply.send(null);
+    const wallet = await orchestrator.getWallet(agentRow.rows[0].agent_id);
+    reply.send(wallet);
+  });
+
+  // GET /api/agents/character — get agent's ElizaOS character config
+  server.get('/agents/character', { preHandler: requireAuth }, async (req, reply) => {
+    const { address } = req.user as { address: string };
+    const agentRow = await server.pg.query(
+      `SELECT agent_id FROM user_agents WHERE wallet_address = $1 AND active = true`,
+      [address]
+    );
+    if (!agentRow.rows.length) return reply.send(null);
+    const character = await orchestrator.getCharacter(agentRow.rows[0].agent_id);
+    reply.send(character);
+  });
+
+  // GET /api/agents/me — current agent info + wallet + character summary
   server.get('/agents/me', { preHandler: requireAuth }, async (req, reply) => {
     const { address } = req.user as { address: string };
     const row = await server.pg.query(
@@ -182,12 +261,30 @@ export async function agentsRoutes(server: FastifyInstance) {
        WHERE ua.wallet_address = $1 AND ua.active = true`,
       [address]
     );
-    reply.send(row.rows[0] ?? null);
+    if (!row.rows.length) return reply.send(null);
+
+    const agent = row.rows[0];
+    // Attach wallet info (without keys)
+    const wallet = await orchestrator.getWallet(agent.agent_id);
+    // Attach character summary
+    const character = await orchestrator.getCharacter(agent.agent_id);
+
+    reply.send({
+      ...agent,
+      wallet: wallet ?? null,
+      character: character ? {
+        name: character.name,
+        bio: character.bio,
+        capabilities: character.settings?.capabilities ?? [],
+        model: character.settings?.model ?? null,
+        riskLevel: character.settings?.riskLevel ?? null,
+      } : null,
+    });
   });
 
   // PATCH /api/agents/config — update a config value on the user's agent
   // Body: { key: string, value: string }
-  server.patch('/agents/config', { preHandler: requireAuth }, async (req, reply) => {
+  const configHandler = async (req: any, reply: any) => {
     const { address } = req.user as { address: string };
     const { key, value } = req.body as { key: string; value: string };
 
@@ -201,14 +298,16 @@ export async function agentsRoutes(server: FastifyInstance) {
       return reply.status(403).send({ error: 'Key not editable from dashboard' });
     }
 
-    // kv_store: key TEXT PK, data JSONB
+    const agentId = agentRow.rows[0].agent_id;
     await server.pg.query(
       `INSERT INTO kv_store (key, data, updated_at)
        VALUES ($1, $2, NOW())
        ON CONFLICT (key) DO UPDATE SET data = $2, updated_at = NOW()`,
-      [`config:${key}`, JSON.stringify(value)]
+      [`agent:${agentId}:config:${key}`, JSON.stringify(value)]
     );
 
     reply.send({ ok: true });
-  });
+  };
+  server.patch('/agents/config', { preHandler: requireAuth }, configHandler);
+  server.post('/agents/config', { preHandler: requireAuth }, configHandler);
 }
