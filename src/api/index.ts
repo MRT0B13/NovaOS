@@ -21,7 +21,7 @@ import { healthRoutes } from './routes/health.js';
 import { launchesRoutes } from './routes/launches.js';
 import { transactionsRoutes } from './routes/transactions.js';
 import { burnRoutes } from './routes/burn.js';
-import { universeRoutes } from './routes/universe_route.js';
+import { universeRoutes } from './routes/universe.js';
 import { registerLiveStream } from './ws/liveStream.js';
 
 async function main() {
@@ -39,8 +39,21 @@ async function main() {
   });
 
   // ── Plugins ───────────────────────────────────────────
+  const allowedOrigins = [
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'https://grumpy-nova-agent-flow.base44.app',
+    ...(process.env.FRONTEND_URL ? process.env.FRONTEND_URL.split(',').map((s: string) => s.trim()) : []),
+    ...(process.env.UNIVERSE_URL  ? process.env.UNIVERSE_URL.split(',').map((s: string) => s.trim())  : []),
+  ].filter(Boolean);
+
   await server.register(cors, {
-    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    origin: (origin: string | undefined, cb: Function) => {
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.some((o: string) => origin.startsWith(o))) return cb(null, true);
+      cb(new Error(`CORS: origin ${origin} not allowed`), false);
+    },
     credentials: true,
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   });
@@ -77,7 +90,7 @@ async function main() {
   server.register(launchesRoutes,   { prefix: '/api' });
   server.register(transactionsRoutes, { prefix: '/api' });
   server.register(burnRoutes,         { prefix: '/api' });
-  server.register(universeRoutes,      { prefix: '/api' });
+  server.register(universeRoutes,     { prefix: '/api' });
 
   // ── WebSocket ─────────────────────────────────────────
   registerLiveStream(server);
