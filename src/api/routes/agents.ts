@@ -455,5 +455,6 @@ export async function agentsRoutes(server: FastifyInstance) {
   };
   server.post('/agents/destroy', { preHandler: requireAuth }, destroyHandler);
   server.post('/agents/teardown', { preHandler: requireAuth }, destroyHandler);
+  server.delete('/agents', { preHandler: requireAuth }, destroyHandler);
   server.delete('/agents/:agentId', { preHandler: requireAuth }, destroyHandler);
 }
