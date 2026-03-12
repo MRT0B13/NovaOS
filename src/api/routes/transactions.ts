@@ -45,12 +45,15 @@ export async function transactionsRoutes(server: FastifyInstance) {
         [agentId]
       );
       if (walletRow.rows.length) {
-        conditions.push(`wallet_address = $${paramIdx++}`);
+        conditions.push(`(wallet_address = $${paramIdx++} OR wallet_address = '' OR wallet_address IS NULL)`);
         params.push(walletRow.rows[0].wallet_address);
+      } else {
+        // Agent exists but no wallet — show all unscoped transactions
+        conditions.push(`(wallet_address = '' OR wallet_address IS NULL)`);
       }
     } else {
       // No agent — fallback: match transactions by wallet_address directly
-      conditions.push(`(wallet_address = $${paramIdx++} OR wallet_address IS NULL)`);
+      conditions.push(`(wallet_address = $${paramIdx++} OR wallet_address IS NULL OR wallet_address = '')`);
       params.push(address);
     }
 
@@ -94,8 +97,10 @@ export async function transactionsRoutes(server: FastifyInstance) {
         [agentId]
       );
       if (walletRow.rows.length) {
-        walletCondition = 'AND wallet_address = $1';
+        walletCondition = 'AND (wallet_address = $1 OR wallet_address = \'\' OR wallet_address IS NULL)';
         params.push(walletRow.rows[0].wallet_address);
+      } else {
+        walletCondition = 'AND (wallet_address = \'\' OR wallet_address IS NULL)';
       }
     }
 

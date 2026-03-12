@@ -122,6 +122,8 @@ export class CFOAgent extends BaseAgent {
   private lastOpportunityScanAt = 0;
   private cycleCount = 0;
   private startedAt = Date.now();
+  private _solWallet = '';
+  private _evmWallet = '';
 
   /** Pending sell orders that were placed but not yet filled (LIVE on the book) */
   private pendingSellOrders = new Map<string, {
@@ -136,8 +138,37 @@ export class CFOAgent extends BaseAgent {
     super({ agentId: 'nova-cfo', agentType: 'cfo' as any, pool });
   }
 
+  /** Resolve wallet address for a given chain — used to tag cfo_transactions */
+  private walletForChain(chain?: string): string {
+    const c = (chain ?? '').toLowerCase();
+    if (['polygon', 'arbitrum', 'ethereum', 'base', 'optimism', 'avalanche', 'evm'].includes(c)) {
+      return this._evmWallet;
+    }
+    // solana, hyperliquid (uses EVM key but tag with EVM addr), default to SOL
+    if (c === 'hyperliquid') return this._evmWallet;
+    return this._solWallet;
+  }
+
   protected async onStart(): Promise<void> {
     const env = getCFOEnv();
+
+    // Derive wallet addresses for transaction tagging
+    try {
+      const secret = (await import('../launchkit/env.ts' as string)).getEnv().AGENT_FUNDING_WALLET_SECRET;
+      if (secret) {
+        const bs58 = await import('bs58' as string);
+        const { Keypair } = await import('@solana/web3.js' as string);
+        this._solWallet = Keypair.fromSecretKey(bs58.default.decode(secret)).publicKey.toBase58();
+      }
+    } catch { /* non-fatal */ }
+    try {
+      if (env.evmPrivateKey) {
+        const ethers = await import('ethers' as string);
+        this._evmWallet = ethers.computeAddress(env.evmPrivateKey);
+      }
+    } catch { /* non-fatal */ }
+    if (this._solWallet) logger.info(`[CFO] SOL wallet: ${this._solWallet.slice(0, 8)}...`);
+    if (this._evmWallet) logger.info(`[CFO] EVM wallet: ${this._evmWallet.slice(0, 10)}...`);
 
     if (!env.cfoEnabled) {
       logger.info('[CFO] CFO_ENABLE=false — idle');
@@ -152,8 +183,30 @@ export class CFOAgent extends BaseAgent {
     if (dbUrl) {
       try {
         this.repo = await PostgresCFORepository.create(dbUrl);
+        // Pass resolved wallet addresses to repo for auto-tagging transactions
+        this.repo.defaultSolWallet = this._solWallet;
+        this.repo.defaultEvmWallet = this._evmWallet;
         this.positionManager = new PositionManager(this.repo);
         logger.info('[CFO] Database ready');
+
+        // One-time migration: backfill wallet_address on existing transactions that have ''
+        if (this._solWallet || this._evmWallet) {
+          const evmChains = ['polygon', 'arbitrum', 'ethereum', 'base', 'optimism', 'avalanche', 'evm', 'hyperliquid'];
+          if (this._evmWallet) {
+            const evmPlaceholders = evmChains.map((_, i) => `$${i + 2}`).join(',');
+            await this.repo['pool'].query(
+              `UPDATE cfo_transactions SET wallet_address = $1 WHERE wallet_address = '' AND LOWER(chain) IN (${evmPlaceholders})`,
+              [this._evmWallet, ...evmChains]
+            ).then(r => { if (r.rowCount) logger.info(`[CFO] Backfilled wallet on ${r.rowCount} EVM transactions`); }).catch(() => {});
+          }
+          if (this._solWallet) {
+            const evmPlaceholders = evmChains.map((_, i) => `$${i + 2}`).join(',');
+            await this.repo['pool'].query(
+              `UPDATE cfo_transactions SET wallet_address = $1 WHERE wallet_address = '' AND LOWER(chain) NOT IN (${evmPlaceholders})`,
+              [this._solWallet, ...evmChains]
+            ).then(r => { if (r.rowCount) logger.info(`[CFO] Backfilled wallet on ${r.rowCount} SOL transactions`); }).catch(() => {});
+          }
+        }
 
         // Reconcile CFO exposure with Guardian based on currently open positions
         // This ensures correct state after restarts (positions opened before this feature)

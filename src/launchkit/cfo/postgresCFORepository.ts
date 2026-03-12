@@ -490,10 +490,26 @@ export class PostgresCFORepository {
     return estimates[chain.toLowerCase()] ?? 0.05;
   }
 
+  /** Configurable default wallet addresses — set by CFOAgent on startup */
+  public defaultSolWallet = '';
+  public defaultEvmWallet = '';
+
+  /** Resolve wallet address: if caller passed empty string, derive from chain */
+  private resolveWallet(walletAddress: string, chain: string): string {
+    if (walletAddress) return walletAddress;
+    const c = chain.toLowerCase();
+    if (['polygon', 'arbitrum', 'ethereum', 'base', 'optimism', 'avalanche', 'evm', 'hyperliquid'].includes(c)) {
+      return this.defaultEvmWallet;
+    }
+    return this.defaultSolWallet;
+  }
+
   async insertTransaction(tx: CFOTransaction): Promise<void> {
     // Auto-estimate gas fee when callers pass 0 — provides learning engine
     // with rough fee drag data instead of a blind spot.
     const feeUsd = tx.feeUsd > 0 ? tx.feeUsd : PostgresCFORepository.estimateGasUsd(tx.chain);
+    // Auto-resolve wallet address when callers pass '' (legacy behavior)
+    const walletAddress = this.resolveWallet(tx.walletAddress, tx.chain);
     try {
       await this.pool.query(
         `INSERT INTO cfo_transactions (
@@ -505,7 +521,7 @@ export class PostgresCFORepository {
         [
           tx.id, tx.timestamp, tx.chain, tx.strategyTag, tx.txType,
           tx.tokenIn ?? null, tx.amountIn ?? null, tx.tokenOut ?? null, tx.amountOut ?? null,
-          feeUsd, tx.txHash ?? null, tx.walletAddress,
+          feeUsd, tx.txHash ?? null, walletAddress,
           tx.positionId ?? null, tx.status, tx.errorMessage ?? null,
           JSON.stringify(tx.metadata),
         ],
