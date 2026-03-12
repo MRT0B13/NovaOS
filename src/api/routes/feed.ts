@@ -89,47 +89,68 @@ function buildDetailFromPayload(payload: any, type: string): string {
 
 export async function feedRoutes(server: FastifyInstance) {
 
-  // GET /api/feed?limit=20
+  // GET /api/feed?limit=20&from_agent=nova-scout&message_type=intel
   server.get('/feed', { preHandler: requireAuth }, async (req, reply) => {
     const { address } = req.user as { address: string };
-    const limit = Math.min(Number((req.query as any).limit ?? 20), 100);
+    const query = req.query as { limit?: string; from_agent?: string; message_type?: string };
+    const limit = Math.min(Number(query.limit ?? 20), 200);
+
+    // Optional filters
+    const fromAgent = query.from_agent || null;
+    const messageType = query.message_type || null;
 
     const agentRow = await server.pg.query(
       `SELECT agent_id FROM user_agents WHERE wallet_address = $1 AND active = true`,
       [address]
     );
 
-    let rows;
-    if (agentRow.rows.length) {
-      const agentId = agentRow.rows[0].agent_id;
-      // Scoped to user's agent
-      rows = await server.pg.query(
-        `SELECT id, from_agent, to_agent, message_type, summary, detail, payload, created_at
-         FROM agent_messages
-         WHERE agent_id = $1
-         ORDER BY created_at DESC
-         LIMIT $2`,
-        [agentId, limit]
-      );
+    // Build dynamic WHERE clause
+    const conditions: string[] = [];
+    const params: any[] = [];
+    let paramIdx = 1;
 
-      // New agent with no messages yet — fall back to global feed
-      if (!rows.rows.length) {
-        rows = await server.pg.query(
-          `SELECT id, from_agent, to_agent, message_type, summary, detail, payload, created_at
-           FROM agent_messages
-           ORDER BY created_at DESC
-           LIMIT $1`,
-          [limit]
-        );
-      }
-    } else {
-      // No agent assigned — show all recent messages (shared view)
+    if (agentRow.rows.length) {
+      conditions.push(`agent_id = $${paramIdx++}`);
+      params.push(agentRow.rows[0].agent_id);
+    }
+    if (fromAgent) {
+      conditions.push(`from_agent = $${paramIdx++}`);
+      params.push(fromAgent);
+    }
+    if (messageType) {
+      conditions.push(`message_type = $${paramIdx++}`);
+      params.push(messageType);
+    }
+
+    const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+    params.push(limit);
+
+    let rows = await server.pg.query(
+      `SELECT id, from_agent, to_agent, message_type, summary, detail, payload, created_at
+       FROM agent_messages
+       ${where}
+       ORDER BY created_at DESC
+       LIMIT $${paramIdx}`,
+      params
+    );
+
+    // New agent with no messages yet — fall back to global feed (only if agent-scoped and no other filters)
+    if (!rows.rows.length && agentRow.rows.length && !fromAgent && !messageType) {
+      const fallbackParams: any[] = [];
+      let fbIdx = 1;
+      const fbConditions: string[] = [];
+      if (fromAgent) { fbConditions.push(`from_agent = $${fbIdx++}`); fallbackParams.push(fromAgent); }
+      if (messageType) { fbConditions.push(`message_type = $${fbIdx++}`); fallbackParams.push(messageType); }
+      const fbWhere = fbConditions.length ? 'WHERE ' + fbConditions.join(' AND ') : '';
+      fallbackParams.push(limit);
+
       rows = await server.pg.query(
         `SELECT id, from_agent, to_agent, message_type, summary, detail, payload, created_at
          FROM agent_messages
+         ${fbWhere}
          ORDER BY created_at DESC
-         LIMIT $1`,
-        [limit]
+         LIMIT $${fbIdx}`,
+        fallbackParams
       );
     }
 
