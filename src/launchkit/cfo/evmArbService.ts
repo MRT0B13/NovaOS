@@ -1396,11 +1396,28 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
   try {
     const { wallet, ethers, provider } = await loadChain(chain.chainId);
 
-    // Check ETH balance for deployment gas
+    // Check native token balance for deployment gas (need ~0.01 for safe margin)
     const balance = await provider.getBalance(wallet.address);
     const balanceEth = Number(balance) / 1e18;
-    if (balanceEth < 0.001) {
-      logger.warn(`[ArbMonitor] ${chain.name}: insufficient ETH for deploy (${balanceEth.toFixed(6)} ETH)`);
+    logger.info(`[ArbMonitor] ${chain.name} wallet balance: ${balanceEth.toFixed(6)} native`);
+    if (balanceEth < 0.01) {
+      logger.warn(`[ArbMonitor] ${chain.name}: insufficient gas for deploy (${balanceEth.toFixed(6)} native, need ≥0.01). Fund wallet ${wallet.address}`);
+      return null;
+    }
+
+    // Pre-flight: verify Aave PoolAddressesProvider is reachable and getPool() works
+    const providerABI = ['function getPool() external view returns (address)'];
+    const aaveProviderContract = new ethers.Contract(aaveProvider, providerABI, provider);
+    let resolvedPoolAddr: string;
+    try {
+      resolvedPoolAddr = await aaveProviderContract.getPool();
+      logger.info(`[ArbMonitor] ${chain.name} Aave pre-flight OK — Pool: ${resolvedPoolAddr}`);
+    } catch (preErr: any) {
+      logger.error(`[ArbMonitor] ${chain.name} Aave pre-flight FAILED — getPool() reverted on ${aaveProvider}. Wrong PoolAddressesProvider address?`, preErr?.message || preErr);
+      return null;
+    }
+    if (!resolvedPoolAddr || resolvedPoolAddr === ethers.ZeroAddress) {
+      logger.warn(`[ArbMonitor] ${chain.name} Aave getPool() returned zero address — pool not initialized on this chain`);
       return null;
     }
 
@@ -1416,8 +1433,21 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
 
     logger.info(`[ArbMonitor] 🚀 Auto-deploying ArbFlashReceiver to ${chain.name} (chainId=${chain.chainId})...`);
 
+    // Estimate gas first to catch revert before sending tx
     const factory = new ethers.ContractFactory(abi, bytecode, wallet);
-    const contract = await factory.deploy(aaveProvider, { gasLimit: 2_500_000 });
+    let gasEstimate: bigint;
+    try {
+      gasEstimate = await provider.estimateGas({
+        from: wallet.address,
+        data: factory.getDeployTransaction(aaveProvider).data,
+      });
+      logger.info(`[ArbMonitor] ${chain.name} deploy gas estimate: ${gasEstimate.toString()}`);
+    } catch (estErr: any) {
+      logger.error(`[ArbMonitor] ${chain.name} deploy gas estimation FAILED (constructor would revert):`, estErr?.message || estErr);
+      return null;
+    }
+
+    const contract = await factory.deploy(aaveProvider, { gasLimit: gasEstimate * 130n / 100n });
     const txHash = contract.deploymentTransaction()?.hash;
     logger.info(`[ArbMonitor] ${chain.name} deploy tx: ${txHash}`);
 
@@ -1452,8 +1482,15 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
 
     return address;
 
-  } catch (err) {
-    logger.error(`[ArbMonitor] Auto-deploy to ${chain.name} failed:`, err);
+  } catch (err: any) {
+    const code = err?.code || 'UNKNOWN';
+    const reason = err?.reason || err?.shortMessage || 'no reason';
+    logger.error(`[ArbMonitor] Auto-deploy to ${chain.name} failed [${code}]: ${reason}`);
+    if (code === 'INSUFFICIENT_FUNDS') {
+      logger.warn(`[ArbMonitor] ↳ Fund wallet on ${chain.name} (chainId=${chain.chainId}) with native gas token`);
+    } else if (code === 'CALL_EXCEPTION') {
+      logger.warn(`[ArbMonitor] ↳ Constructor reverted — verify Aave PoolAddressesProvider address for ${chain.name}: ${aaveProvider}`);
+    }
     return null;
   }
 }
