@@ -640,9 +640,14 @@ async function krystalFetch(
   } catch (err) {
     if (!opts.skipBreaker) {
       _krystalCbFails++;
-      if (_krystalCbFails >= KRYSTAL_CB_THRESHOLD && _krystalCbOpenAt === 0) {
-        _krystalCbOpenAt = Date.now();
+      // Reset the cooldown timer on EVERY failure (including half-open probes).
+      // Previously _krystalCbOpenAt was only set on the initial trip, so after
+      // the cooldown expired, every call became a probe with no delay between them.
+      _krystalCbOpenAt = Date.now();
+      if (_krystalCbFails === KRYSTAL_CB_THRESHOLD) {
         logger.warn(`[Krystal] Circuit breaker OPEN after ${_krystalCbFails} consecutive failures — cooling down ${KRYSTAL_CB_COOLDOWN_MS / 1000}s`);
+      } else if (_krystalCbFails > KRYSTAL_CB_THRESHOLD) {
+        logger.warn(`[Krystal] Circuit breaker probe failed (${_krystalCbFails} total failures) — re-cooling ${KRYSTAL_CB_COOLDOWN_MS / 1000}s`);
       }
     }
     throw err;
