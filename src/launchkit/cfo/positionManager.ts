@@ -293,9 +293,17 @@ export class PositionManager {
    * Returns actions for positions approaching liquidation.
    */
   async updateHyperliquidPrices(livePositions: HLPosition[]): Promise<PositionAction[]> {
-    const openHedge = await this.repo.getOpenPositions('hyperliquid');
-    const openPerp = await this.repo.getOpenPositions('hl_perp');
-    const openPositions = [...openHedge, ...openPerp];
+    // Fetch ALL HL strategy subtypes — positions are stored under various tags
+    // (hl_perp_day, hl_perp_swing, hl_spot_swing, etc.) but they all live on
+    // the same exchange and need price updates from the same getAccountSummary().
+    const hlStrategies: PositionStrategy[] = [
+      'hyperliquid', 'hl_perp', 'hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing',
+      'hl_spot', 'hl_spot_swing', 'hl_spot_accumulation',
+    ];
+    const allPositionArrays = await Promise.all(
+      hlStrategies.map(s => this.repo.getOpenPositions(s)),
+    );
+    const openPositions = allPositionArrays.flat();
     const actions: PositionAction[] = [];
 
     for (const dbPos of openPositions) {

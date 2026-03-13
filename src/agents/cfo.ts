@@ -989,8 +989,8 @@ export class CFOAgent extends BaseAgent {
               description: `Orca LP [${orcaRiskTier}]: ${pair}`,
               chain: 'solana',
               status: 'OPEN',
-              entryPrice: 1,
-              currentPrice: 1,
+              entryPrice: deployUsd,     // Use actual deployed USD as entry (LP has no single "price")
+              currentPrice: deployUsd,   // Will be updated by monitorPositions every 10m
               sizeUnits: deployUsd,
               costBasisUsd: deployUsd,
               currentValueUsd: deployUsd,
@@ -1291,8 +1291,8 @@ export class CFOAgent extends BaseAgent {
               description: `Krystal LP: ${p.pair} on ${p.chainName}`,
               chain: krystalChain,
               status: 'OPEN',
-              entryPrice: 1,
-              currentPrice: 1,
+              entryPrice: actualUsd,     // Use actual deployed USD as entry (LP has no single "price")
+              currentPrice: actualUsd,   // Will be updated by monitorPositions every 10m
               sizeUnits: actualUsd,
               costBasisUsd: actualUsd,
               currentValueUsd: actualUsd,
@@ -1543,7 +1543,9 @@ export class CFOAgent extends BaseAgent {
             ? livePositions.find((p: any) => p.positionMint === mint || p.nftMint === mint)
             : null;
           if (live && live.liquidityUsd > 0) {
-            await this.repo?.updatePositionPrice(dbPos.id, live.currentPrice ?? dbPos.currentPrice, live.liquidityUsd);
+            // Use liquidityUsd as the price indicator for LP positions (same as Krystal).
+            // live.currentPrice is often undefined for LPs — use the USD value instead.
+            await this.repo?.updatePositionPrice(dbPos.id, live.currentPrice ?? live.liquidityUsd, live.liquidityUsd);
           }
         }
       } catch (err) { logger.debug('[CFO] Orca LP price refresh error:', err); }
@@ -1564,7 +1566,14 @@ export class CFOAgent extends BaseAgent {
             ? livePositions.find((p: any) => String(p.tokenId) === String(tokenId) || String(p.nftTokenId) === String(tokenId))
             : null;
           if (live && live.valueUsd > 0) {
-            await this.repo?.updatePositionPrice(dbPos.id, dbPos.currentPrice, live.valueUsd);
+            // Use live.valueUsd as the "price" indicator (LP positions don't have
+            // a single price — valueUsd IS the meaningful metric the dashboard shows).
+            // Previously this passed dbPos.currentPrice which was stuck at 1 forever.
+            await this.repo?.updatePositionPrice(dbPos.id, live.valueUsd, live.valueUsd);
+          } else if (!live) {
+            // Position not found on-chain — may have been closed externally or burned.
+            // Don't zero it out, just log for now.
+            logger.debug(`[CFO] Krystal LP position ${tokenId} not found in live data — skipping price update`);
           }
         }
       } catch (err) { logger.debug('[CFO] Krystal LP price refresh error:', err); }
