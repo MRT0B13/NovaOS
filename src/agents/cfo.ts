@@ -2176,6 +2176,10 @@ export class CFOAgent extends BaseAgent {
 
   // ── Hyperliquid monitor ───────────────────────────────────────────
 
+  private lastLiqAlertAt = 0;
+  private lastLiqAlertCoins = '';
+  private static LIQ_ALERT_COOLDOWN_MS = 15 * 60_000; // 15 minutes between identical alerts
+
   private async monitorHyperliquid(): Promise<void> {
     if (!this.running || this.paused) return;
     if (!getCFOEnv().hyperliquidEnabled) return;
@@ -2183,9 +2187,22 @@ export class CFOAgent extends BaseAgent {
     try {
       const risk = await (await hl()).checkRisk();
       if (risk.atRisk.length > 0) {
-        await this.reportToSupervisor('alert', 'high', { event: 'cfo_hl_liquidation_risk', warning: risk.warning });
-        const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
-        await notifyAdminForce(`⚠️ CFO HYPERLIQUID: ${risk.warning}`);
+        const now = Date.now();
+        const coins = risk.atRisk.map((p: any) => p.coin).sort().join(',');
+        // Only re-alert if coins changed or cooldown expired
+        const coinsChanged = coins !== this.lastLiqAlertCoins;
+        if (now - this.lastLiqAlertAt < CFOAgent.LIQ_ALERT_COOLDOWN_MS && !coinsChanged) {
+          // Suppress duplicate alert
+        } else {
+          this.lastLiqAlertAt = now;
+          this.lastLiqAlertCoins = coins;
+          await this.reportToSupervisor('alert', 'high', { event: 'cfo_hl_liquidation_risk', warning: risk.warning });
+          const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
+          await notifyAdminForce(`⚠️ CFO HYPERLIQUID: ${risk.warning}`);
+        }
+      } else {
+        // Reset when no longer at risk
+        this.lastLiqAlertCoins = '';
       }
     } catch { /* non-fatal if HL not funded */ }
 

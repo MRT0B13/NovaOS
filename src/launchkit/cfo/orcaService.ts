@@ -783,9 +783,22 @@ export async function rebalancePosition(
     return { success: true, newPositionMint: `dry-rebalance-${Date.now()}` };
   }
 
-  logger.info(`[Orca] Rebalancing position ${positionMint.slice(0, 8)}… closing then reopening ±${width / 2}%`);
+  logger.info(`[Orca] Rebalancing position ${positionMint.slice(0, 8)}… claiming fees → closing → reopening ±${width / 2}%`);
 
-  // Step 1: Close existing position — get back SOL + USDC
+  // Step 0: Claim accrued fees BEFORE closing — ensures fees are in wallet
+  try {
+    const feeResult = await claimFees(positionMint);
+    if (feeResult.success) {
+      const feeValue = (feeResult.solClaimed ?? 0) + (feeResult.usdcClaimed ?? 0);
+      if (feeValue > 0) {
+        logger.info(`[Orca] Rebalance: claimed ${feeResult.solClaimed?.toFixed(6)} SOL + ${feeResult.usdcClaimed?.toFixed(4)} USDC in fees`);
+      }
+    }
+  } catch (feeErr) {
+    logger.warn(`[Orca] Rebalance: fee claim failed (${(feeErr as Error).message}) — proceeding with close`);
+  }
+
+  // Step 1: Close existing position — get back SOL + USDC (fees already claimed)
   const closeResult = await closePosition(positionMint);
   if (!closeResult.success) {
     return { success: false, error: `Close failed: ${closeResult.error}` };
@@ -831,42 +844,44 @@ export async function rebalancePosition(
 
   // Step 2: Pre-swap to rebalance proceeds — openPosition needs BOTH sides.
   // If the old position was fully out-of-range it closes with only one token.
-  // We swap ~half back here so openPosition only deposits what came FROM this
-  // position and never inadvertently draws extra SOL/USDC from the wallet.
+  // Target a ~50/50 split by USD value for balanced LP deposit.
   let finalUsdc = usdcReceived;
   let finalSol  = solReceived;
-  // Use value-based thresholds — absolute amounts like "< 0.001 SOL" miss the case
-  // where position came back 98% USDC (e.g. 0.010 SOL + 54 USDC after price moved above range).
   const solValueUsd  = finalSol  * solPriceUsd;
-  const usdcValueUsd = finalUsdc;                  // USDC is 1:1 USD
+  const usdcValueUsd = finalUsdc;
   const totalValueUsd = solValueUsd + usdcValueUsd;
-  // Imbalance threshold: if either side is below 10% of total value, rebalance before reopening
-  const IMBALANCE_THRESHOLD = 0.10;
+  // Imbalance threshold: if either side is below 15% of total value, rebalance
+  const IMBALANCE_THRESHOLD = 0.15;
   try {
     const jup = await import('./jupiterService.ts');
     if (solValueUsd < totalValueUsd * IMBALANCE_THRESHOLD && finalUsdc > 1) {
-      // Position closed mostly/all USDC (price went above range) — swap ~half to SOL
-      const swapAmt = finalUsdc * 0.49; // 49% → SOL, leave 51% as USDC for the other side
-      logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(4)} USDC → SOL (SOL only ${(solValueUsd / totalValueUsd * 100).toFixed(1)}% of value, need ≥${IMBALANCE_THRESHOLD * 100}%)`);
+      // Position closed mostly/all USDC — swap enough to get ~50/50 by value
+      // Target: swapAmt USDC → SOL so that remaining USDC ≈ new SOL value
+      // Solve: (finalUsdc - swapAmt) ≈ swapAmt (both ≈ totalValue/2)
+      const targetSwap = (finalUsdc - totalValueUsd / 2);
+      const swapAmt = Math.max(1, Math.min(targetSwap, finalUsdc * 0.48)); // cap at 48% safety margin
+      logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(4)} USDC → SOL (SOL only ${(solValueUsd / totalValueUsd * 100).toFixed(1)}% of value)`);
       const swapRes = await jup.swapUsdcToSol(swapAmt, 100);
       if (swapRes.success && (swapRes.outputAmount ?? 0) > 0) {
-        finalSol  += swapRes.outputAmount ?? 0; // ADD to existing SOL, don't replace
-        finalUsdc = finalUsdc - swapAmt;
-        logger.info(`[Orca] Rebalance pre-swap done: ${finalSol.toFixed(6)} SOL | ${finalUsdc.toFixed(4)} USDC`);
+        finalSol  += swapRes.outputAmount ?? 0;
+        finalUsdc -= swapAmt;
+        logger.info(`[Orca] Rebalance pre-swap done: ${finalSol.toFixed(6)} SOL ($${(finalSol * solPriceUsd).toFixed(2)}) | ${finalUsdc.toFixed(4)} USDC`);
       } else {
-        logger.warn(`[Orca] Rebalance pre-swap failed (${swapRes.error}) — proceeding with USDC-only open`);
+        logger.warn(`[Orca] Rebalance pre-swap failed (${swapRes.error}) — proceeding with USDC-heavy open`);
       }
     } else if (usdcValueUsd < totalValueUsd * IMBALANCE_THRESHOLD && finalSol > 0.002) {
-      // Position closed mostly/all SOL (price fell below range) — swap ~half to USDC
-      const swapAmt = finalSol * 0.49;
-      logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(6)} SOL → USDC (USDC only ${(usdcValueUsd / totalValueUsd * 100).toFixed(1)}% of value, need ≥${IMBALANCE_THRESHOLD * 100}%)`);
+      // Position closed mostly/all SOL — swap enough to get ~50/50 by value
+      const targetSwapUsd = (solValueUsd - totalValueUsd / 2);
+      const targetSwapSol = targetSwapUsd / solPriceUsd;
+      const swapAmt = Math.max(0.001, Math.min(targetSwapSol, finalSol * 0.48));
+      logger.info(`[Orca] Rebalance pre-swap: ${swapAmt.toFixed(6)} SOL → USDC (USDC only ${(usdcValueUsd / totalValueUsd * 100).toFixed(1)}% of value)`);
       const swapRes = await jup.swapSolToUsdc(swapAmt, 100);
       if (swapRes.success && (swapRes.outputAmount ?? 0) > 0) {
-        finalUsdc += swapRes.outputAmount ?? 0; // ADD to existing USDC, don't replace
-        finalSol  = finalSol - swapAmt;
-        logger.info(`[Orca] Rebalance pre-swap done: ${finalSol.toFixed(6)} SOL | ${finalUsdc.toFixed(4)} USDC`);
+        finalUsdc += swapRes.outputAmount ?? 0;
+        finalSol  -= swapAmt;
+        logger.info(`[Orca] Rebalance pre-swap done: ${finalSol.toFixed(6)} SOL ($${(finalSol * solPriceUsd).toFixed(2)}) | ${finalUsdc.toFixed(4)} USDC`);
       } else {
-        logger.warn(`[Orca] Rebalance pre-swap failed (${swapRes.error}) — proceeding with SOL-only open`);
+        logger.warn(`[Orca] Rebalance pre-swap failed (${swapRes.error}) — proceeding with SOL-heavy open`);
       }
     }
   } catch (swapErr) {

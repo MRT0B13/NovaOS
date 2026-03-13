@@ -119,38 +119,58 @@ export async function getQuote(
   inputAmount: number,
   slippageBps = 50, // 0.5%
 ): Promise<SwapQuote | null> {
-  try {
-    const rawAmount = toRaw(inputAmount, inputMint);
-    const wallet = loadWallet();
-    const taker = wallet.publicKey.toBase58();
-    const url =
-      `${JUPITER_ULTRA_BASE}/order?inputMint=${inputMint}` +
-      `&outputMint=${outputMint}&amount=${rawAmount}&slippageBps=${slippageBps}` +
-      `&taker=${taker}`;
+  const rawAmount = toRaw(inputAmount, inputMint);
+  const wallet = loadWallet();
+  const taker = wallet.publicKey.toBase58();
+  const url =
+    `${JUPITER_ULTRA_BASE}/order?inputMint=${inputMint}` +
+    `&outputMint=${outputMint}&amount=${rawAmount}&slippageBps=${slippageBps}` +
+    `&taker=${taker}`;
 
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      logger.warn(`[Jupiter] Quote failed (${resp.status}): ${await resp.text()}`);
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const resp = await fetch(url);
+
+      // Retry on 429
+      if (resp.status === 429) {
+        const backoffMs = attempt * 2000;
+        logger.warn(`[Jupiter] 429 rate-limited on getQuote (attempt ${attempt}/${maxAttempts}), waiting ${backoffMs}ms`);
+        if (attempt < maxAttempts) {
+          await new Promise(r => setTimeout(r, backoffMs));
+          continue;
+        }
+        return null;
+      }
+
+      if (!resp.ok) {
+        logger.warn(`[Jupiter] Quote failed (${resp.status}): ${await resp.text()}`);
+        return null;
+      }
+
+      const data = await resp.json() as any;
+
+      return {
+        inputMint,
+        outputMint,
+        inAmount: data.inAmount ?? rawAmount,
+        outAmount: data.outAmount,
+        otherAmountThreshold: data.otherAmountThreshold ?? data.outAmount,
+        priceImpactPct: Number(data.priceImpactPct ?? 0),
+        slippageBps,
+        routePlan: data.routePlan ?? [],
+        quoteResponse: data,
+      };
+    } catch (err) {
+      logger.error(`[Jupiter] getQuote error (attempt ${attempt}/${maxAttempts}):`, err);
+      if (attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, attempt * 1000));
+        continue;
+      }
       return null;
     }
-
-    const data = await resp.json() as any;
-
-    return {
-      inputMint,
-      outputMint,
-      inAmount: data.inAmount ?? rawAmount,
-      outAmount: data.outAmount,
-      otherAmountThreshold: data.otherAmountThreshold ?? data.outAmount,
-      priceImpactPct: Number(data.priceImpactPct ?? 0),
-      slippageBps,
-      routePlan: data.routePlan ?? [],
-      quoteResponse: data,
-    };
-  } catch (err) {
-    logger.error('[Jupiter] getQuote error:', err);
-    return null;
   }
+  return null;
 }
 
 // ============================================================================
@@ -209,18 +229,27 @@ export async function executeSwap(
 
     // Submit the signed transaction + requestId to /execute
     const signedTxBase64 = Buffer.from(tx.serialize()).toString('base64');
-    const swapResp = await fetch(`${JUPITER_ULTRA_BASE}/execute`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        signedTransaction: signedTxBase64,
-        requestId,
-      }),
-    });
+    let swapResp: Response | null = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      swapResp = await fetch(`${JUPITER_ULTRA_BASE}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          signedTransaction: signedTxBase64,
+          requestId,
+        }),
+      });
+      if (swapResp.status === 429 && attempt < 3) {
+        logger.warn(`[Jupiter] 429 on /execute (attempt ${attempt}/3), retrying in ${attempt * 2}s`);
+        await new Promise(r => setTimeout(r, attempt * 2000));
+        continue;
+      }
+      break;
+    }
 
-    if (!swapResp.ok) {
-      const text = await swapResp.text();
-      throw new Error(`Jupiter /execute (${swapResp.status}): ${text}`);
+    if (!swapResp!.ok) {
+      const text = await swapResp!.text();
+      throw new Error(`Jupiter /execute (${swapResp!.status}): ${text}`);
     }
 
     const execResult = await swapResp.json() as any;

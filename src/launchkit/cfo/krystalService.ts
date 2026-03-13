@@ -2243,6 +2243,61 @@ export async function openEvmLpPosition(
       logger.info(`[Krystal] Post-zap: ${pool.token0.symbol}=${ethers.formatUnits(amount0Desired, dec0)}, ${pool.token1.symbol}=${ethers.formatUnits(amount1Desired, dec1)}`);
     }
 
+    // 5b. Intermediate rebalance: if both tokens are present but heavily imbalanced
+    //     (one side has > 70% of value, other has < 30%), swap excess to get closer
+    //     to 50/50. This prevents leaving stranded tokens in the wallet after mint.
+    {
+      const held0Usd = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+      const held1Usd = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+      const totalHeld = held0Usd + held1Usd;
+      if (totalHeld > 1) {
+        const pct0 = held0Usd / totalHeld;
+        const pct1 = held1Usd / totalHeld;
+        const IMBALANCE_THRESH = 0.70; // one side > 70% → rebalance
+        if (pct0 > IMBALANCE_THRESH && pct1 < (1 - IMBALANCE_THRESH)) {
+          // Token0 heavy — swap excess into token1 to target ~50/50
+          const excessUsd = held0Usd - totalHeld / 2;
+          const excessTokens = excessUsd / usdPerToken0;
+          logger.info(`[Krystal] Imbalanced: ${pool.token0.symbol}=${(pct0 * 100).toFixed(0)}% / ${pool.token1.symbol}=${(pct1 * 100).toFixed(0)}% — swapping ~$${excessUsd.toFixed(2)} ${pool.token0.symbol} → ${pool.token1.symbol}`);
+          try {
+            const swap = await import('./evmSwapService.ts');
+            if (excessTokens > 0.0001) {
+              const res = await swap.executeEvmSwap(chainNumericId, pool.token0.address, pool.token1.address, excessTokens, pool.feeTier);
+              if (res.success) logger.info(`[Krystal] Rebalance swap OK: ${excessTokens.toFixed(6)} ${pool.token0.symbol} → ${pool.token1.symbol}`);
+              else logger.warn(`[Krystal] Rebalance swap failed: ${res.error}`);
+            }
+          } catch (err) { logger.warn('[Krystal] Rebalance swap failed (non-fatal):', err); }
+          // Re-read balances
+          [bal0, bal1] = await Promise.all([
+            token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+            token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+          ]);
+          amount0Desired = bal0 < maxToken0 ? bal0 : maxToken0;
+          amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
+        } else if (pct1 > IMBALANCE_THRESH && pct0 < (1 - IMBALANCE_THRESH)) {
+          // Token1 heavy — swap excess into token0
+          const excessUsd = held1Usd - totalHeld / 2;
+          const excessTokens = excessUsd / usdPerToken1;
+          logger.info(`[Krystal] Imbalanced: ${pool.token1.symbol}=${(pct1 * 100).toFixed(0)}% / ${pool.token0.symbol}=${(pct0 * 100).toFixed(0)}% — swapping ~$${excessUsd.toFixed(2)} ${pool.token1.symbol} → ${pool.token0.symbol}`);
+          try {
+            const swap = await import('./evmSwapService.ts');
+            if (excessTokens > 0.0001) {
+              const res = await swap.executeEvmSwap(chainNumericId, pool.token1.address, pool.token0.address, excessTokens, pool.feeTier);
+              if (res.success) logger.info(`[Krystal] Rebalance swap OK: ${excessTokens.toFixed(6)} ${pool.token1.symbol} → ${pool.token0.symbol}`);
+              else logger.warn(`[Krystal] Rebalance swap failed: ${res.error}`);
+            }
+          } catch (err) { logger.warn('[Krystal] Rebalance swap failed (non-fatal):', err); }
+          // Re-read balances
+          [bal0, bal1] = await Promise.all([
+            token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+            token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+          ]);
+          amount0Desired = bal0 < maxToken0 ? bal0 : maxToken0;
+          amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
+        }
+      }
+    }
+
     // After zap attempt, if both are still zero, nothing we can do
     if (amount0Desired === BigInt(0) && amount1Desired === BigInt(0)) {
       return { success: false, error: 'No token0 or token1 balance on target chain (even after zap attempt)' };
@@ -2677,6 +2732,39 @@ export async function closeEvmLpPosition(params: {
       throw gaugeErr;
     }
 
+    // 2a. Pre-collect accrued fees BEFORE decreasing liquidity.
+    //     This secures fee income even if decreaseLiquidity fails later.
+    //     V3 NFPM collect() returns whatever is owed — at this point only fees.
+    try {
+      const feeCollectTx = await nfpm.collect({
+        tokenId: posId,
+        recipient: wallet.address,
+        amount0Max: MaxUint128,
+        amount1Max: MaxUint128,
+      }, { nonce: nextNonce });
+      const feeReceipt = await feeCollectTx.wait();
+      nextNonce++;
+      // Log fee amounts if we can parse them
+      for (const log of feeReceipt.logs) {
+        try {
+          const parsed = nfpm.interface.parseLog({ topics: log.topics as string[], data: log.data });
+          if (parsed?.name === 'Collect') {
+            const f0 = parsed.args?.amount0 ?? BigInt(0);
+            const f1 = parsed.args?.amount1 ?? BigInt(0);
+            if (f0 > BigInt(0) || f1 > BigInt(0)) {
+              logger.info(`[Krystal] Pre-collected fees for ${posId}: token0=${f0}, token1=${f1}`);
+            }
+            break;
+          }
+        } catch { /* skip */ }
+      }
+    } catch (feeErr) {
+      logger.warn(`[Krystal] Pre-collect fees failed for ${posId} (non-fatal): ${(feeErr as Error).message}`);
+      // Re-sync nonce in case the tx was submitted but failed
+      nextNonce = await provider.getTransactionCount(wallet.address, 'latest');
+    }
+
+    // 2b. Decrease liquidity (withdraw all)
     if (liquidity > BigInt(0)) {
       const deadline = Math.floor(Date.now() / 1000) + 600;
       const decreaseTx = await nfpm.decreaseLiquidity({
@@ -2691,15 +2779,30 @@ export async function closeEvmLpPosition(params: {
       logger.info(`[Krystal] decreaseLiquidity done for ${posId}`);
     }
 
-    // 3. Collect all tokens + fees
-    const collectTx = await nfpm.collect({
-      tokenId: posId,
-      recipient: wallet.address,
-      amount0Max: MaxUint128,
-      amount1Max: MaxUint128,
-    }, { nonce: nextNonce });
-    const collectReceipt = await collectTx.wait();
-    nextNonce++;
+    // 3. Collect withdrawn liquidity tokens (with retry — if this fails after
+    //    decreaseLiquidity the position is stuck with zero liquidity and tokens owed)
+    let collectReceipt: any;
+    for (let collectAttempt = 1; collectAttempt <= 3; collectAttempt++) {
+      try {
+        // Re-fetch nonce on retry since the previous attempt may have consumed it
+        if (collectAttempt > 1) {
+          nextNonce = await provider.getTransactionCount(wallet.address, 'latest');
+          await new Promise(r => setTimeout(r, 2000 * collectAttempt));
+        }
+        const collectTx = await nfpm.collect({
+          tokenId: posId,
+          recipient: wallet.address,
+          amount0Max: MaxUint128,
+          amount1Max: MaxUint128,
+        }, { nonce: nextNonce });
+        collectReceipt = await collectTx.wait();
+        nextNonce++;
+        break;
+      } catch (collectErr) {
+        logger.warn(`[Krystal] collect attempt ${collectAttempt}/3 failed for ${posId}: ${(collectErr as Error).message}`);
+        if (collectAttempt === 3) throw collectErr;
+      }
+    }
 
     // Parse collected amounts from Collect event
     let amount0Recovered = BigInt(0);
@@ -3127,6 +3230,10 @@ export async function rebalanceEvmLpPosition(params: {
   if (closeOnly) {
     return { closeResult };
   }
+
+  // Brief settling delay — give the RPC node time to index the close tx so
+  // wallet balance reads below reflect the recovered tokens.
+  await new Promise(r => setTimeout(r, 3000));
 
   // Step 2: Reopen on the SAME pool if originalPoolAddress + token info is available.
   // Only fall back to discovery if the original pool info is missing.
