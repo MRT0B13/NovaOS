@@ -174,7 +174,7 @@ class RateLimiter {
   private queue: Array<() => void> = [];
   private draining = false;
   private lastRequestTime = 0;
-  private readonly minDelay = 200; // 200ms between requests — HL allows 1200/min, this caps at ~300/min
+  private readonly minDelay = 300; // 300ms between requests — HL allows 1200/min, this caps at ~200/min (extra headroom to avoid 429s during heavy decision cycles)
   
   async throttle(): Promise<void> {
     return new Promise(resolve => {
@@ -616,18 +616,37 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
       ? formatLimitPrice(coinPrice * 1.02, szDecimals)
       : formatLimitPrice(coinPrice * 0.98, szDecimals);
 
-    const order = await exchange.order({
-      orders: [{
-        a: assetIdx,
-        b: isLong,          // true = BUY (LONG), false = SELL (SHORT)
-        p: limitPrice,
-        s: sizeFmt.toString(),
-        r: false,
-        t: { limit: { tif: 'Ioc' as const } },
-        c: `0x${Buffer.from(`cfo-perp-${side.toLowerCase()}-${Date.now()}`).toString('hex').padEnd(32, '0').slice(0, 32)}`,
-      }],
-      grouping: 'na',
-    });
+    // Rate-limit + retry the order placement (429s can block trades)
+    let order: any;
+    for (let orderAttempt = 1; orderAttempt <= 3; orderAttempt++) {
+      try {
+        await rateLimiter.throttle();
+        order = await exchange.order({
+          orders: [{
+            a: assetIdx,
+            b: isLong,          // true = BUY (LONG), false = SELL (SHORT)
+            p: limitPrice,
+            s: sizeFmt.toString(),
+            r: false,
+            t: { limit: { tif: 'Ioc' as const } },
+            c: `0x${Buffer.from(`cfo-perp-${side.toLowerCase()}-${Date.now()}-${orderAttempt}`).toString('hex').padEnd(32, '0').slice(0, 32)}`,
+          }],
+          grouping: 'na',
+        });
+        break;
+      } catch (orderErr: any) {
+        const is429 = orderErr?.message?.includes('429') ||
+                      orderErr?.status === 429 ||
+                      String(orderErr).includes('Too Many Requests');
+        if (is429 && orderAttempt < 3) {
+          const delay = 2000 * orderAttempt;
+          logger.warn(`[Hyperliquid] ${side} ${coin}-PERP order 429 — retry ${orderAttempt}/3 in ${delay / 1000}s`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw orderErr;
+      }
+    }
 
     const result = (order as any)?.response?.data?.statuses?.[0];
     if (!result || (result as any).error) {
@@ -668,6 +687,7 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
       const slPriceFmt = formatLimitPrice(slPrice, szDecimals);
       const tpPriceFmt = formatLimitPrice(tpPrice, szDecimals);
 
+      await rateLimiter.throttle();
       await exchange.order({
         orders: [
           {
@@ -837,17 +857,36 @@ export async function closePosition(coin: string, sizeInCoin: number, isBuy: boo
       ? formatLimitPrice(markPrice * 1.01, szDecimals)  // buying back short: above mid
       : formatLimitPrice(markPrice * 0.99, szDecimals); // selling long: below mid
 
-    const order = await exchange.order({
-      orders: [{
-        a: assetIdx,
-        b: isBuy,
-        p: limitPx,
-        s: sizeRounded.toString(),
-        r: true,  // reduce only
-        t: { limit: { tif: 'Ioc' as const } },  // Immediate-or-cancel
-      }],
-      grouping: 'na',
-    });
+    // Rate-limit + retry close orders (429s can prevent position exits)
+    let order: any;
+    for (let closeAttempt = 1; closeAttempt <= 3; closeAttempt++) {
+      try {
+        await rateLimiter.throttle();
+        order = await exchange.order({
+          orders: [{
+            a: assetIdx,
+            b: isBuy,
+            p: limitPx,
+            s: sizeRounded.toString(),
+            r: true,  // reduce only
+            t: { limit: { tif: 'Ioc' as const } },  // Immediate-or-cancel
+          }],
+          grouping: 'na',
+        });
+        break;
+      } catch (closeErr: any) {
+        const is429 = closeErr?.message?.includes('429') ||
+                      closeErr?.status === 429 ||
+                      String(closeErr).includes('Too Many Requests');
+        if (is429 && closeAttempt < 3) {
+          const delay = 2000 * closeAttempt;
+          logger.warn(`[Hyperliquid] close ${coin} 429 — retry ${closeAttempt}/3 in ${delay / 1000}s`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw closeErr;
+      }
+    }
 
     const result = (order as any)?.response?.data?.statuses?.[0];
     if (!result || (result as any).error) {
@@ -1360,18 +1399,37 @@ export async function openSpotTrade(params: SpotTradeParams): Promise<HLOrderRes
       `size=${sizeFmt} szDecimals=${szDecimals} pairIndex=${pair.index} (spot offset applied)`,
     );
 
-    const order = await exchange.order({
-      orders: [{
-        a: pair.index,        // spot pair index (10000+)
-        b: isBuy,             // true = buy base token, false = sell base token
-        p: limitPrice,
-        s: sizeFmt.toString(),
-        r: false,             // no reduce-only for spot
-        t: { limit: { tif: 'Ioc' as const } },
-        c: `0x${Buffer.from(`cfo-spot-${side.toLowerCase()}-${Date.now()}`).toString('hex').padEnd(32, '0').slice(0, 32)}`,
-      }],
-      grouping: 'na',
-    });
+    // Rate-limit + retry the order placement (429s were killing spot trades)
+    let order: any;
+    for (let orderAttempt = 1; orderAttempt <= 3; orderAttempt++) {
+      try {
+        await rateLimiter.throttle();
+        order = await exchange.order({
+          orders: [{
+            a: pair.index,        // spot pair index (10000+)
+            b: isBuy,             // true = buy base token, false = sell base token
+            p: limitPrice,
+            s: sizeFmt.toString(),
+            r: false,             // no reduce-only for spot
+            t: { limit: { tif: 'Ioc' as const } },
+            c: `0x${Buffer.from(`cfo-spot-${side.toLowerCase()}-${Date.now()}-${orderAttempt}`).toString('hex').padEnd(32, '0').slice(0, 32)}`,
+          }],
+          grouping: 'na',
+        });
+        break;
+      } catch (orderErr: any) {
+        const is429 = orderErr?.message?.includes('429') ||
+                      orderErr?.status === 429 ||
+                      String(orderErr).includes('Too Many Requests');
+        if (is429 && orderAttempt < 3) {
+          const delay = 2000 * orderAttempt;
+          logger.warn(`[Hyperliquid] ${side} ${coin}-SPOT order 429 — retry ${orderAttempt}/3 in ${delay / 1000}s`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw orderErr;
+      }
+    }
 
     const result = (order as any)?.response?.data?.statuses?.[0];
     if (!result || (result as any).error) {
