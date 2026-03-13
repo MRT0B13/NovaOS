@@ -1453,7 +1453,7 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
     // Last 64 hex chars should be the ABI-encoded constructor arg (padded address)
     logger.info(`[ArbMonitor] ${chain.name} constructor arg (last 64 hex): ${deployData.slice(-64)}`);
 
-    // Simulate deployment via eth_call first to catch revert data
+    // Simulate deployment via eth_call first to catch reverts without wasting gas
     try {
       const simResult = await provider.call({
         from: wallet.address,
@@ -1465,7 +1465,7 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
       const revertData = simErr?.data || simErr?.error?.data || 'none';
       logger.error(`[ArbMonitor] ${chain.name} deploy simulation FAILED — revert data: ${revertData}`);
       logger.error(`[ArbMonitor] ${chain.name} simulation error details: code=${simErr?.code} reason=${simErr?.reason} message=${simErr?.shortMessage || simErr?.message?.slice(0, 200)}`);
-      // Don't return — try the actual deploy anyway for more info
+      return null; // don't send real tx — will retry on next cycle
     }
 
     // Send raw transaction with generous gas limit
@@ -1534,26 +1534,51 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
 
 /**
  * Ensure all enabled chains have a receiver deployed.
- * Called once at startup or on first scan cycle.
+ * Called at startup and on each scan cycle — retries failed chains with backoff.
  */
-let _autoDeployDone = false;
-export async function ensureReceiversDeployed(dbPool?: any): Promise<void> {
-  if (_autoDeployDone) return;
-  _autoDeployDone = true;
+let _receiversHydratedOnce = false;
+const _deployFailures: Map<string, { count: number; nextRetryAt: number }> = new Map();
+const MAX_DEPLOY_RETRIES = 5;
+const DEPLOY_BACKOFF_BASE_MS = 60_000; // 1 min, doubles each retry
 
-  if (dbPool) await hydrateReceiversFromDb(dbPool);
+export async function ensureReceiversDeployed(dbPool?: any): Promise<void> {
+  const firstRun = !_receiversHydratedOnce;
+  if (firstRun && dbPool) {
+    await hydrateReceiversFromDb(dbPool);
+    _receiversHydratedOnce = true;
+  }
 
   const enabled = getEnabledChains();
   for (const chain of enabled) {
     const key = chain.name.toLowerCase();
     const existing = await getReceiverAddress(key);
     if (existing) {
-      logger.info(`[ArbMonitor] ${chain.name} receiver: ${existing}`);
+      if (firstRun) logger.info(`[ArbMonitor] ${chain.name} receiver: ${existing}`);
       continue;
     }
 
-    logger.info(`[ArbMonitor] No receiver for ${chain.name} — auto-deploying...`);
-    await autoDeployReceiver(key, dbPool);
+    // Check retry backoff
+    const failure = _deployFailures.get(key);
+    if (failure) {
+      if (failure.count >= MAX_DEPLOY_RETRIES) continue; // permanently failed, don't log spam
+      if (Date.now() < failure.nextRetryAt) continue;    // waiting for backoff
+    }
+
+    logger.info(`[ArbMonitor] No receiver for ${chain.name} — auto-deploying${failure ? ` (retry ${failure.count + 1}/${MAX_DEPLOY_RETRIES})` : ''}...`);
+    const result = await autoDeployReceiver(key, dbPool);
+    if (result) {
+      _deployFailures.delete(key);
+    } else {
+      const prev = failure?.count ?? 0;
+      const next = prev + 1;
+      const backoffMs = DEPLOY_BACKOFF_BASE_MS * Math.pow(2, prev);
+      _deployFailures.set(key, { count: next, nextRetryAt: Date.now() + backoffMs });
+      if (next >= MAX_DEPLOY_RETRIES) {
+        logger.error(`[ArbMonitor] ${chain.name} deploy failed ${MAX_DEPLOY_RETRIES} times — giving up. Set receiver address manually via CFO_EVM_ARB_RECEIVER_${chain.name.toUpperCase()}`);
+      } else {
+        logger.warn(`[ArbMonitor] ${chain.name} deploy failed — will retry in ${Math.round(backoffMs / 1000)}s`);
+      }
+    }
   }
 }
 
