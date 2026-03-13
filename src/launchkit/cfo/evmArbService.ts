@@ -1396,12 +1396,13 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
   try {
     const { wallet, ethers, provider } = await loadChain(chain.chainId);
 
-    // Check native token balance for deployment gas (need ~0.01 for safe margin)
+    // Check native token balance for deployment gas
+    // L2s (Base, Optimism) need only ~0.0005 ETH; Polygon needs ~0.35 POL
     const balance = await provider.getBalance(wallet.address);
     const balanceEth = Number(balance) / 1e18;
     logger.info(`[ArbMonitor] ${chain.name} wallet balance: ${balanceEth.toFixed(6)} native`);
-    if (balanceEth < 0.01) {
-      logger.warn(`[ArbMonitor] ${chain.name}: insufficient gas for deploy (${balanceEth.toFixed(6)} native, need ≥0.01). Fund wallet ${wallet.address}`);
+    if (balanceEth < 0.0005) {
+      logger.warn(`[ArbMonitor] ${chain.name}: insufficient gas for deploy (${balanceEth.toFixed(6)} native). Fund wallet ${wallet.address}`);
       return null;
     }
 
