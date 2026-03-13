@@ -60,6 +60,8 @@ interface ChainConfig {
   gasUnits2Swap: number;
   /** Typical gas for a 3-swap triangular arb in gas units */
   gasUnits3Swap: number;
+  /** Minimum net profit (USD) to trigger execution. Lower for cheap L2s. */
+  minProfitUsd: number;
 }
 
 // ── Shared addresses across chains ─────────────────────────────────────────
@@ -108,6 +110,7 @@ const CHAIN_CONFIGS: Record<string, ChainConfig> = {
     ]),
     gasUnits2Swap: 800_000,
     gasUnits3Swap: 1_200_000,
+    minProfitUsd: 0.50,
   },
 
   base: {
@@ -137,6 +140,7 @@ const CHAIN_CONFIGS: Record<string, ChainConfig> = {
     ]),
     gasUnits2Swap: 500_000,
     gasUnits3Swap: 800_000,
+    minProfitUsd: 0.05,
   },
 
   polygon: {
@@ -171,6 +175,7 @@ const CHAIN_CONFIGS: Record<string, ChainConfig> = {
     ]),
     gasUnits2Swap: 800_000,
     gasUnits3Swap: 1_200_000,
+    minProfitUsd: 1.00,
   },
 
   optimism: {
@@ -202,6 +207,7 @@ const CHAIN_CONFIGS: Record<string, ChainConfig> = {
     ]),
     gasUnits2Swap: 500_000,
     gasUnits3Swap: 800_000,
+    minProfitUsd: 0.05,
   },
 };
 
@@ -866,7 +872,8 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
   const allPools = await refreshCandidatePools();
   if (allPools.length === 0) return null;
 
-  const minProfit = env.evmArbMinProfitUsdc ?? 0.5;
+  // Per-chain minProfit from config; env var overrides only if explicitly set
+  const envMinProfitOverride = process.env.CFO_EVM_ARB_MIN_PROFIT_USDC;
   const enabledChains = getEnabledChains();
 
   let best: ArbOpportunity | null = null;
@@ -876,6 +883,8 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
     const chainPools = allPools.filter(p => p.chainKey === chain.name.toLowerCase());
     if (chainPools.length === 0) continue;
 
+    // Use per-chain minProfit from config; env var overrides if explicitly set
+    const minProfit = envMinProfitOverride != null ? Number(envMinProfitOverride) : chain.minProfitUsd;
     const chainBest = await scanChain(chain, chainPools, ethPriceUsd, minProfit);
     if (chainBest && (!best || chainBest.netProfitUsd > best.netProfitUsd)) {
       best = chainBest;
