@@ -765,8 +765,12 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
     if (feeData.gasPrice) gasPriceGwei = Number(feeData.gasPrice) / 1e9;
   } catch { /* use fallback */ }
 
+  // Diagnostic counters — logged at end for visibility
+  let pairsSingleVenue = 0, pairsNoFlashAsset = 0, pairsQuoteFail = 0;
+  let pairsNoGross = 0, pairsBelowMin = 0, pairsQuoted = 0;
+
   for (const [pairKey, pairPools] of byPair) {
-    if (pairPools.length < 2) continue; // need at least 2 venues to arb
+    if (pairPools.length < 2) { pairsSingleVenue++; continue; } // need at least 2 venues to arb
 
     // Determine which token to use as flash loan asset (prefer USDC/USDT/WETH — Aave listed)
     // Aave v3 Arbitrum supports: USDC, USDC.e, WETH, WBTC, ARB, LINK, DAI
@@ -788,7 +792,7 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
     const flashAsset = AAVE_LISTED.has(t0) ? pool0.token0
       : AAVE_LISTED.has(t1) ? pool0.token1
       : null;
-    if (!flashAsset) continue;
+    if (!flashAsset) { pairsNoFlashAsset++; continue; }
 
     const tokenOut = flashAsset.address === t0 ? pool0.token1 : pool0.token0;
 
@@ -805,7 +809,7 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
         const out = await getPoolQuote(pool, flashAsset.address, tokenOut.address, flashAmountRaw, ethers, provider);
         if (out && out > 0n) buyQuotes.push({ pool, amountOut: out });
       }));
-      if (buyQuotes.length < 2) continue;
+      if (buyQuotes.length === 0) { pairsQuoteFail++; continue; }
 
       // Best buy = most tokenOut for our flashAsset
       buyQuotes.sort((a, b) => (b.amountOut > a.amountOut ? 1 : -1));
@@ -820,13 +824,32 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
         const out = await getPoolQuote(pool, tokenOut.address, flashAsset.address, buyBest.amountOut, ethers, provider);
         if (out && out > 0n) sellQuotes.push({ pool, amountOut: out });
       }));
-      if (sellQuotes.length === 0) continue;
+      if (sellQuotes.length === 0) { pairsQuoteFail++; continue; }
 
       sellQuotes.sort((a, b) => (b.amountOut > a.amountOut ? 1 : -1));
       const sellBest = sellQuotes[0];
 
       // ── Profit calculation ─────────────────────────────────────────────────
-      if (sellBest.amountOut <= flashAmountRaw) continue; // no gross profit
+      pairsQuoted++;
+
+      const displayPair = `${flashAsset.symbol}/${tokenOut.symbol}`;
+
+      if (sellBest.amountOut <= flashAmountRaw) {
+        // Negative spread — sell gets less than flash amount (market is well-arbed or we're price-impacting)
+        const lossRaw = flashAmountRaw - sellBest.amountOut;
+        const lossUsd = Number(lossRaw) / (10 ** flashAsset.decimals);
+        const lossBps = flashAmountUsd > 0 ? (lossUsd / flashAmountUsd * 10_000).toFixed(1) : '0';
+        pairsNoGross++;
+        // Log the top negative spreads so we can see how tight the market is
+        if (lossUsd < flashAmountUsd * 0.01) { // within 1% — worth reporting
+          logger.info(
+            `[ArbMonitor] ↔ ${displayPair} | ${buyBest.pool.dex}→${sellBest.pool.dex} | ` +
+            `flash:$${flashAmountUsd.toFixed(0)} spread:-${lossBps}bps ` +
+            `(buy ${buyQuotes.length} venues, sell ${sellQuotes.length} venues)`
+          );
+        }
+        continue;
+      }
 
       const grossRaw = sellBest.amountOut - flashAmountRaw;
       const grossUsd = Number(grossRaw) / (10 ** flashAsset.decimals);
@@ -835,19 +858,15 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
       const gasEstimateUsd = (800_000 * gasPriceGwei * 1e-9) * ethPriceUsd;
       const netProfitUsd = grossUsd - aaveFeeUsd - gasEstimateUsd;
 
-      const displayPair = `${flashAsset.symbol}/${tokenOut.symbol}`;
       const spreadBps = flashAmountUsd > 0 ? (grossUsd / flashAmountUsd * 10_000).toFixed(1) : '0';
 
       if (netProfitUsd < minProfit) {
-        // Log all near-misses at info level so we can see what spreads actually exist
-        // on Arbitrum. This helps tune flash size and min profit thresholds.
-        if (grossUsd > 0.01) {
-          logger.info(
-            `[ArbMonitor] ❌ ${displayPair} | ${buyBest.pool.dex}→${sellBest.pool.dex} | ` +
-            `flash:$${flashAmountUsd.toFixed(0)} spread:${spreadBps}bps ` +
-            `gross:$${grossUsd.toFixed(3)} net:$${netProfitUsd.toFixed(3)} (need $${minProfit.toFixed(2)})`
-          );
-        }
+        pairsBelowMin++;
+        logger.info(
+          `[ArbMonitor] ❌ ${displayPair} | ${buyBest.pool.dex}→${sellBest.pool.dex} | ` +
+          `flash:$${flashAmountUsd.toFixed(0)} spread:${spreadBps}bps ` +
+          `gross:$${grossUsd.toFixed(3)} net:$${netProfitUsd.toFixed(3)} (need $${minProfit.toFixed(2)})`
+        );
         continue;
       }
 
@@ -878,9 +897,17 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
       if (!best || opp.netProfitUsd > best.netProfitUsd) best = opp;
 
     } catch (err) {
+      pairsQuoteFail++;
       logger.debug(`[ArbMonitor] Pair ${pairKey} scan error:`, err);
     }
   }
+
+  logger.info(
+    `[ArbMonitor] Cross-venue scan: ${crossVenuePairs.length} pairs → ` +
+    `quoted:${pairsQuoted} noGross:${pairsNoGross} belowMin:${pairsBelowMin} ` +
+    `quoteFail:${pairsQuoteFail} noFlash:${pairsNoFlashAsset} | ` +
+    `gas:${gasPriceGwei.toFixed(3)}gwei minProfit:$${minProfit.toFixed(2)}`
+  );
 
   // ── Triangular arb: A → B → C → A across different pools ──────────────
   // Look for routes through common bridge tokens (WETH, USDC, WBTC)
