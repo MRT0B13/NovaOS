@@ -1453,22 +1453,12 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
     // Last 64 hex chars should be the ABI-encoded constructor arg (padded address)
     logger.info(`[ArbMonitor] ${chain.name} constructor arg (last 64 hex): ${deployData.slice(-64)}`);
 
-    // Simulate deployment via eth_call first to catch reverts without wasting gas
-    try {
-      const simResult = await provider.call({
-        from: wallet.address,
-        data: deployData,
-        gasLimit: 2_500_000n,
-      });
-      logger.info(`[ArbMonitor] ${chain.name} deploy simulation OK — returned ${simResult.length} chars`);
-    } catch (simErr: any) {
-      const revertData = simErr?.data || simErr?.error?.data || 'none';
-      logger.error(`[ArbMonitor] ${chain.name} deploy simulation FAILED — revert data: ${revertData}`);
-      logger.error(`[ArbMonitor] ${chain.name} simulation error details: code=${simErr?.code} reason=${simErr?.reason} message=${simErr?.shortMessage || simErr?.message?.slice(0, 200)}`);
-      return null; // don't send real tx — will retry on next cycle
-    }
+    // Note: eth_call simulation of CREATE txs is unreliable on some L2 RPC nodes
+    // (returns spurious reverts on Base, Polygon, Optimism). The pre-flight getPool()
+    // check above already verifies the only external call in the constructor, so we
+    // skip simulation and deploy directly.
 
-    // Send raw transaction with generous gas limit
+    // Send transaction with generous gas limit
     const tx = await wallet.sendTransaction({
       data: deployData,
       gasLimit: 2_500_000n,
