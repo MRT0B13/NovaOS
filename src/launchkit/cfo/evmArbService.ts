@@ -729,7 +729,9 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
   const pools = await refreshCandidatePools();
   if (pools.length === 0) return null;
 
-  const minProfit = env.evmArbMinProfitUsdc ?? 2;
+  // Arbitrum gas is ~$0.05 per tx, Aave fee is 5bps — so even small arbs are viable.
+  // Default lowered from $2 → $0.50 to catch more opportunities.
+  const minProfit = env.evmArbMinProfitUsdc ?? 0.5;
 
   // ── Group pools by pair ─────────────────────────────────────────────────
   const byPair = new Map<string, CandidatePool[]>();
@@ -837,9 +839,10 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
       const spreadBps = flashAmountUsd > 0 ? (grossUsd / flashAmountUsd * 10_000).toFixed(1) : '0';
 
       if (netProfitUsd < minProfit) {
-        // Log near-misses (within 3× of threshold) so we can see what spreads exist
-        if (netProfitUsd > -1) {
-          logger.debug(
+        // Log all near-misses at info level so we can see what spreads actually exist
+        // on Arbitrum. This helps tune flash size and min profit thresholds.
+        if (grossUsd > 0.01) {
+          logger.info(
             `[ArbMonitor] ❌ ${displayPair} | ${buyBest.pool.dex}→${sellBest.pool.dex} | ` +
             `flash:$${flashAmountUsd.toFixed(0)} spread:${spreadBps}bps ` +
             `gross:$${grossUsd.toFixed(3)} net:$${netProfitUsd.toFixed(3)} (need $${minProfit.toFixed(2)})`

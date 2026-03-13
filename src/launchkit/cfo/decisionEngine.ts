@@ -3009,7 +3009,7 @@ export async function generateDecisions(
       const ethPrice = intel.analystPrices?.['ETH']?.usd ?? 3000;
       const poolCount = arbMod.getCandidatePoolCount();
       // Apply learned arb min profit multiplier (higher if slippage eats profits)
-      const effectiveArbMinProfit = applyAdaptive(env.evmArbMinProfitUsdc ?? 2, learned.evmArbMinProfitMultiplier, conf);
+      const effectiveArbMinProfit = applyAdaptive(env.evmArbMinProfitUsdc ?? 0.5, learned.evmArbMinProfitMultiplier, conf);
       logger.debug(`[CFO:Decision] Section J: scanning ${poolCount} Arbitrum pools (ETH=$${ethPrice.toFixed(0)}, minProfit=$${effectiveArbMinProfit.toFixed(2)})...`);
       const opp      = await arbMod.scanForOpportunity(ethPrice);
 
