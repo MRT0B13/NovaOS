@@ -34,6 +34,8 @@ const ARB_ADDRESSES = {
   UNISWAP_V3_ROUTER:    '0xE592427A0AEce92De3Edee1F18E0157C05861564',
   CAMELOT_V3_ROUTER:    '0xc873fEcbd354f5A56E00E710B90EF4201db2448d',
   PANCAKE_V3_ROUTER:    '0x32226588378236Fd0c7c4053999F88aC0e5cAc77', // PCS SmartRouter (verified: factory() → PCS factory)
+  SUSHI_V3_ROUTER:      '0x8A21F6768C1f8075791D08546Dadf6daA0bE820c', // SushiSwap V3 SwapRouter on Arbitrum
+  RAMSES_V2_ROUTER:     '0xAA23611badAFB62D37E7295A682D21960ac85A90', // Ramses CL router on Arbitrum
   BALANCER_VAULT:       '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
 
   // Quoters (view-only — no gas cost via staticCall)
@@ -42,11 +44,15 @@ const ARB_ADDRESSES = {
                                                                       // Not used — Camelot quotes use local pool-level math instead
                                                                       // (reads globalState + liquidity directly from pool contract).
   PANCAKE_V3_QUOTER:    '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997', // PCS V3 QuoterV2 (verified: factory() → PCS factory)
+  SUSHI_V3_QUOTER:      '0x0524E833cCD057e4d7A296e3aaAb9f7675964Ce1', // SushiSwap V3 uses same QuoterV2 interface
+  RAMSES_V2_QUOTER:     '0xAA20e84a61d5E3C1aA5fc8b1dB0B0FcEFf4015E3', // Ramses CL QuoterV2
 
   // DEX Factories (for resolving pool addresses from token pairs)
   UNISWAP_V3_FACTORY:   '0x1F98431c8aD98523631AE4a59f267346ea31F984',
   CAMELOT_V3_FACTORY:   '0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B',
   PANCAKE_V3_FACTORY:   '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // verified: getPool() returns valid pools
+  SUSHI_V3_FACTORY:     '0x1af415a1EbA07a4986a52B6f2e7dE7003D82231e', // SushiSwap V3 factory on Arbitrum
+  RAMSES_V2_FACTORY:    '0xAA2cd7477c451E703f3B9Ba5663334914763edF8', // Ramses CL factory on Arbitrum
 
   // Aave v3
   AAVE_POOL:            '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
@@ -59,23 +65,31 @@ const AAVE_FLASH_FEE_BPS = 5;
 const DEX_UNISWAP_V3 = 0;
 const DEX_CAMELOT_V3 = 1;
 const DEX_BALANCER   = 2;
-type DexType = typeof DEX_UNISWAP_V3 | typeof DEX_CAMELOT_V3 | typeof DEX_BALANCER;
+const DEX_SUSHI_V3   = 3;
+const DEX_RAMSES_V2  = 4;
+type DexType = typeof DEX_UNISWAP_V3 | typeof DEX_CAMELOT_V3 | typeof DEX_BALANCER | typeof DEX_SUSHI_V3 | typeof DEX_RAMSES_V2;
 
 // DeFiLlama project identifiers (Balancer discovery uses Balancer V3 API instead — see fetchBalancerPools)
-const LLAMA_PROJECTS = new Set(['uniswap-v3', 'camelot-v3', 'pancakeswap-amm-v3']);
+const LLAMA_PROJECTS = new Set([
+  'uniswap-v3', 'camelot-v3', 'pancakeswap-amm-v3',
+  'sushiswap-v3',    // SushiSwap V3 on Arbitrum — additional venue for spreads
+  'ramses-v2',       // Ramses CL (V2) — Arbitrum-native, often has wider spreads
+]);
 
-// Minimum pool TVL to include in candidate list ($100k — balances breadth vs noise)
-const MIN_POOL_TVL_USD = 100_000;
+// Minimum pool TVL to include in candidate list ($50k — lower threshold catches
+// mid-cap pairs with wider spreads that major arb bots ignore)
+const MIN_POOL_TVL_USD = 50_000;
 
 // Flash loan sizes: scale with pool TVL. Cap at env.evmArbMaxFlashUsd.
-// Larger = more profit per spread, but more price impact.
-const FLASH_AMOUNT_FRACTION = 0.05;  // use 5% of pool TVL as flash size
+// 12% captures more spread per trade while staying within safe price-impact range
+// for concentrated liquidity pools (V3-style). Old value was 5%.
+const FLASH_AMOUNT_FRACTION = 0.12;
 
 // ============================================================================
 // Types
 // ============================================================================
 
-export type DexId = 'uniswap_v3' | 'camelot_v3' | 'pancake_v3' | 'balancer';
+export type DexId = 'uniswap_v3' | 'camelot_v3' | 'pancake_v3' | 'sushi_v3' | 'ramses_v2' | 'balancer';
 
 export interface TokenMeta {
   address: string;
@@ -333,22 +347,30 @@ async function enrichPool(raw: any, provider: any, ethers: any): Promise<Candida
       'uniswap-v3': 'uniswap_v3',
       'camelot-v3': 'camelot_v3',
       'pancakeswap-amm-v3': 'pancake_v3',
+      'sushiswap-v3': 'sushi_v3',
+      'ramses-v2': 'ramses_v2',
       'balancer-v2': 'balancer',
     };
     const dex: DexId = dexMap[raw.project];
     const dexType: DexType = dex === 'uniswap_v3' ? DEX_UNISWAP_V3
       : dex === 'camelot_v3' ? DEX_CAMELOT_V3
       : dex === 'pancake_v3' ? DEX_UNISWAP_V3  // PCS V3 is a Uni V3 fork — same router ABI
+      : dex === 'sushi_v3' ? DEX_SUSHI_V3
+      : dex === 'ramses_v2' ? DEX_RAMSES_V2
       : DEX_BALANCER;
 
     const router = dex === 'uniswap_v3' ? ARB_ADDRESSES.UNISWAP_V3_ROUTER
       : dex === 'camelot_v3' ? ARB_ADDRESSES.CAMELOT_V3_ROUTER
       : dex === 'pancake_v3' ? ARB_ADDRESSES.PANCAKE_V3_ROUTER
+      : dex === 'sushi_v3' ? ARB_ADDRESSES.SUSHI_V3_ROUTER
+      : dex === 'ramses_v2' ? ARB_ADDRESSES.RAMSES_V2_ROUTER
       : ARB_ADDRESSES.BALANCER_VAULT;
 
     const quoter = dex === 'uniswap_v3' ? ARB_ADDRESSES.UNISWAP_V3_QUOTER
       : dex === 'camelot_v3' ? ARB_ADDRESSES.CAMELOT_V3_QUOTER
       : dex === 'pancake_v3' ? ARB_ADDRESSES.PANCAKE_V3_QUOTER
+      : dex === 'sushi_v3' ? ARB_ADDRESSES.SUSHI_V3_QUOTER
+      : dex === 'ramses_v2' ? ARB_ADDRESSES.RAMSES_V2_QUOTER
       : ARB_ADDRESSES.BALANCER_VAULT; // Balancer queryBatchSwap is on the vault
 
     // ── Fetch token metadata on-chain ──────────────────────────────────────
@@ -663,8 +685,8 @@ async function getPoolQuote(
   pool: CandidatePool, tokenIn: string, tokenOut: string,
   amountIn: bigint, ethers: any, provider: any,
 ): Promise<bigint | null> {
-  if (pool.dex === 'uniswap_v3' || pool.dex === 'pancake_v3') {
-    // Both use Uniswap V3 QuoterV2 ABI (PCS V3 is a Uni V3 fork)
+  if (pool.dex === 'uniswap_v3' || pool.dex === 'pancake_v3' || pool.dex === 'sushi_v3' || pool.dex === 'ramses_v2') {
+    // All use Uniswap V3 QuoterV2 ABI (forks with same interface)
     return quoteUniswapV3(pool.quoter, tokenIn, tokenOut, amountIn, pool.feeTier, ethers, provider);
   } else if (pool.dex === 'camelot_v3') {
     // Local pool-level math — reads globalState + liquidity from pool contract directly
@@ -802,11 +824,24 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
       const gasEstimateUsd = (800_000 * gasPriceGwei * 1e-9) * ethPriceUsd;
       const netProfitUsd = grossUsd - aaveFeeUsd - gasEstimateUsd;
 
-      if (netProfitUsd < minProfit) continue;
-
       const displayPair = `${flashAsset.symbol}/${tokenOut.symbol}`;
+      const spreadBps = flashAmountUsd > 0 ? (grossUsd / flashAmountUsd * 10_000).toFixed(1) : '0';
+
+      if (netProfitUsd < minProfit) {
+        // Log near-misses (within 3× of threshold) so we can see what spreads exist
+        if (netProfitUsd > -1) {
+          logger.debug(
+            `[ArbMonitor] ❌ ${displayPair} | ${buyBest.pool.dex}→${sellBest.pool.dex} | ` +
+            `flash:$${flashAmountUsd.toFixed(0)} spread:${spreadBps}bps ` +
+            `gross:$${grossUsd.toFixed(3)} net:$${netProfitUsd.toFixed(3)} (need $${minProfit.toFixed(2)})`
+          );
+        }
+        continue;
+      }
+
       logger.info(
         `[ArbMonitor] 💡 ${displayPair} | ${buyBest.pool.dex}→${sellBest.pool.dex} | ` +
+        `flash:$${flashAmountUsd.toFixed(0)} spread:${spreadBps}bps ` +
         `gross:$${grossUsd.toFixed(3)} aave:$${aaveFeeUsd.toFixed(3)} ` +
         `gas:$${gasEstimateUsd.toFixed(3)} net:$${netProfitUsd.toFixed(3)}`
       );
@@ -832,6 +867,166 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
 
     } catch (err) {
       logger.debug(`[ArbMonitor] Pair ${pairKey} scan error:`, err);
+    }
+  }
+
+  // ── Triangular arb: A → B → C → A across different pools ──────────────
+  // Look for routes through common bridge tokens (WETH, USDC, WBTC)
+  // that profit when swapping A→B on one pool, B→C on another, C→A on a third.
+  const BRIDGE_TOKENS = new Set([
+    '0x82af49447d8a07e3bd95bd0d56f35241523fbab1', // WETH
+    '0xaf88d065e77c8cc2239327c5edb3a432268e5831', // USDC
+    '0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f', // WBTC
+    '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8', // USDC.e
+    '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9', // USDT
+  ]);
+
+  // Build adjacency: token → [pools that contain this token]
+  const tokenPools = new Map<string, CandidatePool[]>();
+  for (const pool of pools) {
+    const t0 = pool.token0.address;
+    const t1 = pool.token1.address;
+    (tokenPools.get(t0) ?? (() => { const a: CandidatePool[] = []; tokenPools.set(t0, a); return a; })()).push(pool);
+    (tokenPools.get(t1) ?? (() => { const a: CandidatePool[] = []; tokenPools.set(t1, a); return a; })()).push(pool);
+  }
+
+  // For each bridge token B, find pairs A/B and B/C, then check if A/C pool exists
+  // Route: flash A → swap A→B → swap B→C → swap C→A → repay A
+  // Only check routes where A is Aave-listed (we need to flash it)
+  const AAVE_LISTED_TRI = new Set([
+    '0xaf88d065e77c8cc2239327c5edb3a432268e5831', // USDC
+    '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8', // USDC.e
+    '0x82af49447d8a07e3bd95bd0d56f35241523fbab1', // WETH
+    '0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f', // WBTC
+  ]);
+
+  let triScanned = 0;
+  for (const bridgeToken of BRIDGE_TOKENS) {
+    const bridgePools = tokenPools.get(bridgeToken) ?? [];
+    if (bridgePools.length < 2) continue;
+
+    // Get all tokens reachable via the bridge token
+    const reachable = new Map<string, CandidatePool[]>(); // other_token → pools
+    for (const pool of bridgePools) {
+      const other = pool.token0.address === bridgeToken ? pool.token1.address : pool.token0.address;
+      (reachable.get(other) ?? (() => { const a: CandidatePool[] = []; reachable.set(other, a); return a; })()).push(pool);
+    }
+
+    const reachableTokens = [...reachable.keys()];
+    // For each pair (A, C) reachable via bridge B, check: A→B→C→A
+    for (let i = 0; i < reachableTokens.length && triScanned < 50; i++) {
+      const tokenA = reachableTokens[i];
+      if (!AAVE_LISTED_TRI.has(tokenA)) continue; // must be able to flash A
+
+      for (let j = i + 1; j < reachableTokens.length && triScanned < 50; j++) {
+        const tokenC = reachableTokens[j];
+
+        // Check if direct A/C pool exists (for the final leg C→A)
+        const acKey1 = tokenA < tokenC ? `${tokenA}:${tokenC}` : `${tokenC}:${tokenA}`;
+        const acPools = byPair.get(acKey1);
+        if (!acPools || acPools.length === 0) continue;
+
+        triScanned++;
+
+        // Find best pool for each leg
+        const abPools = reachable.get(tokenA) ?? [];
+        const bcPools = reachable.get(tokenC) ?? [];
+
+        // Flash token A, route: A → B (via abPool) → C (via bcPool) → A (via acPool)
+        const tokenAMeta = abPools[0].token0.address === tokenA ? abPools[0].token0 : abPools[0].token1;
+        const flashAmtUsd = Math.min(
+          ...abPools.map(p => p.flashAmountUsd),
+          ...bcPools.map(p => p.flashAmountUsd),
+          ...acPools.map(p => p.flashAmountUsd),
+        );
+        if (flashAmtUsd < 1000) continue;
+
+        const flashAmtRaw = BigInt(Math.floor(flashAmtUsd * 10 ** tokenAMeta.decimals));
+
+        try {
+          // Leg 1: A → B (pick best abPool)
+          let bestLeg1Out = 0n;
+          let bestLeg1Pool: CandidatePool | null = null;
+          for (const pool of abPools) {
+            const out = await getPoolQuote(pool, tokenA, bridgeToken, flashAmtRaw, ethers, provider);
+            if (out && out > bestLeg1Out) { bestLeg1Out = out; bestLeg1Pool = pool; }
+          }
+          if (!bestLeg1Pool || bestLeg1Out === 0n) continue;
+
+          // Leg 2: B → C (pick best bcPool)
+          let bestLeg2Out = 0n;
+          let bestLeg2Pool: CandidatePool | null = null;
+          for (const pool of bcPools) {
+            const out = await getPoolQuote(pool, bridgeToken, tokenC, bestLeg1Out, ethers, provider);
+            if (out && out > bestLeg2Out) { bestLeg2Out = out; bestLeg2Pool = pool; }
+          }
+          if (!bestLeg2Pool || bestLeg2Out === 0n) continue;
+
+          // Leg 3: C → A (pick best acPool)
+          let bestLeg3Out = 0n;
+          let bestLeg3Pool: CandidatePool | null = null;
+          for (const pool of acPools) {
+            const out = await getPoolQuote(pool, tokenC, tokenA, bestLeg2Out, ethers, provider);
+            if (out && out > bestLeg3Out) { bestLeg3Out = out; bestLeg3Pool = pool; }
+          }
+          if (!bestLeg3Pool || bestLeg3Out === 0n) continue;
+
+          // Profit: leg3 output - flash input
+          if (bestLeg3Out <= flashAmtRaw) continue;
+          const triGrossRaw = bestLeg3Out - flashAmtRaw;
+          const triGrossUsd = Number(triGrossRaw) / (10 ** tokenAMeta.decimals);
+          const triAaveFee = flashAmtUsd * (AAVE_FLASH_FEE_BPS / 10_000);
+          const triGasCost = (1_200_000 * gasPriceGwei * 1e-9) * ethPriceUsd; // 3 swaps ≈ 1.2M gas
+          const triNetProfit = triGrossUsd - triAaveFee - triGasCost;
+
+          const bridgeMeta = bestLeg1Pool.token0.address === bridgeToken ? bestLeg1Pool.token0 : bestLeg1Pool.token1;
+          const tokenCMeta = bestLeg2Pool.token0.address === tokenC ? bestLeg2Pool.token0 : bestLeg2Pool.token1;
+          const triDisplay = `${tokenAMeta.symbol}→${bridgeMeta.symbol}→${tokenCMeta.symbol}→${tokenAMeta.symbol}`;
+          const triSpreadBps = flashAmtUsd > 0 ? (triGrossUsd / flashAmtUsd * 10_000).toFixed(1) : '0';
+
+          if (triNetProfit < minProfit) {
+            if (triNetProfit > -1) {
+              logger.debug(
+                `[ArbMonitor] ❌ TRI ${triDisplay} | ` +
+                `flash:$${flashAmtUsd.toFixed(0)} spread:${triSpreadBps}bps net:$${triNetProfit.toFixed(3)} (need $${minProfit.toFixed(2)})`
+              );
+            }
+            continue;
+          }
+
+          logger.info(
+            `[ArbMonitor] 💡 TRI ${triDisplay} | ` +
+            `${bestLeg1Pool.dex}→${bestLeg2Pool.dex}→${bestLeg3Pool.dex} | ` +
+            `flash:$${flashAmtUsd.toFixed(0)} spread:${triSpreadBps}bps net:$${triNetProfit.toFixed(3)}`
+          );
+
+          // Wrap as opportunity (use leg1 as "buy" and leg3 as "sell" for compatibility)
+          const triOpp: ArbOpportunity = {
+            pairKey: `tri:${tokenA}:${bridgeToken}:${tokenC}`,
+            displayPair: triDisplay,
+            flashLoanAsset: tokenA,
+            flashLoanSymbol: tokenAMeta.symbol,
+            flashAmountRaw: flashAmtRaw,
+            flashAmountUsd: flashAmtUsd,
+            buyPool: bestLeg1Pool,
+            sellPool: bestLeg3Pool,
+            tokenOut: tokenCMeta,
+            expectedGrossUsd: triGrossUsd,
+            aaveFeeUsd: triAaveFee,
+            gasEstimateUsd: triGasCost,
+            netProfitUsd: triNetProfit,
+            detectedAt: Date.now(),
+          };
+
+          if (!best || triOpp.netProfitUsd > best.netProfitUsd) best = triOpp;
+        } catch {
+          // Non-fatal — skip this tri route
+        }
+      }
+    }
+
+    if (triScanned > 0) {
+      logger.debug(`[ArbMonitor] Triangular routes scanned: ${triScanned}`);
     }
   }
 
