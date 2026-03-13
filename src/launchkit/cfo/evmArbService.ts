@@ -1443,21 +1443,10 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
 
     logger.info(`[ArbMonitor] 🚀 Auto-deploying ArbFlashReceiver to ${chain.name} (chainId=${chain.chainId})...`);
 
-    // Estimate gas first to catch revert before sending tx
+    // Deploy — let ethers handle gas estimation automatically
+    // (manual estimateGas can underestimate for contract creation on some RPCs)
     const factory = new ethers.ContractFactory(abi, bytecode, wallet);
-    let gasEstimate: bigint;
-    try {
-      gasEstimate = await provider.estimateGas({
-        from: wallet.address,
-        data: factory.getDeployTransaction(aaveProvider).data,
-      });
-      logger.info(`[ArbMonitor] ${chain.name} deploy gas estimate: ${gasEstimate.toString()}`);
-    } catch (estErr: any) {
-      logger.error(`[ArbMonitor] ${chain.name} deploy gas estimation FAILED (constructor would revert):`, estErr?.message || estErr);
-      return null;
-    }
-
-    const contract = await factory.deploy(aaveProvider, { gasLimit: gasEstimate * 130n / 100n });
+    const contract = await factory.deploy(aaveProvider);
     const txHash = contract.deploymentTransaction()?.hash;
     logger.info(`[ArbMonitor] ${chain.name} deploy tx: ${txHash}`);
 
