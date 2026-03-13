@@ -1443,15 +1443,33 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
 
     logger.info(`[ArbMonitor] 🚀 Auto-deploying ArbFlashReceiver to ${chain.name} (chainId=${chain.chainId})...`);
 
-    // Deploy — let ethers handle gas estimation automatically
-    // (manual estimateGas can underestimate for contract creation on some RPCs)
+    // Deploy with explicit gas limit (ethers' auto-estimation reverts on some L2 RPCs)
     const factory = new ethers.ContractFactory(abi, bytecode, wallet);
-    const contract = await factory.deploy(aaveProvider);
-    const txHash = contract.deploymentTransaction()?.hash;
-    logger.info(`[ArbMonitor] ${chain.name} deploy tx: ${txHash}`);
 
-    await contract.waitForDeployment();
-    const address = (await contract.getAddress()).toLowerCase();
+    // Build deploy tx manually to verify encoding before sending
+    const deployTx = await factory.getDeployTransaction(aaveProvider);
+    const deployData = deployTx.data as string;
+    logger.info(`[ArbMonitor] ${chain.name} deploy tx data: ${deployData.length} chars, starts=${deployData.slice(0, 20)}... ends=...${deployData.slice(-72)}`);
+    // Last 64 hex chars should be the ABI-encoded constructor arg (padded address)
+    logger.info(`[ArbMonitor] ${chain.name} constructor arg (last 64 hex): ${deployData.slice(-64)}`);
+
+    // Send raw transaction with generous gas limit to avoid estimation issues
+    const tx = await wallet.sendTransaction({
+      data: deployData,
+      gasLimit: 500_000n,
+    });
+    logger.info(`[ArbMonitor] ${chain.name} deploy tx: ${tx.hash}`);
+
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status === 0) {
+      logger.error(`[ArbMonitor] ${chain.name} deploy tx reverted on-chain. gasUsed=${receipt?.gasUsed}, status=${receipt?.status}`);
+      return null;
+    }
+    const address = receipt.contractAddress?.toLowerCase();
+    if (!address) {
+      logger.error(`[ArbMonitor] ${chain.name} deploy tx succeeded but no contract address in receipt`);
+      return null;
+    }
 
     // Verify
     const deployed = new ethers.Contract(address, abi, provider);
@@ -1471,7 +1489,7 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
           `INSERT INTO cfo_arb_receivers (chain_key, address, tx_hash)
            VALUES ($1, $2, $3)
            ON CONFLICT (chain_key) DO UPDATE SET address = $2, tx_hash = $3, deployed_at = NOW()`,
-          [chainKey, address, txHash],
+          [chainKey, address, tx.hash],
         );
         logger.info(`[ArbMonitor] Saved ${chain.name} receiver to DB`);
       } catch (dbErr) {
