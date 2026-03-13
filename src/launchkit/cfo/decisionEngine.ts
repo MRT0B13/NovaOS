@@ -3478,7 +3478,10 @@ export async function generateDecisions(
     }
     const maxPosUsd = applyAdaptive(env.hlPerpMaxPositionUsd, learned.hlPerpSizeMultiplier, conf);
     const maxTotalUsd = applyAdaptive(env.hlPerpMaxTotalUsd, learned.hlPerpSizeMultiplier, conf);
-    const maxPositions = Math.max(1, env.hlPerpMaxPositions + Math.round(learned.hlPerpMaxPositionsAdj * conf));
+    // Learning engine can adjust ±1 position, but env value is a HARD CAP —
+    // the learning engine can reduce the limit but never exceed what the user set.
+    const learnedMaxPositions = env.hlPerpMaxPositions + Math.round(learned.hlPerpMaxPositionsAdj * conf);
+    const maxPositions = Math.max(1, Math.min(learnedMaxPositions, env.hlPerpMaxPositions));
     const minConviction = Math.max(
       config.hlPerpMinConviction,
       learned.hlPerpConvictionFloor * conf, // learning can raise floor but never lower it
