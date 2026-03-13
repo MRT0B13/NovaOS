@@ -196,6 +196,14 @@ const CHAIN_CONFIGS: Record<string, ChainConfig> = {
   },
 };
 
+/** Aave V3 PoolAddressesProvider per chain (constructor arg for ArbFlashReceiver) */
+const AAVE_ADDRESSES_PROVIDER: Record<string, string> = {
+  arbitrum: '0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb',
+  base:     '0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D',
+  polygon:  '0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb',
+  optimism: '0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb',
+};
+
 /** Get list of enabled chain keys from env (default: arbitrum only) */
 function getEnabledChains(): ChainConfig[] {
   const env = getCFOEnv();
@@ -1207,14 +1215,8 @@ export async function executeFlashArb(opp: ArbOpportunity, ethPriceUsd = 3000): 
     return { success: false, error: `Opportunity stale (${(ageMs / 1000).toFixed(0)}s old)` };
   }
 
-  // Resolve receiver address for the opportunity's chain
-  const receiverMap: Record<string, string | undefined> = {
-    arbitrum: env.evmArbReceiverAddress,
-    base: env.evmArbReceiverBase,
-    polygon: env.evmArbReceiverPolygon,
-    optimism: env.evmArbReceiverOptimism,
-  };
-  const receiverAddr = receiverMap[opp.chainKey];
+  // Resolve receiver address for the opportunity's chain (DB → env → error)
+  const receiverAddr = await getReceiverAddress(opp.chainKey);
   if (!receiverAddr) {
     return { success: false, error: `No ArbFlashReceiver deployed on ${opp.chainKey}` };
   }
@@ -1301,6 +1303,185 @@ export async function getArbUsdcBalance(): Promise<number> {
 export function getCandidatePoolCount(): number { return _candidatePools.length; }
 export function getPoolsRefreshedAt(): number    { return _poolsRefreshedAt; }
 export function getEnabledChainNames(): string[] { return getEnabledChains().map(c => c.name); }
+
+// ============================================================================
+// Auto-deploy ArbFlashReceiver per chain
+// ============================================================================
+
+/** In-memory cache of deployed receiver addresses per chain */
+const _receiverAddresses = new Map<string, string>();
+let _receiversHydrated = false;
+
+/**
+ * Get receiver address for a chain. Resolution order:
+ * 1. In-memory cache (populated from DB or auto-deploy)
+ * 2. Env var (CFO_EVM_ARB_RECEIVER_ADDRESS / _BASE / _POLYGON / _OPTIMISM)
+ * 3. DB lookup (cfo_arb_receivers table)
+ * 4. Auto-deploy (compiles from pre-built bytecode, stores in DB)
+ */
+export async function getReceiverAddress(chainKey: string): Promise<string | undefined> {
+  // 1. In-memory
+  if (_receiverAddresses.has(chainKey)) return _receiverAddresses.get(chainKey);
+
+  // 2. Env var
+  const env = getCFOEnv();
+  const envMap: Record<string, string | undefined> = {
+    arbitrum: env.evmArbReceiverAddress,
+    base: env.evmArbReceiverBase,
+    polygon: env.evmArbReceiverPolygon,
+    optimism: env.evmArbReceiverOptimism,
+  };
+  if (envMap[chainKey]) {
+    _receiverAddresses.set(chainKey, envMap[chainKey]!);
+    return envMap[chainKey];
+  }
+
+  return undefined;
+}
+
+/**
+ * Hydrate receiver addresses from DB on startup.
+ * Creates the table if it doesn't exist.
+ */
+export async function hydrateReceiversFromDb(pool: any): Promise<void> {
+  if (_receiversHydrated || !pool) return;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cfo_arb_receivers (
+        chain_key TEXT PRIMARY KEY,
+        address TEXT NOT NULL,
+        deployed_at TIMESTAMPTZ DEFAULT NOW(),
+        tx_hash TEXT
+      )
+    `);
+
+    const res = await pool.query('SELECT chain_key, address FROM cfo_arb_receivers');
+    for (const row of res.rows) {
+      _receiverAddresses.set(row.chain_key, row.address);
+      logger.info(`[ArbMonitor] Loaded receiver for ${row.chain_key}: ${row.address}`);
+    }
+    _receiversHydrated = true;
+  } catch (err) {
+    logger.warn('[ArbMonitor] Failed to hydrate receivers from DB:', err);
+  }
+}
+
+/**
+ * Auto-deploy ArbFlashReceiver to a chain.
+ * Uses pre-compiled bytecode from contracts/out/.
+ * Stores deployed address in DB and in-memory cache.
+ */
+export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promise<string | null> {
+  const chain = CHAIN_CONFIGS[chainKey];
+  if (!chain) {
+    logger.warn(`[ArbMonitor] Unknown chain for auto-deploy: ${chainKey}`);
+    return null;
+  }
+
+  const aaveProvider = AAVE_ADDRESSES_PROVIDER[chainKey];
+  if (!aaveProvider) {
+    logger.warn(`[ArbMonitor] No Aave PoolAddressesProvider for ${chainKey}`);
+    return null;
+  }
+
+  try {
+    const { wallet, ethers, provider } = await loadChain(chain.chainId);
+
+    // Check ETH balance for deployment gas
+    const balance = await provider.getBalance(wallet.address);
+    const balanceEth = Number(balance) / 1e18;
+    if (balanceEth < 0.001) {
+      logger.warn(`[ArbMonitor] ${chain.name}: insufficient ETH for deploy (${balanceEth.toFixed(6)} ETH)`);
+      return null;
+    }
+
+    // Load pre-compiled bytecode
+    const { readFileSync } = await import('fs');
+    const { resolve } = await import('path');
+
+    let abi: any, bytecode: string;
+    try {
+      const basePath = resolve(process.cwd(), 'contracts', 'out');
+      abi = JSON.parse(readFileSync(resolve(basePath, 'ArbFlashReceiver.abi'), 'utf8'));
+      bytecode = '0x' + readFileSync(resolve(basePath, 'ArbFlashReceiver.bin'), 'utf8').trim();
+    } catch {
+      logger.warn(`[ArbMonitor] Pre-compiled bytecode not found at contracts/out/. Run: solc --via-ir --abi --bin -o contracts/out contracts/ArbFlashReceiver.sol`);
+      return null;
+    }
+
+    if (!bytecode || bytecode === '0x') {
+      logger.warn('[ArbMonitor] Empty bytecode — cannot deploy');
+      return null;
+    }
+
+    logger.info(`[ArbMonitor] 🚀 Auto-deploying ArbFlashReceiver to ${chain.name} (chainId=${chain.chainId})...`);
+
+    const factory = new ethers.ContractFactory(abi, bytecode, wallet);
+    const contract = await factory.deploy(aaveProvider, { gasLimit: 2_500_000 });
+    const txHash = contract.deploymentTransaction()?.hash;
+    logger.info(`[ArbMonitor] ${chain.name} deploy tx: ${txHash}`);
+
+    await contract.waitForDeployment();
+    const address = (await contract.getAddress()).toLowerCase();
+
+    // Verify
+    const deployed = new ethers.Contract(address, abi, provider);
+    const owner = await deployed.owner();
+    const resolvedPool = await deployed.aavePool();
+
+    logger.info(`[ArbMonitor] ✅ ${chain.name} ArbFlashReceiver deployed at ${address}`);
+    logger.info(`[ArbMonitor]    Owner: ${owner} | Aave Pool: ${resolvedPool}`);
+
+    // Cache in memory
+    _receiverAddresses.set(chainKey, address);
+
+    // Persist to DB
+    if (dbPool) {
+      try {
+        await dbPool.query(
+          `INSERT INTO cfo_arb_receivers (chain_key, address, tx_hash)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (chain_key) DO UPDATE SET address = $2, tx_hash = $3, deployed_at = NOW()`,
+          [chainKey, address, txHash],
+        );
+        logger.info(`[ArbMonitor] Saved ${chain.name} receiver to DB`);
+      } catch (dbErr) {
+        logger.warn(`[ArbMonitor] Failed to save receiver to DB (address still cached in memory):`, dbErr);
+      }
+    }
+
+    return address;
+
+  } catch (err) {
+    logger.error(`[ArbMonitor] Auto-deploy to ${chain.name} failed:`, err);
+    return null;
+  }
+}
+
+/**
+ * Ensure all enabled chains have a receiver deployed.
+ * Called once at startup or on first scan cycle.
+ */
+let _autoDeployDone = false;
+export async function ensureReceiversDeployed(dbPool?: any): Promise<void> {
+  if (_autoDeployDone) return;
+  _autoDeployDone = true;
+
+  if (dbPool) await hydrateReceiversFromDb(dbPool);
+
+  const enabled = getEnabledChains();
+  for (const chain of enabled) {
+    const key = chain.name.toLowerCase();
+    const existing = await getReceiverAddress(key);
+    if (existing) {
+      logger.info(`[ArbMonitor] ${chain.name} receiver: ${existing}`);
+      continue;
+    }
+
+    logger.info(`[ArbMonitor] No receiver for ${chain.name} — auto-deploying...`);
+    await autoDeployReceiver(key, dbPool);
+  }
+}
 
 // ── 24h profit tracker (in-memory, resets on restart) ──────────────────────
 const _profitLog: Array<{ timestamp: number; profitUsd: number }> = [];

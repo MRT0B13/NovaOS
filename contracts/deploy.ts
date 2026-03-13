@@ -1,105 +1,176 @@
 /**
- * Deploy ArbFlashReceiver to Arbitrum (mainnet or Sepolia testnet).
+ * Deploy ArbFlashReceiver to any supported EVM chain.
  *
  * Prerequisites:
+ *   Pre-compiled bytecode in contracts/out/ (run solc if missing):
  *   solc-select install 0.8.20 && solc-select use 0.8.20
+ *   solc --via-ir --abi --bin --optimize --optimize-runs 200 -o contracts/out --overwrite contracts/ArbFlashReceiver.sol
  *
  * Usage:
- *   # Mainnet
+ *   # Deploy to all enabled chains (from CFO_EVM_ARB_CHAINS env var)
  *   bun run contracts/deploy.ts
  *
- *   # Testnet (Arbitrum Sepolia)
- *   bun run contracts/deploy.ts --testnet
+ *   # Deploy to a specific chain
+ *   bun run contracts/deploy.ts --chain base
+ *   bun run contracts/deploy.ts --chain polygon
+ *   bun run contracts/deploy.ts --chain optimism
+ *   bun run contracts/deploy.ts --chain arbitrum
+ *
+ *   # Compile first, then deploy
+ *   bun run contracts/deploy.ts --compile --chain base
  *
  * After deployment:
- *   Set CFO_EVM_ARB_RECEIVER_ADDRESS=<address> in .env
+ *   Addresses are printed. Set in .env or let auto-deploy save to DB.
  */
 
 import { ethers } from 'ethers';
-import { readFileSync, mkdirSync } from 'fs';
+import { readFileSync, mkdirSync, existsSync } from 'fs';
 import { execSync } from 'child_process';
+import { resolve } from 'path';
 
-// Aave v3 PoolAddressesProvider per network
+// Aave v3 PoolAddressesProvider per chain (mainnet)
 const AAVE_PROVIDER: Record<string, string> = {
-  mainnet:  '0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb', // Arbitrum One
-  testnet:  '0x36616cf17557639614c1cdDb356b1B83fc0B2132', // Arbitrum Sepolia
+  arbitrum: '0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb',
+  base:     '0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D',
+  polygon:  '0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb',
+  optimism: '0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb',
 };
 
-async function main() {
-  const isTestnet = process.argv.includes('--testnet');
-  const network = isTestnet ? 'testnet' : 'mainnet';
-  const aaveProvider = AAVE_PROVIDER[network];
+const CHAIN_IDS: Record<string, number> = {
+  arbitrum: 42161,
+  base: 8453,
+  polygon: 137,
+  optimism: 10,
+};
 
-  // Load env from cfoEnv if available, fallback to process.env
-  let privateKey: string | undefined;
-  let rpcUrl: string | undefined;
-  try {
-    const { getCFOEnv } = await import('../src/launchkit/cfo/cfoEnv.ts');
-    const env = getCFOEnv(true);
-    privateKey = env.evmPrivateKey;
-    const alchKey = env.arbitrumRpcUrl?.split('/').pop();
-    rpcUrl = isTestnet
-      ? `https://arb-sepolia.g.alchemy.com/v2/${alchKey}`
-      : env.arbitrumRpcUrl;
-  } catch {
-    privateKey = process.env.CFO_EVM_PRIVATE_KEY;
-    rpcUrl = isTestnet
-      ? 'https://sepolia-rollup.arbitrum.io/rpc'
-      : (process.env.CFO_ARBITRUM_RPC_URL ?? 'https://arb1.arbitrum.io/rpc');
+async function deployToChain(chainKey: string, privateKey: string, rpcUrl: string) {
+  const aaveProvider = AAVE_PROVIDER[chainKey];
+  if (!aaveProvider) {
+    console.error(`❌ Unknown chain: ${chainKey}`);
+    return null;
   }
 
-  if (!privateKey) { console.error('CFO_EVM_PRIVATE_KEY required'); process.exit(1); }
+  const outPath = resolve(process.cwd(), 'contracts', 'out');
+  const abiPath = resolve(outPath, 'ArbFlashReceiver.abi');
+  const binPath = resolve(outPath, 'ArbFlashReceiver.bin');
 
-  console.log(`Network: Arbitrum ${isTestnet ? 'Sepolia (testnet)' : 'One (mainnet)'}`);
+  if (!existsSync(abiPath) || !existsSync(binPath)) {
+    console.error('❌ Pre-compiled artifacts not found. Run with --compile flag first.');
+    return null;
+  }
+
+  const abi = JSON.parse(readFileSync(abiPath, 'utf8'));
+  const bytecode = '0x' + readFileSync(binPath, 'utf8').trim();
+
+  console.log(`\n═══ Deploying to ${chainKey.toUpperCase()} ═══`);
   console.log(`Aave PoolAddressesProvider: ${aaveProvider}`);
 
-  console.log('\nCompiling ArbFlashReceiver.sol (--via-ir)...');
-  mkdirSync('contracts/out', { recursive: true });
-  execSync(
-    'solc --via-ir --abi --bin --optimize --optimize-runs 200 -o contracts/out --overwrite contracts/ArbFlashReceiver.sol',
-    { stdio: 'inherit' }
-  );
-
-  const abi      = JSON.parse(readFileSync('contracts/out/ArbFlashReceiver.abi', 'utf8'));
-  const bytecode = '0x' + readFileSync('contracts/out/ArbFlashReceiver.bin', 'utf8').trim();
-
   const provider = new ethers.JsonRpcProvider(rpcUrl);
-  const wallet   = new ethers.Wallet(privateKey, provider);
+  const wallet = new ethers.Wallet(privateKey, provider);
 
   const chainId = (await provider.getNetwork()).chainId;
   const balance = await provider.getBalance(wallet.address);
-  console.log(`Chain ID: ${chainId}`);
-  console.log(`Deploying from: ${wallet.address}`);
-  console.log(`ETH balance: ${ethers.formatEther(balance)}`);
+  console.log(`Chain ID: ${chainId} | Deployer: ${wallet.address}`);
+  console.log(`Balance: ${ethers.formatEther(balance)} ETH`);
 
   if (balance === 0n) {
-    console.error('\n❌ No ETH for gas. Get testnet ETH from https://faucet.quicknode.com/arbitrum/sepolia');
-    process.exit(1);
+    console.error(`❌ No ETH on ${chainKey} — need gas for deployment`);
+    return null;
   }
 
-  const factory  = new ethers.ContractFactory(abi, bytecode, wallet);
-  const contract = await factory.deploy(aaveProvider, { gasLimit: 2_000_000 });
-  console.log(`\nTx sent: ${contract.deploymentTransaction()?.hash}`);
+  const factory = new ethers.ContractFactory(abi, bytecode, wallet);
+  const contract = await factory.deploy(aaveProvider, { gasLimit: 2_500_000 });
+  console.log(`Tx: ${contract.deploymentTransaction()?.hash}`);
   console.log('Waiting for confirmation...');
   await contract.waitForDeployment();
 
   const address = await contract.getAddress();
 
-  // Verify basic state
+  // Verify
   const deployed = new ethers.Contract(address, abi, provider);
   const owner = await deployed.owner();
-  const aavePool = await deployed.aavePool();
+  const resolvedPool = await deployed.aavePool();
 
-  console.log(`\n✅ ArbFlashReceiver deployed!`);
+  console.log(`✅ ${chainKey.toUpperCase()} deployed!`);
   console.log(`   Address:   ${address}`);
   console.log(`   Owner:     ${owner}`);
-  console.log(`   Aave Pool: ${aavePool}`);
-  console.log(`   Network:   Arbitrum ${isTestnet ? 'Sepolia' : 'One'} (chain ${chainId})`);
+  console.log(`   Aave Pool: ${resolvedPool}`);
 
-  if (!isTestnet) {
-    console.log(`\nAdd to .env:\nCFO_EVM_ARB_RECEIVER_ADDRESS=${address}`);
-  } else {
-    console.log(`\n🧪 Testnet deployment verified. Ready for mainnet:\n   bun run contracts/deploy.ts`);
+  return address;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const shouldCompile = args.includes('--compile');
+  const chainIdx = args.indexOf('--chain');
+  const specificChain = chainIdx >= 0 ? args[chainIdx + 1]?.toLowerCase() : undefined;
+
+  // Compile if requested
+  if (shouldCompile) {
+    console.log('Compiling ArbFlashReceiver.sol (--via-ir)...');
+    mkdirSync('contracts/out', { recursive: true });
+    execSync(
+      'solc --via-ir --abi --bin --optimize --optimize-runs 200 -o contracts/out --overwrite contracts/ArbFlashReceiver.sol',
+      { stdio: 'inherit' }
+    );
+    console.log('Compilation complete.\n');
+  }
+
+  // Load env
+  let privateKey: string | undefined;
+  let rpcUrls: Record<number, string> = {};
+  try {
+    const { getCFOEnv } = await import('../src/launchkit/cfo/cfoEnv.ts');
+    const env = getCFOEnv(true);
+    privateKey = env.evmPrivateKey;
+    rpcUrls = env.evmRpcUrls;
+  } catch {
+    privateKey = process.env.CFO_EVM_PRIVATE_KEY;
+  }
+
+  if (!privateKey) {
+    console.error('CFO_EVM_PRIVATE_KEY required');
+    process.exit(1);
+  }
+
+  // Determine which chains to deploy
+  const chains = specificChain
+    ? [specificChain]
+    : (process.env.CFO_EVM_ARB_CHAINS ?? 'arbitrum').split(',').map(s => s.trim().toLowerCase());
+
+  const results: Record<string, string> = {};
+
+  for (const chain of chains) {
+    const chainId = CHAIN_IDS[chain];
+    if (!chainId) {
+      console.error(`Unknown chain: ${chain}`);
+      continue;
+    }
+
+    const rpcUrl = rpcUrls[chainId];
+    if (!rpcUrl) {
+      console.error(`No RPC URL for ${chain} (chainId ${chainId}). Set CFO_ALCHEMY_API_KEY or CFO_EVM_RPC_URLS.`);
+      continue;
+    }
+
+    try {
+      const address = await deployToChain(chain, privateKey, rpcUrl);
+      if (address) results[chain] = address;
+    } catch (err) {
+      console.error(`Failed to deploy to ${chain}:`, err);
+    }
+  }
+
+  // Summary
+  if (Object.keys(results).length > 0) {
+    console.log('\n═══ DEPLOYMENT SUMMARY ═══');
+    console.log('Add to .env:');
+    for (const [chain, addr] of Object.entries(results)) {
+      const envKey = chain === 'arbitrum'
+        ? 'CFO_EVM_ARB_RECEIVER_ADDRESS'
+        : `CFO_EVM_ARB_RECEIVER_${chain.toUpperCase()}`;
+      console.log(`${envKey}=${addr}`);
+    }
   }
 }
 

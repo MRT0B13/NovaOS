@@ -2995,8 +2995,6 @@ export async function generateDecisions(
     logger.info(`[CFO:Decision] Section J skip: evm_flash_arb strategy score below ${MIN_STRATEGY_SCORE} (${learned.strategyScores['evm_flash_arb']?.toFixed(0) ?? '?'}/100)`);
   } else if (!env.evmArbEnabled) {
     logger.info('[CFO:Decision] Section J skip: evmArbEnabled=false');
-  } else if (!env.evmArbReceiverAddress) {
-    logger.debug('[CFO:Decision] Section J skip: no receiver contract address (CFO_EVM_ARB_RECEIVER_ADDRESS)');
   } else if (intel.guardianCritical) {
     logger.debug('[CFO:Decision] Section J skip: guardian critical alert active');
   } else if (intel.marketCondition === 'danger') {
@@ -3010,7 +3008,7 @@ export async function generateDecisions(
       const poolCount = arbMod.getCandidatePoolCount();
       // Apply learned arb min profit multiplier (higher if slippage eats profits)
       const effectiveArbMinProfit = applyAdaptive(env.evmArbMinProfitUsdc ?? 0.5, learned.evmArbMinProfitMultiplier, conf);
-      logger.debug(`[CFO:Decision] Section J: scanning ${poolCount} Arbitrum pools (ETH=$${ethPrice.toFixed(0)}, minProfit=$${effectiveArbMinProfit.toFixed(2)})...`);
+      logger.debug(`[CFO:Decision] Section J: scanning ${poolCount} pools across ${arbMod.getEnabledChainNames().join('+')} (ETH=$${ethPrice.toFixed(0)}, minProfit=$${effectiveArbMinProfit.toFixed(2)})...`);
       const opp      = await arbMod.scanForOpportunity(ethPrice);
 
       if (opp && opp.netProfitUsd >= effectiveArbMinProfit) {
@@ -6548,11 +6546,12 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
   if (state.polyUsdcBalance > 0) _pSegments.push(`Poly USDC: $${state.polyUsdcBalance.toFixed(0)}`);
   logger.info(`[CFO:Decision] Portfolio: ${_pSegments.join(' | ')}`);
 
-  // 1.5. Hydrate EVM arb profit from DB (survives process restarts)
+  // 1.5. Hydrate EVM arb profit from DB + auto-deploy receivers
   if (env.evmArbEnabled && pool) {
     try {
       const arbMod = await import('./evmArbService.ts');
       await arbMod.hydrateProfit24hFromDb(pool);
+      await arbMod.ensureReceiversDeployed(pool);
     } catch { /* non-fatal */ }
   }
 
