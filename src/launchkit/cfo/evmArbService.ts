@@ -1453,16 +1453,36 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
     // Last 64 hex chars should be the ABI-encoded constructor arg (padded address)
     logger.info(`[ArbMonitor] ${chain.name} constructor arg (last 64 hex): ${deployData.slice(-64)}`);
 
-    // Send raw transaction with generous gas limit to avoid estimation issues
+    // Simulate deployment via eth_call first to catch revert data
+    try {
+      const simResult = await provider.call({
+        from: wallet.address,
+        data: deployData,
+        gasLimit: 2_500_000n,
+      });
+      logger.info(`[ArbMonitor] ${chain.name} deploy simulation OK — returned ${simResult.length} chars`);
+    } catch (simErr: any) {
+      const revertData = simErr?.data || simErr?.error?.data || 'none';
+      logger.error(`[ArbMonitor] ${chain.name} deploy simulation FAILED — revert data: ${revertData}`);
+      logger.error(`[ArbMonitor] ${chain.name} simulation error details: code=${simErr?.code} reason=${simErr?.reason} message=${simErr?.shortMessage || simErr?.message?.slice(0, 200)}`);
+      // Don't return — try the actual deploy anyway for more info
+    }
+
+    // Send raw transaction with generous gas limit
     const tx = await wallet.sendTransaction({
       data: deployData,
-      gasLimit: 500_000n,
+      gasLimit: 2_500_000n,
     });
     logger.info(`[ArbMonitor] ${chain.name} deploy tx: ${tx.hash}`);
 
     const receipt = await tx.wait();
     if (!receipt || receipt.status === 0) {
       logger.error(`[ArbMonitor] ${chain.name} deploy tx reverted on-chain. gasUsed=${receipt?.gasUsed}, status=${receipt?.status}`);
+      // Check if contract was created despite revert (shouldn't happen but log it)
+      if (receipt?.contractAddress) {
+        const code = await provider.getCode(receipt.contractAddress);
+        logger.error(`[ArbMonitor] ${chain.name} contract at ${receipt.contractAddress} has code: ${code.length > 2 ? 'YES' : 'NO'} (${code.length} chars)`);
+      }
       return null;
     }
     const address = receipt.contractAddress?.toLowerCase();
