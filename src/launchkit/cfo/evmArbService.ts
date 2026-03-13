@@ -275,11 +275,20 @@ export async function refreshCandidatePools(): Promise<CandidatePool[]> {
       .filter((p: any) => p.project === 'pancakeswap-amm-v3')
       .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
       .slice(0, 30);
-    const top = [...uniPools, ...camelotPools, ...pcsPools];
+    const sushiPools = raw
+      .filter((p: any) => p.project === 'sushiswap-v3')
+      .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
+      .slice(0, 30);
+    const ramsesPools = raw
+      .filter((p: any) => p.project === 'ramses-v2')
+      .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
+      .slice(0, 30);
+    const top = [...uniPools, ...camelotPools, ...pcsPools, ...sushiPools, ...ramsesPools];
 
     logger.info(
       `[ArbMonitor] DeFiLlama: ${raw.length} CLMM pools → enriching ${top.length} ` +
-      `(${uniPools.length} Uni + ${camelotPools.length} Camelot + ${pcsPools.length} PCS)...`
+      `(${uniPools.length} Uni + ${camelotPools.length} Camelot + ${pcsPools.length} PCS` +
+      `${sushiPools.length ? ` + ${sushiPools.length} Sushi` : ''}${ramsesPools.length ? ` + ${ramsesPools.length} Ramses` : ''})...`
     );
 
     // ── Enrich each DeFiLlama pool with on-chain metadata ──────────────────
