@@ -182,6 +182,31 @@ async function ensureCFOSchema(pool: Pool): Promise<void> {
   await pool.query(`CREATE INDEX IF NOT EXISTS cfo_transactions_strategy_idx ON cfo_transactions (strategy_tag);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS cfo_transactions_position_idx ON cfo_transactions (position_id);`);
 
+  // ── Data migration: fix stale LP position prices ────────────────
+  // Positions opened before the price-tracking fix had entry_price=1 and
+  // current_price stuck at 0 or 1. Backfill from cost_basis_usd which always
+  // had the real deployed amount. This is idempotent — only touches rows where
+  // entry_price is exactly 1 and cost_basis_usd > 1 (indicating a real position).
+  await pool.query(`
+    UPDATE cfo_positions
+    SET entry_price = cost_basis_usd,
+        current_price = CASE WHEN current_price <= 1 THEN cost_basis_usd ELSE current_price END
+    WHERE entry_price = 1
+      AND cost_basis_usd > 1
+      AND strategy IN ('orca_lp', 'krystal_lp')
+  `).catch(() => { /* non-fatal */ });
+
+  // Fix HL positions that have entry_price=0 (stale strategy subtypes that were never tracked)
+  await pool.query(`
+    UPDATE cfo_positions
+    SET entry_price = cost_basis_usd,
+        current_price = CASE WHEN current_price = 0 THEN cost_basis_usd ELSE current_price END
+    WHERE entry_price = 0
+      AND cost_basis_usd > 0
+      AND strategy LIKE 'hl_%'
+      AND status = 'OPEN'
+  `).catch(() => { /* non-fatal */ });
+
   // ── Agent Skills System ──────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS agent_skills (
