@@ -1,22 +1,16 @@
 /**
- * EVM Flash Arbitrage Service — Arbitrum
+ * EVM Flash Arbitrage Service — Multi-chain
  *
- * Dynamic pool discovery + atomic flash loan execution.
+ * Scans Arbitrum, Base, Polygon, and Optimism for atomic flash loan arb
+ * opportunities across multiple DEX venues per chain.
  *
  * Pool list: built from DeFiLlama yields API (public, no auth).
  *   Endpoint: https://yields.llama.fi/pools
- *   Filter: chain=Arbitrum, project in [uniswap-v3, camelot-v3, pancakeswap-amm-v3, balancer-v2], tvlUsd > MIN_POOL_TVL_USD
+ *   Filter: chain ∈ enabled chains, project ∈ per-chain venue list, tvlUsd > MIN_POOL_TVL_USD
  *   Refresh: every CFO_EVM_ARB_POOL_REFRESH_MS (default 4h)
  *
  * Quoting: direct on-chain staticCall to QuoterV2 per venue.
- *   - Uniswap v3 QuoterV2:    quoteExactInputSingle({ tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96 })
- *   - Camelot v3 (Algebra):   quoteExactInput(path, amountIn) — path-encoded, dynamic fee
- *   - PancakeSwap v3 QuoterV2: quoteExactInputSingle({ ... }) — Uni V3 fork, same ABI as Uniswap
- *   - Balancer:               queryBatchSwap() — pool identified by bytes32 poolId
- *
  * Execution: ArbFlashReceiver.sol via Aave v3 flashLoanSimple().
- *   Worst case: tx reverts → gas cost only (~$0.05 on Arbitrum).
- *   Aave fee: 0.05% of flash amount.
  *
  * Key invariant: this module never holds or moves the EVM wallet's balance.
  * All capital is Aave's for the duration of one transaction.
@@ -26,37 +20,188 @@ import { logger } from '@elizaos/core';
 import { getCFOEnv } from './cfoEnv.ts';
 
 // ============================================================================
-// Arbitrum Contract Addresses (mainnet — verified)
+// Multi-chain Configuration
 // ============================================================================
 
-const ARB_ADDRESSES = {
-  // DEX Routers
-  UNISWAP_V3_ROUTER:    '0xE592427A0AEce92De3Edee1F18E0157C05861564',
-  CAMELOT_V3_ROUTER:    '0xc873fEcbd354f5A56E00E710B90EF4201db2448d',
-  PANCAKE_V3_ROUTER:    '0x32226588378236Fd0c7c4053999F88aC0e5cAc77', // PCS SmartRouter (verified: factory() → PCS factory)
-  SUSHI_V3_ROUTER:      '0x8A21F6768C1f8075791D08546Dadf6daA0bE820c', // SushiSwap V3 SwapRouter on Arbitrum
-  RAMSES_V2_ROUTER:     '0xAA23611badAFB62D37E7295A682D21960ac85A90', // Ramses CL router on Arbitrum
-  BALANCER_VAULT:       '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+/** Venue definition — router, quoter, factory addresses for one DEX on one chain */
+interface VenueConfig {
+  dex: DexId;
+  llamaProject: string;     // DeFiLlama project identifier
+  router: string;
+  quoter: string;
+  factory: string;
+  maxPools: number;          // max pools to fetch from DeFiLlama
+  isAlgebra?: boolean;       // true for Camelot/Algebra (dynamic fee, poolByPair)
+}
 
-  // Quoters (view-only — no gas cost via staticCall)
-  UNISWAP_V3_QUOTER:    '0x61fFE014bA17989E743c5F6cB21bF9697530B21e', // QuoterV2
-  CAMELOT_V3_QUOTER:    '0x0524E833cCD057e4d7A296e3aaAb9f7675964Ce1', // NOTE: on-chain factory() returns SushiSwap V3 factory.
-                                                                      // Not used — Camelot quotes use local pool-level math instead
-                                                                      // (reads globalState + liquidity directly from pool contract).
-  PANCAKE_V3_QUOTER:    '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997', // PCS V3 QuoterV2 (verified: factory() → PCS factory)
-  SUSHI_V3_QUOTER:      '0x0524E833cCD057e4d7A296e3aaAb9f7675964Ce1', // SushiSwap V3 uses same QuoterV2 interface
-  RAMSES_V2_QUOTER:     '0xAA20e84a61d5E3C1aA5fc8b1dB0B0FcEFf4015E3', // Ramses CL QuoterV2
+/** Per-chain configuration for arb scanning */
+interface ChainConfig {
+  chainId: number;
+  name: string;              // display name
+  llamaChain: string;        // DeFiLlama chain name (e.g. "Arbitrum", "Base")
+  balancerApiChain: string;  // Balancer API chain enum (e.g. "ARBITRUM", "BASE")
+  aavePool: string;          // Aave V3 Pool address (same across most chains)
+  balancerVault: string;     // Balancer Vault (same across most chains)
+  venues: VenueConfig[];
+  /** Tokens that Aave V3 supports for flash loans on this chain */
+  aaveListedTokens: Set<string>;
+  /** Bridge tokens for triangular arb scanning */
+  bridgeTokens: Set<string>;
+  /** Typical gas for a 2-swap arb in gas units */
+  gasUnits2Swap: number;
+  /** Typical gas for a 3-swap triangular arb in gas units */
+  gasUnits3Swap: number;
+}
 
-  // DEX Factories (for resolving pool addresses from token pairs)
-  UNISWAP_V3_FACTORY:   '0x1F98431c8aD98523631AE4a59f267346ea31F984',
-  CAMELOT_V3_FACTORY:   '0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B',
-  PANCAKE_V3_FACTORY:   '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // verified: getPool() returns valid pools
-  SUSHI_V3_FACTORY:     '0x1af415a1EbA07a4986a52B6f2e7dE7003D82231e', // SushiSwap V3 factory on Arbitrum
-  RAMSES_V2_FACTORY:    '0xAA2cd7477c451E703f3B9Ba5663334914763edF8', // Ramses CL factory on Arbitrum
+// ── Shared addresses across chains ─────────────────────────────────────────
+// Uniswap V3, SushiSwap V3, Balancer, and Aave V3 use canonical deployments
+const UNISWAP_V3_ROUTER_CANONICAL  = '0xE592427A0AEce92De3Edee1F18E0157C05861564';
+const UNISWAP_V3_QUOTER_CANONICAL  = '0x61fFE014bA17989E743c5F6cB21bF9697530B21e';
+const UNISWAP_V3_FACTORY_CANONICAL = '0x1F98431c8aD98523631AE4a59f267346ea31F984';
+const SUSHI_V3_ROUTER_CANONICAL    = '0x8A21F6768C1f8075791D08546Dadf6daA0bE820c';
+const SUSHI_V3_QUOTER_CANONICAL    = '0x64e8802FE490fa7cc61d3c28aFD1A750d0689A07'; // V3 QuoterV2 on most chains
+const SUSHI_V3_FACTORY_CANONICAL   = '0x1af415a1EbA07a4986a52B6f2e7dE7003D82231e';
+const BALANCER_VAULT_CANONICAL     = '0xBA12222222228d8Ba445958a75a0704d566BF2C8';
+const AAVE_V3_POOL_CANONICAL       = '0x794a61358D6845594F94dc1DB02A252b5b4814aD';
 
-  // Aave v3
-  AAVE_POOL:            '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
-} as const;
+// ── Chain configs ──────────────────────────────────────────────────────────
+
+const CHAIN_CONFIGS: Record<string, ChainConfig> = {
+  arbitrum: {
+    chainId: 42161,
+    name: 'Arbitrum',
+    llamaChain: 'Arbitrum',
+    balancerApiChain: 'ARBITRUM',
+    aavePool: AAVE_V3_POOL_CANONICAL,
+    balancerVault: BALANCER_VAULT_CANONICAL,
+    venues: [
+      { dex: 'uniswap_v3', llamaProject: 'uniswap-v3', router: UNISWAP_V3_ROUTER_CANONICAL, quoter: UNISWAP_V3_QUOTER_CANONICAL, factory: UNISWAP_V3_FACTORY_CANONICAL, maxPools: 80 },
+      { dex: 'camelot_v3', llamaProject: 'camelot-v3', router: '0xc873fEcbd354f5A56E00E710B90EF4201db2448d', quoter: '', factory: '0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B', maxPools: 40, isAlgebra: true },
+      { dex: 'pancake_v3', llamaProject: 'pancakeswap-amm-v3', router: '0x32226588378236Fd0c7c4053999F88aC0e5cAc77', quoter: '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997', factory: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', maxPools: 30 },
+      { dex: 'sushi_v3', llamaProject: 'sushiswap-v3', router: SUSHI_V3_ROUTER_CANONICAL, quoter: '0x0524E833cCD057e4d7A296e3aaAb9f7675964Ce1', factory: SUSHI_V3_FACTORY_CANONICAL, maxPools: 30 },
+      { dex: 'ramses_v2', llamaProject: 'ramses-v2', router: '0xAA23611badAFB62D37E7295A682D21960ac85A90', quoter: '0xAA20e84a61d5E3C1aA5fc8b1dB0B0FcEFf4015E3', factory: '0xAA2cd7477c451E703f3B9Ba5663334914763edF8', maxPools: 30 },
+    ],
+    aaveListedTokens: new Set([
+      '0xaf88d065e77c8cc2239327c5edb3a432268e5831', // USDC
+      '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8', // USDC.e
+      '0x82af49447d8a07e3bd95bd0d56f35241523fbab1', // WETH
+      '0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f', // WBTC
+      '0x912ce59144191c1204e64559fe8253a0e49e6548', // ARB
+      '0xf97f4df75117a78c1a5a0dbb814af92458539fb4', // LINK
+      '0xda10009cbd5d07dd0cecc66161fc93d7c9000da1', // DAI
+    ]),
+    bridgeTokens: new Set([
+      '0x82af49447d8a07e3bd95bd0d56f35241523fbab1', // WETH
+      '0xaf88d065e77c8cc2239327c5edb3a432268e5831', // USDC
+      '0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f', // WBTC
+      '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8', // USDC.e
+      '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9', // USDT
+    ]),
+    gasUnits2Swap: 800_000,
+    gasUnits3Swap: 1_200_000,
+  },
+
+  base: {
+    chainId: 8453,
+    name: 'Base',
+    llamaChain: 'Base',
+    balancerApiChain: 'BASE',
+    aavePool: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5', // Aave V3 on Base
+    balancerVault: BALANCER_VAULT_CANONICAL,
+    venues: [
+      { dex: 'uniswap_v3', llamaProject: 'uniswap-v3', router: '0x2626664c2603336E57B271c5C0b26F421741e481', quoter: '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a', factory: '0x33128a8fC17869897dcE68Ed026d694621f6FDfD', maxPools: 80 },
+      { dex: 'pancake_v3', llamaProject: 'pancakeswap-amm-v3', router: '0x678Aa4e4fD66a8E35d4a7Fe7e5D2d5B6Da89A485', quoter: '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997', factory: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', maxPools: 30 },
+      { dex: 'sushi_v3', llamaProject: 'sushiswap-v3', router: '0xFB7eF66a7e61224DD6FcD0D7d9C3be5C8B049b9f', quoter: SUSHI_V3_QUOTER_CANONICAL, factory: '0xc35DADB65012eC5796536bD9864eD8773aBc74C4', maxPools: 30 },
+      // Aerodrome (Velodrome fork on Base) — Algebra-style, dynamic fees
+      { dex: 'camelot_v3', llamaProject: 'aerodrome-v2', router: '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43', quoter: '', factory: '0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A', maxPools: 50, isAlgebra: true },
+    ],
+    aaveListedTokens: new Set([
+      '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', // USDC
+      '0x4200000000000000000000000000000000000006', // WETH
+      '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22', // cbETH
+      '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', // DAI
+    ]),
+    bridgeTokens: new Set([
+      '0x4200000000000000000000000000000000000006', // WETH
+      '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', // USDC
+      '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca', // USDbC
+    ]),
+    gasUnits2Swap: 500_000,
+    gasUnits3Swap: 800_000,
+  },
+
+  polygon: {
+    chainId: 137,
+    name: 'Polygon',
+    llamaChain: 'Polygon',
+    balancerApiChain: 'POLYGON',
+    aavePool: AAVE_V3_POOL_CANONICAL,
+    balancerVault: BALANCER_VAULT_CANONICAL,
+    venues: [
+      { dex: 'uniswap_v3', llamaProject: 'uniswap-v3', router: UNISWAP_V3_ROUTER_CANONICAL, quoter: UNISWAP_V3_QUOTER_CANONICAL, factory: UNISWAP_V3_FACTORY_CANONICAL, maxPools: 80 },
+      { dex: 'pancake_v3', llamaProject: 'pancakeswap-amm-v3', router: '0x32226588378236Fd0c7c4053999F88aC0e5cAc77', quoter: '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997', factory: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', maxPools: 30 },
+      { dex: 'sushi_v3', llamaProject: 'sushiswap-v3', router: '0x0f1480eE0020e0582592668B0E39e4A7A29E939c', quoter: SUSHI_V3_QUOTER_CANONICAL, factory: '0x917933899c6a5f8e37f31e19f92cdbff7e8ff0e2', maxPools: 30 },
+      // QuickSwap V3 (Algebra fork — dynamic fee)
+      { dex: 'camelot_v3', llamaProject: 'quickswap-dex', router: '0xf5b509bB0909a69B1c207E495f687a596C168E12', quoter: '', factory: '0x411b0fAcC3489691f28ad58c47006AF5E3Ab3A28', maxPools: 40, isAlgebra: true },
+    ],
+    aaveListedTokens: new Set([
+      '0x2791bca1f2de4661ed88a30c99a7a9449aa84174', // USDC.e
+      '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', // USDC native
+      '0x7ceb23fd6bc0add59e62ac25578270cff1b9f619', // WETH
+      '0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6', // WBTC
+      '0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270', // WMATIC
+      '0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39', // LINK
+      '0x8f3cf7ad23cd3cadbd9735aff958023239c6a063', // DAI
+    ]),
+    bridgeTokens: new Set([
+      '0x7ceb23fd6bc0add59e62ac25578270cff1b9f619', // WETH
+      '0x2791bca1f2de4661ed88a30c99a7a9449aa84174', // USDC.e
+      '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', // USDC
+      '0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270', // WMATIC
+      '0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6', // WBTC
+    ]),
+    gasUnits2Swap: 800_000,
+    gasUnits3Swap: 1_200_000,
+  },
+
+  optimism: {
+    chainId: 10,
+    name: 'Optimism',
+    llamaChain: 'Optimism',
+    balancerApiChain: 'OPTIMISM',
+    aavePool: AAVE_V3_POOL_CANONICAL,
+    balancerVault: BALANCER_VAULT_CANONICAL,
+    venues: [
+      { dex: 'uniswap_v3', llamaProject: 'uniswap-v3', router: UNISWAP_V3_ROUTER_CANONICAL, quoter: UNISWAP_V3_QUOTER_CANONICAL, factory: UNISWAP_V3_FACTORY_CANONICAL, maxPools: 80 },
+      { dex: 'sushi_v3', llamaProject: 'sushiswap-v3', router: SUSHI_V3_ROUTER_CANONICAL, quoter: SUSHI_V3_QUOTER_CANONICAL, factory: SUSHI_V3_FACTORY_CANONICAL, maxPools: 30 },
+      // Velodrome CL (Algebra-style, dynamic fee)
+      { dex: 'camelot_v3', llamaProject: 'velodrome-v2', router: '0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858', quoter: '', factory: '0xCc0bDDB707055e04e497aB22a59c2aF4391cd12F', maxPools: 50, isAlgebra: true },
+    ],
+    aaveListedTokens: new Set([
+      '0x0b2c639c533813f4aa9d7837caf62653d097ff85', // USDC native
+      '0x7f5c764cbc14f9669b88837ca1490cca17c31607', // USDC.e
+      '0x4200000000000000000000000000000000000006', // WETH
+      '0x68f180fcce6836688e9084f035309e29bf0a2095', // WBTC
+      '0x4200000000000000000000000000000000000042', // OP
+      '0xda10009cbd5d07dd0cecc66161fc93d7c9000da1', // DAI
+    ]),
+    bridgeTokens: new Set([
+      '0x4200000000000000000000000000000000000006', // WETH
+      '0x0b2c639c533813f4aa9d7837caf62653d097ff85', // USDC
+      '0x7f5c764cbc14f9669b88837ca1490cca17c31607', // USDC.e
+      '0x68f180fcce6836688e9084f035309e29bf0a2095', // WBTC
+    ]),
+    gasUnits2Swap: 500_000,
+    gasUnits3Swap: 800_000,
+  },
+};
+
+/** Get list of enabled chain keys from env (default: arbitrum only) */
+function getEnabledChains(): ChainConfig[] {
+  const env = getCFOEnv();
+  const keys = env.evmArbChains.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  return keys.map(k => CHAIN_CONFIGS[k]).filter(Boolean);
+}
 
 // Aave v3 flash loan fee: 0.05%
 const AAVE_FLASH_FEE_BPS = 5;
@@ -68,13 +213,6 @@ const DEX_BALANCER   = 2;
 const DEX_SUSHI_V3   = 3;
 const DEX_RAMSES_V2  = 4;
 type DexType = typeof DEX_UNISWAP_V3 | typeof DEX_CAMELOT_V3 | typeof DEX_BALANCER | typeof DEX_SUSHI_V3 | typeof DEX_RAMSES_V2;
-
-// DeFiLlama project identifiers (Balancer discovery uses Balancer V3 API instead — see fetchBalancerPools)
-const LLAMA_PROJECTS = new Set([
-  'uniswap-v3', 'camelot-v3', 'pancakeswap-amm-v3',
-  'sushiswap-v3',    // SushiSwap V3 on Arbitrum — additional venue for spreads
-  'ramses-v2',       // Ramses CL (V2) — Arbitrum-native, often has wider spreads
-]);
 
 // Minimum pool TVL to include in candidate list ($50k — lower threshold catches
 // mid-cap pairs with wider spreads that major arb bots ignore)
@@ -114,6 +252,7 @@ export interface CandidatePool {
   tvlUsd: number;
   flashAmountUsd: number;     // computed flash size for this pool
   pairKey: string;            // canonical e.g. "0xabc...123_0xdef...456" (lower address first)
+  chainKey: string;           // e.g. "arbitrum", "base", "polygon", "optimism"
 }
 
 export interface ArbOpportunity {
@@ -130,6 +269,7 @@ export interface ArbOpportunity {
   aaveFeeUsd: number;
   gasEstimateUsd: number;
   netProfitUsd: number;
+  chainKey: string;           // which chain this opportunity is on
   detectedAt: number;
 }
 
@@ -186,50 +326,56 @@ const RECEIVER_ABI = [
 ];
 
 // ============================================================================
-// Lazy Arbitrum provider (same private key as Polygon, different RPC)
+// Multi-chain provider management (lazy init, one provider per chain)
 // ============================================================================
 
-let _provider: any = null;
-let _wallet: any   = null;
-let _ethers: any   = null;
+let _ethers: any = null;
+const _providers = new Map<number, any>();   // chainId → JsonRpcProvider
+const _wallets   = new Map<number, any>();   // chainId → Wallet
 
-async function loadArb() {
-  if (_wallet) return { provider: _provider, wallet: _wallet, ethers: _ethers };
+async function loadChain(chainId: number): Promise<{ provider: any; wallet: any; ethers: any }> {
+  if (!_ethers) {
+    const mod = await import('ethers');
+    _ethers = mod.ethers ?? mod;
+  }
 
-  const mod = await import('ethers');
-  _ethers = mod.ethers ?? mod;
+  if (_wallets.has(chainId)) {
+    return { provider: _providers.get(chainId), wallet: _wallets.get(chainId), ethers: _ethers };
+  }
 
   const env = getCFOEnv();
-  if (!env.evmPrivateKey)
-    throw new Error('[ArbMonitor] CFO_EVM_PRIVATE_KEY not set');
+  if (!env.evmPrivateKey) throw new Error('[ArbMonitor] CFO_EVM_PRIVATE_KEY not set');
 
-  _provider = new _ethers.JsonRpcProvider(env.arbitrumRpcUrl);
-  _wallet   = new _ethers.Wallet(env.evmPrivateKey, _provider);
+  const rpcUrl = env.evmRpcUrls[chainId];
+  if (!rpcUrl) throw new Error(`[ArbMonitor] No RPC URL for chainId ${chainId}`);
 
-  logger.info(`[ArbMonitor] Arbitrum provider: ${env.arbitrumRpcUrl}`);
-  logger.info(`[ArbMonitor] Wallet: ${_wallet.address}`);
-  return { provider: _provider, wallet: _wallet, ethers: _ethers };
+  const provider = new _ethers.JsonRpcProvider(rpcUrl);
+  const wallet = new _ethers.Wallet(env.evmPrivateKey, provider);
+
+  _providers.set(chainId, provider);
+  _wallets.set(chainId, wallet);
+
+  logger.info(`[ArbMonitor] Chain ${chainId} provider: ${rpcUrl.replace(/\/v2\/.*/, '/v2/***')}`);
+  if (_wallets.size === 1) logger.info(`[ArbMonitor] Wallet: ${wallet.address}`);
+
+  return { provider, wallet, ethers: _ethers };
+}
+
+/** Backwards compat — loads Arbitrum provider */
+async function loadArb() {
+  return loadChain(42161);
 }
 
 // ============================================================================
-// Pool Discovery — DeFiLlama yields API + on-chain metadata
+// Pool Discovery — DeFiLlama yields API + on-chain metadata (multi-chain)
 // ============================================================================
 
 let _candidatePools: CandidatePool[] = [];
 let _poolsRefreshedAt = 0;
 
 /**
- * Fetch top Arbitrum pools from DeFiLlama and enrich with on-chain metadata.
+ * Fetch top pools from DeFiLlama for all enabled chains, enrich with on-chain metadata.
  * Results cached for evmArbPoolRefreshMs (default 4h).
- *
- * DeFiLlama endpoint: https://yields.llama.fi/pools
- * Response: { status: 'ok', data: Array<{ chain, project, symbol, tvlUsd, pool, underlyingTokens, apyBase }> }
- * 'pool' field is the EVM pool contract address.
- * 'underlyingTokens' is the array of token addresses in the pool.
- *
- * For Uniswap v3 and Camelot v3 pools, we call the pool contract to get fee tier.
- * For Balancer pools, we need the poolId (bytes32) — fetched from Balancer Vault.
- * Token symbols and decimals are fetched on-chain from each token contract.
  */
 export async function refreshCandidatePools(): Promise<CandidatePool[]> {
   const env = getCFOEnv();
@@ -239,88 +385,99 @@ export async function refreshCandidatePools(): Promise<CandidatePool[]> {
     return _candidatePools;
   }
 
-  logger.info('[ArbMonitor] Refreshing candidate pool list from DeFiLlama...');
+  const enabledChains = getEnabledChains();
+  if (enabledChains.length === 0) {
+    logger.warn('[ArbMonitor] No chains enabled — set CFO_EVM_ARB_CHAINS');
+    return _candidatePools;
+  }
+
+  logger.info(`[ArbMonitor] Refreshing pools from DeFiLlama for ${enabledChains.map(c => c.name).join(', ')}...`);
 
   try {
-    const { provider, ethers } = await loadArb();
-
-    // ── Fetch from DeFiLlama ────────────────────────────────────────────────
+    // ── Fetch from DeFiLlama (single API call for all chains) ───────────────
     const resp = await fetch('https://yields.llama.fi/pools');
     if (!resp.ok) throw new Error(`DeFiLlama yields API: ${resp.status}`);
     const data = await resp.json() as { status: string; data: any[] };
 
-    // Filter: Arbitrum, supported DEXes, minimum TVL
-    // Note: DeFiLlama `pool` field is a UUID, not an on-chain address.
-    // Pool addresses are resolved via factory contracts in enrichPool().
-    // Balancer pools with >2 tokens are included but only pairwise arbs are checked.
-    const raw = data.data.filter((p: any) =>
-      p.chain === 'Arbitrum' &&
-      LLAMA_PROJECTS.has(p.project) &&
-      (p.tvlUsd ?? 0) >= MIN_POOL_TVL_USD &&
-      Array.isArray(p.underlyingTokens) &&
-      p.underlyingTokens.length >= 2
-    );
+    const allPools: CandidatePool[] = [];
 
-    // Take top pools per venue separately — smaller venues would otherwise be
-    // squeezed out by Uniswap's higher TVL across all Arbitrum pools
-    const uniPools = raw
-      .filter((p: any) => p.project === 'uniswap-v3')
-      .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
-      .slice(0, 80);
-    const camelotPools = raw
-      .filter((p: any) => p.project === 'camelot-v3')
-      .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
-      .slice(0, 40);
-    const pcsPools = raw
-      .filter((p: any) => p.project === 'pancakeswap-amm-v3')
-      .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
-      .slice(0, 30);
-    const sushiPools = raw
-      .filter((p: any) => p.project === 'sushiswap-v3')
-      .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
-      .slice(0, 30);
-    const ramsesPools = raw
-      .filter((p: any) => p.project === 'ramses-v2')
-      .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
-      .slice(0, 30);
-    const top = [...uniPools, ...camelotPools, ...pcsPools, ...sushiPools, ...ramsesPools];
+    // ── Process each enabled chain in parallel ──────────────────────────────
+    await Promise.all(enabledChains.map(async (chain) => {
+      try {
+        const { provider, ethers } = await loadChain(chain.chainId);
 
-    logger.info(
-      `[ArbMonitor] DeFiLlama: ${raw.length} CLMM pools → enriching ${top.length} ` +
-      `(${uniPools.length} Uni + ${camelotPools.length} Camelot + ${pcsPools.length} PCS` +
-      `${sushiPools.length ? ` + ${sushiPools.length} Sushi` : ''}${ramsesPools.length ? ` + ${ramsesPools.length} Ramses` : ''})...`
-    );
+        // Build set of DeFiLlama projects for this chain
+        const llamaProjects = new Set(chain.venues.map(v => v.llamaProject));
 
-    // ── Enrich each DeFiLlama pool with on-chain metadata ──────────────────
-    const pools: CandidatePool[] = [];
+        // Filter DeFiLlama data for this chain
+        const raw = data.data.filter((p: any) =>
+          p.chain === chain.llamaChain &&
+          llamaProjects.has(p.project) &&
+          (p.tvlUsd ?? 0) >= MIN_POOL_TVL_USD &&
+          Array.isArray(p.underlyingTokens) &&
+          p.underlyingTokens.length >= 2
+        );
 
-    // Batch on-chain calls with Promise.allSettled to avoid one failure blocking all
-    const enriched = await Promise.allSettled(
-      top.map((raw: any) => enrichPool(raw, provider, ethers))
-    );
+        // Per-venue pool selection — prevents large venues from squeezing out small ones
+        const top: any[] = [];
+        for (const venue of chain.venues) {
+          const venuePools = raw
+            .filter((p: any) => p.project === venue.llamaProject)
+            .sort((a: any, b: any) => (b.tvlUsd ?? 0) - (a.tvlUsd ?? 0))
+            .slice(0, venue.maxPools);
+          top.push(...venuePools);
+        }
 
-    for (const result of enriched) {
-      if (result.status === 'fulfilled' && result.value) {
-        pools.push(result.value);
+        // Venue breakdown for logging
+        const venueCounts = chain.venues
+          .map(v => {
+            const count = top.filter((p: any) => p.project === v.llamaProject).length;
+            return count > 0 ? `${count} ${v.dex}` : null;
+          })
+          .filter(Boolean);
+
+        logger.info(`[ArbMonitor] ${chain.name}: ${raw.length} raw → enriching ${top.length} (${venueCounts.join(' + ')})...`);
+
+        // Enrich with on-chain metadata
+        const enriched = await Promise.allSettled(
+          top.map((raw: any) => enrichPool(raw, provider, ethers, chain))
+        );
+
+        const chainPools: CandidatePool[] = [];
+        for (const result of enriched) {
+          if (result.status === 'fulfilled' && result.value) {
+            chainPools.push(result.value);
+          }
+        }
+
+        // Balancer pools (if Balancer vault exists for this chain)
+        if (chain.balancerVault) {
+          const balPools = await fetchBalancerPools(provider, ethers, chain);
+          chainPools.push(...balPools);
+        }
+
+        logger.info(`[ArbMonitor] ${chain.name}: ${chainPools.length} pools ready across ${new Set(chainPools.map(p => p.dex)).size} venues`);
+        allPools.push(...chainPools);
+
+      } catch (err) {
+        logger.warn(`[ArbMonitor] ${chain.name} pool discovery failed:`, err);
       }
-    }
+    }));
 
-    // ── Balancer pools from Balancer V3 API (DeFiLlama UUIDs can't resolve) ──
-    const balancerPools = await fetchBalancerPools(provider, ethers);
-    pools.push(...balancerPools);
+    // Summary
+    const chainSummary = enabledChains.map(c => {
+      const count = allPools.filter(p => p.chainKey === c.name.toLowerCase()).length;
+      return `${c.name}:${count}`;
+    }).join(' ');
+    logger.info(`[ArbMonitor] Pool list ready: ${allPools.length} total | ${chainSummary}`);
 
-    logger.info(`[ArbMonitor] Pool list ready: ${pools.length} pools (${
-      pools.filter(p => p.dex !== 'balancer').length} CLMM + ${balancerPools.length} Bal) across ${
-      new Set(pools.map(p => p.dex)).size
-    } venues`);
-
-    _candidatePools = pools;
+    _candidatePools = allPools;
     _poolsRefreshedAt = Date.now();
-    return pools;
+    return allPools;
 
   } catch (err) {
     logger.warn('[ArbMonitor] Pool refresh failed, using cached list:', err);
-    return _candidatePools; // return stale if available
+    return _candidatePools;
   }
 }
 
@@ -340,10 +497,8 @@ function parsePoolMetaFee(poolMeta: string | undefined): number {
 /**
  * Enrich a single DeFiLlama pool entry with on-chain token metadata and fee tier.
  * Returns null if the pool can't be used (e.g. missing data, non-ERC20 token).
- *
- * Pool addresses are resolved from factory contracts since DeFiLlama `pool` is a UUID.
  */
-async function enrichPool(raw: any, provider: any, ethers: any): Promise<CandidatePool | null> {
+async function enrichPool(raw: any, provider: any, ethers: any, chain: ChainConfig): Promise<CandidatePool | null> {
   try {
     const env = getCFOEnv();
     const [t0addr, t1addr]: [string, string] = [
@@ -351,16 +506,11 @@ async function enrichPool(raw: any, provider: any, ethers: any): Promise<Candida
       raw.underlyingTokens[1].toLowerCase(),
     ];
 
-    // ── Map DeFiLlama project to our DexId ────────────────────────────────
-    const dexMap: Record<string, DexId> = {
-      'uniswap-v3': 'uniswap_v3',
-      'camelot-v3': 'camelot_v3',
-      'pancakeswap-amm-v3': 'pancake_v3',
-      'sushiswap-v3': 'sushi_v3',
-      'ramses-v2': 'ramses_v2',
-      'balancer-v2': 'balancer',
-    };
-    const dex: DexId = dexMap[raw.project];
+    // Find venue config for this DeFiLlama project
+    const venue = chain.venues.find(v => v.llamaProject === raw.project);
+    if (!venue) return null;
+
+    const dex = venue.dex;
     const dexType: DexType = dex === 'uniswap_v3' ? DEX_UNISWAP_V3
       : dex === 'camelot_v3' ? DEX_CAMELOT_V3
       : dex === 'pancake_v3' ? DEX_UNISWAP_V3  // PCS V3 is a Uni V3 fork — same router ABI
@@ -368,70 +518,43 @@ async function enrichPool(raw: any, provider: any, ethers: any): Promise<Candida
       : dex === 'ramses_v2' ? DEX_RAMSES_V2
       : DEX_BALANCER;
 
-    const router = dex === 'uniswap_v3' ? ARB_ADDRESSES.UNISWAP_V3_ROUTER
-      : dex === 'camelot_v3' ? ARB_ADDRESSES.CAMELOT_V3_ROUTER
-      : dex === 'pancake_v3' ? ARB_ADDRESSES.PANCAKE_V3_ROUTER
-      : dex === 'sushi_v3' ? ARB_ADDRESSES.SUSHI_V3_ROUTER
-      : dex === 'ramses_v2' ? ARB_ADDRESSES.RAMSES_V2_ROUTER
-      : ARB_ADDRESSES.BALANCER_VAULT;
-
-    const quoter = dex === 'uniswap_v3' ? ARB_ADDRESSES.UNISWAP_V3_QUOTER
-      : dex === 'camelot_v3' ? ARB_ADDRESSES.CAMELOT_V3_QUOTER
-      : dex === 'pancake_v3' ? ARB_ADDRESSES.PANCAKE_V3_QUOTER
-      : dex === 'sushi_v3' ? ARB_ADDRESSES.SUSHI_V3_QUOTER
-      : dex === 'ramses_v2' ? ARB_ADDRESSES.RAMSES_V2_QUOTER
-      : ARB_ADDRESSES.BALANCER_VAULT; // Balancer queryBatchSwap is on the vault
-
     // ── Fetch token metadata on-chain ──────────────────────────────────────
+    const cacheKey = `${chain.chainId}:`;
     const [t0, t1] = await Promise.all([
-      fetchTokenMeta(t0addr, provider, ethers),
-      fetchTokenMeta(t1addr, provider, ethers),
+      fetchTokenMeta(cacheKey + t0addr, t0addr, provider, ethers),
+      fetchTokenMeta(cacheKey + t1addr, t1addr, provider, ethers),
     ]);
     if (!t0 || !t1) return null;
 
-    // ── Parse fee tier from DeFiLlama poolMeta (e.g. "0.05%" → 500) ───────
-    // DeFiLlama `pool` field is a UUID, not an on-chain address.
-    // Fee tiers and pool addresses are resolved from poolMeta + factory contracts.
     let feeTier = 0;
     let poolId = ethers.ZeroHash as string;
     let poolAddr = '';
 
-    if (dex === 'uniswap_v3' || dex === 'pancake_v3') {
-      // Parse fee from poolMeta string (e.g. "0.05%" → 500)
-      feeTier = parsePoolMetaFee(raw.poolMeta);
-      if (feeTier === 0) return null; // can't trade without fee tier
-
-      // Resolve on-chain pool address from Factory (both Uni V3 and PCS V3 use getPool)
-      const factoryAddr = dex === 'uniswap_v3'
-        ? ARB_ADDRESSES.UNISWAP_V3_FACTORY
-        : ARB_ADDRESSES.PANCAKE_V3_FACTORY;
-      const factory = new ethers.Contract(factoryAddr, [
-        'function getPool(address,address,uint24) view returns (address)',
-      ], provider);
-      poolAddr = (await factory.getPool(t0addr, t1addr, feeTier)).toLowerCase();
-      if (!poolAddr || poolAddr === ethers.ZeroAddress) return null;
-
-    } else if (dex === 'camelot_v3') {
-      // Camelot (Algebra): fee is dynamic per pool, resolved by quoter. feeTier stays 0.
-      const factory = new ethers.Contract(ARB_ADDRESSES.CAMELOT_V3_FACTORY, [
+    if (venue.isAlgebra) {
+      // Algebra-style (Camelot, QuickSwap, Velodrome CL, Aerodrome): dynamic fee, poolByPair
+      const factory = new ethers.Contract(venue.factory, [
         'function poolByPair(address,address) view returns (address)',
       ], provider);
       poolAddr = (await factory.poolByPair(t0addr, t1addr)).toLowerCase();
       if (!poolAddr || poolAddr === ethers.ZeroAddress) return null;
+    } else {
+      // Uniswap V3 style (Uni, PCS, Sushi, Ramses): fee tier from poolMeta, getPool
+      feeTier = parsePoolMetaFee(raw.poolMeta);
+      if (feeTier === 0) return null;
 
-    } else if (dex === 'balancer') {
-      // Balancer pools are fetched directly from Balancer V3 API (see fetchBalancerPools).
-      // This branch is unreachable since 'balancer-v2' was removed from LLAMA_PROJECTS.
-      return null;
+      const factory = new ethers.Contract(venue.factory, [
+        'function getPool(address,address,uint24) view returns (address)',
+      ], provider);
+      poolAddr = (await factory.getPool(t0addr, t1addr, feeTier)).toLowerCase();
+      if (!poolAddr || poolAddr === ethers.ZeroAddress) return null;
     }
 
     // ── Compute flash size ─────────────────────────────────────────────────
     const tvlUsd = raw.tvlUsd ?? 0;
     const maxFlash = env.evmArbMaxFlashUsd ?? 50_000;
     const flashAmountUsd = Math.min(tvlUsd * FLASH_AMOUNT_FRACTION, maxFlash);
-    if (flashAmountUsd < 1000) return null; // too small to be worth it
+    if (flashAmountUsd < 1000) return null;
 
-    // ── Canonical pair key (lower address first for deduplication) ─────────
     const [lo, hi] = t0addr < t1addr ? [t0addr, t1addr] : [t1addr, t0addr];
     const pairKey = `${lo}_${hi}`;
 
@@ -440,30 +563,31 @@ async function enrichPool(raw: any, provider: any, ethers: any): Promise<Candida
       poolId,
       dex,
       dexType,
-      router,
-      quoter,
+      router: venue.router,
+      quoter: venue.quoter,
       token0: t0,
       token1: t1,
       feeTier,
       tvlUsd,
       flashAmountUsd,
       pairKey,
+      chainKey: chain.name.toLowerCase(),
     };
   } catch {
     return null;
   }
 }
 
-// Cache token metadata to avoid redundant on-chain calls
+// Cache token metadata to avoid redundant on-chain calls (keyed by chainId:address)
 const _tokenCache = new Map<string, TokenMeta>();
 
-async function fetchTokenMeta(address: string, provider: any, ethers: any): Promise<TokenMeta | null> {
-  if (_tokenCache.has(address)) return _tokenCache.get(address)!;
+async function fetchTokenMeta(cacheKey: string, address: string, provider: any, ethers: any): Promise<TokenMeta | null> {
+  if (_tokenCache.has(cacheKey)) return _tokenCache.get(cacheKey)!;
   try {
     const token = new ethers.Contract(address, ERC20_ABI, provider);
     const [symbol, decimals] = await Promise.all([token.symbol(), token.decimals()]);
     const meta: TokenMeta = { address, symbol: String(symbol), decimals: Number(decimals) };
-    _tokenCache.set(address, meta);
+    _tokenCache.set(cacheKey, meta);
     return meta;
   } catch {
     return null;
@@ -482,11 +606,11 @@ async function fetchTokenMeta(address: string, provider: any, ethers: any): Prom
  * Multi-token pools generate pairwise CandidatePool entries for each token pair
  * (e.g. a WBTC-WETH-USDC pool → 3 entries: WBTC/WETH, WBTC/USDC, WETH/USDC).
  */
-async function fetchBalancerPools(provider: any, ethers: any): Promise<CandidatePool[]> {
+async function fetchBalancerPools(provider: any, ethers: any, chain: ChainConfig): Promise<CandidatePool[]> {
   try {
     const query = `{
       poolGetPools(
-        where: { chainIn: [ARBITRUM], minTvl: ${MIN_POOL_TVL_USD} }
+        where: { chainIn: [${chain.balancerApiChain}], minTvl: ${MIN_POOL_TVL_USD} }
         orderBy: totalLiquidity
         orderDirection: desc
         first: 20
@@ -514,29 +638,29 @@ async function fetchBalancerPools(provider: any, ethers: any): Promise<Candidate
     const env = getCFOEnv();
     const maxFlash = env.evmArbMaxFlashUsd ?? 50_000;
     const pools: CandidatePool[] = [];
+    const cacheKeyPrefix = `${chain.chainId}:`;
 
     for (const p of apiPools) {
-      // Only WEIGHTED, STABLE, COMPOSABLE_STABLE are standard pool types
       if (!['WEIGHTED', 'STABLE', 'COMPOSABLE_STABLE'].includes(p.type)) continue;
 
       const tvlUsd = parseFloat(p.dynamicData?.totalLiquidity ?? '0');
       if (tvlUsd < MIN_POOL_TVL_USD) continue;
 
       const poolAddr = p.address.toLowerCase();
-      const poolId = p.id as string; // bytes32 poolId
+      const poolId = p.id as string;
 
-      // Filter out BPT (pool's own token which appears in COMPOSABLE_STABLE pools)
       const tokens = (p.poolTokens ?? []).filter(
         (t: any) => t.address.toLowerCase() !== poolAddr
       );
       if (tokens.length < 2) continue;
 
-      // Fetch on-chain metadata for all tokens in this pool (cached)
       const tokenMetas = await Promise.all(
-        tokens.map((t: any) => fetchTokenMeta(t.address.toLowerCase(), provider, ethers))
+        tokens.map((t: any) => {
+          const addr = t.address.toLowerCase();
+          return fetchTokenMeta(cacheKeyPrefix + addr, addr, provider, ethers);
+        })
       );
 
-      // Generate pairwise CandidatePool entries for each valid token combination
       for (let i = 0; i < tokenMetas.length; i++) {
         for (let j = i + 1; j < tokenMetas.length; j++) {
           const t0 = tokenMetas[i];
@@ -555,23 +679,24 @@ async function fetchBalancerPools(provider: any, ethers: any): Promise<Candidate
             poolId,
             dex: 'balancer',
             dexType: DEX_BALANCER,
-            router: ARB_ADDRESSES.BALANCER_VAULT,
-            quoter: ARB_ADDRESSES.BALANCER_VAULT,
+            router: chain.balancerVault,
+            quoter: chain.balancerVault,
             token0: t0,
             token1: t1,
             feeTier: 0,
             tvlUsd,
             flashAmountUsd,
             pairKey: `${lo}_${hi}`,
+            chainKey: chain.name.toLowerCase(),
           });
         }
       }
     }
 
-    logger.info(`[ArbMonitor] Balancer API: ${apiPools.length} pools → ${pools.length} pairwise entries`);
+    logger.info(`[ArbMonitor] ${chain.name} Balancer: ${apiPools.length} pools → ${pools.length} pairwise entries`);
     return pools;
   } catch (err) {
-    logger.warn('[ArbMonitor] Balancer API fetch failed, skipping Balancer pools:', err);
+    logger.warn(`[ArbMonitor] ${chain.name} Balancer API fetch failed:`, err);
     return [];
   }
 }
@@ -670,7 +795,7 @@ async function quoteBalancer(
   amountIn: bigint, ethers: any, provider: any,
 ): Promise<bigint | null> {
   try {
-    const vault = new ethers.Contract(ARB_ADDRESSES.BALANCER_VAULT, BALANCER_VAULT_ABI, provider);
+    const vault = new ethers.Contract(BALANCER_VAULT_CANONICAL, BALANCER_VAULT_ABI, provider);
     const assets = [tokenIn, tokenOut];
     const swaps = [{ poolId, assetInIndex: 0, assetOutIndex: 1, amount: amountIn, userData: '0x' }];
     const funds = {
@@ -710,14 +835,10 @@ async function getPoolQuote(
 // ============================================================================
 
 /**
- * Find the best arb opportunity across all candidate pool pairs.
+ * Find the best arb opportunity across all enabled chains.
  *
- * Algorithm:
- * 1. Group pools by pairKey (same token pair, different venues)
- * 2. For groups with 2+ pools: quote amountIn on all venues
- * 3. Pick best buy (highest tokenOut) and best sell (highest tokenIn back)
- * 4. Calculate net profit after Aave fee + gas
- * 5. Return best opportunity above threshold, or null
+ * Groups pools by chain, then by pair within each chain (can't arb across chains).
+ * For each cross-venue pair: quote buy and sell legs, calculate net profit.
  *
  * @param ethPriceUsd   ETH price for gas cost conversion (from Analyst intel)
  */
@@ -725,13 +846,36 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
   const env = getCFOEnv();
   if (!env.evmArbEnabled) return null;
 
-  const { provider, ethers } = await loadArb();
-  const pools = await refreshCandidatePools();
-  if (pools.length === 0) return null;
+  const allPools = await refreshCandidatePools();
+  if (allPools.length === 0) return null;
 
-  // Arbitrum gas is ~$0.05 per tx, Aave fee is 5bps — so even small arbs are viable.
-  // Default lowered from $2 → $0.50 to catch more opportunities.
   const minProfit = env.evmArbMinProfitUsdc ?? 0.5;
+  const enabledChains = getEnabledChains();
+
+  let best: ArbOpportunity | null = null;
+
+  // Scan each chain independently (can't arb across chains)
+  for (const chain of enabledChains) {
+    const chainPools = allPools.filter(p => p.chainKey === chain.name.toLowerCase());
+    if (chainPools.length === 0) continue;
+
+    const chainBest = await scanChain(chain, chainPools, ethPriceUsd, minProfit);
+    if (chainBest && (!best || chainBest.netProfitUsd > best.netProfitUsd)) {
+      best = chainBest;
+    }
+  }
+
+  return best;
+}
+
+/**
+ * Scan a single chain for arb opportunities.
+ */
+async function scanChain(
+  chain: ChainConfig, pools: CandidatePool[],
+  ethPriceUsd: number, minProfit: number,
+): Promise<ArbOpportunity | null> {
+  const { provider, ethers } = await loadChain(chain.chainId);
 
   // ── Group pools by pair ─────────────────────────────────────────────────
   const byPair = new Map<string, CandidatePool[]>();
@@ -743,52 +887,38 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
 
   const crossVenuePairs = [...byPair.entries()].filter(([, p]) => p.length >= 2);
   logger.info(
-    `[ArbMonitor] ${byPair.size} unique pairs, ${crossVenuePairs.length} cross-venue ` +
-    `(2+ venues). Top candidates: ${
-      crossVenuePairs.slice(0, 5).map(([, p]) =>
+    `[ArbMonitor] ${chain.name}: ${byPair.size} pairs, ${crossVenuePairs.length} cross-venue. ` +
+    `Top: ${
+      crossVenuePairs.slice(0, 3).map(([, p]) =>
         `${p[0].token0.symbol}/${p[0].token1.symbol}(${p.map(pp => pp.dex).join('+')})`
       ).join(', ') || 'none'
     }`
   );
 
-  if (crossVenuePairs.length === 0) {
-    logger.warn('[ArbMonitor] No cross-venue pairs — pool fetch or Camelot quoter issue');
-    return null;
-  }
+  if (crossVenuePairs.length === 0) return null;
 
   let best: ArbOpportunity | null = null;
 
-  // ── Fetch live gas price for accurate cost estimation ─────────────────────
-  let gasPriceGwei = 0.1; // fallback: 0.1 gwei on Arbitrum
+  // ── Fetch live gas price ──────────────────────────────────────────────
+  let gasPriceGwei = 0.01; // fallback for L2s
   try {
     const feeData = await provider.getFeeData();
     if (feeData.gasPrice) gasPriceGwei = Number(feeData.gasPrice) / 1e9;
   } catch { /* use fallback */ }
 
-  // Diagnostic counters — logged at end for visibility
+  // Diagnostic counters
   let pairsSingleVenue = 0, pairsNoFlashAsset = 0, pairsQuoteFail = 0;
   let pairsNoGross = 0, pairsBelowMin = 0, pairsQuoted = 0;
 
-  for (const [pairKey, pairPools] of byPair) {
-    if (pairPools.length < 2) { pairsSingleVenue++; continue; } // need at least 2 venues to arb
+  const AAVE_LISTED = chain.aaveListedTokens;
 
-    // Determine which token to use as flash loan asset (prefer USDC/USDT/WETH — Aave listed)
-    // Aave v3 Arbitrum supports: USDC, USDC.e, WETH, WBTC, ARB, LINK, DAI
-    const AAVE_LISTED = new Set([
-      '0xaf88d065e77c8cc2239327c5edb3a432268e5831', // USDC native
-      '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8', // USDC.e
-      '0x82af49447d8a07e3bd95bd0d56f35241523fbab1', // WETH
-      '0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f', // WBTC
-      '0x912ce59144191c1204e64559fe8253a0e49e6548', // ARB
-      '0xf97f4df75117a78c1a5a0dbb814af92458539fb4', // LINK
-      '0xda10009cbd5d07dd0cecc66161fc93d7c9000da1', // DAI
-    ]);
+  for (const [pairKey, pairPools] of byPair) {
+    if (pairPools.length < 2) { pairsSingleVenue++; continue; }
 
     const pool0 = pairPools[0];
     const t0 = pool0.token0.address;
     const t1 = pool0.token1.address;
 
-    // Flash loan asset = whichever token is Aave-listed (prefer token0)
     const flashAsset = AAVE_LISTED.has(t0) ? pool0.token0
       : AAVE_LISTED.has(t1) ? pool0.token1
       : null;
@@ -854,8 +984,7 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
       const grossRaw = sellBest.amountOut - flashAmountRaw;
       const grossUsd = Number(grossRaw) / (10 ** flashAsset.decimals);
       const aaveFeeUsd = flashAmountUsd * (AAVE_FLASH_FEE_BPS / 10_000);
-      // Gas: ~800k units × live gas price (gwei) → ETH → USD
-      const gasEstimateUsd = (800_000 * gasPriceGwei * 1e-9) * ethPriceUsd;
+      const gasEstimateUsd = (chain.gasUnits2Swap * gasPriceGwei * 1e-9) * ethPriceUsd;
       const netProfitUsd = grossUsd - aaveFeeUsd - gasEstimateUsd;
 
       const spreadBps = flashAmountUsd > 0 ? (grossUsd / flashAmountUsd * 10_000).toFixed(1) : '0';
@@ -891,6 +1020,7 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
         aaveFeeUsd,
         gasEstimateUsd,
         netProfitUsd,
+        chainKey: chain.name.toLowerCase(),
         detectedAt: Date.now(),
       };
 
@@ -898,27 +1028,19 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
 
     } catch (err) {
       pairsQuoteFail++;
-      logger.debug(`[ArbMonitor] Pair ${pairKey} scan error:`, err);
+      logger.debug(`[ArbMonitor] ${chain.name} pair ${pairKey} scan error:`, err);
     }
   }
 
   logger.info(
-    `[ArbMonitor] Cross-venue scan: ${crossVenuePairs.length} pairs → ` +
+    `[ArbMonitor] ${chain.name} scan: ${crossVenuePairs.length} pairs → ` +
     `quoted:${pairsQuoted} noGross:${pairsNoGross} belowMin:${pairsBelowMin} ` +
     `quoteFail:${pairsQuoteFail} noFlash:${pairsNoFlashAsset} | ` +
     `gas:${gasPriceGwei.toFixed(3)}gwei minProfit:$${minProfit.toFixed(2)}`
   );
 
   // ── Triangular arb: A → B → C → A across different pools ──────────────
-  // Look for routes through common bridge tokens (WETH, USDC, WBTC)
-  // that profit when swapping A→B on one pool, B→C on another, C→A on a third.
-  const BRIDGE_TOKENS = new Set([
-    '0x82af49447d8a07e3bd95bd0d56f35241523fbab1', // WETH
-    '0xaf88d065e77c8cc2239327c5edb3a432268e5831', // USDC
-    '0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f', // WBTC
-    '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8', // USDC.e
-    '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9', // USDT
-  ]);
+  const BRIDGE_TOKENS = chain.bridgeTokens;
 
   // Build adjacency: token → [pools that contain this token]
   const tokenPools = new Map<string, CandidatePool[]>();
@@ -928,16 +1050,6 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
     (tokenPools.get(t0) ?? (() => { const a: CandidatePool[] = []; tokenPools.set(t0, a); return a; })()).push(pool);
     (tokenPools.get(t1) ?? (() => { const a: CandidatePool[] = []; tokenPools.set(t1, a); return a; })()).push(pool);
   }
-
-  // For each bridge token B, find pairs A/B and B/C, then check if A/C pool exists
-  // Route: flash A → swap A→B → swap B→C → swap C→A → repay A
-  // Only check routes where A is Aave-listed (we need to flash it)
-  const AAVE_LISTED_TRI = new Set([
-    '0xaf88d065e77c8cc2239327c5edb3a432268e5831', // USDC
-    '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8', // USDC.e
-    '0x82af49447d8a07e3bd95bd0d56f35241523fbab1', // WETH
-    '0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f', // WBTC
-  ]);
 
   let triScanned = 0;
   for (const bridgeToken of BRIDGE_TOKENS) {
@@ -955,13 +1067,13 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
     // For each pair (A, C) reachable via bridge B, check: A→B→C→A
     for (let i = 0; i < reachableTokens.length && triScanned < 50; i++) {
       const tokenA = reachableTokens[i];
-      if (!AAVE_LISTED_TRI.has(tokenA)) continue; // must be able to flash A
+      if (!AAVE_LISTED.has(tokenA)) continue; // must be able to flash A
 
       for (let j = i + 1; j < reachableTokens.length && triScanned < 50; j++) {
         const tokenC = reachableTokens[j];
 
         // Check if direct A/C pool exists (for the final leg C→A)
-        const acKey1 = tokenA < tokenC ? `${tokenA}:${tokenC}` : `${tokenC}:${tokenA}`;
+        const acKey1 = tokenA < tokenC ? `${tokenA}_${tokenC}` : `${tokenC}_${tokenA}`;
         const acPools = byPair.get(acKey1);
         if (!acPools || acPools.length === 0) continue;
 
@@ -1015,7 +1127,7 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
           const triGrossRaw = bestLeg3Out - flashAmtRaw;
           const triGrossUsd = Number(triGrossRaw) / (10 ** tokenAMeta.decimals);
           const triAaveFee = flashAmtUsd * (AAVE_FLASH_FEE_BPS / 10_000);
-          const triGasCost = (1_200_000 * gasPriceGwei * 1e-9) * ethPriceUsd; // 3 swaps ≈ 1.2M gas
+          const triGasCost = (chain.gasUnits3Swap * gasPriceGwei * 1e-9) * ethPriceUsd;
           const triNetProfit = triGrossUsd - triAaveFee - triGasCost;
 
           const bridgeMeta = bestLeg1Pool.token0.address === bridgeToken ? bestLeg1Pool.token0 : bestLeg1Pool.token1;
@@ -1054,6 +1166,7 @@ export async function scanForOpportunity(ethPriceUsd: number): Promise<ArbOpport
             aaveFeeUsd: triAaveFee,
             gasEstimateUsd: triGasCost,
             netProfitUsd: triNetProfit,
+            chainKey: chain.name.toLowerCase(),
             detectedAt: Date.now(),
           };
 
@@ -1094,11 +1207,24 @@ export async function executeFlashArb(opp: ArbOpportunity, ethPriceUsd = 3000): 
     return { success: false, error: `Opportunity stale (${(ageMs / 1000).toFixed(0)}s old)` };
   }
 
-  if (!env.evmArbReceiverAddress) {
-    return { success: false, error: 'CFO_EVM_ARB_RECEIVER_ADDRESS not set — deploy contract first' };
+  // Resolve receiver address for the opportunity's chain
+  const receiverMap: Record<string, string | undefined> = {
+    arbitrum: env.evmArbReceiverAddress,
+    base: env.evmArbReceiverBase,
+    polygon: env.evmArbReceiverPolygon,
+    optimism: env.evmArbReceiverOptimism,
+  };
+  const receiverAddr = receiverMap[opp.chainKey];
+  if (!receiverAddr) {
+    return { success: false, error: `No ArbFlashReceiver deployed on ${opp.chainKey}` };
   }
 
-  const { wallet, ethers } = await loadArb();
+  // Load provider for the right chain
+  const chainConfig = CHAIN_CONFIGS[opp.chainKey];
+  if (!chainConfig) {
+    return { success: false, error: `Unknown chain: ${opp.chainKey}` };
+  }
+  const { wallet, ethers } = await loadChain(chainConfig.chainId);
 
   // minProfit = 80% of expected (allows small quote drift between scan and execution)
   const minProfitRaw = BigInt(Math.floor(opp.netProfitUsd * 0.8 * 10 ** 6));
@@ -1126,10 +1252,10 @@ export async function executeFlashArb(opp: ArbOpportunity, ethPriceUsd = 3000): 
     ]
   );
 
-  const receiver = new ethers.Contract(env.evmArbReceiverAddress, RECEIVER_ABI, wallet);
+  const receiver = new ethers.Contract(receiverAddr, RECEIVER_ABI, wallet);
 
   logger.info(
-    `[ArbMonitor] 🚀 ${opp.displayPair} | ${opp.buyPool.dex}→${opp.sellPool.dex} | ` +
+    `[ArbMonitor] 🚀 ${opp.chainKey.toUpperCase()} ${opp.displayPair} | ${opp.buyPool.dex}→${opp.sellPool.dex} | ` +
     `flash:$${opp.flashAmountUsd.toLocaleString()} | est net:$${opp.netProfitUsd.toFixed(3)}`
   );
 
@@ -1174,6 +1300,7 @@ export async function getArbUsdcBalance(): Promise<number> {
 
 export function getCandidatePoolCount(): number { return _candidatePools.length; }
 export function getPoolsRefreshedAt(): number    { return _poolsRefreshedAt; }
+export function getEnabledChainNames(): string[] { return getEnabledChains().map(c => c.name); }
 
 // ── 24h profit tracker (in-memory, resets on restart) ──────────────────────
 const _profitLog: Array<{ timestamp: number; profitUsd: number }> = [];

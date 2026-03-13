@@ -36,7 +36,7 @@ export interface CFOEnv {
   evmPrivateKey: string | undefined;
   polygonRpcUrl: string;
 
-  /** Arbitrum RPC — used for Hyperliquid */
+  /** Arbitrum RPC — used for Hyperliquid + arb monitor */
   arbitrumRpcUrl: string;
 
   // ── Polymarket ────────────────────────────────────────────────────
@@ -134,11 +134,15 @@ export interface CFOEnv {
   kaminoBorrowLpMaxLtvPct: number;                // won't borrow if post-borrow LTV exceeds this (default 55)
   kaminoBorrowLpCapacityPct: number;              // use at most X% of remaining borrow headroom (default 20)
 
-  // ── EVM Flash Arbitrage (Arbitrum) ─────────────────────────────────────
+  // ── EVM Flash Arbitrage (multi-chain) ──────────────────────────────────
   evmArbEnabled: boolean;              // enable arb scanning + execution (default false)
+  evmArbChains: string;                // comma-separated chain list: "arbitrum,base,polygon,optimism" (default "arbitrum")
   evmArbMinProfitUsdc: number;         // minimum net profit per trade in USD (default 2)
   evmArbMaxFlashUsd: number;           // max flash loan size in USD (default 50000)
-  evmArbReceiverAddress: string | undefined;  // deployed ArbFlashReceiver contract address
+  evmArbReceiverAddress: string | undefined;  // deployed ArbFlashReceiver contract address (Arbitrum)
+  evmArbReceiverBase: string | undefined;     // ArbFlashReceiver on Base
+  evmArbReceiverPolygon: string | undefined;  // ArbFlashReceiver on Polygon
+  evmArbReceiverOptimism: string | undefined; // ArbFlashReceiver on Optimism
   evmArbScanIntervalMs: number;        // how often to scan for opportunities (default 30000)
   evmArbPoolRefreshMs: number;         // how often to refresh pool list from DeFiLlama (default 14400000)
 
@@ -385,9 +389,13 @@ export function getCFOEnv(bust = false): CFOEnv {
     kaminoBorrowLpCapacityPct: Number(process.env.CFO_KAMINO_BORROW_LP_CAPACITY_PCT ?? 20),
 
     evmArbEnabled:          process.env.CFO_EVM_ARB_ENABLE === 'true',
+    evmArbChains:           process.env.CFO_EVM_ARB_CHAINS ?? 'arbitrum',
     evmArbMinProfitUsdc:    Number(process.env.CFO_EVM_ARB_MIN_PROFIT_USDC ?? 2),
     evmArbMaxFlashUsd:      Number(process.env.CFO_EVM_ARB_MAX_FLASH_USD ?? 50_000),
     evmArbReceiverAddress:  process.env.CFO_EVM_ARB_RECEIVER_ADDRESS,
+    evmArbReceiverBase:     process.env.CFO_EVM_ARB_RECEIVER_BASE,
+    evmArbReceiverPolygon:  process.env.CFO_EVM_ARB_RECEIVER_POLYGON,
+    evmArbReceiverOptimism: process.env.CFO_EVM_ARB_RECEIVER_OPTIMISM,
     evmArbScanIntervalMs:   Number(process.env.CFO_EVM_ARB_SCAN_INTERVAL_MS ?? 30_000),
     evmArbPoolRefreshMs:    Number(process.env.CFO_EVM_ARB_POOL_REFRESH_MS ?? 4 * 3600_000),
 
