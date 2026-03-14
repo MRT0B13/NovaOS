@@ -271,7 +271,7 @@ export async function discoverEvmPools(forceRefresh = false): Promise<EvmPoolCan
     const tierCounts = { low: 0, medium: 0, high: 0 };
     for (const c of candidates) tierCounts[c.riskTier]++;
     const top10 = candidates.slice(0, 10).map((c, i) =>
-      `${i + 1}. [${c.riskTier.toUpperCase()}] ${c.pair} (${c.chainName}) score=${c.score.toFixed(0)} APR7d=${c.apr7d.toFixed(1)}% TVL=$${(c.tvlUsd / 1e6).toFixed(1)}M pred=${c.predictedClass}`,
+      `${i + 1}. [${c.riskTier.toUpperCase()}] ${c.pair} (${c.chainName}) score=${c.score.toFixed(0)} APR7d=${c.apr7d.toFixed(1)}% APR24h=${c.apr24h.toFixed(1)}% Vol=$${(c.volumeUsd1d / 1e6).toFixed(1)}M TVL=$${(c.tvlUsd / 1e6).toFixed(1)}M pred=${c.predictedClass}`,
     ).join('\n');
     logger.info(
       `[EvmPoolDiscovery] ${candidates.length} pools scored (low:${tierCounts.low} med:${tierCounts.medium} high:${tierCounts.high}). Top 10:\n${top10}`,
@@ -293,88 +293,99 @@ export async function discoverEvmPools(forceRefresh = false): Promise<EvmPoolCan
  * Score an EVM pool using multi-factor analysis.
  * Uses DeFiLlama ML signals.
  *
- * Factors (total ~100 points):
- *   1. APR 7d (40pts):             primary income signal
- *   2. TVL Depth (25pts):          stability / slippage resistance
- *   3. Volume Consistency (20pts): trading activity + APR sustainability
- *   4. Protocol Quality (10pts):   DEX reputation + audit track record
- *   5. Range Safety (5pts):        stablecoin pairs = minimal IL
+ * Factors (total ~100 points base + bonuses):
+ *   1. APR 7d (30pts):             baseline income signal
+ *   2. 24h Momentum (20pts):       recent fee activity, volume spikes, new launches
+ *   3. TVL Depth (15pts):          stability / slippage resistance
+ *   4. Volume Intensity (20pts):   trading activity + fee generation potential
+ *   5. Protocol Quality (10pts):   DEX reputation + audit track record
+ *   6. Range Safety (5pts):        stablecoin pairs = minimal IL
  *
  * ML & statistical bonuses (up to +25pts):
  *   - ML prediction (Stable/Up with high confidence: +15)
- *   - APR consistency (30d vs 7d alignment: +5)
- *   - Volatility risk (low sigma: +5)
+ *   - Volatility boost (high sigma = more fee opportunities for active LP: +5)
  *   - Learning bonus (historically profitable pair: +5)
  */
 function scoreEvmPool(pool: EvmPoolCandidate, lpBestPairs: string[] = []): void {
   const breakdown: Record<string, number> = {};
   const reasons: string[] = [];
 
-  // ── 1. APR 7d (0-40 pts) ──────────────────────────────────────────
-  const apr = Math.min(pool.apr7d, 200); // cap at 200%
-  if (apr >= 100)     { breakdown.apr7d = 40; reasons.push(`very high APR ${pool.apr7d.toFixed(0)}%`); }
-  else if (apr >= 50) { breakdown.apr7d = 33; reasons.push(`high APR ${pool.apr7d.toFixed(0)}%`); }
-  else if (apr >= 25) { breakdown.apr7d = 25; reasons.push(`good APR ${pool.apr7d.toFixed(0)}%`); }
-  else if (apr >= 15) { breakdown.apr7d = 18; }
-  else if (apr >= 10) { breakdown.apr7d = 12; }
-  else if (apr >= 5)  { breakdown.apr7d = 6; }
+  // ── 1. APR 7d (0-30 pts) — baseline income signal ────────────────
+  const apr = Math.min(pool.apr7d, 500); // cap at 500%
+  if (apr >= 200)     { breakdown.apr7d = 30; reasons.push(`exceptional APR ${pool.apr7d.toFixed(0)}%`); }
+  else if (apr >= 100){ breakdown.apr7d = 27; reasons.push(`very high APR ${pool.apr7d.toFixed(0)}%`); }
+  else if (apr >= 50) { breakdown.apr7d = 22; reasons.push(`high APR ${pool.apr7d.toFixed(0)}%`); }
+  else if (apr >= 25) { breakdown.apr7d = 17; reasons.push(`good APR ${pool.apr7d.toFixed(0)}%`); }
+  else if (apr >= 15) { breakdown.apr7d = 12; }
+  else if (apr >= 10) { breakdown.apr7d = 8; }
+  else if (apr >= 5)  { breakdown.apr7d = 4; }
   else                { breakdown.apr7d = 0; }
 
-  // APR consistency — 30d mean close to 7d = sustainable income
-  if (pool.apr30d > 0 && pool.apr7d > 0) {
-    const ratio = pool.apr7d / pool.apr30d;
-    if (ratio >= 0.7 && ratio <= 1.5) {
-      breakdown.apr7d += 5;
-      reasons.push('consistent APR');
-    } else if (ratio > 2.5) {
-      breakdown.apr7d -= 3;
-      reasons.push('recent APR spike — may be unsustainable');
-    }
-  }
-  breakdown.apr7d = Math.max(0, Math.min(45, breakdown.apr7d)); // clamp
+  // ── 2. 24h Momentum (0-20 pts) — captures hot pools + new launches ─
+  // Compare 24h APR to 7d — a ratio > 1 means fees are accelerating.
+  // This rewards pools experiencing volume surges (new token launches,
+  // volatility events, new pair listings) which generate outsized fees
+  // for LPs positioned early.
+  const apr24h = Math.min(pool.apr24h, 2000); // cap at 2000% (early launch spikes)
+  if (apr24h >= 500)       { breakdown.momentum24h = 20; reasons.push(`🔥 24h APR ${pool.apr24h.toFixed(0)}% — fee surge`); }
+  else if (apr24h >= 200)  { breakdown.momentum24h = 17; reasons.push(`hot 24h APR ${pool.apr24h.toFixed(0)}%`); }
+  else if (apr24h >= 100)  { breakdown.momentum24h = 14; }
+  else if (apr24h >= 50)   { breakdown.momentum24h = 10; }
+  else if (apr24h >= 25)   { breakdown.momentum24h = 6; }
+  else                     { breakdown.momentum24h = 2; }
 
-  // ── 2. TVL Depth (0-25 pts) ───────────────────────────────────────
-  const tvl = pool.tvlUsd;
-  if (tvl >= 10e6)         { breakdown.tvl = 25; reasons.push(`deep TVL $${(tvl / 1e6).toFixed(1)}M`); }
-  else if (tvl >= 5e6)     { breakdown.tvl = 20; }
-  else if (tvl >= 2e6)     { breakdown.tvl = 17; }
-  else if (tvl >= 1e6)     { breakdown.tvl = 15; }
-  else if (tvl >= 500_000) { breakdown.tvl = 10; }
-  else                     { breakdown.tvl = 5; }
-
-  // ── 3. Volume Consistency (0-20 pts) ──────────────────────────────
-  // Compare 24h APR vs 7d APR — penalise spike-and-die pools
+  // Momentum ratio bonus: 24h APR rising compared to 7d means fees are accelerating NOW
   if (pool.apr7d > 0 && pool.apr24h > 0) {
-    const ratio = pool.apr24h / pool.apr7d;
-    if (ratio >= 0.6 && ratio <= 1.6) {
-      breakdown.consistency = 20;
-      reasons.push('consistent volume');
-    } else if (ratio >= 0.3 && ratio <= 2.5) {
-      breakdown.consistency = 12;
-    } else if (ratio > 2.5) {
-      breakdown.consistency = 5;
-      reasons.push('volume spike — may be unsustainable');
-    } else {
-      breakdown.consistency = 5;
-      reasons.push('declining volume');
+    const momentumRatio = pool.apr24h / pool.apr7d;
+    if (momentumRatio >= 3.0) {
+      breakdown.momentum24h = Math.min(20, breakdown.momentum24h + 5);
+      reasons.push(`momentum ${momentumRatio.toFixed(1)}x (24h vs 7d)`);
+    } else if (momentumRatio >= 1.5) {
+      breakdown.momentum24h = Math.min(20, breakdown.momentum24h + 3);
+      reasons.push('rising fee activity');
+    } else if (momentumRatio < 0.3) {
+      breakdown.momentum24h = Math.max(0, breakdown.momentum24h - 5);
+      reasons.push('fees cooling off');
     }
-  } else {
-    breakdown.consistency = 10; // insufficient data
   }
 
-  // Volume/TVL ratio bonus
-  const volTvlRatio = tvl > 0 ? pool.volumeUsd1d / tvl : 0;
-  if (volTvlRatio >= 3) {
-    breakdown.consistency = Math.min(20, (breakdown.consistency ?? 0) + 5);
+  // ── 3. TVL Depth (0-15 pts) ───────────────────────────────────────
+  const tvl = pool.tvlUsd;
+  if (tvl >= 10e6)         { breakdown.tvl = 15; reasons.push(`deep TVL $${(tvl / 1e6).toFixed(1)}M`); }
+  else if (tvl >= 5e6)     { breakdown.tvl = 13; }
+  else if (tvl >= 2e6)     { breakdown.tvl = 11; }
+  else if (tvl >= 1e6)     { breakdown.tvl = 9; }
+  else if (tvl >= 500_000) { breakdown.tvl = 7; }
+  else                     { breakdown.tvl = 4; }
+
+  // ── 4. Volume Intensity (0-20 pts) ────────────────────────────────
+  // Active trading = more fees. Weight 24h volume heavily as a signal
+  // of current market interest — critical for catching new launches.
+  const vol1d = pool.volumeUsd1d ?? 0;
+  if (vol1d >= 50e6)       { breakdown.volume = 20; reasons.push(`massive volume $${(vol1d / 1e6).toFixed(0)}M/day`); }
+  else if (vol1d >= 20e6)  { breakdown.volume = 17; reasons.push(`high volume $${(vol1d / 1e6).toFixed(0)}M/day`); }
+  else if (vol1d >= 10e6)  { breakdown.volume = 14; }
+  else if (vol1d >= 5e6)   { breakdown.volume = 11; }
+  else if (vol1d >= 1e6)   { breakdown.volume = 8; }
+  else if (vol1d >= 500_000) { breakdown.volume = 5; }
+  else                     { breakdown.volume = 2; }
+
+  // Volume/TVL ratio — higher = more fee revenue per $ of LP capital
+  const volTvlRatio = tvl > 0 ? vol1d / tvl : 0;
+  if (volTvlRatio >= 5) {
+    breakdown.volume = Math.min(20, breakdown.volume + 5);
+    reasons.push(`extremely active ${volTvlRatio.toFixed(1)}x TVL/day`);
+  } else if (volTvlRatio >= 2) {
+    breakdown.volume = Math.min(20, breakdown.volume + 3);
     reasons.push(`intensely traded ${volTvlRatio.toFixed(1)}x TVL/day`);
   }
 
-  // ── 4. Protocol Quality (0-10 pts) ────────────────────────────────
+  // ── 5. Protocol Quality (0-10 pts) ────────────────────────────────
   const protoInfo = PROTOCOL_SCORE[pool.protocol.llamaProject];
   breakdown.protocol = protoInfo?.bonus ?? 5;
   reasons.push(protoInfo?.label ?? pool.protocol.name);
 
-  // ── 5. Range Safety / IL Risk (0-5 pts) ───────────────────────────
+  // ── 6. Range Safety / IL Risk (0-5 pts) ───────────────────────────
   const sym0 = pool.token0.symbol.toUpperCase();
   const sym1 = pool.token1.symbol.toUpperCase();
   const is0Stable = isStablecoin(sym0);
@@ -414,13 +425,16 @@ function scoreEvmPool(pool: EvmPoolCandidate, lpBestPairs: string[] = []): void 
     breakdown.mlPrediction = 7; // unknown
   }
 
-  // ── Volatility Risk bonus (0-5 pts) ───────────────────────────────
+  // ── Volatility signal (0-5 pts) ────────────────────────────────────
+  // Higher sigma = more price movement = more fee opportunities for actively
+  // managed LP positions with rebalancing. Penalise only extreme sigma (>2.0)
+  // which signals boom-bust cycles that may leave positions stranded.
   const sigma = pool.sigma ?? 0;
-  if (sigma <= 0.05)      { breakdown.volatilityRisk = 5; reasons.push('very stable'); }
-  else if (sigma <= 0.15) { breakdown.volatilityRisk = 4; }
-  else if (sigma <= 0.5)  { breakdown.volatilityRisk = 3; }
-  else if (sigma <= 1.0)  { breakdown.volatilityRisk = 1; }
-  else                    { breakdown.volatilityRisk = 0; reasons.push('high APR volatility'); }
+  if (sigma >= 0.5 && sigma <= 2.0) { breakdown.volatilitySignal = 5; reasons.push('active volatility — fee-rich'); }
+  else if (sigma >= 0.15)           { breakdown.volatilitySignal = 4; }
+  else if (sigma <= 0.05)           { breakdown.volatilitySignal = 2; reasons.push('low volatility'); }
+  else if (sigma > 2.0)             { breakdown.volatilitySignal = 1; reasons.push('extreme volatility'); }
+  else                              { breakdown.volatilitySignal = 3; }
 
   // ── Compute base score ────────────────────────────────────────────
   pool.score = Object.values(breakdown).reduce((s, v) => s + v, 0);

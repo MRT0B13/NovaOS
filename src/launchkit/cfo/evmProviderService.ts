@@ -54,6 +54,14 @@ export async function getEvmProvider(numericChainId: number): Promise<any> {
     ? ethers.Network.from(numericChainId)
     : new ethers.Network(CHAIN_NAMES[numericChainId] ?? `chain-${numericChainId}`, numericChainId);
   const provider = new ethers.JsonRpcProvider(url, staticNetwork, { staticNetwork: true });
+  // Override resolveName to bypass ENS entirely on all chains.
+  // ethers v6 automatically calls resolveName when addresses are passed to
+  // contract methods. Without ENS support, this throws UNSUPPORTED_OPERATION.
+  // This override returns valid hex addresses as-is and rejects everything else.
+  provider.resolveName = async (name: string) => {
+    if (ethers.isAddress(name)) return ethers.getAddress(name);
+    return null;
+  };
   _providerCache.set(numericChainId, provider);
   return provider;
 }
