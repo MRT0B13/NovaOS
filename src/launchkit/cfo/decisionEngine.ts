@@ -2826,12 +2826,13 @@ export async function generateDecisions(
             .filter(b => b.totalValueUsd >= 10)
             .map(b => b.chainId),
         );
-        // If any chain has enough to bridge, all configured chains are reachable
+        // Bridge-reachable chains are available as fallback, but we strongly
+        // prefer funded chains to avoid bridge costs and latency.
         const totalCrossChainValue = state.evmChainBalances.reduce((s, b) => s + b.totalValueUsd, 0);
         const bridgeReachable = totalCrossChainValue >= 20 && env.lifiEnabled;
-        const deployableChainIds = bridgeReachable
-          ? new Set([...fundedChainIds, ...Object.keys(env.evmRpcUrls).map(Number)])
-          : fundedChainIds;
+        const bridgeOnlyChainIds = bridgeReachable
+          ? new Set(Object.keys(env.evmRpcUrls).map(Number).filter(id => !fundedChainIds.has(id)))
+          : new Set<number>();
 
         // Build set of chains with enough native gas for LP operations (approve×2 + swap + mint).
         // 0.003 ETH ~= $6 — covers multi-step txs on all EVM chains comfortably.
@@ -2842,17 +2843,34 @@ export async function generateDecisions(
             .map(b => b.chainId),
         );
 
-        const eligible = pools.filter(p =>
+        // First pass: pools on FUNDED chains only (where capital already sits)
+        const fundedEligible = pools.filter(p =>
           p.tvlUsd >= env.evmLpMinTvlUsd &&
           p.apr7d >= learnedMinApr &&
           (env.evmRpcUrls[p.chainId] || p.chainId === 42161) &&
-          deployableChainIds.has(p.chainId) && // deploy on funded chains OR bridge-reachable chains
-          gasReadyChainIds.has(p.chainId) &&   // must have enough native gas on target chain
+          fundedChainIds.has(p.chainId) &&         // funded chains only
+          gasReadyChainIds.has(p.chainId) &&
           env.evmLpRiskTiers.has(p.riskTier) &&
-          // Skip pools with known-unswappable tokens (populated by pre-flight failures, TTL 2h)
           !swapSvc.hasSwapFailure(p.chainId, p.token0.address) &&
           !swapSvc.hasSwapFailure(p.chainId, p.token1.address),
         );
+
+        // Fallback: if no good pools on funded chains, expand to bridge-reachable chains
+        const eligible = fundedEligible.length > 0
+          ? fundedEligible
+          : pools.filter(p =>
+              p.tvlUsd >= env.evmLpMinTvlUsd &&
+              p.apr7d >= learnedMinApr &&
+              (env.evmRpcUrls[p.chainId] || p.chainId === 42161) &&
+              (fundedChainIds.has(p.chainId) || bridgeOnlyChainIds.has(p.chainId)) &&
+              // Bridge targets don't need gas — bridge can include native token
+              (fundedChainIds.has(p.chainId) ? gasReadyChainIds.has(p.chainId) : true) &&
+              env.evmLpRiskTiers.has(p.riskTier) &&
+              !swapSvc.hasSwapFailure(p.chainId, p.token0.address) &&
+              !swapSvc.hasSwapFailure(p.chainId, p.token1.address),
+            );
+
+        logger.info(`[EVM_LP] Pool filter: ${fundedEligible.length} pools on funded chains [${[...fundedChainIds].join(',')}], ${eligible.length} total eligible (bridge fallback: ${fundedEligible.length === 0 && bridgeOnlyChainIds.size > 0})`);
 
         // Build a map from normalised pair key → existing position (for increase-liquidity)
         // Case-insensitive symbol comparison prevents duplicates from mismatched casing (cbBTC vs CBBTC)
