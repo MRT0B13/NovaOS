@@ -146,6 +146,11 @@ function getFactoryForProtocol(protoKey: string, chainId: number): string | unde
   return resolved?.factoryAddress;
 }
 
+/** Returns true when addr is a checksummed or lowercase 0x-prefixed 40-hex-char EVM address. */
+function isValidEvmAddress(addr: string): boolean {
+  return /^0x[a-fA-F0-9]{40}$/.test(addr);
+}
+
 // Legacy constant for backward compatibility
 const NFPM_ADDRESS = '0xC36442b4a4522E871399CD717aBDD847Ab11FE88';
 
@@ -994,12 +999,54 @@ export async function openEvmLpPosition(
       return { success: false, error: `No NFPM deployed on chainId ${chainNumericId} for protocol ${protoName}` };
     }
 
+    // 0b. Resolve pool address — if the stored address is not a valid 0x hex address
+    //     (e.g. a DeFiLlama UUID was stored), resolve the actual on-chain address from
+    //     the factory contract before any ethers.Contract is constructed with it.
+    //     ethers v6 interprets any string containing hyphens as an ENS name and throws
+    //     UNCONFIGURED_NAME when ENS is not set up on the provider.
+    let resolvedPoolAddress = pool.poolAddress;
+    if (!isValidEvmAddress(resolvedPoolAddress)) {
+      const factoryForResolution = protoResolved?.factoryAddress;
+      if (!factoryForResolution) {
+        return {
+          success: false,
+          error: `poolAddress "${resolvedPoolAddress}" is not a valid EVM address and no factory is available to resolve it on chain ${chainNumericId}`,
+        };
+      }
+      logger.warn(
+        `[EvmLP] poolAddress "${resolvedPoolAddress}" is not a valid 0x address — ` +
+        `resolving from ${protoResolved?.def.label ?? protoName} factory`,
+      );
+      const resolveAbiStr = isAerodromeCl
+        ? 'function getPool(address,address,int24) view returns (address)'
+        : 'function getPool(address,address,uint24) view returns (address)';
+      const resolveFactory = new ethers.Contract(factoryForResolution, [resolveAbiStr], provider);
+      const factoryResult: string | null = await resolveFactory
+        .getPool(pool.token0.address, pool.token1.address, pool.feeTier)
+        .catch(() => null);
+      if (!factoryResult) {
+        return {
+          success: false,
+          error: `Factory call failed when resolving pool address for ${pool.token0.symbol}/${pool.token1.symbol} fee=${pool.feeTier}`,
+        };
+      }
+      if (factoryResult === ethers.ZeroAddress) {
+        return {
+          success: false,
+          error: `Cannot resolve pool address for ${pool.token0.symbol}/${pool.token1.symbol} ` +
+                 `fee=${pool.feeTier} from factory — pool does not exist on-chain`,
+        };
+      }
+      resolvedPoolAddress = factoryResult;
+      logger.info(`[EvmLP] Resolved pool address from factory: ${resolvedPoolAddress}`);
+    }
+
     // 1. Read current tick + on-chain tickSpacing from pool contract
     //    We read tickSpacing() on-chain because the API feeTier field
     //    may not match the on-chain value (e.g. Aerodrome returns feeTier=402
     //    but the real tickSpacing is 100). All V3-style pools expose tickSpacing().
     //    Aerodrome CL slot0() returns 6 values (no feeProtocol); Uniswap V3 returns 7.
-    const poolContract = new ethers.Contract(pool.poolAddress, getPoolAbi(isAerodromeCl), provider);
+    const poolContract = new ethers.Contract(resolvedPoolAddress, getPoolAbi(isAerodromeCl), provider);
     const [slot0, onChainTickSpacing] = await Promise.all([
       poolContract.slot0(),
       poolContract.tickSpacing().catch(() => null),
