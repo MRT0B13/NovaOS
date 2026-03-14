@@ -2845,13 +2845,13 @@ export async function generateDecisions(
         const eligible = pools.filter(p =>
           p.tvlUsd >= env.evmLpMinTvlUsd &&
           p.apr7d >= learnedMinApr &&
-          (env.evmRpcUrls[p.chainNumericId] || p.chainNumericId === 42161) &&
-          deployableChainIds.has(p.chainNumericId) && // deploy on funded chains OR bridge-reachable chains
-          gasReadyChainIds.has(p.chainNumericId) &&   // must have enough native gas on target chain
+          (env.evmRpcUrls[p.chainId] || p.chainId === 42161) &&
+          deployableChainIds.has(p.chainId) && // deploy on funded chains OR bridge-reachable chains
+          gasReadyChainIds.has(p.chainId) &&   // must have enough native gas on target chain
           env.evmLpRiskTiers.has(p.riskTier) &&
           // Skip pools with known-unswappable tokens (populated by pre-flight failures, TTL 2h)
-          !swapSvc.hasSwapFailure(p.chainNumericId, p.token0.address) &&
-          !swapSvc.hasSwapFailure(p.chainNumericId, p.token1.address),
+          !swapSvc.hasSwapFailure(p.chainId, p.token0.address) &&
+          !swapSvc.hasSwapFailure(p.chainId, p.token1.address),
         );
 
         // Build a map from normalised pair key → existing position (for increase-liquidity)
@@ -2869,7 +2869,7 @@ export async function generateDecisions(
         const newPools: typeof eligible = [];
         const increasePools: Array<{ pool: typeof eligible[0]; existing: { posId: string; inRange: boolean; valueUsd: number } }> = [];
         for (const p of eligible) {
-          const key = `${p.chainNumericId}_${p.token0.symbol.toUpperCase()}_${p.token1.symbol.toUpperCase()}`;
+          const key = `${p.chainId}_${p.token0.symbol.toUpperCase()}_${p.token1.symbol.toUpperCase()}`;
           const existing = existingPairMap.get(key);
           if (existing) {
             // Only add to in-range positions (out-of-range → let rebalance handle it)
@@ -2915,8 +2915,8 @@ export async function generateDecisions(
           // Exclude pools whose pair was already selected in another tier this cycle
           const tierPools = newPools.filter(p =>
             p.riskTier === tier &&
-            !pairsSelectedThisCycle.has(`${p.chainNumericId}_${p.token0.symbol.toUpperCase()}_${p.token1.symbol.toUpperCase()}`) &&
-            !pairsSelectedThisCycle.has(`${p.chainNumericId}_${p.token1.symbol.toUpperCase()}_${p.token0.symbol.toUpperCase()}`),
+            !pairsSelectedThisCycle.has(`${p.chainId}_${p.token0.symbol.toUpperCase()}_${p.token1.symbol.toUpperCase()}`) &&
+            !pairsSelectedThisCycle.has(`${p.chainId}_${p.token1.symbol.toUpperCase()}_${p.token0.symbol.toUpperCase()}`),       
           );
           if (tierPools.length === 0) {
             evmLpSkip(`no ${tier}-risk NEW pools pass filters (${newPools.length} new, ${increasePools.length} increase-eligible)`);
@@ -2932,12 +2932,12 @@ export async function generateDecisions(
           }
 
           // Cap deploy to available value: target chain local value + bridgeable value from other chains
-          const targetChainBal = state.evmChainBalances.find(b => b.chainId === best.chainNumericId);
+          const targetChainBal = state.evmChainBalances.find(b => b.chainId === best.chainId);
           const targetChainLocalValue = targetChainBal?.totalValueUsd ?? 0;
           // If target chain is underfunded, consider bridgeable funds from other chains (minus ~3% for bridge fees)
           const otherChainsValue = bridgeReachable
             ? state.evmChainBalances
-                .filter(b => b.chainId !== best.chainNumericId && b.totalValueUsd >= 5)
+                .filter(b => b.chainId !== best.chainId && b.totalValueUsd >= 5)
                 .reduce((s, b) => s + b.totalValueUsd, 0) * 0.97
             : 0;
           const effectiveValue = targetChainLocalValue + otherChainsValue;
@@ -2970,7 +2970,7 @@ export async function generateDecisions(
             params: {
               pool: {
                 chainId: best.chainId,
-                chainNumericId: best.chainNumericId,
+                chainNumericId: best.chainId,
                 poolAddress: best.poolAddress,
                 token0: best.token0,
                 token1: best.token1,
@@ -2985,7 +2985,7 @@ export async function generateDecisions(
               // Bridge funding: pick the chain with the most total value (stables + native + WETH)
               bridgeFunding: (() => {
                 const bestBal = state.evmChainBalances
-                  .filter(b => b.chainId !== best.chainNumericId && b.totalValueUsd >= deployUsd * 0.5)
+                  .filter(b => b.chainId !== best.chainId && b.totalValueUsd >= deployUsd * 0.5)
                   .sort((a, b) => b.totalValueUsd - a.totalValueUsd)[0];
                 if (bestBal && env.evmPrivateKey) {
                   return { sourceChainId: bestBal.chainId, walletAddress: '' };
@@ -3004,8 +3004,8 @@ export async function generateDecisions(
           tiersOpened++;
 
           // Mark this pair as selected so no other tier can open it again this cycle
-          const pairKey0 = `${best.chainNumericId}_${best.token0.symbol.toUpperCase()}_${best.token1.symbol.toUpperCase()}`;
-          const pairKey1 = `${best.chainNumericId}_${best.token1.symbol.toUpperCase()}_${best.token0.symbol.toUpperCase()}`;
+          const pairKey0 = `${best.chainId}_${best.token0.symbol.toUpperCase()}_${best.token1.symbol.toUpperCase()}`;
+          const pairKey1 = `${best.chainId}_${best.token1.symbol.toUpperCase()}_${best.token0.symbol.toUpperCase()}`;
           pairsSelectedThisCycle.add(pairKey0);
           pairsSelectedThisCycle.add(pairKey1);
           // Also add to existingPairMap so INCREASE section doesn't double-up
@@ -3037,7 +3037,7 @@ export async function generateDecisions(
             }
 
             // Cap deploy per increase to per-tier budget
-            const targetChainBal = state.evmChainBalances.find(b => b.chainId === incPool.chainNumericId);
+            const targetChainBal = state.evmChainBalances.find(b => b.chainId === incPool.chainId);
             const localValue = targetChainBal?.totalValueUsd ?? 0;
             const deployUsd = Math.min(perTierMaxUsd, env.evmLpMaxUsd, evmDeployCap, localValue * 0.9);
             if (deployUsd < 10) continue; // too small to bother
@@ -3050,7 +3050,7 @@ export async function generateDecisions(
               params: {
                 pool: {
                   chainId: incPool.chainId,
-                  chainNumericId: incPool.chainNumericId,
+                  chainNumericId: incPool.chainId,
                   poolAddress: incPool.poolAddress,
                   token0: incPool.token0,
                   token1: incPool.token1,
