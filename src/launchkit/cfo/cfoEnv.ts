@@ -78,6 +78,10 @@ export interface CFOEnv {
   hlPerpSwingEnabled: boolean;                   // enable swing style 1d/1h (default: true when TA on)
   hlPerpScalpCooldownMs: number;                 // cooldown between scalp entries per coin (default: 10m)
 
+  // ── Hyperliquid Perp: Session Activity Gate ──────────────────────────
+  hlPerpSessionGateEnabled: boolean;              // volume-based session activity gate (default: true)
+  hlPerpSessionQuietThreshold: number;            // activity score below which dampening applies (0-1, default: 0.30)
+
   // ── Hyperliquid Spot Trading ──────────────────────────────────────────
   hlSpotTradingEnabled: boolean;                 // master switch for spot trades (default: false)
   hlSpotTaEnabled: boolean;                      // enable TA-driven spot entries (default: true when spot on)
@@ -328,6 +332,10 @@ export function getCFOEnv(bust = false): CFOEnv {
     hlPerpDayEnabled: process.env.CFO_HL_PERP_DAY_ENABLE !== 'false',
     hlPerpSwingEnabled: process.env.CFO_HL_PERP_SWING_ENABLE !== 'false',
     hlPerpScalpCooldownMs: Number(process.env.CFO_HL_PERP_SCALP_COOLDOWN_MIN ?? 10) * 60_000,
+
+    // Session activity gate
+    hlPerpSessionGateEnabled: process.env.CFO_HL_PERP_SESSION_GATE_ENABLE !== 'false', // default ON
+    hlPerpSessionQuietThreshold: Math.max(0, Math.min(1, Number(process.env.CFO_HL_PERP_SESSION_QUIET_THRESHOLD ?? 0.30))),
 
     // Spot trading (accept both ENABLE and ENABLED suffixes)
     hlSpotTradingEnabled: (process.env.CFO_HL_SPOT_TRADING_ENABLED ?? process.env.CFO_HL_SPOT_TRADING_ENABLE) === 'true',

@@ -641,6 +641,10 @@ export class CFOAgent extends BaseAgent {
                 stopLossPct: p.stopLossPct,
                 takeProfitPct: p.takeProfitPct,
                 decisionType: d.type,
+                ...(p.sessionActivityScore !== undefined ? {
+                  sessionActivityScore: p.sessionActivityScore,
+                  sessionQuiet: p.sessionQuiet,
+                } : {}),
               },
               openedAt: now,
               updatedAt: now,

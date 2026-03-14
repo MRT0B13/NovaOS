@@ -142,6 +142,50 @@ export function recordSLHitForCircuitBreaker(): void {
   _recentSLHits = _recentSLHits.filter(t => t > cutoff);
 }
 
+// ── Session activity scoring (volume-based, replaces clock-based dead zones) ──
+// Tracks aggregate 24h notional volume across perp coins each decision cycle.
+// Compares short-term average to a slow-moving EMA baseline.
+// Score: 0 = dead market, 0.5 = normal, 1.0 = very active.
+const ACTIVITY_HISTORY_SIZE = 60; // ~1 hour of samples at 60s cycles
+let _activityHistory: { ts: number; aggVolume: number }[] = [];
+let _activityEma = 0;
+
+function computeSessionActivityScore(
+  assetContexts: Map<string, { coin: string; dayNtlVlm: number; [k: string]: any }>,
+  perpCoins: string[],
+): number {
+  // Sum 24h notional volume across all traded coins
+  let aggVolume = 0;
+  for (const coin of perpCoins) {
+    const ctx = assetContexts.get(coin);
+    if (ctx) aggVolume += ctx.dayNtlVlm;
+  }
+  if (aggVolume === 0) return 0.5; // no data = neutral
+
+  // Push into ring buffer
+  _activityHistory.push({ ts: Date.now(), aggVolume });
+  if (_activityHistory.length > ACTIVITY_HISTORY_SIZE) {
+    _activityHistory = _activityHistory.slice(-ACTIVITY_HISTORY_SIZE);
+  }
+
+  // Slow EMA baseline (alpha=0.05 ≈ tracks "normal" volume over ~20 samples)
+  if (_activityEma === 0) {
+    _activityEma = aggVolume;
+  } else {
+    _activityEma = 0.05 * aggVolume + 0.95 * _activityEma;
+  }
+
+  // Short-term average (last 10 samples ≈ last 10 min)
+  const recentSlice = _activityHistory.slice(-10);
+  const recentAvg = recentSlice.reduce((s, h) => s + h.aggVolume, 0) / recentSlice.length;
+
+  // Activity ratio: recent / baseline
+  const activityRatio = _activityEma > 0 ? recentAvg / _activityEma : 1.0;
+
+  // Normalize to 0-1: ratio ≤0.5→0, ratio 1.0→0.5, ratio ≥2.0→1.0
+  return Math.max(0, Math.min(1.0, (activityRatio - 0.5) / 1.5));
+}
+
 /** Remove a tracked trade style after the position is closed (from scalp monitor or external close) */
 export function clearTradeStyle(key: string): void {
   _perpTradeStyles.delete(key);
@@ -3537,6 +3581,26 @@ export async function generateDecisions(
     // Dead zones for scalps: Asian overnight (00:00-06:00 UTC) + weekends
     const isScalpDeadZone = (utcHour >= 0 && utcHour < 6) || isWeekendLowLiq;
 
+    // ── Session activity gate (volume-based) ──────────────────────────────
+    // Measures real-time aggregate volume vs recent baseline — data-driven,
+    // not clock-based. Score: 0 = dead market, 0.5 = normal, 1.0 = very active.
+    let sessionActivityScore = 0.5; // neutral default
+    let sessionIsQuiet = false;
+    const sessionGateOn = env.hlPerpSessionGateEnabled;
+    const sessionQuietThreshold = env.hlPerpSessionQuietThreshold;
+    if (sessionGateOn && assetContexts.size > 0) {
+      sessionActivityScore = computeSessionActivityScore(assetContexts, perpCoins);
+      // Clock-based nudge: during traditional dead zones, apply a small pessimistic bias
+      if (isScalpDeadZone) sessionActivityScore = Math.max(0, sessionActivityScore - 0.1);
+      sessionIsQuiet = sessionActivityScore < sessionQuietThreshold;
+      if (sessionIsQuiet) {
+        logger.info(
+          `[CFO:Decision] Section M: Session activity score ${sessionActivityScore.toFixed(2)} ` +
+          `< ${sessionQuietThreshold} — dampening entries`,
+        );
+      }
+    }
+
     // ── Portfolio heat check (aggregate risk % of equity) ──────────────────
     // Sum of (sizeUsd × SL%) across all open perp positions = total $ at risk.
     // Cap at 8% of HL equity to prevent catastrophic correlated drawdowns.
@@ -3683,11 +3747,21 @@ export async function generateDecisions(
       const conviction = Math.min(1.0, Math.abs(netBull));
       const side: 'LONG' | 'SHORT' = netBull >= 0 ? 'LONG' : 'SHORT';
 
-      if (conviction >= minConviction && reasons.length >= 2) {
+      // ── Session activity dampening for sentiment-driven signals ────
+      // Apply same volume-based gate as TA signals — sentiment uses 'day' scale (0.7).
+      let effectiveConviction = conviction;
+      if (sessionIsQuiet && effectiveConviction > 0) {
+        const dampeningMult = 0.30 + (sessionActivityScore / sessionQuietThreshold) * 0.70;
+        const learnedStr = learned.hlPerpSessionDampeningMult ?? 1.0;
+        const sentDampening = 1.0 - (1.0 - dampeningMult) * 0.7 * learnedStr;
+        effectiveConviction *= sentDampening;
+      }
+
+      if (effectiveConviction >= minConviction && reasons.length >= 2) {
         signals.push({
           coin,
           side,
-          conviction,
+          conviction: effectiveConviction,
           reasoning: reasons.join(', '),
           sources: [...new Set(sources)],
         });
@@ -3726,8 +3800,9 @@ export async function generateDecisions(
           // ── Danger market gate — skip new longs in danger mode ────────
           if (intel.marketCondition === 'danger' && taSig.bias === 'LONG') { taDangerRejects++; continue; }
 
-          // ── Time-of-day filter — skip scalps during low-liquidity periods ──
-          if (taSig.style === 'scalp' && isScalpDeadZone) { taStyleConvRejects++; continue; }
+          // ── Time-of-day nudge — clock-based dead zone is now folded into the
+          // session activity score (see sessionActivityScore -= 0.1 above). Volume-
+          // based dampening handles quiet periods data-driven, so no hard skip here.
 
           // ── Per-style learning: conviction floor ─────────────────────
           const styleConvFloor = learned.hlPerpStyleConvictionFloors?.[taSig.style] ?? 0;
@@ -3774,6 +3849,25 @@ export async function generateDecisions(
             const volToOI = assetCtx.dayNtlVlm / assetCtx.openInterest;
             if (taSig.style === 'scalp' && volToOI < 0.5) {
               finalConviction *= 0.85; // thin liquidity → harder to exit cleanly
+            }
+          }
+
+          // ── Session activity dampening ──────────────────────────────────
+          // Low market activity → dampen conviction. Scalps penalized hardest,
+          // swings least. Per-coin volume override: if this specific coin is
+          // moving (volumeRatio > 2x avg), partially restore conviction.
+          if (sessionIsQuiet) {
+            const dampeningMult = 0.30 + (sessionActivityScore / sessionQuietThreshold) * 0.70;
+            const stylePenalty: Record<string, number> = { scalp: 1.0, day: 0.7, swing: 0.4 };
+            const scale = stylePenalty[taSig.style] ?? 0.7;
+            const learnedStr = learned.hlPerpSessionDampeningMult ?? 1.0;
+            const effectiveDampening = 1.0 - (1.0 - dampeningMult) * scale * learnedStr;
+            finalConviction *= effectiveDampening;
+
+            // Per-coin override: coin-specific volume surge overrides quiet market
+            if (taSig.volumeRatio && taSig.volumeRatio > 2.0) {
+              const override = Math.min(0.5, (taSig.volumeRatio - 2.0) * 0.25);
+              finalConviction = Math.min(1.0, finalConviction * (1 + override));
             }
           }
 
@@ -4021,6 +4115,7 @@ export async function generateDecisions(
           signal: sig.sources.join('+'),
           conviction: sig.conviction,
           ...(sig.tradeStyle ? { tradeStyle: sig.tradeStyle } : {}),
+          ...(sessionGateOn ? { sessionActivityScore, sessionQuiet: sessionIsQuiet } : {}),
         },
         urgency: sig.conviction > 0.7 ? 'medium' : 'low',
         estimatedImpactUsd: sizeUsd,

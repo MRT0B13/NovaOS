@@ -1434,7 +1434,7 @@ export async function autoDeployReceiver(chainKey: string, dbPool?: any): Promis
     // Embedded ABI + bytecode (compiled with solc 0.8.20 --via-ir --optimize --optimize-runs 200)
     // Source: contracts/ArbFlashReceiver.sol
     const abi = ARBFLASH_ABI;
-    const bytecode = ARBFLASH_BYTECODE;
+    const bytecode: string = ARBFLASH_BYTECODE;
 
     if (!bytecode || bytecode === '0x') {
       logger.warn('[ArbMonitor] Empty bytecode — cannot deploy');

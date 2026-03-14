@@ -107,6 +107,9 @@ export interface AdaptiveParams {
   hlPerpStyleConvictionFloors: Record<string, number>;    // per-style conviction floor
   hlPerpStyleLeverageMultipliers: Record<string, number>; // per-style leverage multiplier (scalp can go higher)
 
+  // Hyperliquid perp session activity gate
+  hlPerpSessionDampeningMult: number; // learned dampening strength for quiet sessions (default 1.0)
+
   // Hyperliquid spot (signal-driven + accumulation)
   hlSpotConvictionFloor: number;       // raise if too many losing spot trades at low conviction
   hlSpotSizeMultiplier: number;        // scale spot position size based on outcomes
@@ -701,6 +704,7 @@ function computeAdaptiveParams(
   prior: AdaptiveParams | null,
   feeStats: FeeStats,
   portfolio: PortfolioLearning,
+  sessionDampMult: number = 1.0,
 ): AdaptiveParams {
 
   const blend = (newVal: number, priorVal: number | undefined): number => {
@@ -1197,6 +1201,7 @@ function computeAdaptiveParams(
       day: blend(perpStyleLevMults.day, prior?.hlPerpStyleLeverageMultipliers?.day),
       swing: blend(perpStyleLevMults.swing, prior?.hlPerpStyleLeverageMultipliers?.swing),
     },
+    hlPerpSessionDampeningMult: blend(sessionDampMult, prior?.hlPerpSessionDampeningMult),
     hlSpotConvictionFloor: blend(spotConvFloor, prior?.hlSpotConvictionFloor),
     hlSpotSizeMultiplier: blend(spotSizeMult, prior?.hlSpotSizeMultiplier),
     hlSpotStopLossMultiplier: blend(spotStopMult, prior?.hlSpotStopLossMultiplier),
@@ -1365,8 +1370,45 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
     // 6. Portfolio-level intelligence (regime detection, Sharpe)
     const portfolio = await computePortfolioStats(dbPool, stats);
 
+    // 6b. Session activity dampening — compare quiet vs active perp trades
+    let sessionDampMult = 1.0;
+    try {
+      const sessionRes = await dbPool.query(
+        `SELECT
+           metadata->>'sessionQuiet' AS session_quiet,
+           COUNT(*) AS cnt,
+           AVG(realized_pnl_usd) AS avg_pnl,
+           SUM(CASE WHEN realized_pnl_usd > 0 THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0) AS wr
+         FROM cfo_positions
+         WHERE strategy LIKE 'hl_perp%' AND status = 'CLOSED'
+           AND closed_at > NOW() - INTERVAL '${LOOKBACK_DAYS} days'
+           AND metadata->>'sessionQuiet' IS NOT NULL
+         GROUP BY metadata->>'sessionQuiet'`,
+      );
+      const quietRow = sessionRes.rows.find((r: any) => r.session_quiet === 'true');
+      const activeRow = sessionRes.rows.find((r: any) => r.session_quiet === 'false');
+      if (quietRow && Number(quietRow.cnt) >= 3 && activeRow && Number(activeRow.cnt) >= 3) {
+        const quietWR = Number(quietRow.wr);
+        const quietPnl = Number(quietRow.avg_pnl);
+        const activeWR = Number(activeRow.wr);
+        const activePnl = Number(activeRow.avg_pnl);
+        if (quietWR < activeWR - 0.10 || (quietPnl < 0 && activePnl > 0)) {
+          const wrGap = Math.max(0, activeWR - quietWR);
+          sessionDampMult = Math.min(1.5, 1.0 + wrGap * 2);
+        } else if (quietWR >= activeWR - 0.02 && quietPnl >= 0) {
+          sessionDampMult = 0.7;
+        }
+        logger.debug(
+          `[Learning] Session gate: quiet(${quietRow.cnt} trades, WR=${(quietWR * 100).toFixed(0)}%, avg=$${quietPnl.toFixed(2)}) ` +
+          `vs active(${activeRow.cnt} trades, WR=${(activeWR * 100).toFixed(0)}%, avg=$${activePnl.toFixed(2)}) → damp×${sessionDampMult.toFixed(2)}`,
+        );
+      }
+    } catch {
+      // Non-fatal — session metadata may not exist yet on early trades
+    }
+
     // 7. Compute adaptive params (now with fee + portfolio inputs)
-    const params = computeAdaptiveParams(stats, lpStats, polyCal, prior, feeStats, portfolio);
+    const params = computeAdaptiveParams(stats, lpStats, polyCal, prior, feeStats, portfolio, sessionDampMult);
 
     // 8. Persist (current + daily snapshot)
     await saveLearned(dbPool, params);
@@ -1387,6 +1429,7 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
       `perpSize×${params.hlPerpSizeMultiplier.toFixed(2)} | ` +
       `perpSL×${params.hlPerpStopLossMultiplier.toFixed(2)} | ` +
       `perpStyles: S×${params.hlPerpStyleSizeMultipliers?.scalp?.toFixed(2) ?? '1'} D×${params.hlPerpStyleSizeMultipliers?.day?.toFixed(2) ?? '1'} W×${params.hlPerpStyleSizeMultipliers?.swing?.toFixed(2) ?? '1'} | ` +
+      `sessionDamp×${params.hlPerpSessionDampeningMult.toFixed(2)} | ` +
       `spotSize×${params.hlSpotSizeMultiplier.toFixed(2)} spotSL×${params.hlSpotStopLossMultiplier.toFixed(2)} | ` +
       `spotStyles: D×${params.hlSpotStyleSizeMultipliers?.day?.toFixed(2) ?? '1'} W×${params.hlSpotStyleSizeMultipliers?.swing?.toFixed(2) ?? '1'} A×${params.hlSpotStyleSizeMultipliers?.accumulation?.toFixed(2) ?? '1'} | ` +
       `lpRange×${params.lpRangeWidthMultiplier.toFixed(2)} | ` +
@@ -1474,6 +1517,7 @@ export function getDefaultParams(): AdaptiveParams {
     hlPerpStyleStopMultipliers: { scalp: 1.0, day: 1.0, swing: 1.0 },
     hlPerpStyleConvictionFloors: { scalp: 0, day: 0, swing: 0 },
     hlPerpStyleLeverageMultipliers: { scalp: 1.0, day: 1.0, swing: 1.0 },
+    hlPerpSessionDampeningMult: 1.0,
     hlSpotConvictionFloor: 0,
     hlSpotSizeMultiplier: 1.0,
     hlSpotStopLossMultiplier: 1.0,
@@ -1608,6 +1652,11 @@ export function formatLearningSummary(params: AdaptiveParams): string {
       }
     }
     if (styleAdj.length > 0) adj.push(`Perp styles: ${styleAdj.join(', ')}`);
+  }
+  // Session activity dampening
+  if (Math.abs(params.hlPerpSessionDampeningMult - 1) > 0.05) {
+    const dir = params.hlPerpSessionDampeningMult > 1 ? 'Quiet-hour dampening increased' : 'Quiet-hour dampening relaxed';
+    adj.push(`${dir} (×${params.hlPerpSessionDampeningMult.toFixed(2)})`);
   }
   // Per-style spot adjustments
   if (params.hlSpotStyleSizeMultipliers) {
