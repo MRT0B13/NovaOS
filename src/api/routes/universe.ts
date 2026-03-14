@@ -56,15 +56,15 @@ export async function universeRoutes(fastify: FastifyInstance) {
       // Fetch agent registry rows for this wallet's agents
       const agentRows = await db.query(`
         SELECT
-          ar.agent_id,
+          ar.agent_name AS agent_id,
           ar.status,
           ar.last_heartbeat,
           ar.metadata,
           ua.created_at
         FROM agent_registry ar
-        JOIN user_agents ua ON ua.agent_id = ar.agent_id
+        JOIN user_agents ua ON ua.template_id = ar.agent_name
         WHERE ua.wallet_address = $1
-        ORDER BY ar.agent_id
+        ORDER BY ar.agent_name
       `, [walletAddress]);
 
       // Fetch latest message per agent (last action)
@@ -76,7 +76,7 @@ export async function universeRoutes(fastify: FastifyInstance) {
           m.content->>'text'    AS last_msg,
           m.created_at
         FROM memories m
-        JOIN user_agents ua ON ua.agent_id = m.metadata->>'agent'
+        JOIN user_agents ua ON ua.template_id = m.metadata->>'agent'
         WHERE ua.wallet_address = $1
           AND m.type = 'messages'
           AND m.created_at > NOW() - INTERVAL '24 hours'
@@ -89,7 +89,7 @@ export async function universeRoutes(fastify: FastifyInstance) {
           m.metadata->>'agent' AS agent_id,
           COUNT(*) AS msg_count
         FROM memories m
-        JOIN user_agents ua ON ua.agent_id = m.metadata->>'agent'
+        JOIN user_agents ua ON ua.template_id = m.metadata->>'agent'
         WHERE ua.wallet_address = $1
           AND m.type = 'messages'
           AND m.created_at > NOW() - INTERVAL '24 hours'
@@ -136,10 +136,10 @@ export async function universeRoutes(fastify: FastifyInstance) {
     try {
       const rows = await db.query(`
         SELECT
-          ar.agent_id,
+          ar.agent_name AS agent_id,
           ar.status
         FROM agent_registry ar
-        JOIN user_agents ua ON ua.agent_id = ar.agent_id
+        JOIN user_agents ua ON ua.template_id = ar.agent_name
         WHERE ua.wallet_address = $1
       `, [walletAddress]);
 
@@ -180,7 +180,7 @@ export async function universeRoutes(fastify: FastifyInstance) {
             fe.metadata,
             fe.created_at    AS ts
           FROM feed_events fe
-          JOIN user_agents ua ON ua.agent_id = fe.agent_id
+          JOIN user_agents ua ON ua.template_id = fe.agent_id
           WHERE ua.wallet_address = $1
           ORDER BY fe.created_at DESC
           LIMIT $2
@@ -197,7 +197,7 @@ export async function universeRoutes(fastify: FastifyInstance) {
             m.metadata            AS metadata,
             m.created_at          AS ts
           FROM memories m
-          JOIN user_agents ua ON ua.agent_id = m.metadata->>'agent'
+          JOIN user_agents ua ON ua.template_id = m.metadata->>'agent'
           WHERE ua.wallet_address = $1
             AND m.type = 'messages'
           ORDER BY m.created_at DESC
