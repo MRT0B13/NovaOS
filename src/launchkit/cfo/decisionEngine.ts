@@ -516,6 +516,7 @@ export interface PortfolioState {
   // Orca concentrated LP state
   orcaLpValueUsd: number;            // total value in Orca LP positions
   orcaLpFeeApy: number;              // estimated fee APY on current LP positions
+  orcaBorrowFundedLpValueUsd: number; // value of LP positions funded by Kamino borrows
   orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string; riskTier?: string; tokenA?: string; tokenB?: string; valueUsd?: number; feesUsd?: number }>;
 
   // EVM Flash Arb state
@@ -1117,6 +1118,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
   let kaminoActiveLstLoop: string | null = null;
   let kaminoMultiplyVaults: PortfolioState['kaminoMultiplyVaults'] = [];
   let orcaLpValueUsd = 0, orcaLpFeeApy = 0;
+  let orcaBorrowFundedLpValueUsd = 0;
   let orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string; riskTier?: string; tokenA?: string; tokenB?: string; valueUsd?: number; feesUsd?: number }> = [];
   let evmArbProfit24h = 0, evmArbPoolCount = 0, evmArbUsdcBalance = 0;
   let evmLpPositions: PortfolioState['evmLpPositions'] = [];
@@ -1196,7 +1198,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
           logger.info(`[CFO] Orca on-chain scan returned ${positions.length} position(s)`);
           orcaLpValueUsd = positions.reduce((s, p) => s + p.liquidityUsd, 0);
 
-          const dbTierMap = new Map<string, { tier?: string; tokenA?: string; tokenB?: string }>();
+          const dbTierMap = new Map<string, { tier?: string; tokenA?: string; tokenB?: string; borrowFunded?: boolean }>();
           try {
             const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
             if (dbUrl) {
@@ -1204,12 +1206,16 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
               const pgPool = new Pool({ connectionString: dbUrl, max: 1 });
               try {
                 const orcaDbRes = await pgPool.query(
-                  `SELECT asset, metadata FROM cfo_positions WHERE strategy = 'orca_lp' AND status = 'OPEN'`,
+                  `SELECT asset, metadata, current_value_usd FROM cfo_positions WHERE strategy = 'orca_lp' AND status = 'OPEN'`,
                 );
                 for (const row of orcaDbRes.rows) {
                   const meta = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata;
                   const wp = meta?.whirlpoolAddress;
-                  if (wp) dbTierMap.set(wp, { tier: meta?.riskTier, tokenA: meta?.tokenA, tokenB: meta?.tokenB });
+                  const isBorrowFunded = meta?.fundingSource === 'kamino_borrow';
+                  if (wp) dbTierMap.set(wp, { tier: meta?.riskTier, tokenA: meta?.tokenA, tokenB: meta?.tokenB, borrowFunded: isBorrowFunded });
+                  if (isBorrowFunded) {
+                    orcaBorrowFundedLpValueUsd += parseFloat(row.current_value_usd ?? '0') || meta?.borrowUsd || 0;
+                  }
                 }
               } finally {
                 pgPool.end().catch(() => {});
@@ -1402,6 +1408,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     kaminoMultiplyVaults,
     orcaLpValueUsd,
     orcaLpFeeApy,
+    orcaBorrowFundedLpValueUsd,
     orcaPositions,
     evmArbProfit24h,
     evmArbPoolCount,
@@ -2453,6 +2460,41 @@ export async function generateDecisions(
         });
       } else {
         // Simple loop: repay USDC.
+        // Guard: if borrowed USDC is deployed in active Orca LP positions, don't try to
+        // repay — the capital is working. Only override if health factor is critically low.
+        const borrowDeployedInLp = state.orcaBorrowFundedLpValueUsd > 5;
+        if (borrowDeployedInLp && !healthDanger) {
+          logger.info(
+            `[CFO:Decision] Kamino repay skipped — $${state.orcaBorrowFundedLpValueUsd.toFixed(0)} of borrowed USDC ` +
+            `is deployed in active Orca LP(s). LTV ${(state.kaminoLtv * 100).toFixed(1)}%, ` +
+            `HF ${state.kaminoHealthFactor.toFixed(2)}. Will repay when LP closes.`,
+          );
+        } else if (borrowDeployedInLp && healthDanger) {
+          // Health is critical — need to close the borrow-funded LP first, THEN repay.
+          logger.warn(
+            `[CFO:Decision] Kamino health danger (HF=${state.kaminoHealthFactor.toFixed(2)}) but ` +
+            `$${state.orcaBorrowFundedLpValueUsd.toFixed(0)} borrow is in LP. ` +
+            `Generating LP close + repay sequence.`,
+          );
+          // Find borrow-funded positions to close
+          const borrowFundedPositions = state.orcaPositions.filter(p => {
+            // Match by checking the dbTierMap or just close all positions when critical
+            return p.valueUsd && p.valueUsd > 1;
+          });
+          for (const pos of borrowFundedPositions) {
+            decisions.push({
+              type: 'ORCA_LP_CLOSE' as DecisionType,
+              reasoning:
+                `Emergency: Kamino HF=${state.kaminoHealthFactor.toFixed(2)} — closing borrow-funded LP ` +
+                `${pos.tokenA}/${pos.tokenB} ($${(pos.valueUsd ?? 0).toFixed(0)}) to free USDC for debt repayment.`,
+              params: { positionMint: pos.positionMint, swapToUsdc: true },
+              urgency: 'critical',
+              estimatedImpactUsd: pos.valueUsd ?? 0,
+              intelUsed: [],
+              tier: 'AUTO',
+            });
+          }
+        } else {
         // When health is dangerous, try to repay as much as possible (full borrow).
         // When merely LTV-breached, just bring LTV back to 40%.
         const targetLtv = 0.40;
@@ -2510,6 +2552,7 @@ export async function generateDecisions(
             }
           }
         }
+      } // end borrowDeployedInLp guard
       }
     // H-bis: Proactive repay — if wallet has USDC from LP fees/closes and Kamino has
     // an active borrow, repay some to reduce interest drag and free borrow capacity.
@@ -2520,8 +2563,11 @@ export async function generateDecisions(
       !ltvBreached && !healthDanger &&
       checkCooldown('KAMINO_REPAY_PROACTIVE', 6 * 3600_000)
     ) {
-      // Repay up to 80% of wallet USDC (keep some for gas/fees)
-      const repayUsd = Math.min(state.solanaUsdcBalance * 0.8, state.kaminoBorrowValueUsd);
+      // Only repay the portion of the borrow NOT deployed in active LP positions.
+      // If $200 is borrowed and $180 is in active LP, only repay up to $20 (the idle portion).
+      const borrowNotInLp = Math.max(0, state.kaminoBorrowValueUsd - state.orcaBorrowFundedLpValueUsd);
+      // Repay up to 80% of wallet USDC (keep some for gas/fees), capped to idle borrow
+      const repayUsd = Math.min(state.solanaUsdcBalance * 0.8, borrowNotInLp > 0 ? borrowNotInLp : state.kaminoBorrowValueUsd);
       if (repayUsd > 5) {
         decisions.push({
           type: 'KAMINO_REPAY',
@@ -4937,7 +4983,10 @@ export async function generateDecisions(
     // I: Orca LP (new positions via Section K / Kamino borrow; this tracks rebalance only)
     if (env.orcaLpEnabled) {
       const orcaTierTag = [...env.orcaLpRiskTiers].join('/');
-      if (state.orcaPositions.length > 0) diag.push(`OrcaLP:active(${state.orcaPositions.length})[${orcaTierTag}]`);
+      if (state.orcaPositions.length > 0) {
+        const borrowTag = state.orcaBorrowFundedLpValueUsd > 5 ? `,borrow$${state.orcaBorrowFundedLpValueUsd.toFixed(0)}` : '';
+        diag.push(`OrcaLP:active(${state.orcaPositions.length}${borrowTag})[${orcaTierTag}]`);
+      }
       else if (env.kaminoBorrowLpEnabled) diag.push(`OrcaLP:via-kamino-borrow(K)[${orcaTierTag}]`);
       else diag.push('OrcaLP:needs-borrow-enable');
     }
