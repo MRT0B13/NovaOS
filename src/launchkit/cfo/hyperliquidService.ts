@@ -205,6 +205,14 @@ class RateLimiter {
 
 const rateLimiter = new RateLimiter();
 
+/**
+ * Expose rate limiter throttle for use by other modules (e.g. TA candle fetches).
+ * Ensures ALL HL API calls — info and exchange — share the same request queue.
+ */
+export function throttleHLRequest(): Promise<void> {
+  return rateLimiter.throttle();
+}
+
 // Retry helper (exponential backoff for 429s)
 // ============================================================================
 
@@ -456,6 +464,8 @@ export async function hedgeTreasury(params: HedgeParams): Promise<HLOrderResult>
       return { success: false, error: `Notional $${(sizeFmt * coinPrice).toFixed(2)} below HL minimum $10` };
     }
 
+    await rateLimiter.throttle();
+    await rateLimiter.throttle();
     await exchange.updateLeverage({
       asset: assetIdx,
       isCross: false,
@@ -467,6 +477,7 @@ export async function hedgeTreasury(params: HedgeParams): Promise<HLOrderResult>
     // formatLimitPrice keeps enough decimals so slippage survives on cheap coins.
     const limitPrice = formatLimitPrice(coinPrice * 0.98, szDecimals);
 
+    await rateLimiter.throttle();
     const order = await exchange.order({
       orders: [{
         a: assetIdx,
@@ -688,7 +699,8 @@ export async function openPerpTrade(params: PerpTradeParams): Promise<HLOrderRes
       const tpPriceFmt = formatLimitPrice(tpPrice, szDecimals);
 
       await rateLimiter.throttle();
-      await exchange.order({
+      await rateLimiter.throttle();
+    await exchange.order({
         orders: [
           {
             a: assetIdx,
@@ -908,10 +920,12 @@ export async function cancelAllOpenOrders(): Promise<{ cancelled: number; errors
   const errors: string[] = [];
   try {
     const { exchange, info, wallet } = await loadHL();
+    await rateLimiter.throttle();
     const openOrders = await info.openOrders({ user: wallet.address });
     if (!openOrders || openOrders.length === 0) return { cancelled: 0, errors: [] };
 
     // Map coin name → asset index for the cancel API
+    await rateLimiter.throttle();
     const meta = await info.meta();
     const universe = (meta as any).universe ?? [];
     const coinToAsset = new Map<string, number>();
@@ -919,18 +933,35 @@ export async function cancelAllOpenOrders(): Promise<{ cancelled: number; errors
       coinToAsset.set(universe[i].name, i);
     }
 
+    // Batch all cancels into a single API call
+    const cancels: Array<{ a: number; o: number }> = [];
     for (const o of openOrders) {
+      const assetIdx = coinToAsset.get(o.coin);
+      if (assetIdx === undefined) {
+        errors.push(`${o.coin}: unknown asset`);
+        continue;
+      }
+      cancels.push({ a: assetIdx, o: o.oid });
+    }
+
+    if (cancels.length > 0) {
       try {
-        const assetIdx = coinToAsset.get(o.coin);
-        if (assetIdx === undefined) {
-          errors.push(`${o.coin}: unknown asset`);
-          continue;
-        }
-        await exchange.cancel({ cancels: [{ a: assetIdx, o: o.oid }] });
-        cancelled++;
-        logger.info(`[Hyperliquid] Cancelled stale order ${o.oid} (${o.coin} ${o.side === 'B' ? 'BUY' : 'SELL'})`);
+        await rateLimiter.throttle();
+        await exchange.cancel({ cancels });
+        cancelled = cancels.length;
+        logger.info(`[Hyperliquid] Batch-cancelled ${cancelled} stale open orders`);
       } catch (e) {
-        errors.push(`${o.coin}/${o.oid}: ${(e as Error).message}`);
+        // Fallback: cancel one-by-one if batch fails
+        logger.debug(`[Hyperliquid] Batch cancel failed, falling back to serial: ${(e as Error).message}`);
+        for (const c of cancels) {
+          try {
+            await rateLimiter.throttle();
+            await exchange.cancel({ cancels: [c] });
+            cancelled++;
+          } catch (e2) {
+            errors.push(`asset ${c.a}/oid ${c.o}: ${(e2 as Error).message}`);
+          }
+        }
       }
     }
   } catch (err) {
@@ -948,21 +979,35 @@ export async function cancelAllOpenOrders(): Promise<{ cancelled: number; errors
 export async function cancelTriggerOrdersForCoin(coin: string): Promise<void> {
   try {
     const { exchange, info, wallet } = await loadHL();
+    await rateLimiter.throttle();
     const openOrders = await info.openOrders({ user: wallet.address });
     if (!openOrders || openOrders.length === 0) return;
 
+    await rateLimiter.throttle();
     const meta = await info.meta();
     const universe = (meta as any).universe ?? [];
     const assetIdx = universe.findIndex((u: any) => u.name === coin);
     if (assetIdx < 0) return;
 
     const coinOrders = openOrders.filter((o: any) => o.coin === coin);
-    for (const o of coinOrders) {
-      try {
-        await exchange.cancel({ cancels: [{ a: assetIdx, o: o.oid }] });
-        logger.info(`[Hyperliquid] Cancelled trigger order ${o.oid} for ${coin}`);
-      } catch (e) {
-        logger.debug(`[Hyperliquid] Failed to cancel order ${o.oid} for ${coin}: ${(e as Error).message}`);
+    if (coinOrders.length === 0) return;
+
+    // Batch all cancels for this coin into a single API call
+    const cancels = coinOrders.map((o: any) => ({ a: assetIdx, o: o.oid }));
+    try {
+      await rateLimiter.throttle();
+      await exchange.cancel({ cancels });
+      logger.info(`[Hyperliquid] Batch-cancelled ${cancels.length} trigger order(s) for ${coin}`);
+    } catch (e) {
+      // Fallback: cancel one-by-one
+      for (const c of cancels) {
+        try {
+          await rateLimiter.throttle();
+          await exchange.cancel({ cancels: [c] });
+          logger.info(`[Hyperliquid] Cancelled trigger order ${c.o} for ${coin}`);
+        } catch (e2) {
+          logger.debug(`[Hyperliquid] Failed to cancel order ${c.o} for ${coin}: ${(e2 as Error).message}`);
+        }
       }
     }
   } catch (err) {
@@ -988,6 +1033,7 @@ export async function updateNativeTpSl(params: {
   try {
     const { exchange, info, wallet } = await loadHL();
 
+    await rateLimiter.throttle();
     const meta = await info.meta();
     const universe = (meta as any).universe ?? [];
     const assetIdx = universe.findIndex((u: any) => u.name === coin);
@@ -995,11 +1041,14 @@ export async function updateNativeTpSl(params: {
     const szDecimals: number = universe[assetIdx].szDecimals ?? 1;
 
     // Cancel existing trigger orders first
+    await rateLimiter.throttle();
     const openOrders = await info.openOrders({ user: wallet.address });
     const coinOrders = (openOrders || []).filter((o: any) => o.coin === coin);
-    for (const o of coinOrders) {
+    if (coinOrders.length > 0) {
+      const cancels = coinOrders.map((o: any) => ({ a: assetIdx, o: o.oid }));
       try {
-        await exchange.cancel({ cancels: [{ a: assetIdx, o: o.oid }] });
+        await rateLimiter.throttle();
+        await exchange.cancel({ cancels });
       } catch { /* best-effort cancel */ }
     }
 

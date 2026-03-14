@@ -582,6 +582,9 @@ export async function fetchCandles(
     const intervalMs = intervalToMs(interval);
     const startTime = Date.now() - lookback * intervalMs;
 
+    // Throttle through the shared HL rate limiter to avoid 429s
+    await hl.throttleHLRequest();
+
     const raw = await info.candleSnapshot({
       coin,
       interval,
@@ -1004,6 +1007,11 @@ export async function scoreCoins(
     const batchResults = await Promise.all(batchPromises);
     for (const sig of batchResults) {
       if (sig) results.push(sig);
+    }
+
+    // Small delay between batches to let the rate limiter breathe
+    if (i + BATCH_SIZE < coins.length) {
+      await new Promise(r => setTimeout(r, 500));
     }
   }
 

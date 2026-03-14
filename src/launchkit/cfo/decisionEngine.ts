@@ -517,7 +517,7 @@ export interface PortfolioState {
   orcaLpValueUsd: number;            // total value in Orca LP positions
   orcaLpFeeApy: number;              // estimated fee APY on current LP positions
   orcaBorrowFundedLpValueUsd: number; // value of LP positions funded by Kamino borrows
-  orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string; riskTier?: string; tokenA?: string; tokenB?: string; valueUsd?: number; feesUsd?: number }>;
+  orcaPositions: Array<{ positionMint: string; rangeUtilisationPct: number; inRange: boolean; whirlpoolAddress?: string; riskTier?: string; tokenA?: string; tokenB?: string; valueUsd?: number; feesUsd?: number; borrowFunded?: boolean }>;
 
   // EVM Flash Arb state
   evmArbProfit24h: number;        // confirmed flash arb profit last 24h (in-memory)
@@ -647,7 +647,7 @@ export function getDecisionConfig(): DecisionConfig {
     hlLiquidationWarningPct:    Number(process.env.CFO_HL_LIQUIDATION_WARNING_PCT ?? 15),
     autoPolymarket:             process.env.CFO_AUTO_POLYMARKET !== 'false', // default ON when polymarket enabled
     polyBetCooldownMs:          Number(process.env.CFO_POLY_BET_COOLDOWN_HOURS ?? 2) * 3600_000,
-    maxDecisionsPerCycle:       Number(process.env.CFO_MAX_DECISIONS_PER_CYCLE ?? 3),
+    maxDecisionsPerCycle:       Number(process.env.CFO_MAX_DECISIONS_PER_CYCLE ?? 5),
     hedgeCooldownMs:            Number(process.env.CFO_HEDGE_COOLDOWN_HOURS ?? 4) * 3600_000,
     stakeCooldownMs:            Number(process.env.CFO_STAKE_COOLDOWN_HOURS ?? 6) * 3600_000,
     closeCooldownMs:            Number(process.env.CFO_CLOSE_COOLDOWN_HOURS ?? 1) * 3600_000,
@@ -1252,6 +1252,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
               tokenB: p.tokenB ?? dbInfo?.tokenB ?? discInfo?.tokenB,
               valueUsd: p.liquidityUsd,
               feesUsd,
+              borrowFunded: dbInfo?.borrowFunded ?? false,
             };
           });
           const inRangePositions = positions.filter(p => p.inRange).length;
@@ -2470,29 +2471,34 @@ export async function generateDecisions(
             `HF ${state.kaminoHealthFactor.toFixed(2)}. Will repay when LP closes.`,
           );
         } else if (borrowDeployedInLp && healthDanger) {
-          // Health is critical — need to close the borrow-funded LP first, THEN repay.
-          logger.warn(
-            `[CFO:Decision] Kamino health danger (HF=${state.kaminoHealthFactor.toFixed(2)}) but ` +
-            `$${state.orcaBorrowFundedLpValueUsd.toFixed(0)} borrow is in LP. ` +
-            `Generating LP close + repay sequence.`,
-          );
-          // Find borrow-funded positions to close
-          const borrowFundedPositions = state.orcaPositions.filter(p => {
-            // Match by checking the dbTierMap or just close all positions when critical
-            return p.valueUsd && p.valueUsd > 1;
-          });
-          for (const pos of borrowFundedPositions) {
-            decisions.push({
-              type: 'ORCA_LP_CLOSE' as DecisionType,
-              reasoning:
-                `Emergency: Kamino HF=${state.kaminoHealthFactor.toFixed(2)} — closing borrow-funded LP ` +
-                `${pos.tokenA}/${pos.tokenB} ($${(pos.valueUsd ?? 0).toFixed(0)}) to free USDC for debt repayment.`,
-              params: { positionMint: pos.positionMint, swapToUsdc: true },
-              urgency: 'critical',
-              estimatedImpactUsd: pos.valueUsd ?? 0,
-              intelUsed: [],
-              tier: 'AUTO',
-            });
+          // Health is in danger territory but only force-close LPs when truly critical (HF < 1.3).
+          // Between 1.3-1.5 HF, let the LPs keep working — they'll generate fees to help repay.
+          if (state.kaminoHealthFactor < 1.3) {
+            logger.warn(
+              `[CFO:Decision] Kamino critical (HF=${state.kaminoHealthFactor.toFixed(2)}) — ` +
+              `$${state.orcaBorrowFundedLpValueUsd.toFixed(0)} borrow is in LP. ` +
+              `Closing borrow-funded LP(s) to free USDC for debt repayment.`,
+            );
+            // Only close positions that are actually borrow-funded
+            const borrowFundedPositions = state.orcaPositions.filter(p => p.borrowFunded);
+            for (const pos of borrowFundedPositions) {
+              decisions.push({
+                type: 'ORCA_LP_CLOSE' as DecisionType,
+                reasoning:
+                  `Emergency: Kamino HF=${state.kaminoHealthFactor.toFixed(2)} — closing borrow-funded LP ` +
+                  `${pos.tokenA}/${pos.tokenB} ($${(pos.valueUsd ?? 0).toFixed(0)}) to free USDC for debt repayment.`,
+                params: { positionMint: pos.positionMint, swapToUsdc: true },
+                urgency: 'critical',
+                estimatedImpactUsd: pos.valueUsd ?? 0,
+                intelUsed: [],
+                tier: 'AUTO',
+              });
+            }
+          } else {
+            logger.info(
+              `[CFO:Decision] Kamino HF=${state.kaminoHealthFactor.toFixed(2)} elevated but not critical — ` +
+              `$${state.orcaBorrowFundedLpValueUsd.toFixed(0)} borrow in LP, letting LP fees work toward repayment.`,
+            );
           }
         } else {
         // When health is dangerous, try to repay as much as possible (full borrow).
@@ -5091,8 +5097,45 @@ export async function generateDecisions(
     }
   }
 
-  // Cap to maxDecisionsPerCycle
-  return decisions.slice(0, config.maxDecisionsPerCycle);
+  // Budget allocation: ensure trading decisions (perps, spot) aren't crowded out
+  // by infrastructure decisions (repay, hedge, rebalance, fee claims, etc.).
+  // Split decisions into trading vs non-trading, then merge with reserved slots.
+  const TRADING_TYPES = new Set([
+    'HL_PERP_OPEN', 'HL_SPOT_BUY', 'HL_SPOT_SELL',
+    'KAMINO_BORROW_LP', 'ORCA_LP_OPEN', 'EVM_FLASH_ARB', 'EVM_LP_OPEN',
+  ]);
+  const tradingDecisions = decisions.filter(d => TRADING_TYPES.has(d.type));
+  const infraDecisions = decisions.filter(d => !TRADING_TYPES.has(d.type));
+
+  // Reserve at least 1 slot for trading when both exist, but always prioritize critical infra
+  const maxTotal = config.maxDecisionsPerCycle;
+  const criticalInfra = infraDecisions.filter(d => d.urgency === 'critical');
+  let infraBudget: number;
+  let tradeBudget: number;
+
+  if (tradingDecisions.length === 0) {
+    infraBudget = maxTotal;
+    tradeBudget = 0;
+  } else if (infraDecisions.length === 0) {
+    infraBudget = 0;
+    tradeBudget = maxTotal;
+  } else {
+    // Reserve at least half the slots for trades (min 1), rest for infra
+    tradeBudget = Math.max(1, Math.ceil(maxTotal / 2));
+    infraBudget = maxTotal - tradeBudget;
+    // Critical infra (health danger, etc.) gets priority over the reservation
+    if (criticalInfra.length > infraBudget) {
+      infraBudget = Math.min(criticalInfra.length, maxTotal - 1);
+      tradeBudget = maxTotal - infraBudget;
+    }
+  }
+
+  const selectedInfra = infraDecisions.slice(0, infraBudget);
+  const selectedTrades = tradingDecisions.slice(0, tradeBudget);
+  // Merge: infra first (they may be urgent), then trades
+  const merged = [...selectedInfra, ...selectedTrades];
+
+  return merged;
 }
 
 // ============================================================================
