@@ -41,6 +41,11 @@ export async function getEvmProvider(numericChainId: number): Promise<any> {
 
   const ethers = await loadEthers();
   const staticNetwork = ethers.Network.from(numericChainId);
+  // Disable ENS on non-mainnet chains — ethers v6 still attempts resolver()
+  // calls even with staticNetwork, which fails on L2s without ENS registries.
+  if (numericChainId !== 1) {
+    staticNetwork.attachPlugin(new ethers.EnsPlugin(null));
+  }
   const provider = new ethers.JsonRpcProvider(url, staticNetwork, { staticNetwork: true });
   _providerCache.set(numericChainId, provider);
   return provider;
