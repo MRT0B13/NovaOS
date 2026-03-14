@@ -45,7 +45,7 @@ let _bridge:  any = null; const bridge  = async () => _bridge  ??= await import(
 let _x402:    any = null; const x402    = async () => _x402    ??= await import('../launchkit/cfo/x402Service.ts');
 let _pyth:    any = null; const pyth    = async () => _pyth    ??= await import('../launchkit/cfo/pythOracleService.ts');
 let _helius:  any = null; const helius  = async () => _helius  ??= await import('../launchkit/cfo/heliusService.ts');
-let _krystal: any = null; const krystalSvc = async () => _krystal ??= await import('../launchkit/cfo/krystalService.ts');
+let _evmLp: any = null; const evmLpSvc = async () => _evmLp ??= await import('../launchkit/cfo/evmLpService.ts');
 
 interface ScoutIntel { cryptoBullish?: boolean; btcEstimate?: number; narratives?: string[]; receivedAt: number; }
 
@@ -1229,6 +1229,79 @@ export class CFOAgent extends BaseAgent {
             break;
           }
 
+          // ── AAVE V3 Borrow → EVM LP ─────────────────────────
+          case 'AAVE_BORROW_LP': {
+            const aaveResultAny = r as any;
+            const aaveBorrowUsd = p.borrowUsd ?? 0;
+            const aaveBorrowChain = p.chainName ?? 'unknown';
+            const aaveBorrowChainId = p.chainId ?? 42161;
+            const aaveBorrowTier = p.riskTier ?? 'medium';
+            const aaveBorrowAsset = p.borrowAsset ?? 'USDC';
+            const aaveLpPair = `${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'}`;
+            const aaveLpPosId = aaveResultAny.txId ?? `aave-lp-${Date.now()}`;
+
+            // Record the AAVE borrow transaction
+            await this.repo.insertTransaction({
+              id: `tx-aave-borrow-lp-${aaveLpPosId}`, timestamp: now,
+              chain: aaveBorrowChain, strategyTag: 'aave_borrow_lp', txType: 'borrow',
+              tokenIn: 'collateral', amountIn: 0,
+              tokenOut: aaveBorrowAsset, amountOut: aaveBorrowUsd,
+              feeUsd: 0, txHash: aaveResultAny.txHash ?? r.txId, walletAddress: '', status: 'confirmed',
+              metadata: {
+                deployTarget: 'evm_lp', borrowApy: p.borrowApy, spreadPct: p.spreadPct,
+                riskTier: aaveBorrowTier, chainId: aaveBorrowChainId, reasoning: d.reasoning,
+              },
+            });
+
+            // Record the LP deployment
+            await this.repo.insertTransaction({
+              id: `tx-evm-lp-borrowed-${aaveLpPosId}`, timestamp: now,
+              chain: aaveBorrowChain, strategyTag: 'evm_lp', txType: 'liquidity_add',
+              tokenIn: `${aaveBorrowAsset}(borrowed)`, amountIn: aaveBorrowUsd,
+              tokenOut: `evm-lp-${aaveLpPair}`, amountOut: aaveBorrowUsd,
+              feeUsd: 0, txHash: aaveResultAny.txHash ?? r.txId, walletAddress: '', status: 'confirmed',
+              metadata: {
+                pair: aaveLpPair, fundingSource: 'aave_borrow', riskTier: aaveBorrowTier,
+                chainId: aaveBorrowChainId, chainName: aaveBorrowChain,
+                token0Symbol: p.token0Symbol, token1Symbol: p.token1Symbol,
+                poolAddress: p.poolAddress, protocol: p.protocol,
+                borrowUsd: aaveBorrowUsd, estimatedLpApy: p.estimatedLpApy,
+                borrowApy: p.borrowApy, rangeWidthPct: p.rangeWidthPct, reasoning: d.reasoning,
+              },
+            });
+
+            // Track as cfo_position for learning engine
+            await this.repo.upsertPosition({
+              id: `evm-lp-aave-${aaveLpPosId}`,
+              strategy: 'evm_lp',
+              asset: aaveLpPair,
+              description: `EVM LP [${aaveBorrowTier}]: ${aaveLpPair} on ${aaveBorrowChain} (AAVE-borrowed)`,
+              chain: aaveBorrowChain,
+              status: 'OPEN',
+              entryPrice: 1,
+              currentPrice: 1,
+              sizeUnits: aaveBorrowUsd,
+              costBasisUsd: aaveBorrowUsd,
+              currentValueUsd: aaveBorrowUsd,
+              realizedPnlUsd: 0,
+              unrealizedPnlUsd: 0,
+              entryTxHash: aaveResultAny.txHash ?? r.txId,
+              externalId: aaveLpPosId,
+              metadata: {
+                pair: aaveLpPair, poolAddress: p.poolAddress,
+                rangeWidthPct: p.rangeWidthPct, riskTier: aaveBorrowTier,
+                chainId: aaveBorrowChainId, chainName: aaveBorrowChain,
+                token0Symbol: p.token0Symbol, token1Symbol: p.token1Symbol,
+                fundingSource: 'aave_borrow', protocol: p.protocol,
+              },
+              openedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+
+            logger.info(`[CFO] Persisted AAVE_BORROW_LP [${aaveBorrowTier}]: borrowed $${aaveBorrowUsd.toFixed(0)} ${aaveBorrowAsset} on ${aaveBorrowChain} → ${aaveLpPair} LP`);
+            break;
+          }
+
           // ── EVM Flash Arb (Arbitrum) ─────────────────────────
           case 'EVM_FLASH_ARB': {
             const arbResult = r as any;
@@ -1244,8 +1317,8 @@ export class CFOAgent extends BaseAgent {
             break;
           }
 
-          // ── Krystal EVM LP Open ──────────────────────────────
-          case 'KRYSTAL_LP_OPEN': {
+          // ── EVM LP Open ──────────────────────────────
+          case 'EVM_LP_OPEN': {
             const pool = p.pool ?? {};
             const resultAny = r as any;
             // Use actual deployed USD from the mint result if available, fall back to target
@@ -1255,12 +1328,12 @@ export class CFOAgent extends BaseAgent {
             // This prevents phantom $0 positions from being tracked (e.g. mints
             // that succeeded on-chain but deposited near-zero token amounts).
             if (actualUsd < 2) {
-              logger.warn(`[CFO] Skipping persist for KRYSTAL_LP_OPEN: actualUsd=$${actualUsd.toFixed(2)} too small (min $2). Pair: ${p.pair} on ${p.chainName}`);
+              logger.warn(`[CFO] Skipping persist for EVM_LP_OPEN: actualUsd=$${actualUsd.toFixed(2)} too small (min $2). Pair: ${p.pair} on ${p.chainName}`);
               break;
             }
             await this.repo.insertTransaction({
-              id: `tx-krystal-lp-open-${r.txId ?? Date.now()}`, timestamp: now,
-              chain: p.chainName ?? 'evm', strategyTag: 'krystal_lp', txType: 'liquidity_add' as TransactionType,
+              id: `tx-evm-lp-open-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: p.chainName ?? 'evm', strategyTag: 'evm_lp', txType: 'liquidity_add' as TransactionType,
               tokenIn: pool.token0?.symbol ?? '?', amountIn: actualUsd,
               tokenOut: `${pool.token0?.symbol ?? '?'}/${pool.token1?.symbol ?? '?'}-LP`, amountOut: actualUsd,
               feeUsd: 0, txHash: resultAny.txHash ?? r.txId, walletAddress: '', status: 'confirmed',
@@ -1284,16 +1357,16 @@ export class CFOAgent extends BaseAgent {
               entryUsd: actualUsd,
               openedAt: Date.now(),
             });
-            logger.info(`[CFO] Persisted KRYSTAL_LP_OPEN: ${p.pair} on ${p.chainName} $${actualUsd.toFixed(2)} (target $${(p.deployUsd ?? 0).toFixed(0)})`);
+            logger.info(`[CFO] Persisted EVM_LP_OPEN: ${p.pair} on ${p.chainName} $${actualUsd.toFixed(2)} (target $${(p.deployUsd ?? 0).toFixed(0)})`);
             // Track in cfo_positions for learning engine
-            const krystalPosId = `krystal-lp-${r.txId ?? Date.now()}`;
-            const krystalChain = mapEvmChain(p.chainName ?? '');
+            const evmLpPosId = `evm-lp-${r.txId ?? Date.now()}`;
+            const evmLpChain = mapEvmChain(p.chainName ?? '');
             await this.repo.upsertPosition({
-              id: krystalPosId,
-              strategy: 'krystal_lp',
+              id: evmLpPosId,
+              strategy: 'evm_lp',
               asset: p.pair ?? `${pool.token0?.symbol ?? '?'}/${pool.token1?.symbol ?? '?'}`,
-              description: `Krystal LP: ${p.pair} on ${p.chainName}`,
-              chain: krystalChain,
+              description: `EVM LP: ${p.pair} on ${p.chainName}`,
+              chain: evmLpChain,
               status: 'OPEN',
               entryPrice: actualUsd,     // Use actual deployed USD as entry (LP has no single "price")
               currentPrice: actualUsd,   // Will be updated by monitorPositions every 10m
@@ -1311,20 +1384,20 @@ export class CFOAgent extends BaseAgent {
             break;
           }
 
-          // ── Krystal EVM LP Increase (add to existing position) ──
-          case 'KRYSTAL_LP_INCREASE': {
+          // ── EVM LP Increase (add to existing position) ──
+          case 'EVM_LP_INCREASE': {
             const pool = p.pool ?? {};
             const resultAny = r as any;
             const actualUsd = resultAny.actualDeployUsd ?? p.deployUsd ?? 0;
 
             // Guard: don't persist increases with negligible actual value
             if (actualUsd < 1) {
-              logger.warn(`[CFO] Skipping persist for KRYSTAL_LP_INCREASE: actualUsd=$${actualUsd.toFixed(2)} too small. PosId: ${p.existingPosId}`);
+              logger.warn(`[CFO] Skipping persist for EVM_LP_INCREASE: actualUsd=$${actualUsd.toFixed(2)} too small. PosId: ${p.existingPosId}`);
               break;
             }
             await this.repo.insertTransaction({
-              id: `tx-krystal-lp-increase-${Date.now()}`, timestamp: now,
-              chain: p.chainName ?? 'evm', strategyTag: 'krystal_lp', txType: 'liquidity_add' as TransactionType,
+              id: `tx-evm-lp-increase-${Date.now()}`, timestamp: now,
+              chain: p.chainName ?? 'evm', strategyTag: 'evm_lp', txType: 'liquidity_add' as TransactionType,
               tokenIn: pool.token0?.symbol ?? '?', amountIn: actualUsd,
               tokenOut: `${pool.token0?.symbol ?? '?'}/${pool.token1?.symbol ?? '?'}-LP`, amountOut: actualUsd,
               feeUsd: 0, txHash: resultAny.txHash ?? '', walletAddress: '', status: 'confirmed',
@@ -1335,7 +1408,7 @@ export class CFOAgent extends BaseAgent {
               },
             });
             // Update existing kv_store record with new entryUsd (additive)
-            const existingRecords = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('../launchkit/cfo/krystalService.ts').EvmLpRecord[];
+            const existingRecords = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('../launchkit/cfo/evmLpService.ts').EvmLpRecord[];
             const existingRec = existingRecords.find(
               (pos) => String(pos.posId) === String(p.existingPosId),
             );
@@ -1345,7 +1418,7 @@ export class CFOAgent extends BaseAgent {
                 entryUsd: (existingRec.entryUsd ?? 0) + actualUsd,
               });
             }
-            logger.info(`[CFO] Persisted KRYSTAL_LP_INCREASE: +$${actualUsd.toFixed(2)} → #${p.existingPosId} on ${p.chainName}`);
+            logger.info(`[CFO] Persisted EVM_LP_INCREASE: +$${actualUsd.toFixed(2)} → #${p.existingPosId} on ${p.chainName}`);
             // Also update cfo_positions cost basis so learning engine PnL stays accurate
             try {
               const incPos = await this.repo.getPositionByExternalId(String(p.existingPosId));
@@ -1362,12 +1435,12 @@ export class CFOAgent extends BaseAgent {
             break;
           }
 
-          // ── Krystal EVM LP Rebalance ─────────────────────────
-          case 'KRYSTAL_LP_REBALANCE': {
+          // ── EVM LP Rebalance ─────────────────────────
+          case 'EVM_LP_REBALANCE': {
             const resultAny = r as any;
             await this.repo.insertTransaction({
-              id: `tx-krystal-lp-rebalance-${r.txId ?? Date.now()}`, timestamp: now,
-              chain: p.chainName ?? 'evm', strategyTag: 'krystal_lp', txType: 'liquidity_rebalance' as TransactionType,
+              id: `tx-evm-lp-rebalance-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: p.chainName ?? 'evm', strategyTag: 'evm_lp', txType: 'liquidity_rebalance' as TransactionType,
               tokenIn: `${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'}-LP`, amountIn: 0,
               tokenOut: `${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'}-LP`, amountOut: 0,
               feeUsd: 0, txHash: resultAny.txHash ?? r.txId, walletAddress: '', status: 'confirmed',
@@ -1399,7 +1472,7 @@ export class CFOAgent extends BaseAgent {
                 openedAt: Date.now(),
               });
             }
-            logger.info(`[CFO] Persisted KRYSTAL_LP_REBALANCE: posId=${p.posId} closeOnly=${p.closeOnly}`);
+            logger.info(`[CFO] Persisted EVM_LP_REBALANCE: posId=${p.posId} closeOnly=${p.closeOnly}`);
             // Close old position in cfo_positions for learning engine
             try {
               const oldKPos = await this.repo.getPositionByExternalId(String(p.posId));
@@ -1423,10 +1496,10 @@ export class CFOAgent extends BaseAgent {
               const rebalChain = mapEvmChain(p.chainName ?? '');
               const newActualUsd = (r as any).actualDeployUsd ?? p.deployUsd ?? 0;
               await this.repo.upsertPosition({
-                id: `krystal-lp-${r.txId}`,
-                strategy: 'krystal_lp',
+                id: `evm-lp-${r.txId}`,
+                strategy: 'evm_lp',
                 asset: `${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'}`,
-                description: `Krystal LP: ${p.token0Symbol}/${p.token1Symbol} on ${p.chainName}`,
+                description: `EVM LP: ${p.token0Symbol}/${p.token1Symbol} on ${p.chainName}`,
                 chain: rebalChain,
                 status: 'OPEN',
                 entryPrice: 1, currentPrice: 1,
@@ -1443,17 +1516,17 @@ export class CFOAgent extends BaseAgent {
             break;
           }
 
-          // ── Krystal EVM LP Fee Claim ─────────────────────────
-          case 'KRYSTAL_LP_CLAIM_FEES': {
+          // ── EVM LP Fee Claim ─────────────────────────
+          case 'EVM_LP_CLAIM_FEES': {
             await this.repo.insertTransaction({
-              id: `tx-krystal-lp-claim-${r.txId ?? Date.now()}`, timestamp: now,
-              chain: p.chainName ?? 'evm', strategyTag: 'krystal_lp', txType: 'fee_claim' as TransactionType,
+              id: `tx-evm-lp-claim-${r.txId ?? Date.now()}`, timestamp: now,
+              chain: p.chainName ?? 'evm', strategyTag: 'evm_lp', txType: 'fee_claim' as TransactionType,
               tokenIn: 'fees', amountIn: 0,
               tokenOut: `${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'}-fees`, amountOut: p.feesOwedUsd ?? 0,
               feeUsd: 0, txHash: r.txId, walletAddress: '', status: 'confirmed',
               metadata: { posId: p.posId, chainName: p.chainName, feesOwedUsd: p.feesOwedUsd, reasoning: d.reasoning },
             });
-            logger.info(`[CFO] Persisted KRYSTAL_LP_CLAIM_FEES: posId=${p.posId} fees=$${(p.feesOwedUsd ?? 0).toFixed(2)}`);
+            logger.info(`[CFO] Persisted EVM_LP_CLAIM_FEES: posId=${p.posId} fees=$${(p.feesOwedUsd ?? 0).toFixed(2)}`);
             // Update cfo_positions with realized fee income
             try {
               const feePos = await this.repo.getPositionByExternalId(String(p.posId));
@@ -1465,6 +1538,28 @@ export class CFOAgent extends BaseAgent {
                 });
               }
             } catch { /* best effort */ }
+            break;
+          }
+
+          // ── Reinvestment Sweep ─────────────────────────────────
+          case 'REINVEST_SWEEP': {
+            const sweepResult = r as any;
+            const reinvestedUsd = sweepResult.reinvestedUsd ?? 0;
+            if (reinvestedUsd > 0) {
+              await this.repo.insertTransaction({
+                id: `tx-reinvest-sweep-${Date.now()}`, timestamp: now,
+                chain: 'multi', strategyTag: 'reinvest', txType: 'reinvest' as TransactionType,
+                tokenIn: 'idle_profits', amountIn: reinvestedUsd,
+                tokenOut: 'deployed', amountOut: reinvestedUsd,
+                feeUsd: 0, txHash: undefined, walletAddress: '', status: 'confirmed',
+                metadata: {
+                  sweepResults: sweepResult.sweepResults,
+                  totalAccumulatedUsd: p.totalAccumulatedUsd,
+                  reasoning: d.reasoning,
+                },
+              });
+              logger.info(`[CFO] Persisted REINVEST_SWEEP: $${reinvestedUsd.toFixed(2)} redeployed`);
+            }
             break;
           }
 
@@ -1547,7 +1642,7 @@ export class CFOAgent extends BaseAgent {
             ? livePositions.find((p: any) => p.positionMint === mint || p.nftMint === mint)
             : null;
           if (live && live.liquidityUsd > 0) {
-            // Use liquidityUsd as the price indicator for LP positions (same as Krystal).
+            // Use liquidityUsd as the price indicator for LP positions (same as EVM LP).
             // live.currentPrice is often undefined for LPs — use the USD value instead.
             await this.repo?.updatePositionPrice(dbPos.id, live.currentPrice ?? live.liquidityUsd, live.liquidityUsd);
           }
@@ -1555,14 +1650,14 @@ export class CFOAgent extends BaseAgent {
       } catch (err) { logger.debug('[CFO] Orca LP price refresh error:', err); }
     }
 
-    // ── Refresh Krystal EVM LP position values ──
-    if (env.krystalLpEnabled && env.evmPrivateKey && this.positionManager) {
+    // ── Refresh EVM LP position values ──
+    if (env.evmLpEnabled && env.evmPrivateKey && this.positionManager) {
       try {
-        const krystalMod = await import('../launchkit/cfo/krystalService.ts');
+        const evmLpMod = await import('../launchkit/cfo/evmLpService.ts');
         const ethers = await import('ethers' as string);
         const walletAddr = ethers.computeAddress(env.evmPrivateKey);
-        const livePositions = await krystalMod.fetchKrystalPositions(walletAddr, ((globalThis as any).__cfo_evm_lp_records ?? []));
-        const dbPositions = await this.repo?.getOpenPositions('krystal_lp') ?? [];
+        const livePositions = await evmLpMod.fetchEvmLpPositions(walletAddr, ((globalThis as any).__cfo_evm_lp_records ?? []));
+        const dbPositions = await this.repo?.getOpenPositions('evm_lp') ?? [];
         for (const dbPos of dbPositions) {
           const meta = dbPos.metadata as { tokenId?: string; nftTokenId?: string };
           const tokenId = meta.tokenId ?? meta.nftTokenId;
@@ -1577,10 +1672,10 @@ export class CFOAgent extends BaseAgent {
           } else if (!live) {
             // Position not found on-chain — may have been closed externally or burned.
             // Don't zero it out, just log for now.
-            logger.debug(`[CFO] Krystal LP position ${tokenId} not found in live data — skipping price update`);
+            logger.debug(`[CFO] EVM LP position ${tokenId} not found in live data — skipping price update`);
           }
         }
-      } catch (err) { logger.debug('[CFO] Krystal LP price refresh error:', err); }
+      } catch (err) { logger.debug('[CFO] EVM LP price refresh error:', err); }
     }
 
     // ── Refresh Polymarket position prices ──
@@ -2042,10 +2137,10 @@ export class CFOAgent extends BaseAgent {
               logger.error(`[CFO] Approved decision ${d.type} failed: ${execResult.error}`);
               const { notifyAdminForce } = await import('../launchkit/services/adminNotify.ts');
               const err = String(execResult.error ?? 'unknown error');
-              if (d.type === 'KRYSTAL_LP_INCREASE') {
+              if (d.type === 'EVM_LP_INCREASE') {
                 const p: any = d.params ?? {};
                 await notifyAdminForce(
-                  `⚠️ KRYSTAL_LP_INCREASE skipped — #${p.existingPosId ?? 'n/a'} ${p.pair ?? '?/?'} on ${p.chainName ?? 'evm'}: ${err}`,
+                  `⚠️ EVM_LP_INCREASE skipped — #${p.existingPosId ?? 'n/a'} ${p.pair ?? '?/?'} on ${p.chainName ?? 'evm'}: ${err}`,
                 );
               } else {
                 await notifyAdminForce(`❌ ${d.type} failed: ${err}`);
@@ -2079,11 +2174,11 @@ export class CFOAgent extends BaseAgent {
         await notifyAdminForce(msg);
       }
 
-      // ── Explicit skip alerts: KRYSTAL_LP_INCREASE preflight/revert reasons ──
+      // ── Explicit skip alerts: EVM_LP_INCREASE preflight/revert reasons ──
       // One-line, actionable alerts so admin can immediately see why an add-liquidity
       // attempt was skipped (owner mismatch, zero liquidity, token mismatch, etc.).
       const increaseSkipResults = results.filter((r) => {
-        if (r.decision.type !== 'KRYSTAL_LP_INCREASE' || !r.executed || r.success) return false;
+        if (r.decision.type !== 'EVM_LP_INCREASE' || !r.executed || r.success) return false;
         const err = String(r.error ?? '').toLowerCase();
         return (
           err.includes('cannot increase #') ||
@@ -2100,7 +2195,7 @@ export class CFOAgent extends BaseAgent {
         for (const r of increaseSkipResults) {
           const p: any = r.decision.params ?? {};
           await notifyAdminForce(
-            `⚠️ KRYSTAL_LP_INCREASE skipped — #${p.existingPosId ?? 'n/a'} ${p.pair ?? '?/?'} on ${p.chainName ?? 'evm'}: ${String(r.error ?? 'unknown error')}`,
+            `⚠️ EVM_LP_INCREASE skipped — #${p.existingPosId ?? 'n/a'} ${p.pair ?? '?/?'} on ${p.chainName ?? 'evm'}: ${String(r.error ?? 'unknown error')}`,
           );
         }
       }
@@ -2713,7 +2808,7 @@ export class CFOAgent extends BaseAgent {
     if (env.heliusEnabled) services.push('helius');
     if (env.x402Enabled) services.push('x402');
     if (env.orcaLpEnabled) services.push('orca-lp');
-    if (env.krystalLpEnabled) services.push('krystal-lp');
+    if (env.evmLpEnabled) services.push('evm-lp');
     if (env.wormholeEnabled) services.push('wormhole');
     if (env.lifiEnabled) services.push('lifi');
     if (env.evmArbEnabled) services.push('evm-arb');
@@ -2818,12 +2913,12 @@ export class CFOAgent extends BaseAgent {
         } catch { /* non-fatal */ }
       }
 
-      if (env.krystalLpEnabled && env.evmPrivateKey) {
+      if (env.evmLpEnabled && env.evmPrivateKey) {
         try {
-          const krystalMod = await import('../launchkit/cfo/krystalService.ts');
+          const evmLpMod = await import('../launchkit/cfo/evmLpService.ts');
           const ethers = await import('ethers' as string);
           const walletAddr = ethers.computeAddress(env.evmPrivateKey);
-          const evmPositions = await krystalMod.fetchKrystalPositions(walletAddr, ((globalThis as any).__cfo_evm_lp_records ?? []));
+          const evmPositions = await evmLpMod.fetchEvmLpPositions(walletAddr, ((globalThis as any).__cfo_evm_lp_records ?? []));
           const active = evmPositions.filter((p: any) => p.valueUsd > 0);
           if (active.length > 0) {
             const totalUsd = active.reduce((s: number, p: any) => s + (p.valueUsd ?? 0), 0);
@@ -2915,16 +3010,16 @@ export class CFOAgent extends BaseAgent {
         }
 
         // Add live EVM LP values
-        if (env.krystalLpEnabled && env.evmPrivateKey) {
+        if (env.evmLpEnabled && env.evmPrivateKey) {
           try {
-            const krystalMod = await import('../launchkit/cfo/krystalService.ts');
+            const evmLpMod = await import('../launchkit/cfo/evmLpService.ts');
             const ethers = await import('ethers' as string);
             const walletAddr = ethers.computeAddress(env.evmPrivateKey);
-            const evmPositions = await krystalMod.fetchKrystalPositions(walletAddr, ((globalThis as any).__cfo_evm_lp_records ?? []));
+            const evmPositions = await evmLpMod.fetchEvmLpPositions(walletAddr, ((globalThis as any).__cfo_evm_lp_records ?? []));
             const liveEvmUsd = evmPositions
               .filter((p: any) => p.valueUsd > 0)
               .reduce((s: number, p: any) => s + (p.valueUsd ?? 0), 0);
-            const trackedEvmUsd = m.byStrategy['krystal_lp']?.totalValueUsd ?? 0;
+            const trackedEvmUsd = m.byStrategy['evm_lp']?.totalValueUsd ?? 0;
             totalPortfolioUsd += (liveEvmUsd - trackedEvmUsd);
           } catch { /* non-fatal */ }
         }
@@ -3833,13 +3928,13 @@ export class CFOAgent extends BaseAgent {
     }
   }
 
-  // ── EVM LP Position Persistence (Krystal) ──────────────────────
+  // ── EVM LP Position Persistence ──────────────────────
 
   /**
    * Persist an EVM LP position record to kv_store for cross-restart tracking.
    * Key: `cfo_evm_lp_<posId>_<chainNumericId>`
    */
-  private async persistEvmLpPosition(record: import('../launchkit/cfo/krystalService.ts').EvmLpRecord): Promise<void> {
+  private async persistEvmLpPosition(record: import('../launchkit/cfo/evmLpService.ts').EvmLpRecord): Promise<void> {
     try {
       const key = `cfo_evm_lp_${record.posId}_${record.chainNumericId}`;
       await this.pool.query(
@@ -3847,7 +3942,7 @@ export class CFOAgent extends BaseAgent {
         [key, JSON.stringify(record)],
       );
       // Keep in-memory globalThis cache in sync
-      const existing = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('../launchkit/cfo/krystalService.ts').EvmLpRecord[];
+      const existing = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('../launchkit/cfo/evmLpService.ts').EvmLpRecord[];
       existing.push(record);
       (globalThis as any).__cfo_evm_lp_records = existing;
       logger.debug(`[CFO] Persisted EVM LP position: ${key}`);
@@ -3866,7 +3961,7 @@ export class CFOAgent extends BaseAgent {
         [`cfo_evm_lp_${posId}_%`],
       );
       // Keep in-memory globalThis cache in sync
-      const existing = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('../launchkit/cfo/krystalService.ts').EvmLpRecord[];
+      const existing = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('../launchkit/cfo/evmLpService.ts').EvmLpRecord[];
       (globalThis as any).__cfo_evm_lp_records = existing.filter(r => r.posId !== posId);
       logger.debug(`[CFO] Removed EVM LP position: ${posId}`);
     } catch (err) {
@@ -3876,16 +3971,16 @@ export class CFOAgent extends BaseAgent {
 
   /**
    * Hydrate all saved EVM LP positions from kv_store.
-   * Used by krystalService.fetchKrystalPositions() for openedAt timestamps.
+   * Used by evmLpService.fetchEvmLpPositions() for openedAt timestamps.
    */
-  private async hydrateEvmLpPositionsFromDb(): Promise<import('../launchkit/cfo/krystalService.ts').EvmLpRecord[]> {
+  private async hydrateEvmLpPositionsFromDb(): Promise<import('../launchkit/cfo/evmLpService.ts').EvmLpRecord[]> {
     try {
       const result = await this.pool.query(
         `SELECT data FROM kv_store WHERE key LIKE 'cfo_evm_lp_%'`,
       );
       return result.rows.map((r: any) => {
         const data = typeof r.data === 'string' ? JSON.parse(r.data) : r.data;
-        return data as import('../launchkit/cfo/krystalService.ts').EvmLpRecord;
+        return data as import('../launchkit/cfo/evmLpService.ts').EvmLpRecord;
       });
     } catch {
       return [];

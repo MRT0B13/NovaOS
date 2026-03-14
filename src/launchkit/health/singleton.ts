@@ -34,6 +34,8 @@ export function initHealthSystem(databaseUrl: string): {
     connectionString: databaseUrl,
     max: 3,
     idleTimeoutMillis: 30_000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
   });
 
   _heartbeat = new HeartbeatClient(_pool, 'nova', '1.0.0');

@@ -143,6 +143,8 @@ export async function initLaunchKit(
         connectionTimeoutMillis: 10_000,  // fail fast if no connection in 10s
         max: 5,
         idleTimeoutMillis: 30_000,        // release idle connections after 30s
+        keepAlive: true,                  // prevent Railway proxy from killing idle TCP sockets
+        keepAliveInitialDelayMillis: 10_000,
       });
       _swarmHandle = await initSwarm(pool, {
         // Callbacks are wired later when xPublisher/novaChannel are available

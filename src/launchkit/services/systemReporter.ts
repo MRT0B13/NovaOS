@@ -141,11 +141,11 @@ interface CFOSnapshot {
   polyUsdcBalance: number;
   polyPositions: Array<{ question: string; outcome: string; costBasisUsd: number; currentValueUsd: number; unrealizedPnlUsd: number; currentPrice: number }>;
 
-  // Krystal EVM LP
-  krystalEnabled: boolean;
-  krystalLpValueUsd: number;
-  krystalLpFeesUsd: number;
-  krystalPositions: Array<{ posId: string; chainName: string; token0Symbol: string; token1Symbol: string; inRange: boolean; rangeUtilisationPct: number; valueUsd: number; feesOwedUsd: number; riskTier: string }>;
+  // EVM LP
+  evmLpEnabled: boolean;
+  evmLpValueUsd: number;
+  evmLpFeesUsd: number;
+  evmLpPositions: Array<{ posId: string; chainName: string; token0Symbol: string; token1Symbol: string; inRange: boolean; rangeUtilisationPct: number; valueUsd: number; feesOwedUsd: number; riskTier: string }>;
 
   // x402 revenue
   x402TotalCalls: number;
@@ -707,10 +707,10 @@ async function gatherCFOSnapshot(): Promise<CFOSnapshot | null> {
         leverage: p.leverage,
       })),
 
-      krystalEnabled: env.krystalLpEnabled,
-      krystalLpValueUsd: ps.evmLpTotalValueUsd,
-      krystalLpFeesUsd: ps.evmLpTotalFeesUsd,
-      krystalPositions: ps.evmLpPositions.map(p => {
+      evmLpEnabled: env.evmLpEnabled,
+      evmLpValueUsd: ps.evmLpTotalValueUsd,
+      evmLpFeesUsd: ps.evmLpTotalFeesUsd,
+      evmLpPositions: ps.evmLpPositions.map(p => {
         const _stables = new Set(['USDC', 'USDT', 'DAI', 'USDG', 'FRAX', 'TUSD', 'BUSD', 'USDCE', 'USDC.E']);
         const s0 = _stables.has(p.token0Symbol.toUpperCase());
         const s1 = _stables.has(p.token1Symbol.toUpperCase());
@@ -1098,10 +1098,10 @@ async function sendStatusReport(): Promise<void> {
       message += `    Est. fee APY: ${(c.orcaLpFeeApy * 100).toFixed(1)}%\n\n`;
     }
 
-    // Krystal EVM LP
-    if (c.krystalEnabled && c.krystalPositions.length > 0) {
-      message += `  <b>💎 Krystal LP ($${c.krystalLpValueUsd.toFixed(2)}):</b>\n`;
-      for (const pos of c.krystalPositions) {
+    // EVM LP
+    if (c.evmLpEnabled && c.evmLpPositions.length > 0) {
+      message += `  <b>💎 EVM LP ($${c.evmLpValueUsd.toFixed(2)}):</b>\n`;
+      for (const pos of c.evmLpPositions) {
         const rangeEmoji = pos.inRange ? '🟢' : '🔴';
         const tierTag = pos.riskTier === 'high' ? '🔥' : pos.riskTier === 'low' ? '🛡️' : '⚖️';
         message += `    ${rangeEmoji}${tierTag} ${pos.token0Symbol}/${pos.token1Symbol} on ${pos.chainName} — $${pos.valueUsd.toFixed(2)} | ${pos.rangeUtilisationPct.toFixed(0)}% util [${pos.riskTier}]`;
@@ -1310,13 +1310,13 @@ async function sendDailySummary(): Promise<void> {
       message += `  • Orca LP: $${c.orcaLpValueUsd.toFixed(2)} | ${inRange}/${c.orcaPositions.length} in range | ${orcaTierStr} | ${(c.orcaLpFeeApy * 100).toFixed(1)}% APY\n`;
     }
 
-    if (c.krystalEnabled && c.krystalPositions.length > 0) {
-      const inRange = c.krystalPositions.filter(p => p.inRange).length;
-      const chains = [...new Set(c.krystalPositions.map(p => p.chainName))].join(',');
+    if (c.evmLpEnabled && c.evmLpPositions.length > 0) {
+      const inRange = c.evmLpPositions.filter(p => p.inRange).length;
+      const chains = [...new Set(c.evmLpPositions.map(p => p.chainName))].join(',');
       const tierCounts = { low: 0, medium: 0, high: 0 } as Record<string, number>;
-      for (const p of c.krystalPositions) tierCounts[p.riskTier] = (tierCounts[p.riskTier] ?? 0) + 1;
+      for (const p of c.evmLpPositions) tierCounts[p.riskTier] = (tierCounts[p.riskTier] ?? 0) + 1;
       const tierStr = Object.entries(tierCounts).filter(([, v]) => v > 0).map(([k, v]) => `${v}×${k}`).join(' ');
-      message += `  • Krystal LP: $${c.krystalLpValueUsd.toFixed(2)} | ${inRange}/${c.krystalPositions.length} in range | ${tierStr} | ${chains}\n`;
+      message += `  • EVM LP: $${c.evmLpValueUsd.toFixed(2)} | ${inRange}/${c.evmLpPositions.length} in range | ${tierStr} | ${chains}\n`;
     }
 
     if (c.jitoSolBalance > 0) {

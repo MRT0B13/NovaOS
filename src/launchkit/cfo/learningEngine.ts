@@ -21,7 +21,7 @@
  *   - polymarket  → Kelly fraction, min edge, bet sizing
  *   - hyperliquid → stop-loss %, leverage bias, hedge ratio
  *   - orca_lp     → range width multiplier, pool selection scoring
- *   - krystal_lp  → range width multiplier, chain preference, APR floor
+ *   - evm_lp  → range width multiplier, chain preference, APR floor
  *   - kamino      → LTV target, borrow spread threshold
  *   - jito        → stake/unstake aggressiveness
  *   - hl_spot     → spot conviction floor, size multiplier, SL multiplier
@@ -54,7 +54,7 @@ export interface StrategyStats {
 }
 
 export interface LPStats {
-  strategy: 'orca_lp' | 'krystal_lp';
+  strategy: 'orca_lp' | 'evm_lp';
   riskTier?: 'low' | 'medium' | 'high'; // per-tier breakdown (undefined = aggregate)
   totalPositions: number;
   avgFeesEarnedUsd: number;
@@ -120,7 +120,7 @@ export interface AdaptiveParams {
   hlSpotStyleStopMultipliers: Record<string, number>;       // per-style SL multiplier
   hlSpotStyleConvictionFloors: Record<string, number>;      // per-style conviction floor
 
-  // LP (Orca + Krystal) — global
+  // LP (Orca + EVM) — global
   lpRangeWidthMultiplier: number;  // wider/narrower ranges based on rebalance frequency
   lpMinAprAdjustment: number;      // increase min APR floor if LP positions underperform
   lpRebalanceTriggerMultiplier: number; // tighter if OOR rate high, looser if profitable
@@ -130,7 +130,7 @@ export interface AdaptiveParams {
   lpTierMinAprAdjustments: Record<string, number>;  // per-tier APR floor nudges
 
   // LP pair intelligence (used for increase / remove gating)
-  lpBestPairs: string[];           // top-performing LP pairs by daily PnL (combined Orca + Krystal)
+  lpBestPairs: string[];           // top-performing LP pairs by daily PnL (combined Orca + EVM)
   lpTotalPositions: number;        // total historical LP positions (confidence gate)
 
   // Kamino
@@ -140,6 +140,14 @@ export interface AdaptiveParams {
   // BorrowLP pipeline (Kamino borrow → Orca LP → fees → repay)
   borrowLpNetYield: number;         // net annualized yield (LP fees - borrow cost) from BorrowLP positions
   borrowLpCycleCount: number;       // completed borrow→LP→repay cycles (confidence gate)
+
+  // AAVE BorrowLP pipeline (AAVE V3 borrow → EVM LP → fees → repay)
+  aaveBorrowLpNetYield: number;     // net annualized yield (LP fees - borrow cost) from AAVE borrow-LP
+  aaveBorrowLpCycleCount: number;   // completed AAVE borrow→LP→repay cycles
+
+  // Profit Reinvestment
+  reinvestEfficiency: number;       // ratio of reinvested USD that generated additional yield (0-1)
+  reinvestSweepCount: number;       // total reinvestment sweeps executed
 
   // EVM Arb
   evmArbMinProfitMultiplier: number; // raise if slippage consistently eats profit
@@ -276,7 +284,7 @@ async function computeStrategyStats(
  */
 async function computeLPStats(
   pool: any,
-  strategy: 'orca_lp' | 'krystal_lp',
+  strategy: 'orca_lp' | 'evm_lp',
   riskTier?: 'low' | 'medium' | 'high',
 ): Promise<LPStats> {
   const empty: LPStats = {
@@ -975,14 +983,14 @@ function computeAdaptiveParams(
     }
   }
 
-  // ── LP adaptations (Orca + Krystal) ─────────────────────────────
+  // ── LP adaptations (Orca + EVM) ─────────────────────────────
   let lpRangeMult = 1.0;
   let lpMinAprAdj = 0;
   let lpRebalTriggerMult = 1.0;
 
   const orcaLp = lpStats['orca_lp'];
-  const krystalLp = lpStats['krystal_lp'];
-  const allLp = [orcaLp, krystalLp].filter(Boolean);
+  const evmLp = lpStats['evm_lp'];
+  const allLp = [orcaLp, evmLp].filter(Boolean);
 
   for (const lp of allLp) {
     if (!lp || lp.totalPositions < 3) continue;
@@ -1003,7 +1011,7 @@ function computeAdaptiveParams(
     }
   }
 
-  // ── LP pair intelligence (combined Orca + Krystal) ──────────────
+  // ── LP pair intelligence (combined Orca + EVM) ──────────────
   // Merge bestPairs from both providers, deduplicate, rank by appearance
   const combinedBestPairs = new Map<string, number>(); // pair → priority (lower = better)
   let lpTotalPos = 0;
@@ -1021,18 +1029,18 @@ function computeAdaptiveParams(
     .slice(0, 10)
     .map(([pair]) => pair);
 
-  // ── Per-tier LP adaptations (both Orca and Krystal risk tiers) ─────────
+  // ── Per-tier LP adaptations (both Orca and EVM risk tiers) ─────────
   // Each tier learns independently: high-risk OOR doesn't widen low-risk ranges
   const lpTierRangeMultipliers: Record<string, number> = { low: 1.0, medium: 1.0, high: 1.0 };
   const lpTierMinAprAdjustments: Record<string, number> = { low: 0, medium: 0, high: 0 };
 
   for (const tier of ['low', 'medium', 'high'] as const) {
-    // Merge Orca + Krystal per-tier data for combined learning
+    // Merge Orca + EVM per-tier data for combined learning
     const orcaTier = lpStats[`orca_lp_${tier}`];
-    const krystalTier = lpStats[`krystal_lp_${tier}`];
+    const evmLpTier = lpStats[`evm_lp_${tier}`];
 
     // Use whichever has more data, or combine if both have enough
-    const tierCandidates = [orcaTier, krystalTier].filter(t => t && t.totalPositions >= 2);
+    const tierCandidates = [orcaTier, evmLpTier].filter(t => t && t.totalPositions >= 2);
     if (tierCandidates.length === 0) continue;
 
     // Average stats across both LP providers for this tier
@@ -1083,6 +1091,32 @@ function computeAdaptiveParams(
     borrowLpNetYieldComputed = lpAnnualYieldPct - borrowCostPct;
     borrowLpCycles = orcaLpForBorrow.totalPositions;
   }
+
+  // ── AAVE BorrowLP pipeline yield ────────────────────────────────
+  // Mirrors the Kamino borrow-LP logic but for EVM LP positions funded by AAVE.
+  let aaveBorrowLpNetYieldComputed = 0;
+  let aaveBorrowLpCycles = 0;
+  const evmLpForBorrow = lpStats['evm_lp'];
+  if (evmLpForBorrow && evmLpForBorrow.totalPositions >= 1) {
+    const lpAnnualYieldPct = evmLpForBorrow.avgPnlPerDayUsd > 0
+      ? (evmLpForBorrow.avgPnlPerDayUsd * 365) / Math.max(1, evmLpForBorrow.totalPositions * 50)
+      : 0;
+    // AAVE borrow cost — use aave_borrow_lp strategy stats if available
+    const aaveBorrowSt = stats['aave_borrow_lp'];
+    const borrowCostPct = aaveBorrowSt && aaveBorrowSt.avgPnlUsd < 0
+      ? Math.abs(aaveBorrowSt.avgPnlUsd) * 365 / Math.max(1, aaveBorrowSt.avgHoldHours / 24 * aaveBorrowSt.totalTrades * 50)
+      : 0.06; // default 6% AAVE borrow rate
+    aaveBorrowLpNetYieldComputed = lpAnnualYieldPct - borrowCostPct;
+    aaveBorrowLpCycles = evmLpForBorrow.totalPositions;
+  }
+
+  // ── Reinvestment efficiency ──────────────────────────────────────
+  // Track how many reinvestment sweeps have been executed via the 'reinvest' strategy tag.
+  const reinvestSt = stats['reinvest'];
+  const reinvestSweepCount = reinvestSt ? reinvestSt.totalTrades : 0;
+  const reinvestEfficiency = reinvestSt && reinvestSt.totalTrades > 0
+    ? Math.max(0, Math.min(1, reinvestSt.winRate))
+    : 0.5; // neutral default
 
   if (kaminoSt && kaminoSt.totalTrades >= 3) {
     if (kaminoSt.maxDrawdownUsd < -20) {
@@ -1240,6 +1274,10 @@ function computeAdaptiveParams(
     kaminoSpreadFloorMultiplier: blend(kaminoSpreadMult, prior?.kaminoSpreadFloorMultiplier),
     borrowLpNetYield: blend(borrowLpNetYieldComputed, prior?.borrowLpNetYield),
     borrowLpCycleCount: borrowLpCycles,
+    aaveBorrowLpNetYield: blend(aaveBorrowLpNetYieldComputed, prior?.aaveBorrowLpNetYield),
+    aaveBorrowLpCycleCount: aaveBorrowLpCycles,
+    reinvestEfficiency: blend(reinvestEfficiency, prior?.reinvestEfficiency),
+    reinvestSweepCount: reinvestSweepCount,
     evmArbMinProfitMultiplier: blend(evmArbMinProfitMult, prior?.evmArbMinProfitMultiplier),
     feeDragPct: feeStats.feeDragPct,
     executionFailRates,
@@ -1330,35 +1368,35 @@ export async function refreshLearning(pool?: any): Promise<AdaptiveParams> {
     const prior = await loadPrior(dbPool);
 
     // 2. Compute stats for each strategy
-    const strategies = ['polymarket', 'hyperliquid', 'hl_perp', 'hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing', 'hl_spot', 'hl_spot_swing', 'hl_spot_accumulation', 'kamino', 'jito', 'orca_lp', 'krystal_lp', 'evm_flash_arb'];
+    const strategies = ['polymarket', 'hyperliquid', 'hl_perp', 'hl_perp_scalp', 'hl_perp_day', 'hl_perp_swing', 'hl_spot', 'hl_spot_swing', 'hl_spot_accumulation', 'kamino', 'jito', 'orca_lp', 'evm_lp', 'evm_flash_arb'];
     const statsEntries = await Promise.all(
       strategies.map(async s => [s, await computeStrategyStats(dbPool, s)] as const),
     );
     const stats: Record<string, StrategyStats> = Object.fromEntries(statsEntries);
 
-    // 3. LP-specific stats (aggregate + per-tier for both Orca and Krystal)
+    // 3. LP-specific stats (aggregate + per-tier for both Orca and EVM)
     const [
       orcaLpStats, orcaLow, orcaMed, orcaHigh,
-      krystalLpStats, krystalLow, krystalMed, krystalHigh,
+      evmLpStats, evmLpLow, evmLpMed, evmLpHigh,
     ] = await Promise.all([
       computeLPStats(dbPool, 'orca_lp'),
       computeLPStats(dbPool, 'orca_lp', 'low'),
       computeLPStats(dbPool, 'orca_lp', 'medium'),
       computeLPStats(dbPool, 'orca_lp', 'high'),
-      computeLPStats(dbPool, 'krystal_lp'),
-      computeLPStats(dbPool, 'krystal_lp', 'low'),
-      computeLPStats(dbPool, 'krystal_lp', 'medium'),
-      computeLPStats(dbPool, 'krystal_lp', 'high'),
+      computeLPStats(dbPool, 'evm_lp'),
+      computeLPStats(dbPool, 'evm_lp', 'low'),
+      computeLPStats(dbPool, 'evm_lp', 'medium'),
+      computeLPStats(dbPool, 'evm_lp', 'high'),
     ]);
     const lpStats: Record<string, LPStats> = {
       orca_lp: orcaLpStats,
       orca_lp_low: orcaLow,
       orca_lp_medium: orcaMed,
       orca_lp_high: orcaHigh,
-      krystal_lp: krystalLpStats,
-      krystal_lp_low: krystalLow,
-      krystal_lp_medium: krystalMed,
-      krystal_lp_high: krystalHigh,
+      evm_lp: evmLpStats,
+      evm_lp_low: evmLpLow,
+      evm_lp_medium: evmLpMed,
+      evm_lp_high: evmLpHigh,
     };
 
     // 4. Polymarket calibration
@@ -1536,6 +1574,10 @@ export function getDefaultParams(): AdaptiveParams {
     kaminoSpreadFloorMultiplier: 1.0,
     borrowLpNetYield: 0,
     borrowLpCycleCount: 0,
+    aaveBorrowLpNetYield: 0,
+    aaveBorrowLpCycleCount: 0,
+    reinvestEfficiency: 0.5,
+    reinvestSweepCount: 0,
     evmArbMinProfitMultiplier: 1.0,
     feeDragPct: 0,
     executionFailRates: {},
@@ -1594,7 +1636,7 @@ export function formatLearningSummary(params: AdaptiveParams): string {
     hl_perp_scalp: 'HL Scalp', hl_perp_day: 'HL Day', hl_perp_swing: 'HL Swing',
     hl_spot: 'HL Spot', hl_spot_swing: 'HL Spot Swing', hl_spot_accumulation: 'HL Spot Accum',
     kamino: 'Kamino', jito: 'Jito Staking',
-    orca_lp: 'Orca LP', krystal_lp: 'EVM LP', evm_flash_arb: 'Arb Scanner',
+    orca_lp: 'Orca LP', evm_lp: 'EVM LP', evm_flash_arb: 'Arb Scanner',
     polymarket: 'Polymarket',
   };
   const sorted = Object.entries(params.strategyScores)

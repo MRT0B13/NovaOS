@@ -3,13 +3,13 @@
  *
  * Role: Multi-chain portfolio monitoring with PnL tracking and alerts.
  * Aggregates positions across Solana (Jupiter, Orca, Kamino, Jito) and
- * EVM (Krystal LP, Polymarket, Hyperliquid) — surfaces gains, losses,
+ * EVM (EVM LP, Polymarket, Hyperliquid) — surfaces gains, losses,
  * and rebalance opportunities.
  *
  * Data sources:
  *   - portfolioService → Aggregated portfolio snapshot
  *   - positionManager → Active positions across all strategies
- *   - krystalService → EVM LP positions + multi-chain balances
+ *   - evmProviderService → EVM LP positions + multi-chain balances
  *   - pnlTracker → Historical PnL data
  *   - Pyth Oracle → Real-time prices
  *
@@ -336,9 +336,9 @@ export class PortfolioWatchdogAgent extends BaseAgent {
         // portfolioService may not be initialized — gather manually
       }
 
-      // Add EVM balances from Krystal
+      // Add EVM balances
       try {
-        const { getMultiChainEvmBalances } = await import('../launchkit/cfo/krystalService.ts');
+        const { getMultiChainEvmBalances } = await import('../launchkit/cfo/evmProviderService.ts');
         const evmBalances = await getMultiChainEvmBalances();
 
         for (const cb of evmBalances) {
@@ -361,9 +361,9 @@ export class PortfolioWatchdogAgent extends BaseAgent {
         // EVM not configured — that's fine
       }
 
-      // Add Krystal LP positions
+      // Add EVM LP positions
       try {
-        const { fetchKrystalPositions } = await import('../launchkit/cfo/krystalService.ts');
+        const { fetchEvmLpPositions } = await import('../launchkit/cfo/evmLpService.ts');
 
         // Prefer user wallet config, fall back to system CFO env
         let walletAddress: string | null = null;
@@ -381,7 +381,7 @@ export class PortfolioWatchdogAgent extends BaseAgent {
         }
 
         if (walletAddress) {
-          const positions = await fetchKrystalPositions(walletAddress) as any[];
+          const positions = await fetchEvmLpPositions(walletAddress) as any[];
           if (positions && Array.isArray(positions)) {
             for (const pos of positions) {
               const value = (pos as any).totalValueUsd || (pos as any).valueUsd || 0;

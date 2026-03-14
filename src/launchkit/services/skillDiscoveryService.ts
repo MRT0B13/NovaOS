@@ -21,7 +21,7 @@ const AGENT_PROFILES: Record<string, string> = {
     - Kamino Finance: lending/borrowing, USDC deposits, JitoSOL loop strategies, LTV management
     - Jito liquid staking (SOL → JitoSOL, MEV rewards, compounding)
     - Orca LP on Solana (concentrated liquidity, range management, fee collection, rebalancing)
-    - Krystal LP on EVM chains (Uniswap V3, PancakeSwap V3, Aerodrome CL, multi-chain)
+    - EVM LP (DeFiLlama) (Uniswap V3, PancakeSwap V3, Aerodrome CL, multi-chain)
     - Wormhole cross-chain bridging
     - x402 micropayment monetization
     - Risk management: position limits, exposure caps, approval tiers, emergency exits`,

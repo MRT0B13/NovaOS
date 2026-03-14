@@ -316,11 +316,11 @@ async function executeLifiEvmRoute(quote: BridgeQuote, fromPrivateKey: string): 
       59144: linea, 534352: scroll, 5000: mantle, 81457: blast,
     };
 
-    // Use dynamic provider from krystalService (covers all configured chains)
+    // Use dynamic provider from evmProviderService (covers all configured chains)
     const fromChainId = WELL_KNOWN_CHAIN_IDS[quote.fromChain] ?? 137;
     let rpcUrl: string;
     try {
-      const { getEvmProvider } = await import('./krystalService.ts');
+      const { getEvmProvider } = await import('./evmProviderService.ts');
       const p = await getEvmProvider(fromChainId);
       rpcUrl = (p as any)._getConnection?.()?.url ?? getCFOEnv().polygonRpcUrl;
     } catch {
@@ -781,7 +781,7 @@ export async function getEvmTokenBalance(
   walletAddress: string,
 ): Promise<number> {
   try {
-    const { getEvmProvider } = await import('./krystalService.ts');
+    const { getEvmProvider } = await import('./evmProviderService.ts');
     const ethers = await import('ethers' as string);
     const provider = await getEvmProvider(chainId);
     const erc20 = new ethers.Contract(tokenAddress, [
@@ -807,7 +807,7 @@ export async function getEvmNativeBalance(
   walletAddress: string,
 ): Promise<number> {
   try {
-    const { getEvmProvider } = await import('./krystalService.ts');
+    const { getEvmProvider } = await import('./evmProviderService.ts');
     const ethers = await import('ethers' as string);
     const provider = await getEvmProvider(chainId);
     const balance = await provider.getBalance(walletAddress);

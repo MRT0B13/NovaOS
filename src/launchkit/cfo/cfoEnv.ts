@@ -118,17 +118,16 @@ export interface CFOEnv {
   orcaLpMaxPositions: number;                     // max concurrent Orca LP positions (default 3)
   orcaLpRiskTiers: Set<string>;                    // enabled risk tiers: low,medium,high (default: low,medium)
 
-  // ── Krystal EVM Concentrated LP ──────────────────────────────────
-  krystalLpEnabled: boolean;                      // enable Krystal EVM LP (default false)
-  krystalApiKey: string | undefined;              // Krystal Cloud API key
-  krystalLpMaxUsd: number;                        // max USD per position (default 200)
-  krystalLpMinTvlUsd: number;                     // min pool TVL filter (default 500000)
-  krystalLpMinApr7d: number;                      // min 7d APR filter (default 15)
-  krystalLpMaxPositions: number;                  // max concurrent EVM LP positions (default 3)
-  krystalLpRangeWidthTicks: number;               // range width in ticks (default 300, ±150 ticks ≈ ±1.5%)
-  krystalLpRebalanceTriggerPct: number;           // rebalance when utilisation drops below X% (default 10)
-  krystalLpRiskTiers: Set<string>;                 // enabled risk tiers: low,medium,high (default: low,medium)
-  krystalLpOpenCooldownMs: number;                // cooldown between KRYSTAL_LP_OPEN decisions (default 4h)
+  // ── EVM Concentrated LP ──────────────────────────────────────────
+  evmLpEnabled: boolean;                          // enable EVM LP (default false) — accepts CFO_KRYSTAL_LP_ENABLE as fallback
+  evmLpMaxUsd: number;                            // max USD per position (default 200)
+  evmLpMinTvlUsd: number;                         // min pool TVL filter (default 500000)
+  evmLpMinApr7d: number;                          // min 7d APR filter (default 15)
+  evmLpMaxPositions: number;                      // max concurrent EVM LP positions (default 3)
+  evmLpRangeWidthTicks: number;                   // range width in ticks (default 300, ±150 ticks ≈ ±1.5%)
+  evmLpRebalanceTriggerPct: number;               // rebalance when utilisation drops below X% (default 10)
+  evmLpRiskTiers: Set<string>;                    // enabled risk tiers: low,medium,high (default: low,medium)
+  evmLpOpenCooldownMs: number;                    // cooldown between EVM_LP_OPEN decisions (default 4h)
   evmRpcUrls: Record<number, string>;             // chainId → RPC URL mapping
 
   // ── Kamino-funded LP (borrow → LP → fees repay loan) ─────────────
@@ -137,6 +136,14 @@ export interface CFOEnv {
   kaminoBorrowLpMinSpreadPct: number;             // LP fee APY must beat borrow cost by this % (default 5)
   kaminoBorrowLpMaxLtvPct: number;                // won't borrow if post-borrow LTV exceeds this (default 55)
   kaminoBorrowLpCapacityPct: number;              // use at most X% of remaining borrow headroom (default 20)
+
+  // ── AAVE-funded LP (EVM borrow → LP → fees repay loan) ─────────────
+  aaveBorrowLpEnabled: boolean;                   // enable AAVE borrow-for-LP strategy (default false)
+  aaveBorrowLpMaxUsd: number;                     // max USD borrowed for LP (default 200)
+  aaveBorrowLpMinSpreadPct: number;               // LP fee APY must beat borrow cost by this % (default 5)
+  aaveBorrowLpMaxLtvPct: number;                  // won't borrow if post-borrow LTV exceeds this (default 55)
+  aaveBorrowLpCapacityPct: number;                // use at most X% of remaining borrow headroom (default 20)
+  aaveBorrowLpChains: string;                     // comma-separated chains: "arbitrum,base" (default "arbitrum")
 
   // ── EVM Flash Arbitrage (multi-chain) ──────────────────────────────────
   evmArbEnabled: boolean;              // enable arb scanning + execution (default false)
@@ -171,6 +178,12 @@ export interface CFOEnv {
 
   // ── Pyth ─────────────────────────────────────────────────────────
   pythEnabled: boolean;
+
+  // ── Profit Reinvestment ──────────────────────────────────────────
+  reinvestEnabled: boolean;                       // enable automatic profit reinvestment (default true)
+  reinvestMinUsd: number;                         // min USD to trigger reinvestment (default 10)
+  reinvestSweepIntervalH: number;                 // hours between accumulated-profit sweeps (default 0.5 = 30 min)
+  reinvestPreferVolatile: boolean;                // bias reinvestment toward high-fee volatile pools (default true)
 
   // ── Emergency ─────────────────────────────────────────────────────
   /** Minutes to auto-resume after emergency pause (default 240 = 4h) */
@@ -375,19 +388,18 @@ export function getCFOEnv(bust = false): CFOEnv {
         .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
     ),
 
-    krystalLpEnabled: process.env.CFO_KRYSTAL_LP_ENABLE === 'true',
-    krystalApiKey: process.env.CFO_KRYSTAL_API_KEY,
-    krystalLpMaxUsd: Number(process.env.CFO_KRYSTAL_LP_MAX_USD ?? 200),
-    krystalLpMinTvlUsd: Number(process.env.CFO_KRYSTAL_LP_MIN_TVL_USD ?? 500_000),
-    krystalLpMinApr7d: Number(process.env.CFO_KRYSTAL_LP_MIN_APR_7D ?? 15),
-    krystalLpMaxPositions: Number(process.env.CFO_KRYSTAL_LP_MAX_POSITIONS ?? 3),
-    krystalLpRangeWidthTicks: Number(process.env.CFO_KRYSTAL_LP_RANGE_WIDTH_TICKS ?? 300),
-    krystalLpRebalanceTriggerPct: Number(process.env.CFO_KRYSTAL_LP_REBALANCE_TRIGGER_PCT ?? 10),
-    krystalLpRiskTiers: new Set(
-      (process.env.CFO_KRYSTAL_LP_RISK_TIERS ?? 'low,medium,high')
+    evmLpEnabled: (process.env.CFO_EVM_LP_ENABLE ?? process.env.CFO_KRYSTAL_LP_ENABLE) === 'true',
+    evmLpMaxUsd: Number(process.env.CFO_EVM_LP_MAX_USD ?? process.env.CFO_KRYSTAL_LP_MAX_USD ?? 200),
+    evmLpMinTvlUsd: Number(process.env.CFO_EVM_LP_MIN_TVL_USD ?? process.env.CFO_KRYSTAL_LP_MIN_TVL_USD ?? 500_000),
+    evmLpMinApr7d: Number(process.env.CFO_EVM_LP_MIN_APR_7D ?? process.env.CFO_KRYSTAL_LP_MIN_APR_7D ?? 15),
+    evmLpMaxPositions: Number(process.env.CFO_EVM_LP_MAX_POSITIONS ?? process.env.CFO_KRYSTAL_LP_MAX_POSITIONS ?? 3),
+    evmLpRangeWidthTicks: Number(process.env.CFO_EVM_LP_RANGE_WIDTH_TICKS ?? process.env.CFO_KRYSTAL_LP_RANGE_WIDTH_TICKS ?? 300),
+    evmLpRebalanceTriggerPct: Number(process.env.CFO_EVM_LP_REBALANCE_TRIGGER_PCT ?? process.env.CFO_KRYSTAL_LP_REBALANCE_TRIGGER_PCT ?? 10),
+    evmLpRiskTiers: new Set(
+      (process.env.CFO_EVM_LP_RISK_TIERS ?? process.env.CFO_KRYSTAL_LP_RISK_TIERS ?? 'low,medium,high')
         .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
     ),
-    krystalLpOpenCooldownMs: Number(process.env.CFO_KRYSTAL_LP_OPEN_COOLDOWN_HOURS ?? 4) * 3600_000,
+    evmLpOpenCooldownMs: Number(process.env.CFO_EVM_LP_OPEN_COOLDOWN_HOURS ?? process.env.CFO_KRYSTAL_LP_OPEN_COOLDOWN_HOURS ?? 4) * 3600_000,
     evmRpcUrls: parseEvmRpcUrls(),
 
     kaminoBorrowLpEnabled: process.env.CFO_KAMINO_BORROW_LP_ENABLE === 'true',
@@ -395,6 +407,13 @@ export function getCFOEnv(bust = false): CFOEnv {
     kaminoBorrowLpMinSpreadPct: Number(process.env.CFO_KAMINO_BORROW_LP_MIN_SPREAD_PCT ?? 5),
     kaminoBorrowLpMaxLtvPct: Number(process.env.CFO_KAMINO_BORROW_LP_MAX_LTV_PCT ?? 55),
     kaminoBorrowLpCapacityPct: Number(process.env.CFO_KAMINO_BORROW_LP_CAPACITY_PCT ?? 20),
+
+    aaveBorrowLpEnabled: process.env.CFO_AAVE_BORROW_LP_ENABLE === 'true',
+    aaveBorrowLpMaxUsd: Number(process.env.CFO_AAVE_BORROW_LP_MAX_USD ?? 200),
+    aaveBorrowLpMinSpreadPct: Number(process.env.CFO_AAVE_BORROW_LP_MIN_SPREAD_PCT ?? 5),
+    aaveBorrowLpMaxLtvPct: Number(process.env.CFO_AAVE_BORROW_LP_MAX_LTV_PCT ?? 55),
+    aaveBorrowLpCapacityPct: Number(process.env.CFO_AAVE_BORROW_LP_CAPACITY_PCT ?? 20),
+    aaveBorrowLpChains: process.env.CFO_AAVE_BORROW_LP_CHAINS ?? 'arbitrum',
 
     evmArbEnabled:          process.env.CFO_EVM_ARB_ENABLE === 'true',
     evmArbChains:           process.env.CFO_EVM_ARB_CHAINS ?? 'arbitrum',
@@ -423,6 +442,12 @@ export function getCFOEnv(bust = false): CFOEnv {
     heliusApiKey: process.env.CFO_HELIUS_API_KEY,
 
     pythEnabled,
+
+    // ── Profit Reinvestment ──
+    reinvestEnabled: process.env.CFO_REINVEST_ENABLE !== 'false',            // default ON
+    reinvestMinUsd: Number(process.env.CFO_REINVEST_MIN_USD ?? 10),
+    reinvestSweepIntervalH: Number(process.env.CFO_REINVEST_SWEEP_INTERVAL_H ?? 0.5),
+    reinvestPreferVolatile: process.env.CFO_REINVEST_PREFER_VOLATILE !== 'false', // default ON
 
     emergencyCooldownMinutes: Number(process.env.CFO_EMERGENCY_COOLDOWN_MINUTES ?? 240),
   };

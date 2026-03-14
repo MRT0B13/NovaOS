@@ -102,7 +102,7 @@ export async function registerFactoryCommands(
         `Optional: <i>subreddits, minScore</i>`,
         ``,
         `💰 <b>Yield Monitoring</b>`,
-        `DeFi yields across Krystal (EVM), Orca, Kamino, Jito (Solana).`,
+        `DeFi yields across EVM LP, Orca, Kamino, Jito (Solana).`,
         `<code>/request_agent monitor defi yields above 20% apy</code>`,
         `Optional: <i>minApy, minTvl, chains</i>`,
         ``,
@@ -179,7 +179,7 @@ export async function registerFactoryCommands(
             '• whale, wallet — whale tracking (Solana + EVM)\n• token, price, volume — token monitoring\n' +
             '• rug, safety, scan — safety scanning\n• KOL, twitter, influencer — KOL scanning\n' +
             '• narrative, sentiment — narrative tracking\n• social, trending, memes, viral, reddit — social trending\n' +
-            '• yield, apy, farming, krystal, orca, kamino — yield monitoring\n' +
+            '• yield, apy, farming, evm-lp, orca, kamino — yield monitoring\n' +
             '• arb, arbitrage, flash loan, cross-dex — arb scanning\n' +
             '• portfolio, pnl, drawdown, positions — portfolio monitoring',
           );

@@ -16,13 +16,13 @@ const TEMPLATES: Record<string, { agents: string[]; defaultSkills: string[]; des
   'full-nova': {
     agents: ['nova-cfo', 'nova-scout', 'nova-guardian', 'nova-supervisor'],
     defaultSkills: ['risk-framework', 'hyperliquid-trader', 'polymarket-edge',
-                    'kamino-yield', 'orca-lp', 'krystal-lp'],
+                    'kamino-yield', 'orca-lp', 'evm-lp'],
     description: 'Full-spectrum DeFi operations: trading, intel, safety, yield, LP management',
   },
   'cfo-agent': {
     agents: ['nova-cfo', 'nova-guardian'],
     defaultSkills: ['risk-framework', 'hyperliquid-trader', 'kamino-yield',
-                    'orca-lp', 'krystal-lp'],
+                    'orca-lp', 'evm-lp'],
     description: 'Autonomous CFO: portfolio management, yield strategies, risk control',
   },
   'scout-agent': {
@@ -32,8 +32,8 @@ const TEMPLATES: Record<string, { agents: string[]; defaultSkills: string[]; des
   },
   'lp-specialist': {
     agents: ['nova-cfo'],
-    defaultSkills: ['risk-framework', 'orca-lp', 'krystal-lp'],
-    description: 'LP specialist: concentrated liquidity on Orca, Kamino, Krystal',
+    defaultSkills: ['risk-framework', 'orca-lp', 'evm-lp'],
+    description: 'LP specialist: concentrated liquidity on Orca, Kamino, EVM LP',
   },
   'governance-agent': {
     agents: ['nova-supervisor'],
@@ -87,7 +87,7 @@ const RISK_CONFIGS: Record<string, Record<string, string>> = {
 
 // Whitelist of user-editable config keys
 const EDITABLE_KEYS = [
-  'CFO_ORCA_LP_MAX_USD', 'CFO_KRYSTAL_LP_MAX_USD', 'CFO_AUTO_TIER_USD',
+  'CFO_ORCA_LP_MAX_USD', 'CFO_EVM_LP_MAX_USD', 'CFO_AUTO_TIER_USD',
   'CFO_KELLY_FRACTION', 'CFO_KAMINO_JITO_LOOP_MAX_LOOPS',
   'CFO_ORCA_LP_RANGE_WIDTH_PCT', 'CFO_MAX_DECISIONS_PER_CYCLE',
 ];
@@ -99,6 +99,10 @@ export async function agentsRoutes(server: FastifyInstance) {
     connectionString: dbUrl,
     ssl: dbUrl.includes('sslmode=require') || process.env.PGSSLMODE === 'require'
       ? { rejectUnauthorized: false } : undefined,
+    max: 3,
+    idleTimeoutMillis: 30_000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
   });
   const orchestrator = new AgentOrchestrator(pool);
 

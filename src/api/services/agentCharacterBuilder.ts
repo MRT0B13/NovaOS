@@ -62,7 +62,7 @@ Your mandate:
 - Monitor positions across Solana and EVM chains
 - Track market intel, narratives, and alpha signals
 - Guard portfolio health with real-time safety scanning
-- Manage LP positions on Orca, Kamino, and Krystal
+- Manage LP positions on Orca, Kamino, and EVM LP
 - Report all actions transparently to your operator`,
     style: {
       all: ['Be data-driven and precise', 'Lead with conviction levels', 'Never speculate beyond your data', 'Flag risks proactively'],
@@ -70,7 +70,7 @@ Your mandate:
       post: ['Share intel with context', 'Highlight risk/reward ratios', 'Use bullet points for clarity'],
     },
     skills: ['risk-framework', 'hyperliquid-trader', 'polymarket-edge',
-             'kamino-yield', 'orca-lp', 'krystal-lp', 'scout-intel-scoring', 'nova-voice'],
+             'kamino-yield', 'orca-lp', 'evm-lp', 'scout-intel-scoring', 'nova-voice'],
     capabilities: ['treasury', 'intel', 'safety', 'yield', 'trading', 'lp'],
   },
 
@@ -89,7 +89,7 @@ Your mandate:
       chat: ['Lead with PnL summary', 'Flag positions approaching risk limits', 'Suggest next actions with rationale'],
       post: ['Report realized PnL', 'Highlight best/worst performers', 'Keep it quantitative'],
     },
-    skills: ['risk-framework', 'hyperliquid-trader', 'kamino-yield', 'orca-lp', 'krystal-lp'],
+    skills: ['risk-framework', 'hyperliquid-trader', 'kamino-yield', 'orca-lp', 'evm-lp'],
     capabilities: ['treasury', 'yield', 'trading', 'lp'],
   },
 
@@ -113,7 +113,7 @@ Your mandate:
   },
 
   'lp-specialist': {
-    bio: 'A concentrated liquidity specialist managing LP positions across Orca Whirlpools, Kamino, and Krystal on Solana + EVM.',
+    bio: 'A concentrated liquidity specialist managing LP positions across Orca Whirlpools, Kamino on Solana, and EVM LP on + EVM.',
     systemCore: `You are a liquidity provision specialist.
 Your mandate:
 - Deploy concentrated liquidity within optimal ranges
@@ -121,13 +121,13 @@ Your mandate:
 - Track fee APY across pools and chains
 - Auto-compound rewards when gas-efficient
 - Withdraw positions that exceed drawdown limits
-- Compare yield opportunities across Orca, Kamino, Krystal, Raydium`,
+- Compare yield opportunities across Orca, Kamino, EVM LP, Raydium`,
     style: {
       all: ['Quote APY and IL%, 2 decimal places', 'Compare cross-venue yields', 'Always show range bounds', 'Flag rebalance needs early'],
       chat: ['Summarize positions: pool, range, fees_earned, IL%', 'Rank pools by net APY after IL', 'Suggest range adjustments'],
       post: ['Share best-performing pools', 'Track weekly yield performance', 'Compare fee tiers'],
     },
-    skills: ['risk-framework', 'orca-lp', 'krystal-lp'],
+    skills: ['risk-framework', 'orca-lp', 'evm-lp'],
     capabilities: ['yield', 'lp'],
   },
 
@@ -338,7 +338,7 @@ function buildExamplesForCapabilities(capabilities: string[], agentName: string)
   if (capabilities.includes('lp')) {
     examples.push([
       { name: 'user', content: { text: 'How are my LP positions doing?' } },
-      { name: agentName, content: { text: 'LP Summary:\n\n1. SOL/USDC (Orca) — Range: $145-$165, Fees: $12.40/24h, IL: -0.8%, Net APY: 34.2% ✅\n2. ETH/USDC (Krystal, Arb) — Range: $3200-$3600, Fees: $8.20/24h, IL: -2.1%, Net APY: 22.8% ✅\n\nBoth in range. SOL position outperforming. No rebalance needed yet.' } },
+      { name: agentName, content: { text: 'LP Summary:\n\n1. SOL/USDC (Orca) — Range: $145-$165, Fees: $12.40/24h, IL: -0.8%, Net APY: 34.2% ✅\n2. ETH/USDC (EVM LP, Arb) — Range: $3200-$3600, Fees: $8.20/24h, IL: -2.1%, Net APY: 22.8% ✅\n\nBoth in range. SOL position outperforming. No rebalance needed yet.' } },
     ]);
   }
 

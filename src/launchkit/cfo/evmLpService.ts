@@ -1,0 +1,2671 @@
+/**
+ * EVM LP Service — Multi-chain concentrated LP execution engine
+ *
+ * Execution: Uniswap V3 / PancakeSwap V3 / Aerodrome CL NonfungiblePositionManager
+ * Discovery: DeFiLlama yields API (via evmPoolDiscovery.ts)
+ * Providers: Shared provider pool (via evmProviderService.ts)
+ *
+ * Key functions:
+ *   fetchEvmLpPositions(addr)     → all open EVM LP positions for wallet
+ *   openEvmLpPosition(pool, usd)  → mint LP NFT on target chain
+ *   closeEvmLpPosition(pos)       → burn LP NFT and recover tokens
+ *   claimEvmLpFees(pos)           → collect accumulated fees
+ *   rebalanceEvmLpPosition(pos)   → close + reopen out-of-range position
+ *   setAnalystPrices(prices)      → set price overrides
+ */
+
+import { logger } from '@elizaos/core';
+import { getCFOEnv } from './cfoEnv.ts';
+import {
+  loadEthers,
+  getEvmProvider,
+  getEvmWallet,
+  evictProvider,
+  withRpcRetry,
+  TRANSIENT_RPC_CODES,
+  WRAPPED_NATIVE_ADDR,
+  NATIVE_SYMBOLS,
+  BRIDGED_USDC,
+  WELL_KNOWN_USDT,
+  ERC20_ABI,
+  isStablecoin,
+} from './evmProviderService.ts';
+
+// ============================================================================
+// Multi-Protocol Registry
+// ============================================================================
+// Supports Uniswap V3, PancakeSwap V3 (same ABI), and Aerodrome CL (different ABI).
+// Each protocol has its own NFPM + Factory addresses per chain.
+
+type AbiVariant = 'uniswap-v3' | 'aerodrome-cl';
+
+interface ProtocolDef {
+  /** Regex patterns to match protocol key/name (case-insensitive) */
+  matchPatterns: RegExp[];
+  /** ABI variant — determines mint params shape */
+  abi: AbiVariant;
+  /** NonfungiblePositionManager addresses per chainId */
+  nfpm: Record<number, string>;
+  /** Factory addresses per chainId (for pool verification) */
+  factory: Record<number, string>;
+  /** Human-readable label */
+  label: string;
+  /** Score bonus (0-10) for protocol quality */
+  scoreBonus: number;
+}
+
+const PROTOCOL_REGISTRY: ProtocolDef[] = [
+  {
+    label: 'Uniswap V3',
+    matchPatterns: [/uniswap.*v3/i, /uniswapv3/i],
+    abi: 'uniswap-v3',
+    scoreBonus: 10,
+    nfpm: {
+      1:     '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Ethereum
+      10:    '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Optimism
+      137:   '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Polygon
+      8453:  '0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1', // Base (v1.3.0)
+      42161: '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', // Arbitrum
+    },
+    factory: {
+      1:     '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Ethereum
+      10:    '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Optimism
+      137:   '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Polygon
+      8453:  '0x33128a8fC17869897dcE68Ed026d694621f6FDfD', // Base (v1.3.0)
+      42161: '0x1F98431c8aD98523631AE4a59f267346ea31F984', // Arbitrum
+    },
+  },
+  {
+    label: 'PancakeSwap V3',
+    matchPatterns: [/pancake.*v3/i, /pancakeswap/i],
+    abi: 'uniswap-v3',  // Same ABI as Uniswap V3 (direct fork)
+    scoreBonus: 8,
+    nfpm: {
+      1:     '0x46A15B0b27311cedF172AB29E4f4766fbE7F4364', // Ethereum
+      56:    '0x46A15B0b27311cedF172AB29E4f4766fbE7F4364', // BSC
+      8453:  '0x46A15B0b27311cedF172AB29E4f4766fbE7F4364', // Base
+      42161: '0x46A15B0b27311cedF172AB29E4f4766fbE7F4364', // Arbitrum
+    },
+    factory: {
+      1:     '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // Ethereum
+      56:    '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // BSC
+      8453:  '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // Base
+      42161: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', // Arbitrum
+    },
+  },
+  {
+    label: 'Aerodrome CL',
+    matchPatterns: [/aerodrome/i, /slipstream/i],
+    abi: 'aerodrome-cl',  // Different ABI: tickSpacing instead of fee, extra sqrtPriceX96
+    scoreBonus: 7,
+    nfpm: {
+      8453:  '0x827922686190790b37229fd06084350E74485b72', // Base only
+    },
+    factory: {
+      8453:  '0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A', // Base only
+    },
+  },
+];
+
+/** Resolved protocol config for a specific pool + chain */
+interface ResolvedProtocol {
+  def: ProtocolDef;
+  nfpmAddress: string;
+  factoryAddress: string;
+}
+
+/** Match a protocol key to our registry entry */
+function resolveProtocolDef(protoKey: string): ProtocolDef | undefined {
+  for (const def of PROTOCOL_REGISTRY) {
+    if (def.matchPatterns.some(p => p.test(protoKey))) return def;
+  }
+  return undefined;
+}
+
+/** Resolve protocol + chain → NFPM/Factory addresses. Returns undefined if unsupported. */
+function resolveProtocol(protoKey: string, chainId: number): ResolvedProtocol | undefined {
+  const def = resolveProtocolDef(protoKey);
+  if (!def) return undefined;
+  const nfpmAddress = def.nfpm[chainId];
+  const factoryAddress = def.factory[chainId];
+  if (!nfpmAddress) return undefined; // protocol not deployed on this chain
+  return { def, nfpmAddress, factoryAddress: factoryAddress ?? '' };
+}
+
+// Backward compat helpers — used internally when protocol is unknown (DB positions)
+function getNfpmAddress(chainId: number): string | undefined {
+  // Try Uniswap V3 first (most common), then PancakeSwap V3, then Aerodrome
+  for (const def of PROTOCOL_REGISTRY) {
+    if (def.nfpm[chainId]) return def.nfpm[chainId];
+  }
+  return undefined;
+}
+
+function getFactoryForProtocol(protoKey: string, chainId: number): string | undefined {
+  const resolved = resolveProtocol(protoKey, chainId);
+  return resolved?.factoryAddress;
+}
+
+// Legacy constant for backward compatibility
+const NFPM_ADDRESS = '0xC36442b4a4522E871399CD717aBDD847Ab11FE88';
+
+// Uniswap V3 / PancakeSwap V3 NFPM ABI (identical interface)
+const NFPM_ABI = [
+  'function mint((address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, address recipient, uint256 deadline)) returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'function increaseLiquidity((uint256 tokenId, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
+  'function ownerOf(uint256 tokenId) view returns (address)',
+  'function decreaseLiquidity((uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint256 amount0, uint256 amount1)',
+  'function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)',
+  'function burn(uint256 tokenId)',
+  'function balanceOf(address owner) view returns (uint256)',
+  'function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)',
+  'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
+  'event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)',
+];
+
+// Aerodrome CL (Slipstream) NFPM ABI — uses tickSpacing instead of fee, extra sqrtPriceX96 in mint
+const AERODROME_NFPM_ABI = [
+  'function mint((address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, address recipient, uint256 deadline, uint160 sqrtPriceX96)) returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'function increaseLiquidity((uint256 tokenId, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
+  'function ownerOf(uint256 tokenId) view returns (address)',
+  'function decreaseLiquidity((uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint256 amount0, uint256 amount1)',
+  'function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)',
+  'function burn(uint256 tokenId)',
+  'function balanceOf(address owner) view returns (uint256)',
+  'function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)',
+  'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
+  'event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)',
+];
+
+/** Get the correct NFPM ABI based on protocol variant */
+function getNfpmAbiForProtocol(abi: AbiVariant): string[] {
+  return abi === 'aerodrome-cl' ? AERODROME_NFPM_ABI : NFPM_ABI;
+}
+
+// Uniswap V3 / PancakeSwap V3 pool ABI (7 slot0 return values including feeProtocol)
+const POOL_ABI = [
+  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+  'function tickSpacing() view returns (int24)',
+  'function feeGrowthGlobal0X128() view returns (uint256)',
+  'function feeGrowthGlobal1X128() view returns (uint256)',
+  'function ticks(int24 tick) view returns (uint128 liquidityGross, int128 liquidityNet, uint256 feeGrowthOutside0X128, uint256 feeGrowthOutside1X128, int56 tickCumulativeOutside, uint160 secondsPerLiquidityOutsideX128, uint32 secondsOutside, bool initialized)',
+];
+
+// Aerodrome CL (Slipstream) pool ABI — slot0 returns 6 values (no feeProtocol)
+const AERODROME_POOL_ABI = [
+  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, bool unlocked)',
+  'function tickSpacing() view returns (int24)',
+  'function feeGrowthGlobal0X128() view returns (uint256)',
+  'function feeGrowthGlobal1X128() view returns (uint256)',
+  'function ticks(int24 tick) view returns (uint128 liquidityGross, int128 liquidityNet, uint256 feeGrowthOutside0X128, uint256 feeGrowthOutside1X128, int56 tickCumulativeOutside, uint160 secondsPerLiquidityOutsideX128, uint32 secondsOutside, bool initialized)',
+];
+
+/** Pick correct pool ABI based on protocol variant */
+function getPoolAbi(isAerodrome: boolean): string[] {
+  return isAerodrome ? AERODROME_POOL_ABI : POOL_ABI;
+}
+
+// ============================================================================
+// Uniswap V3 Pending Fee Computation
+// ============================================================================
+/**
+ * Compute true pending fees for a V3 position using fee growth checkpoints.
+ * Equivalent to what Uniswap's SDK does with collectFeesQuote.
+ * Uses unsigned 256-bit wraparound arithmetic (Q128 mask) for correctness.
+ *
+ * Returns { fees0, fees1 } in raw token units (not divided by decimals).
+ * Both tokensOwed (already collected but not claimed) + uncollected growth.
+ */
+async function computePendingFeesV3(
+  poolContract: any,
+  posData: any,           // return value from nfpm.positions(tokenId)
+  currentTick: number,
+): Promise<{ fees0: bigint; fees1: bigint }> {
+  const Q128   = BigInt('0x100000000000000000000000000000000'); // 2^128
+  const MASK128 = Q128 - 1n;
+
+  const tickLower  = Number(posData.tickLower  ?? posData[5] ?? 0);
+  const tickUpper  = Number(posData.tickUpper  ?? posData[6] ?? 0);
+  const liquidity  = BigInt(posData.liquidity  ?? posData[7] ?? 0);
+  const fg0Last    = BigInt(posData.feeGrowthInside0LastX128 ?? posData[8] ?? 0);
+  const fg1Last    = BigInt(posData.feeGrowthInside1LastX128 ?? posData[9] ?? 0);
+  const tokensOwed0 = BigInt(posData.tokensOwed0 ?? posData[10] ?? 0);
+  const tokensOwed1 = BigInt(posData.tokensOwed1 ?? posData[11] ?? 0);
+
+  if (liquidity === 0n) return { fees0: tokensOwed0, fees1: tokensOwed1 };
+
+  // Read pool globals + tick data in parallel
+  const [fg0Raw, fg1Raw, tickLoData, tickHiData] = await Promise.all([
+    poolContract.feeGrowthGlobal0X128(),
+    poolContract.feeGrowthGlobal1X128(),
+    poolContract.ticks(tickLower),
+    poolContract.ticks(tickUpper),
+  ]);
+
+  const fgGlobal0 = BigInt(fg0Raw ?? 0);
+  const fgGlobal1 = BigInt(fg1Raw ?? 0);
+
+  // feeGrowthOutside from tick structs
+  const tickLoFGO0 = BigInt(tickLoData.feeGrowthOutside0X128 ?? tickLoData[2] ?? 0);
+  const tickLoFGO1 = BigInt(tickLoData.feeGrowthOutside1X128 ?? tickLoData[3] ?? 0);
+  const tickHiFGO0 = BigInt(tickHiData.feeGrowthOutside0X128 ?? tickHiData[2] ?? 0);
+  const tickHiFGO1 = BigInt(tickHiData.feeGrowthOutside1X128 ?? tickHiData[3] ?? 0);
+
+  // Standard V3 fee growth below / above formula (see UniswapV3Pool.sol)
+  const fgBelow0 = currentTick >= tickLower ? tickLoFGO0 : (fgGlobal0 - tickLoFGO0) & MASK128;
+  const fgBelow1 = currentTick >= tickLower ? tickLoFGO1 : (fgGlobal1 - tickLoFGO1) & MASK128;
+  const fgAbove0 = currentTick  < tickUpper ? tickHiFGO0 : (fgGlobal0 - tickHiFGO0) & MASK128;
+  const fgAbove1 = currentTick  < tickUpper ? tickHiFGO1 : (fgGlobal1 - tickHiFGO1) & MASK128;
+
+  const fgInside0 = (fgGlobal0 - fgBelow0 - fgAbove0) & MASK128;
+  const fgInside1 = (fgGlobal1 - fgBelow1 - fgAbove1) & MASK128;
+
+  // Delta (unsigned wraparound)
+  const delta0 = (fgInside0 - fg0Last) & MASK128;
+  const delta1 = (fgInside1 - fg1Last) & MASK128;
+
+  const fees0 = tokensOwed0 + (delta0 * liquidity / Q128);
+  const fees1 = tokensOwed1 + (delta1 * liquidity / Q128);
+  return { fees0, fees1 };
+}
+
+const MaxUint128 = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF');
+
+// ============================================================================
+// V3 Math Helpers — compute token amounts from on-chain liquidity
+// ============================================================================
+const Q96 = BigInt(1) << BigInt(96);
+
+/**
+ * Convert a Uniswap V3 tick index to sqrtPriceX96 (Q64.96 fixed-point).
+ * Formula: floor( sqrt(1.0001^tick) * 2^96 )
+ */
+function tickToSqrtPriceX96(tick: number): bigint {
+  // Use the standard absTick bit-decomposition approach for precision.
+  const absTick = Math.abs(tick);
+  // Start with ratio = 1 in Q128
+  let ratio = BigInt('0x100000000000000000000000000000000'); // 1 << 128
+
+  // Each bit of absTick multiplies by a precomputed magic constant
+  if (absTick & 0x1)     ratio = (ratio * BigInt('0xfffcb933bd6fad37aa2d162d1a594001')) >> BigInt(128);
+  if (absTick & 0x2)     ratio = (ratio * BigInt('0xfff97272373d413259a46990580e213a')) >> BigInt(128);
+  if (absTick & 0x4)     ratio = (ratio * BigInt('0xfff2e50f5f656932ef12357cf3c7fdcc')) >> BigInt(128);
+  if (absTick & 0x8)     ratio = (ratio * BigInt('0xffe5caca7e10e4e61c3624eaa0941cd0')) >> BigInt(128);
+  if (absTick & 0x10)    ratio = (ratio * BigInt('0xffcb9843d60f6159c9db58835c926644')) >> BigInt(128);
+  if (absTick & 0x20)    ratio = (ratio * BigInt('0xff973b41fa98c081472e6896dfb254c0')) >> BigInt(128);
+  if (absTick & 0x40)    ratio = (ratio * BigInt('0xff2ea16466c96a3843ec78b326b52861')) >> BigInt(128);
+  if (absTick & 0x80)    ratio = (ratio * BigInt('0xfe5dee046a99a2a811c461f1969c3053')) >> BigInt(128);
+  if (absTick & 0x100)   ratio = (ratio * BigInt('0xfcbe86c7900a88aedcffc83b479aa3a4')) >> BigInt(128);
+  if (absTick & 0x200)   ratio = (ratio * BigInt('0xf987a7253ac413176f2b074cf7815e54')) >> BigInt(128);
+  if (absTick & 0x400)   ratio = (ratio * BigInt('0xf3392b0822b70005940c7a398e4b70f3')) >> BigInt(128);
+  if (absTick & 0x800)   ratio = (ratio * BigInt('0xe7159475a2c29b7443b29c7fa6e889d9')) >> BigInt(128);
+  if (absTick & 0x1000)  ratio = (ratio * BigInt('0xd097f3bdfd2022b8845ad8f792aa5825')) >> BigInt(128);
+  if (absTick & 0x2000)  ratio = (ratio * BigInt('0xa9f746462d870fdf8a65dc1f90e061e5')) >> BigInt(128);
+  if (absTick & 0x4000)  ratio = (ratio * BigInt('0x70d869a156d2a1b890bb3df62baf32f7')) >> BigInt(128);
+  if (absTick & 0x8000)  ratio = (ratio * BigInt('0x31be135f97d08fd981231505542fcfa6')) >> BigInt(128);
+  if (absTick & 0x10000) ratio = (ratio * BigInt('0x9aa508b5b7a84e1c677de54f3e99bc9')) >> BigInt(128);
+  if (absTick & 0x20000) ratio = (ratio * BigInt('0x5d6af8dedb81196699c329225ee604')) >> BigInt(128);
+  if (absTick & 0x40000) ratio = (ratio * BigInt('0x2216e584f5fa1ea926041bedfe98')) >> BigInt(128);
+  if (absTick & 0x80000) ratio = (ratio * BigInt('0x48a170391f7dc42444e8fa2')) >> BigInt(128);
+
+  // If tick > 0, invert
+  if (tick > 0) {
+    ratio = (BigInt(1) << BigInt(256)) / ratio; // type(uint256).max / ratio, simplified
+  }
+
+  // Shift from Q128 to Q96
+  return (ratio >> BigInt(32)) + (ratio % (BigInt(1) << BigInt(32)) === BigInt(0) ? BigInt(0) : BigInt(1));
+}
+
+/**
+ * Compute token amounts for a V3 position given liquidity and price bounds.
+ * Mirrors Uniswap V3's LiquidityAmounts.getAmountsForLiquidity().
+ */
+function getAmountsForLiquidity(
+  sqrtPriceX96: bigint,
+  sqrtPriceLower: bigint,
+  sqrtPriceUpper: bigint,
+  liquidity: bigint,
+): { amount0: bigint; amount1: bigint } {
+  if (sqrtPriceLower > sqrtPriceUpper) {
+    [sqrtPriceLower, sqrtPriceUpper] = [sqrtPriceUpper, sqrtPriceLower];
+  }
+
+  let amount0 = BigInt(0);
+  let amount1 = BigInt(0);
+
+  if (sqrtPriceX96 <= sqrtPriceLower) {
+    // Current price below range — position is entirely token0
+    amount0 = (liquidity * Q96 * (sqrtPriceUpper - sqrtPriceLower))
+      / (sqrtPriceLower * sqrtPriceUpper);
+  } else if (sqrtPriceX96 >= sqrtPriceUpper) {
+    // Current price above range — position is entirely token1
+    amount1 = (liquidity * (sqrtPriceUpper - sqrtPriceLower)) / Q96;
+  } else {
+    // In range — position holds both tokens
+    amount0 = (liquidity * Q96 * (sqrtPriceUpper - sqrtPriceX96))
+      / (sqrtPriceX96 * sqrtPriceUpper);
+    amount1 = (liquidity * (sqrtPriceX96 - sqrtPriceLower)) / Q96;
+  }
+
+  return { amount0, amount1 };
+}
+
+// Uniswap V3 SwapRouter02 (universal, for pre-position swaps)
+const SWAP_ROUTER_02 = '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45';
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export interface EvmLpPoolToken {
+  address: string;
+  symbol: string;
+  name: string;
+  decimals: number;
+  logo?: string;
+}
+
+
+export interface EvmLpPosition {
+  posId: string;
+  chainId: string;
+  chainNumericId: number;
+  chainName: string;
+  protocol: string;
+  poolAddress: string;
+  token0: { address: string; symbol: string; decimals: number };
+  token1: { address: string; symbol: string; decimals: number };
+  valueUsd: number;
+  inRange: boolean;
+  rangeUtilisationPct: number;
+  tickLower: number;
+  tickUpper: number;
+  currentTick: number;
+  feesOwed0: number;
+  feesOwed1: number;
+  feesOwedUsd: number;
+  openedAt: number;
+  /** Original entry value in USD from kv_store (used for rebalance sizing) */
+  entryUsd: number;
+}
+
+export interface EvmLpOpenResult {
+  success: boolean;
+  tokenId?: string;
+  txHash?: string;
+  error?: string;
+  /** Actual USD value deposited (may differ from target deployUsd if underfunded) */
+  actualDeployUsd?: number;
+}
+
+export interface EvmLpCloseResult {
+  success: boolean;
+  txHash?: string;
+  error?: string;
+  amount0Recovered: bigint;
+  amount1Recovered: bigint;
+  valueRecoveredUsd: number;
+  feeTier: number;
+  chainName: string;
+}
+
+export interface EvmLpClaimResult {
+  success: boolean;
+  txHash?: string;
+  error?: string;
+  amount0Claimed?: bigint;
+  amount1Claimed?: bigint;
+}
+
+export interface EvmLpRecord {
+  posId: string;
+  chainId: string;
+  chainNumericId: number;
+  chainName: string;
+  protocol: string;
+  poolAddress: string;
+  token0Symbol: string;
+  token1Symbol: string;
+  entryUsd: number;
+  openedAt: number;
+}
+
+// ============================================================================
+// Chain helpers
+// ============================================================================
+
+export function parseEvmChainId(raw: string): { name: string; numericId: number } {
+  const parts = raw.split('@');
+  return { name: parts[0] ?? raw, numericId: parseInt(parts[1] ?? '0', 10) };
+}
+
+function computeRangeUtilisation(tickLower: number, tickUpper: number, currentTick: number): number {
+  if (currentTick <= tickLower || currentTick >= tickUpper) return 0;
+  const rangeHalf = (tickUpper - tickLower) / 2;
+  const centre = (tickLower + tickUpper) / 2;
+  const distanceFromCentre = Math.abs(currentTick - centre);
+  return Math.max(0, Math.round((1 - distanceFromCentre / rangeHalf) * 100));
+}
+
+// ============================================================================
+// Position tracking
+// ============================================================================
+
+// Cache for slot0 reads (per pool address per chain), 60s TTL
+const _slot0Cache = new Map<string, { tick: number; ts: number }>();
+const SLOT0_CACHE_TTL = 60_000;
+
+/** Extended return: array of live positions + closedOnChainPosIds for DB cleanup */
+export type EvmLpPositionResult = EvmLpPosition[] & { closedOnChainPosIds: string[] };
+
+export async function fetchEvmLpPositions(
+  ownerAddress: string,
+  dbRecords?: EvmLpRecord[],
+): Promise<EvmLpPositionResult> {
+  const env = getCFOEnv();
+  if (!env.evmLpEnabled) {
+    const empty = [] as unknown as EvmLpPositionResult;
+    empty.closedOnChainPosIds = [];
+    return empty;
+  }
+
+  try {
+    // All positions are tracked on-chain via DB records — no external API needed
+    const rawPositions: any[] = [];
+    const dbLookup = new Map<string, EvmLpRecord>();
+    if (dbRecords) {
+      for (const r of dbRecords) dbLookup.set(`${r.posId}_${r.chainNumericId}`, r);
+    }
+
+    const positions: EvmLpPosition[] = [];
+
+    // Track CLOSED positions from API for ghost reconciliation
+    const closedPosIds: string[] = [];
+
+    for (const pos of rawPositions) {
+      // Skip closed positions — but track them for reconciliation with DB
+      if (pos.status === 'CLOSED') {
+        const closedId = String(pos.tokenId ?? pos.posId ?? '');
+        if (closedId) closedPosIds.push(closedId);
+        continue;
+      }
+
+      // ── Normalise DEX positions API shape ──
+      // chain: { name, id } → chainId string
+      const chainObj = pos.chain ?? {};
+      const numericId = Number(chainObj.id ?? 0);
+      const name = String(chainObj.name ?? 'unknown').toLowerCase();
+      const chainIdStr = `${name}@${numericId}`;
+
+      // tokenId (the NFT ID to pass to NFPM)
+      const posId = String(pos.tokenId ?? pos.posId ?? '');
+      if (!posId) continue;
+
+      // Pool address from nested pool object
+      const poolAddress = pos.pool?.poolAddress ?? pos.poolAddress ?? '';
+
+      // Protocol
+      const protocol = pos.pool?.protocol?.name ?? pos.protocol?.name ?? 'unknown';
+
+      // Tokens from currentAmounts array (or flat token0/token1 fallback)
+      const amt0 = pos.currentAmounts?.[0] ?? {};
+      const amt1 = pos.currentAmounts?.[1] ?? {};
+      const token0: Omit<EvmLpPoolToken, 'logo' | 'name'> & { name?: string } = {
+        address:  amt0.token?.address ?? pos.token0?.token?.address ?? pos.token0?.address ?? '',
+        symbol:   amt0.token?.symbol  ?? pos.token0?.token?.symbol  ?? pos.token0?.symbol  ?? '?',
+        decimals: Number(amt0.token?.decimals ?? pos.token0?.token?.decimals ?? pos.token0?.decimals ?? 18),
+      };
+      const token1: Omit<EvmLpPoolToken, 'logo' | 'name'> & { name?: string } = {
+        address:  amt1.token?.address ?? pos.token1?.token?.address ?? pos.token1?.address ?? '',
+        symbol:   amt1.token?.symbol  ?? pos.token1?.token?.symbol  ?? pos.token1?.symbol  ?? '?',
+        decimals: Number(amt1.token?.decimals ?? pos.token1?.token?.decimals ?? pos.token1?.decimals ?? 18),
+      };
+
+      // Read tick range from on-chain NFPM.positions() — API doesn't provide ticks
+      let tickLower = 0;
+      let tickUpper = 0;
+      let currentTick = 0;
+      let feeTier = 0;
+
+      if (env.evmRpcUrls[numericId] && posId) {
+        try {
+          const ethers = await loadEthers();
+          const provider = await getEvmProvider(numericId);
+          // Resolve protocol → correct NFPM address + ABI
+          const protoResolved = resolveProtocol(protocol.toLowerCase(), numericId);
+          const nfpmAddr = protoResolved?.nfpmAddress ?? getNfpmAddress(numericId);
+          if (!nfpmAddr) continue; // no NFPM on this chain — skip on-chain reads
+          const nfpmAbi = protoResolved ? getNfpmAbiForProtocol(protoResolved.def.abi) : NFPM_ABI;
+          const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, provider);
+          const [posData, ownerOnChain] = await withRpcRetry(
+            () => Promise.all([
+              nfpm.positions(posId),
+              nfpm.ownerOf(posId),
+            ]),
+            `positions+ownerOf(${posId})`,
+          );
+
+          // Guard: the API can occasionally return stale/non-owned entries.
+          // Skip anything not owned by the CFO wallet to avoid repeated increase reverts.
+          if (String(ownerOnChain).toLowerCase() !== ownerAddress.toLowerCase()) {
+            logger.debug(`[EvmLP] Skip position ${posId} on ${name}: owner mismatch (${ownerOnChain})`);
+            continue;
+          }
+
+          const liquidity = BigInt(posData.liquidity ?? posData[7] ?? 0);
+          if (liquidity === 0n) {
+            logger.debug(`[EvmLP] Skip position ${posId} on ${name}: on-chain liquidity is zero`);
+            continue;
+          }
+
+          tickLower = Number(posData.tickLower ?? posData[5] ?? 0);
+          tickUpper = Number(posData.tickUpper ?? posData[6] ?? 0);
+          feeTier = Number(posData.fee ?? posData[4] ?? 0);
+
+          // Get current tick from pool slot0 (cached)
+          if (poolAddress) {
+            const poolKey = `${numericId}_${poolAddress}`;
+            const cached = _slot0Cache.get(poolKey);
+            if (cached && Date.now() - cached.ts < SLOT0_CACHE_TTL) {
+              currentTick = cached.tick;
+            } else {
+              const isAero = protoResolved?.def.abi === 'aerodrome-cl';
+              const poolContract = new ethers.Contract(poolAddress, getPoolAbi(isAero), provider);
+              const slot0 = await withRpcRetry(
+                () => poolContract.slot0(),
+                `slot0(${poolAddress})`,
+              );
+              currentTick = Number(slot0.tick ?? slot0[1] ?? 0);
+              _slot0Cache.set(poolKey, { tick: currentTick, ts: Date.now() });
+            }
+          }
+        } catch (err: any) {
+          // On persistent RPC failure, evict cached provider so next cycle retries fresh
+          if (TRANSIENT_RPC_CODES.includes(err?.code)) evictProvider(numericId);
+          logger.warn(`[EvmLP] Failed to read on-chain data for position ${posId}:`, err);
+        }
+      }
+
+      const inRange = currentTick !== 0 ? (currentTick > tickLower && currentTick < tickUpper) : (pos.status !== 'OUT_OF_RANGE');
+      const rangeUtilisationPct = currentTick !== 0
+        ? computeRangeUtilisation(tickLower, tickUpper, currentTick)
+        : (inRange ? 50 : 0);
+
+      // Fees from tradingFee.pending array
+      const pendingFees = pos.tradingFee?.pending ?? [];
+      const feesOwed0 = parseFloat(pendingFees[0]?.balance ?? '0') / (10 ** token0.decimals);
+      const feesOwed1 = parseFloat(pendingFees[1]?.balance ?? '0') / (10 ** token1.decimals);
+      const feesOwedUsd = (feesOwed0 * (pendingFees[0]?.price ?? 0)) + (feesOwed1 * (pendingFees[1]?.price ?? 0));
+
+      // Current value
+      const valueUsd = (parseFloat(amt0.balance ?? '0') / (10 ** token0.decimals) * (amt0.price ?? 0))
+                      + (parseFloat(amt1.balance ?? '0') / (10 ** token1.decimals) * (amt1.price ?? 0));
+
+      // Look up openedAt from DB record or API openedTime
+      const dbKey = `${posId}_${numericId}`;
+      const dbRec = dbLookup.get(dbKey);
+      const openedAt = dbRec?.openedAt ?? (pos.openedTime ? pos.openedTime * 1000 : Date.now());
+
+      positions.push({
+        posId,
+        chainId: chainIdStr,
+        chainNumericId: numericId,
+        chainName: name,
+        protocol,
+        poolAddress,
+        token0: { address: token0.address, symbol: token0.symbol, decimals: token0.decimals },
+        token1: { address: token1.address, symbol: token1.symbol, decimals: token1.decimals },
+        valueUsd,
+        inRange,
+        rangeUtilisationPct,
+        tickLower,
+        tickUpper,
+        currentTick,
+        feesOwed0,
+        feesOwed1,
+        feesOwedUsd,
+        openedAt,
+        entryUsd: dbRec?.entryUsd ?? 0,
+      });
+    }
+
+    // ── On-chain NFPM fallback for DB positions missing from API ────────
+    // Positions minted directly via NFPM (not through the protocol) won't appear
+    // in the API. Read them on-chain using the NFPM contract.
+    const closedOnChainPosIds: string[] = [];
+    if (dbRecords && dbRecords.length > 0) {
+      const apiPosIds = new Set(positions.map(p => `${p.posId}_${p.chainNumericId}`));
+      const missingRecords = dbRecords.filter(r => !apiPosIds.has(`${r.posId}_${r.chainNumericId}`));
+
+      for (const dbRec of missingRecords) {
+        try {
+          // posId must be a numeric NFPM token ID (uint256) for on-chain reads
+          if (!dbRec.posId || !/^\d+$/.test(String(dbRec.posId))) {
+            logger.debug(`[EvmLP] Skipping non-numeric posId "${dbRec.posId}" — not a valid NFPM tokenId`);
+            continue;
+          }
+
+          const dbProtoKey = (dbRec.protocol || 'uniswap_v3').toLowerCase();
+          const dbProtoResolved = resolveProtocol(dbProtoKey, dbRec.chainNumericId);
+          const nfpmAddr = dbProtoResolved?.nfpmAddress ?? getNfpmAddress(dbRec.chainNumericId);
+          if (!nfpmAddr || !env.evmRpcUrls[dbRec.chainNumericId]) continue;
+
+          const ethers = await loadEthers();
+          const provider = await getEvmProvider(dbRec.chainNumericId);
+          const nfpmAbi = dbProtoResolved ? getNfpmAbiForProtocol(dbProtoResolved.def.abi) : NFPM_ABI;
+          const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, provider);
+
+          // Read position data from NFPM (with retry for transient RPC errors)
+          const [posData, ownerOnChain] = await withRpcRetry(
+            () => Promise.all([
+              nfpm.positions(dbRec.posId),
+              nfpm.ownerOf(dbRec.posId),
+            ]),
+            `db-positions+ownerOf(${dbRec.posId})`,
+          );
+
+          // Guard stale DB rows: only keep positions still owned by this wallet.
+          if (String(ownerOnChain).toLowerCase() !== ownerAddress.toLowerCase()) {
+            logger.info(`[EvmLP] Skipping DB position ${dbRec.posId}: owner is ${ownerOnChain}, not ${ownerAddress}`);
+            continue;
+          }
+
+          const liquidity = BigInt(posData.liquidity ?? posData[7] ?? 0);
+
+          // If liquidity is 0, check for uncollected tokens before declaring closed.
+          // A partial rebalance (decrease succeeded, collect failed) leaves tokensOwed > 0.
+          let isZeroLiqCollectable = false;
+          if (liquidity === 0n) {
+            const owed0 = BigInt(posData.tokensOwed0 ?? posData[10] ?? 0);
+            const owed1 = BigInt(posData.tokensOwed1 ?? posData[11] ?? 0);
+            if (owed0 === 0n && owed1 === 0n) {
+              logger.info(`[EvmLP] On-chain position ${dbRec.posId} has 0 liquidity and no uncollected tokens — closed externally`);
+              closedOnChainPosIds.push(dbRec.posId);
+              continue;
+            }
+            logger.info(`[EvmLP] On-chain position ${dbRec.posId} has 0 liquidity but uncollected tokens (owed0=${owed0}, owed1=${owed1}) — treating as collectable`);
+            isZeroLiqCollectable = true;
+          }
+
+          const token0Addr = posData.token0 ?? posData[2] ?? '';
+          const token1Addr = posData.token1 ?? posData[3] ?? '';
+          const feeTier = Number(posData.fee ?? posData[4] ?? 0);
+          const tickLower = Number(posData.tickLower ?? posData[5] ?? 0);
+          const tickUpper = Number(posData.tickUpper ?? posData[6] ?? 0);
+
+          // Read token symbols and decimals
+          const token0Contract = new ethers.Contract(token0Addr, ERC20_ABI, provider);
+          const token1Contract = new ethers.Contract(token1Addr, ERC20_ABI, provider);
+          const [sym0, dec0, sym1, dec1] = await withRpcRetry(
+            () => Promise.all([
+              token0Contract.symbol().catch(() => dbRec.token0Symbol || '?'),
+              token0Contract.decimals().catch(() => 18),
+              token1Contract.symbol().catch(() => dbRec.token1Symbol || '?'),
+              token1Contract.decimals().catch(() => 18),
+            ]),
+            `erc20-meta(${dbRec.posId})`,
+          );
+
+          // Get current tick from pool via factory
+          let currentTick = 0;
+          let poolAddress = dbRec.poolAddress;
+          const isAerodrome = dbProtoResolved?.def.abi === 'aerodrome-cl';
+          const factoryAddr = dbProtoResolved?.factoryAddress || getFactoryForProtocol('uniswap_v3', dbRec.chainNumericId);
+          if (factoryAddr) {
+            try {
+              // Aerodrome uses getPool(addr, addr, int24 tickSpacing); Uniswap/PCS use getPool(addr, addr, uint24 fee)
+              const factoryAbiStr = isAerodrome
+                ? 'function getPool(address, address, int24) view returns (address)'
+                : 'function getPool(address, address, uint24) view returns (address)';
+              const factory = new ethers.Contract(factoryAddr, [factoryAbiStr], provider);
+              const discoveredPool = await withRpcRetry(
+                () => factory.getPool(token0Addr, token1Addr, feeTier),
+                `getPool(${dbRec.posId})`,
+              );
+              if (discoveredPool && discoveredPool !== ethers.ZeroAddress) {
+                poolAddress = discoveredPool;
+                const poolContract = new ethers.Contract(discoveredPool, getPoolAbi(isAerodrome), provider);
+                const slot0 = await withRpcRetry(
+                  () => poolContract.slot0(),
+                  `db-slot0(${discoveredPool})`,
+                );
+                currentTick = Number(slot0.tick ?? slot0[1] ?? 0);
+              }
+            } catch { /* use 0 tick — inRange will fall back to DB state */ }
+          }
+
+          let inRange = currentTick !== 0 ? (currentTick > tickLower && currentTick < tickUpper) : true;
+          // Zero-liquidity collectable positions are always "out of range" — they need
+          // a rebalance (collect + reopen) regardless of current tick.
+          if (isZeroLiqCollectable) inRange = false;
+          const rangeUtilisationPct = currentTick !== 0
+            ? computeRangeUtilisation(tickLower, tickUpper, currentTick)
+            : (inRange ? 50 : 0);
+
+          // ── Compute real on-chain liquidity value via V3 math ──
+          // Uses getAmountsForLiquidity: given current sqrtPrice and tick range,
+          // calculate how much of each token the position holds.
+          let valueUsd = 0;
+          // Per-token USD prices — computed once, reused for both value and fee conversion
+          let perTokenPriceUsd0 = 0;
+          let perTokenPriceUsd1 = 0;
+          try {
+            const ethersLib = ethers; // use the already-imported ethers
+            // We already have currentTick + slot0 from pool lookup above.
+            // If we have a poolAddress, read slot0 to get sqrtPriceX96
+            if (poolAddress && currentTick !== 0) {
+              const poolContract = new ethersLib.Contract(poolAddress, getPoolAbi(isAerodrome), provider);
+              const slot0 = await poolContract.slot0();
+              const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96 ?? slot0[0] ?? 0);
+
+              // V3 getAmountsForLiquidity
+              const sqrtPriceLower = tickToSqrtPriceX96(tickLower);
+              const sqrtPriceUpper = tickToSqrtPriceX96(tickUpper);
+
+              const { amount0, amount1 } = getAmountsForLiquidity(
+                sqrtPriceX96, sqrtPriceLower, sqrtPriceUpper, liquidity,
+              );
+
+              const ui0 = Number(ethersLib.formatUnits(amount0, Number(dec0)));
+              const ui1 = Number(ethersLib.formatUnits(amount1, Number(dec1)));
+
+              // ── Per-token USD pricing (pool-price aware) ──────────────────
+              // Derive the price ratio from sqrtPriceX96: price = (sqrtPrice / 2^96)^2
+              // This gives token1-per-token0 adjusted for decimals.
+              const sqrtPriceNum = Number(sqrtPriceX96) / (2 ** 96);
+              const rawPrice = sqrtPriceNum * sqrtPriceNum;
+              // Adjust for decimal difference: rawPrice is in raw units, need to scale
+              const decimalAdj = 10 ** (Number(dec0) - Number(dec1));
+              const price0In1 = rawPrice * decimalAdj; // how many token1 per 1 token0
+
+              const nativePriceForVal = await getNativeTokenPrice(dbRec.chainNumericId);
+              const wrappedNative = WRAPPED_NATIVE_ADDR[dbRec.chainNumericId]?.toLowerCase();
+
+              const s0 = String(sym0).toUpperCase();
+              const s1 = String(sym1).toUpperCase();
+              const t0IsStable = isStablecoin(s0);
+              const t1IsStable = isStablecoin(s1);
+              const t0IsNative = wrappedNative && token0Addr.toLowerCase() === wrappedNative;
+              const t1IsNative = wrappedNative && token1Addr.toLowerCase() === wrappedNative;
+
+              let usd0: number;
+              let usd1: number;
+
+              if (t0IsStable && t1IsStable) {
+                usd0 = ui0;
+                usd1 = ui1;
+              } else if (t0IsStable) {
+                // token0 is stable → 1 token0 = $1, so token1 price = price0In1 (token1 per token0) → $1/price0In1
+                usd0 = ui0;
+                usd1 = price0In1 > 0 ? ui1 * (1 / price0In1) : 0;
+              } else if (t1IsStable) {
+                // token1 is stable → token0 price = price0In1 (how many stable per token0)
+                usd0 = ui0 * price0In1;
+                usd1 = ui1;
+              } else if (t0IsNative) {
+                // token0 is wrapped native (WETH etc.) → price it at nativePrice
+                usd0 = ui0 * nativePriceForVal;
+                // token1 price = nativePrice / price0In1 (since price0In1 = token1 per token0)
+                usd1 = price0In1 > 0 ? ui1 * (nativePriceForVal / price0In1) : 0;
+              } else if (t1IsNative) {
+                // token1 is wrapped native → price from pool ratio
+                usd1 = ui1 * nativePriceForVal;
+                usd0 = price0In1 > 0 ? ui0 * (price0In1 * nativePriceForVal) : 0;
+              } else {
+                // Neither stable nor native — fall back to native pricing for both (best-effort)
+                usd0 = ui0 * nativePriceForVal;
+                usd1 = price0In1 > 0 ? ui1 * (nativePriceForVal / price0In1) : 0;
+                logger.debug(`[EvmLP] Unknown pair ${sym0}/${sym1} — using pool-ratio × native fallback`);
+              }
+              valueUsd = usd0 + usd1;
+              // Store per-token prices for fee calculation below.
+              // For zero-liquidity collectable positions, amounts are 0 so derive
+              // per-token prices directly from the pricing cascade instead.
+              if (isZeroLiqCollectable) {
+                // Derive per-token USD prices from price ratio (independent of amounts)
+                if (t0IsStable && t1IsStable) {
+                  perTokenPriceUsd0 = 1; perTokenPriceUsd1 = 1;
+                } else if (t0IsStable) {
+                  perTokenPriceUsd0 = 1;
+                  perTokenPriceUsd1 = price0In1 > 0 ? 1 / price0In1 : 0;
+                } else if (t1IsStable) {
+                  perTokenPriceUsd0 = price0In1;
+                  perTokenPriceUsd1 = 1;
+                } else if (t0IsNative) {
+                  perTokenPriceUsd0 = nativePriceForVal;
+                  perTokenPriceUsd1 = price0In1 > 0 ? nativePriceForVal / price0In1 : 0;
+                } else if (t1IsNative) {
+                  perTokenPriceUsd1 = nativePriceForVal;
+                  perTokenPriceUsd0 = price0In1 > 0 ? price0In1 * nativePriceForVal : 0;
+                } else {
+                  perTokenPriceUsd0 = nativePriceForVal;
+                  perTokenPriceUsd1 = price0In1 > 0 ? nativePriceForVal / price0In1 : 0;
+                }
+                // Compute value from uncollected tokensOwed × per-token price
+                const rawOwed0 = BigInt(posData.tokensOwed0 ?? posData[10] ?? 0);
+                const rawOwed1 = BigInt(posData.tokensOwed1 ?? posData[11] ?? 0);
+                const owedHuman0 = Number(ethersLib.formatUnits(rawOwed0, Number(dec0)));
+                const owedHuman1 = Number(ethersLib.formatUnits(rawOwed1, Number(dec1)));
+                valueUsd = owedHuman0 * perTokenPriceUsd0 + owedHuman1 * perTokenPriceUsd1;
+                logger.info(`[EvmLP] Zero-liq collectable: owed ${owedHuman0.toFixed(4)} ${sym0} + ${owedHuman1.toFixed(4)} ${sym1} → $${valueUsd.toFixed(2)}`);
+              } else {
+                perTokenPriceUsd0 = ui0 > 0 ? usd0 / ui0 : 0;
+                perTokenPriceUsd1 = ui1 > 0 ? usd1 / ui1 : 0;
+              }
+              logger.debug(`[EvmLP] On-chain value: ${sym0}=${ui0.toFixed(6)} ($${usd0.toFixed(2)}), ${sym1}=${ui1.toFixed(6)} ($${usd1.toFixed(2)}) → $${valueUsd.toFixed(2)}`);
+            }
+          } catch (valErr) {
+            logger.debug(`[EvmLP] On-chain value calc failed, falling back to entryUsd:`, valErr);
+          }
+          // Fallback to entryUsd if on-chain calc failed or returned 0
+          if (valueUsd <= 0) valueUsd = dbRec.entryUsd;
+
+          // Pending fees: use proper V3 fee growth math (tokensOwed0/1 are stale until collect())
+          // Falls back to raw tokensOwed if pool read fails or no pool address available.
+          let tokensOwed0 = 0;
+          let tokensOwed1 = 0;
+          if (poolAddress && currentTick !== 0) {
+            try {
+              const poolContract = new ethers.Contract(poolAddress, getPoolAbi(isAerodrome), provider);
+              const { fees0, fees1 } = await computePendingFeesV3(poolContract, posData, currentTick);
+              tokensOwed0 = Number(ethers.formatUnits(fees0, Number(dec0)));
+              tokensOwed1 = Number(ethers.formatUnits(fees1, Number(dec1)));
+            } catch (feeErr) {
+              // Fallback to raw tokensOwed (may be stale/0)
+              tokensOwed0 = Number(ethers.formatUnits(posData.tokensOwed0 ?? posData[10] ?? 0, Number(dec0)));
+              tokensOwed1 = Number(ethers.formatUnits(posData.tokensOwed1 ?? posData[11] ?? 0, Number(dec1)));
+              logger.debug(`[EvmLP] Fee growth math failed for ${dbRec.posId}, using raw tokensOwed:`, feeErr);
+            }
+          } else {
+            tokensOwed0 = Number(ethers.formatUnits(posData.tokensOwed0 ?? posData[10] ?? 0, Number(dec0)));
+            tokensOwed1 = Number(ethers.formatUnits(posData.tokensOwed1 ?? posData[11] ?? 0, Number(dec1)));
+          }
+          // Re-use per-token USD prices derived from sqrtPriceX96 value calc above
+          const fee0Usd = tokensOwed0 * perTokenPriceUsd0;
+          const fee1Usd = tokensOwed1 * perTokenPriceUsd1;
+
+          const chainName = dbRec.chainName || NATIVE_SYMBOLS[dbRec.chainNumericId]?.toLowerCase() || 'evm';
+
+          positions.push({
+            posId: dbRec.posId,
+            chainId: `${chainName}@${dbRec.chainNumericId}`,
+            chainNumericId: dbRec.chainNumericId,
+            chainName,
+            protocol: dbRec.protocol || 'uniswapv3',
+            poolAddress: poolAddress || '',
+            token0: { address: token0Addr, symbol: String(sym0), decimals: Number(dec0) },
+            token1: { address: token1Addr, symbol: String(sym1), decimals: Number(dec1) },
+            valueUsd,
+            inRange,
+            rangeUtilisationPct,
+            tickLower,
+            tickUpper,
+            currentTick,
+            feesOwed0: tokensOwed0,
+            feesOwed1: tokensOwed1,
+            feesOwedUsd: fee0Usd + fee1Usd,
+            openedAt: dbRec.openedAt,
+            entryUsd: dbRec.entryUsd ?? 0,
+          });
+
+          logger.info(`[EvmLP] On-chain fallback: position ${dbRec.posId} (${sym0}/${sym1} on ${chainName}) — $${valueUsd.toFixed(0)}, ${inRange ? 'in-range' : 'out-of-range'}`);
+        } catch (err: any) {
+          if (TRANSIENT_RPC_CODES.includes(err?.code)) evictProvider(dbRec.chainNumericId);
+          logger.warn(`[EvmLP] On-chain read failed for position ${dbRec.posId}:`, err);
+        }
+      }
+    }
+
+    // ── Ghost position reconciliation ────────────────────────────────
+    // If the API reports a position as CLOSED but we still have it in DB as open,
+    // log it so the CFO can clean up stale records.
+    if (closedPosIds.length > 0 && dbRecords && dbRecords.length > 0) {
+      for (const closedId of closedPosIds) {
+        const dbKey = dbRecords.find(r => String(r.posId) === closedId);
+        if (dbKey) {
+          logger.warn(`[EvmLP] Ghost position detected: posId=${closedId} is CLOSED on API but still in DB. Should be reconciled.`);
+        }
+      }
+    }
+
+    // Attach closed posIds for caller-side DB cleanup
+    const result = positions as EvmLpPositionResult;
+    result.closedOnChainPosIds = closedOnChainPosIds;
+    return result;
+  } catch (err) {
+    logger.warn('[EvmLP] fetchEvmLpPositions failed:', err);
+    const empty = [] as unknown as EvmLpPositionResult;
+    empty.closedOnChainPosIds = [];
+    return empty;
+  }
+}
+
+// ============================================================================
+// Open Position — mint LP NFT via NonfungiblePositionManager
+// ============================================================================
+
+export async function openEvmLpPosition(
+  pool: {
+    chainId: string;
+    chainNumericId?: number;
+    poolAddress: string;
+    token0: EvmLpPoolToken;
+    token1: EvmLpPoolToken;
+    protocol: { name: string; factoryAddress: string } | string;
+    feeTier: number;
+  },
+  deployUsd: number,
+  rangeWidthTicks = 400,
+  /** Optional: attempt to bridge USDC from another chain if local balance insufficient */
+  bridgeFunding?: {
+    sourceChainId: number;    // chain with available USDC
+    walletAddress: string;    // EVM wallet address
+  },
+  /** Optional: if provided, adds liquidity to an existing position instead of minting a new one */
+  existingTokenId?: string,
+): Promise<EvmLpOpenResult> {
+  const env = getCFOEnv();
+  const { numericId: chainNumericId } = pool.chainNumericId
+    ? { numericId: pool.chainNumericId }
+    : parseEvmChainId(pool.chainId);
+
+  if (env.dryRun) {
+    const verb = existingTokenId ? `increase LP #${existingTokenId}` : 'open LP';
+    logger.info(`[EvmLP] DRY RUN — would ${verb}: $${deployUsd} on ${pool.token0.symbol}/${pool.token1.symbol} (chain ${chainNumericId})`);
+    return { success: true, tokenId: existingTokenId ?? `dry-evm-lp-${Date.now()}` };
+  }
+
+  try {
+    const ethers = await loadEthers();
+    const wallet = await getEvmWallet(chainNumericId);
+    const provider = await getEvmProvider(chainNumericId);
+
+    // 0. Pre-flight: resolve protocol → NFPM + factory addresses
+    const protoName = typeof pool.protocol === 'string' ? pool.protocol : pool.protocol?.name ?? '';
+    const protoResolved = resolveProtocol(protoName.toLowerCase(), chainNumericId);
+    const nfpmAddrEarly = protoResolved?.nfpmAddress ?? getNfpmAddress(chainNumericId);
+    const isAerodromeCl = protoResolved?.def.abi === 'aerodrome-cl';
+    if (!nfpmAddrEarly) {
+      return { success: false, error: `No NFPM deployed on chainId ${chainNumericId} for protocol ${protoName}` };
+    }
+
+    // 1. Read current tick + on-chain tickSpacing from pool contract
+    //    We read tickSpacing() on-chain because the API feeTier field
+    //    may not match the on-chain value (e.g. Aerodrome returns feeTier=402
+    //    but the real tickSpacing is 100). All V3-style pools expose tickSpacing().
+    //    Aerodrome CL slot0() returns 6 values (no feeProtocol); Uniswap V3 returns 7.
+    const poolContract = new ethers.Contract(pool.poolAddress, getPoolAbi(isAerodromeCl), provider);
+    const [slot0, onChainTickSpacing] = await Promise.all([
+      poolContract.slot0(),
+      poolContract.tickSpacing().catch(() => null),
+    ]);
+    const currentTick = Number(slot0.tick ?? slot0[1]);
+
+    // Resolve effective tickSpacing: prefer on-chain, fall back to feeTier mapping
+    const feeToTickSpacing: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
+    const tickSpacing = onChainTickSpacing != null
+      ? Number(onChainTickSpacing)
+      : isAerodromeCl
+        ? pool.feeTier  // last resort for Aerodrome
+        : (feeToTickSpacing[pool.feeTier] ?? 60);
+
+    if (isAerodromeCl && onChainTickSpacing != null && pool.feeTier !== Number(onChainTickSpacing)) {
+      logger.info(
+        `[EvmLP] Aerodrome feeTier=${pool.feeTier} differs from on-chain tickSpacing=${onChainTickSpacing}; using on-chain value`,
+      );
+    }
+
+    // Verify pool exists on the protocol's factory
+    const earlyFactoryAddr = protoResolved?.factoryAddress;
+    if (earlyFactoryAddr) {
+      const factoryAbiStr = isAerodromeCl
+        ? 'function getPool(address,address,int24) view returns (address)'
+        : 'function getPool(address,address,uint24) view returns (address)';
+      const factory = new ethers.Contract(earlyFactoryAddr, [factoryAbiStr], provider);
+      // Aerodrome uses tickSpacing as 3rd param; Uniswap/PCS use feeTier
+      const poolLookupParam = isAerodromeCl ? tickSpacing : pool.feeTier;
+      const verifiedPool = await factory.getPool(pool.token0.address, pool.token1.address, poolLookupParam);
+      if (!verifiedPool || verifiedPool === ethers.ZeroAddress) {
+        logger.warn(
+          `[EvmLP] Pool ${pool.token0.symbol}/${pool.token1.symbol} fee=${pool.feeTier} (tickSpacing=${tickSpacing}) ` +
+          `NOT found on ${protoResolved?.def.label ?? protoName} factory. Skipping.`,
+        );
+        return { success: false, error: `Pool not on ${protoResolved?.def.label ?? protoName} factory — cannot mint` };
+      }
+      logger.info(`[EvmLP] ✓ Pool verified on ${protoResolved?.def.label} factory: ${verifiedPool}`);
+    }
+
+    // 2. Compute tick range centred on current tick, aligned to tick spacing
+    const rawLower = currentTick - rangeWidthTicks;
+    const rawUpper = currentTick + rangeWidthTicks;
+    const tickLower = Math.floor(rawLower / tickSpacing) * tickSpacing;
+    const tickUpper = Math.ceil(rawUpper / tickSpacing) * tickSpacing;
+
+    // 3. Check wallet balances for token0 and token1
+    const token0Contract = new ethers.Contract(pool.token0.address, ERC20_ABI, provider);
+    const token1Contract = new ethers.Contract(pool.token1.address, ERC20_ABI, provider);
+
+    let [bal0, bal1] = await Promise.all([
+      token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+    ]);
+
+    // ── Compute token USD prices early (needed for value-based funding decisions) ──
+    const sqrtPriceX96 = slot0.sqrtPriceX96 ?? slot0[0] ?? BigInt(0);
+    const dec0 = pool.token0.decimals ?? 18;
+    const dec1 = pool.token1.decimals ?? 18;
+    const sqrtP = Number(sqrtPriceX96) / (2 ** 96);
+    const rawPrice = sqrtP * sqrtP;
+    const price0In1 = rawPrice * (10 ** dec0) / (10 ** dec1);
+
+    const stableSymbols = ['USDC', 'USDT', 'DAI', 'BUSD', 'USDCE', 'USDC.E', 'USDT0'];
+    const is0Stable = stableSymbols.includes(pool.token0.symbol.toUpperCase());
+    const is1Stable = stableSymbols.includes(pool.token1.symbol.toUpperCase());
+
+    let usdPerToken0: number;
+    let usdPerToken1: number;
+
+    if (is1Stable) {
+      usdPerToken1 = 1;
+      usdPerToken0 = price0In1;
+    } else if (is0Stable) {
+      usdPerToken0 = 1;
+      usdPerToken1 = 1 / price0In1;
+    } else {
+      // Neither token is a stablecoin (e.g. SIREN/WBNB, cbBTC/WETH).
+      // Identify which token (if any) is the chain's wrapped native so we can
+      // anchor pricing to the native-token oracle price.
+      const nPrice = await getNativeTokenPrice(chainNumericId);
+      const wrappedAddr = WRAPPED_NATIVE_ADDR[chainNumericId]?.toLowerCase();
+      const is0Native = wrappedAddr && pool.token0.address.toLowerCase() === wrappedAddr;
+      const is1Native = wrappedAddr && pool.token1.address.toLowerCase() === wrappedAddr;
+
+      if (is0Native) {
+        // token0 IS the native wrapper (e.g. WETH/SIREN) → anchor token0
+        usdPerToken0 = nPrice;
+        usdPerToken1 = nPrice / price0In1; // 1 t0 = price0In1 t1 → t1 = nPrice / price0In1
+      } else if (is1Native) {
+        // token1 IS the native wrapper (e.g. SIREN/WBNB) → anchor token1
+        usdPerToken1 = nPrice;
+        usdPerToken0 = price0In1 * nPrice; // 1 t0 = price0In1 × t1_usd
+      } else {
+        // Neither token is native (rare, e.g. PEPE/SHIB) — best-effort: use
+        // ratio from pool & native price, log a warning.
+        logger.warn(
+          `[EvmLP] Neither ${pool.token0.symbol} nor ${pool.token1.symbol} is wrapped native ` +
+          `on chain ${chainNumericId} — pricing may be inaccurate (using native price as token0 proxy).`,
+        );
+        usdPerToken0 = nPrice;
+        usdPerToken1 = nPrice / price0In1;
+      }
+    }
+
+    // Compute total value of currently-held tokens
+    const heldUsd0 = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+    const heldUsd1 = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+    const totalHeldUsd = heldUsd0 + heldUsd1;
+    const fundingGapUsd = deployUsd - totalHeldUsd;
+
+    logger.info(`[EvmLP] Pre-funding: held $${totalHeldUsd.toFixed(2)} (${pool.token0.symbol}=$${heldUsd0.toFixed(2)}, ${pool.token1.symbol}=$${heldUsd1.toFixed(2)}), target $${deployUsd.toFixed(2)}, gap $${fundingGapUsd.toFixed(2)}`);
+
+    // ── Pre-flight: verify both tokens are swappable from USDC before bridging ──
+    // Prevents wasting bridge fees on pools where a token has no DEX liquidity
+    // (e.g. VIRTUAL only trades on Aerodrome, not Uniswap V3; exotic BSC tokens etc.)
+    if (fundingGapUsd > 1) {
+      try {
+        const swapSvc = await import('./evmSwapService.ts');
+        const bridgeSvc = await import('./wormholeService.ts');
+        const usdcAddr = bridgeSvc.resolveTokenAddress(chainNumericId, 'USDC');
+        if (usdcAddr) {
+          const stableSyms = ['USDC', 'USDT', 'DAI', 'BUSD', 'USDCE', 'USDC.E', 'USDT0', 'USD\u20AE0'];
+          const tok0IsStable = stableSyms.includes(pool.token0.symbol.toUpperCase());
+          const tok1IsStable = stableSyms.includes(pool.token1.symbol.toUpperCase());
+          const [ok0, ok1] = await Promise.all([
+            tok0IsStable ? Promise.resolve(true) : swapSvc.canSwapFromUsdc(chainNumericId, usdcAddr, pool.token0.address),
+            tok1IsStable ? Promise.resolve(true) : swapSvc.canSwapFromUsdc(chainNumericId, usdcAddr, pool.token1.address),
+          ]);
+          if (!ok0 || !ok1) {
+            const bad = [!ok0 && pool.token0.symbol, !ok1 && pool.token1.symbol].filter(Boolean).join(', ');
+            logger.warn(`[EvmLP] Pre-flight failed: no swap route for ${bad} on chain ${chainNumericId} — skipping pool (recorded 2h)`);
+            return { success: false, error: `No swap route for ${bad} on chain ${chainNumericId}` };
+          }
+          logger.info(`[EvmLP] Pre-flight OK: ${pool.token0.symbol}+${pool.token1.symbol} swappable on chain ${chainNumericId}`);
+        }
+      } catch (err) {
+        logger.warn('[EvmLP] Pre-flight swap check failed (non-fatal, continuing):', err);
+      }
+    }
+
+    // ── Bridge + Swap Funding Flow ──────────────────────────────────
+    // Phase 1: Bridge — if held value < 50% of deploy target and bridge funding is available
+    if (totalHeldUsd < deployUsd * 0.5 && bridgeFunding) {
+      const bridgeAmountUsd = deployUsd - totalHeldUsd; // bridge the gap
+      logger.info(`[EvmLP] Underfunded ($${totalHeldUsd.toFixed(2)} < 50% of $${deployUsd.toFixed(2)}) — attempting bridge of $${bridgeAmountUsd.toFixed(2)} from chain ${bridgeFunding.sourceChainId}`);
+      try {
+        const bridge = await import('./wormholeService.ts');
+
+        // Check if LI.FI is enabled
+        if (!env.lifiEnabled) {
+          logger.warn('[EvmLP] Bridge funding skipped — LI.FI not enabled');
+        } else {
+          // Scan all stablecoin variants on source chain (native USDC, USDC.e, USDT)
+          const srcChain = bridgeFunding.sourceChainId;
+          const stableCandidates: Array<{ symbol: string; addr: string; balance: number }> = [];
+
+          const nativeUsdcAddr = bridge.WELL_KNOWN_USDC[srcChain];
+          const bridgedUsdcAddr = BRIDGED_USDC[srcChain];
+          const usdtAddr = WELL_KNOWN_USDT[srcChain];
+
+          const [nativeUsdcBal, bridgedUsdcBal, usdtBal] = await Promise.all([
+            nativeUsdcAddr
+              ? bridge.getEvmTokenBalance(srcChain, nativeUsdcAddr, bridgeFunding.walletAddress)
+              : Promise.resolve(0),
+            bridgedUsdcAddr
+              ? bridge.getEvmTokenBalance(srcChain, bridgedUsdcAddr, bridgeFunding.walletAddress)
+              : Promise.resolve(0),
+            usdtAddr
+              ? bridge.getEvmTokenBalance(srcChain, usdtAddr, bridgeFunding.walletAddress)
+              : Promise.resolve(0),
+          ]);
+
+          if (nativeUsdcAddr && nativeUsdcBal > 0.5) stableCandidates.push({ symbol: 'USDC', addr: nativeUsdcAddr, balance: nativeUsdcBal });
+          if (bridgedUsdcAddr && bridgedUsdcBal > 0.5) stableCandidates.push({ symbol: 'USDC.e', addr: bridgedUsdcAddr, balance: bridgedUsdcBal });
+          if (usdtAddr && usdtBal > 0.5) stableCandidates.push({ symbol: 'USDT', addr: usdtAddr, balance: usdtBal });
+
+          // Also check native + WETH as funding sources (can bridge via LI.FI swap)
+          const nativePrice = await getNativeTokenPrice(srcChain);
+          const nativeBal = await bridge.getEvmNativeBalance(srcChain, bridgeFunding.walletAddress);
+          const nativeUsdValue = nativeBal * nativePrice;
+          const wethAddr = WRAPPED_NATIVE_ADDR[srcChain];
+          const wethBal = wethAddr
+            ? await bridge.getEvmTokenBalance(srcChain, wethAddr, bridgeFunding.walletAddress)
+            : 0;
+          const wethUsdValue = wethBal * nativePrice;
+
+          // Sort by balance descending — try the richest source first
+          stableCandidates.sort((a, b) => b.balance - a.balance);
+
+          // Build full funding candidates list (stables first, then WETH, then native)
+          type FundCandidate = { symbol: string; addr: string; balance: number; isNative?: boolean };
+          const allCandidates: FundCandidate[] = [...stableCandidates];
+          if (wethAddr && wethUsdValue > 1) allCandidates.push({ symbol: 'WETH', addr: wethAddr, balance: wethUsdValue });
+          if (nativeUsdValue > 5) allCandidates.push({ symbol: 'NATIVE', addr: '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE', balance: nativeUsdValue, isNative: true });
+
+          logger.info(`[EvmLP] Source chain ${srcChain} funds: ${allCandidates.map(c => `${c.symbol}=$${c.balance.toFixed(2)}`).join(', ') || 'none'}`);
+
+          // Find a token with enough balance to cover the bridge
+          const bestSource = allCandidates.find(c => c.balance >= bridgeAmountUsd);
+          if (bestSource) {
+            // Destination: always bridge into native USDC on target chain
+            const destUsdcAddr = bridge.WELL_KNOWN_USDC[chainNumericId];
+            logger.info(`[EvmLP] Bridging $${bridgeAmountUsd.toFixed(2)} ${bestSource.symbol} from chain ${srcChain} → chain ${chainNumericId}`);
+
+            // For non-stablecoin sources (ETH, WETH), bridge amount is in USD value, not token units
+            // LI.FI handles cross-token routing natively (ETH → USDC cross-chain)
+            const isStableSource = !bestSource.isNative && bestSource.symbol !== 'WETH';
+            const bridgeTokenSymbol = isStableSource ? bestSource.symbol : 'ETH';
+            const bridgeResult = await bridge.bridgeEvmToEvm(
+              srcChain,
+              chainNumericId,
+              bridgeTokenSymbol,
+              isStableSource ? bridgeAmountUsd : bridgeAmountUsd / nativePrice,  // convert $ to native units
+              bridgeFunding.walletAddress,
+              wallet.address,
+              // Pass explicit addresses so LI.FI can handle cross-token routing
+              destUsdcAddr ? { fromTokenAddress: bestSource.addr, toTokenAddress: destUsdcAddr } : undefined,
+            );
+
+            if (bridgeResult.success && bridgeResult.txHash) {
+              const bridgeStatus = await bridge.awaitBridgeCompletion(
+                bridgeResult.txHash,
+                bridge.chainIdToName(srcChain),
+              );
+              if (bridgeStatus !== 'DONE') {
+                logger.warn(`[EvmLP] Bridge ${bridgeStatus} — proceeding with whatever balance is available`);
+              } else {
+                logger.info(`[EvmLP] Bridge completed — USDC now on chain ${chainNumericId}`);
+              }
+            } else {
+              logger.warn(`[EvmLP] Bridge failed: ${bridgeResult.error}`);
+            }
+          } else {
+            // No single source covers the full amount — log total available
+            const totalAvailable = allCandidates.reduce((s, c) => s + c.balance, 0);
+            logger.warn(`[EvmLP] Insufficient funds on source chain ${srcChain}: $${totalAvailable.toFixed(2)} available < $${bridgeAmountUsd.toFixed(2)} needed`);
+
+            // If the target chain also has zero balance, abort early — no point
+            // proceeding to zap/mint with nothing.
+            if (totalHeldUsd < 1) {
+              return { success: false, error: `Insufficient funds: $${totalAvailable.toFixed(2)} on source chain + $${totalHeldUsd.toFixed(2)} on target chain` };
+            }
+          }
+        }
+      } catch (err) {
+        logger.warn('[EvmLP] Bridge funding failed (non-fatal):', err);
+      }
+    }
+
+    // Gas guard: abort LP deployment if the target chain has no native gas for transactions.
+    // This prevents the cascade of failed swaps that happen after a cross-chain bridge
+    // delivers tokens but doesn't include gas (e.g. bridging to BSC without BNB).
+    {
+      const gasCheckBal = await provider.getBalance(wallet.address);
+      const gasCheckHuman = Number(ethers.formatEther(gasCheckBal));
+      const minGasNative = 0.002; // covers ~2-3 swap txs on any EVM chain
+      if (gasCheckHuman < minGasNative) {
+        const nativeSym = CHAIN_NATIVE_SYMBOL[chainNumericId] ?? 'ETH';
+        logger.error(`[EvmLP] Aborting LP on chain ${chainNumericId}: only ${gasCheckHuman.toFixed(6)} ${nativeSym} — need ≥${minGasNative} for gas`);
+        return { success: false, error: `No ${nativeSym} gas on chain ${chainNumericId} (bal ${gasCheckHuman.toFixed(6)})` };
+      }
+    }
+
+    // Phase 2: Swap USDC into pool tokens if we have USDC but are missing/underfunded on one side
+    // This runs ALWAYS (not just after bridge) — handles cases where wallet has USDC
+    // on the target chain already, or where one pool token is USDC and we need the other.
+    // Re-read balances first (bridge may have deposited USDC)
+    [bal0, bal1] = await Promise.all([
+      token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+    ]);
+    try {
+      const swap = await import('./evmSwapService.ts');
+      const bridge = await import('./wormholeService.ts');
+      const usdcAddr = bridge.resolveTokenAddress(chainNumericId, 'USDC');
+
+      if (usdcAddr) {
+        const usdcBal = await bridge.getEvmTokenBalance(chainNumericId, usdcAddr, wallet.address);
+        const isToken0Usdc = pool.token0.address.toLowerCase() === usdcAddr.toLowerCase();
+        const isToken1Usdc = pool.token1.address.toLowerCase() === usdcAddr.toLowerCase();
+
+        // Value-based check: swap if a token's USD value < 30% of its target half
+        const halfTarget = deployUsd / 2;
+        const held0Usd = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+        const held1Usd = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+        const needSwap0 = !isToken0Usdc && held0Usd < halfTarget * 0.3 && usdcBal > 0.5;
+        const needSwap1 = !isToken1Usdc && held1Usd < halfTarget * 0.3 && usdcBal > 0.5;
+
+        if ((needSwap0 || needSwap1) && usdcBal > 0) {
+          // Calculate how much USDC to swap into each missing side
+          const neededUsd0 = needSwap0 ? Math.max(0, halfTarget - held0Usd) : 0;
+          const neededUsd1 = needSwap1 ? Math.max(0, halfTarget - held1Usd) : 0;
+          const totalNeeded = neededUsd0 + neededUsd1;
+          // Pro-rate if we don't have enough USDC for both
+          const scale = totalNeeded > 0 && usdcBal < totalNeeded ? usdcBal / totalNeeded : 1;
+          const swapPortion0 = neededUsd0 * scale;
+          const swapPortion1 = neededUsd1 * scale;
+          logger.info(`[EvmLP] Auto-swap: USDC bal=$${usdcBal.toFixed(2)}, need0=$${neededUsd0.toFixed(2)}, need1=$${neededUsd1.toFixed(2)} (scale=${scale.toFixed(2)})`);
+
+          if (needSwap0 && swapPortion0 > 2) {
+            const quote0 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token0.address, swapPortion0, pool.feeTier);
+            if (quote0 && quote0.priceImpactPct > 3) {
+              logger.warn(`[EvmLP] Swap USDC→${pool.token0.symbol} price impact ${quote0.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+            } else if (!quote0) {
+              logger.warn(`[EvmLP] Swap $${swapPortion0.toFixed(2)} USDC→${pool.token0.symbol}: no quote available (chain ${chainNumericId})`);
+            } else {
+              const swapResult = await swap.executeEvmSwap(
+                chainNumericId, usdcAddr, pool.token0.address, swapPortion0, pool.feeTier,
+              );
+              if (swapResult.success) logger.info(`[EvmLP] Swapped $${swapPortion0.toFixed(2)} USDC → ${pool.token0.symbol}`);
+              else logger.warn(`[EvmLP] Swap USDC→${pool.token0.symbol} failed: ${swapResult.error}`);
+            }
+          }
+
+          if (needSwap1 && swapPortion1 > 2) {
+            const quote1 = await swap.quoteEvmSwap(chainNumericId, usdcAddr, pool.token1.address, swapPortion1, pool.feeTier);
+            if (quote1 && quote1.priceImpactPct > 3) {
+              logger.warn(`[EvmLP] Swap USDC→${pool.token1.symbol} price impact ${quote1.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+            } else if (!quote1) {
+              logger.warn(`[EvmLP] Swap $${swapPortion1.toFixed(2)} USDC→${pool.token1.symbol}: no quote available (chain ${chainNumericId})`);
+            } else {
+              const swapResult = await swap.executeEvmSwap(
+                chainNumericId, usdcAddr, pool.token1.address, swapPortion1, pool.feeTier,
+              );
+              if (swapResult.success) logger.info(`[EvmLP] Swapped $${swapPortion1.toFixed(2)} USDC → ${pool.token1.symbol}`);
+              else logger.warn(`[EvmLP] Swap USDC→${pool.token1.symbol} failed: ${swapResult.error}`);
+            }
+          }
+        }
+      }
+
+      // Phase 2a: Also check USDT balance (e.g. from failed rebalance zap, or bridge deposit)
+      // Treat USDT the same as USDC — swap into whichever pool tokens we're missing.
+      const usdtAddr = WELL_KNOWN_USDT[chainNumericId];
+      if (usdtAddr) {
+        const usdtBal = await bridge.getEvmTokenBalance(chainNumericId, usdtAddr, wallet.address);
+        if (usdtBal > 1) {
+          const isToken0Usdt = pool.token0.address.toLowerCase() === usdtAddr.toLowerCase();
+          const isToken1Usdt = pool.token1.address.toLowerCase() === usdtAddr.toLowerCase();
+
+          // Re-read balances after any USDC swaps above
+          [bal0, bal1] = await Promise.all([
+            token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+            token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+          ]);
+          const held0Usd2 = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+          const held1Usd2 = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+          const halfTarget2 = deployUsd / 2;
+          const needSwapUsdt0 = !isToken0Usdt && held0Usd2 < halfTarget2 * 0.3 && usdtBal > 0.5;
+          const needSwapUsdt1 = !isToken1Usdt && held1Usd2 < halfTarget2 * 0.3 && usdtBal > 0.5;
+
+          if (needSwapUsdt0 || needSwapUsdt1) {
+            const neededUsd0 = needSwapUsdt0 ? Math.max(0, halfTarget2 - held0Usd2) : 0;
+            const neededUsd1 = needSwapUsdt1 ? Math.max(0, halfTarget2 - held1Usd2) : 0;
+            const totalNeeded = neededUsd0 + neededUsd1;
+            const scale = totalNeeded > 0 && usdtBal < totalNeeded ? usdtBal / totalNeeded : 1;
+            const swapPortion0 = neededUsd0 * scale;
+            const swapPortion1 = neededUsd1 * scale;
+            logger.info(`[EvmLP] Phase 2a (USDT): bal=$${usdtBal.toFixed(2)}, need0=$${neededUsd0.toFixed(2)}, need1=$${neededUsd1.toFixed(2)} (scale=${scale.toFixed(2)})`);
+
+            if (needSwapUsdt0 && swapPortion0 > 2) {
+              const quote0 = await swap.quoteEvmSwap(chainNumericId, usdtAddr, pool.token0.address, swapPortion0, pool.feeTier);
+              if (quote0 && quote0.priceImpactPct > 3) {
+                logger.warn(`[EvmLP] Swap USDT→${pool.token0.symbol} price impact ${quote0.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+              } else if (!quote0) {
+                logger.warn(`[EvmLP] Swap $${swapPortion0.toFixed(2)} USDT→${pool.token0.symbol}: no quote (chain ${chainNumericId})`);
+              } else {
+                const swapResult = await swap.executeEvmSwap(chainNumericId, usdtAddr, pool.token0.address, swapPortion0, pool.feeTier);
+                if (swapResult.success) logger.info(`[EvmLP] Swapped $${swapPortion0.toFixed(2)} USDT → ${pool.token0.symbol}`);
+                else logger.warn(`[EvmLP] Swap USDT→${pool.token0.symbol} failed: ${swapResult.error}`);
+              }
+            }
+
+            if (needSwapUsdt1 && swapPortion1 > 2) {
+              const quote1 = await swap.quoteEvmSwap(chainNumericId, usdtAddr, pool.token1.address, swapPortion1, pool.feeTier);
+              if (quote1 && quote1.priceImpactPct > 3) {
+                logger.warn(`[EvmLP] Swap USDT→${pool.token1.symbol} price impact ${quote1.priceImpactPct.toFixed(1)}% > 3% — skipping`);
+              } else if (!quote1) {
+                logger.warn(`[EvmLP] Swap $${swapPortion1.toFixed(2)} USDT→${pool.token1.symbol}: no quote (chain ${chainNumericId})`);
+              } else {
+                const swapResult = await swap.executeEvmSwap(chainNumericId, usdtAddr, pool.token1.address, swapPortion1, pool.feeTier);
+                if (swapResult.success) logger.info(`[EvmLP] Swapped $${swapPortion1.toFixed(2)} USDT → ${pool.token1.symbol}`);
+                else logger.warn(`[EvmLP] Swap USDT→${pool.token1.symbol} failed: ${swapResult.error}`);
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn('[EvmLP] Pre-position swap failed (non-fatal):', err);
+    }
+
+    // Phase 2b: Swap native/WETH into pool tokens if no USDC is available on target chain
+    // This handles the common case: wallet has ETH/WETH but zero stables
+    try {
+      // Re-read after Phase 2
+      [bal0, bal1] = await Promise.all([
+        token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+        token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      ]);
+      const held0Usd = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+      const held1Usd = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+      const heldTotal = held0Usd + held1Usd;
+
+      // Only proceed if still underfunded after USDC swap attempts
+      if (heldTotal < deployUsd * 0.4) {
+        const swap = await import('./evmSwapService.ts');
+        const bridge = await import('./wormholeService.ts');
+
+        // Check WETH balance (already an ERC20, easy to swap)
+        const wethInfo = WRAPPED_NATIVE_ADDR[chainNumericId];
+        const wethBal = wethInfo
+          ? await bridge.getEvmTokenBalance(chainNumericId, wethInfo, wallet.address)
+          : 0;
+        const nativePrice = await getNativeTokenPrice(chainNumericId);
+        const wethUsd = wethBal * nativePrice;
+
+        // Check native balance — keep a real gas reserve (not 0.005!)
+        // On Polygon wrapping POL→WPOL costs value + gas, so 0.005 is never enough.
+        const nativeBal = await provider.getBalance(wallet.address);
+        const nativeBalHuman = Number(ethers.formatEther(nativeBal));
+        const gasReserve = 0.05; // ~$0.15 on Polygon, ~$120 on ETH mainnet — plenty for gas
+        const usableNative = Math.max(0, nativeBalHuman - gasReserve);
+        const nativeUsd = usableNative * nativePrice;
+
+        const totalFundableUsd = wethUsd + nativeUsd;
+        if (totalFundableUsd > 2) {
+          logger.info(`[EvmLP] Phase 2b: No USDC — using native assets: WETH=$${wethUsd.toFixed(2)}, native=$${nativeUsd.toFixed(2)}`);
+          const halfTarget = deployUsd / 2;
+          const needToken0 = held0Usd < halfTarget * 0.3;
+          const needToken1 = held1Usd < halfTarget * 0.3;
+
+          // If we have WETH and need a pool token, swap WETH → pool token via DEX.
+          // CRITICAL: if WETH IS one of the pool tokens (WPOL/USDT, WETH/USDC etc.),
+          // only swap HALF the WETH so the other half funds the WETH side of the LP.
+          if (wethInfo && wethBal > 0.0001) {
+            const t0IsWeth = pool.token0.address.toLowerCase() === wethInfo.toLowerCase();
+            const t1IsWeth = pool.token1.address.toLowerCase() === wethInfo.toLowerCase();
+            const wethIsPoolToken = t0IsWeth || t1IsWeth;
+            // When WETH is one of the pool tokens, cap what we swap to leave the rest for the LP.
+            const maxSwappableWeth = wethIsPoolToken ? wethBal / 2 : wethBal;
+
+            // Swap WETH into whichever pool token we need
+            // If WETH IS a pool token, swap into the OTHER token only
+            if (needToken0 && !t0IsWeth && wethUsd > 1) {
+              const swapAmt = Math.min(maxSwappableWeth, (halfTarget - held0Usd) / nativePrice);
+              if (swapAmt > 0.0001) {
+                const result = await swap.executeEvmSwap(chainNumericId, wethInfo, pool.token0.address, swapAmt, pool.feeTier);
+                if (result.success) logger.info(`[EvmLP] Swapped ${swapAmt.toFixed(4)} WETH → ${pool.token0.symbol}`);
+                else logger.warn(`[EvmLP] Swap WETH→${pool.token0.symbol} failed: ${result.error}`);
+              }
+            }
+            if (needToken1 && !t1IsWeth && wethUsd > 1) {
+              // Re-check WETH balance (may have swapped some above)
+              const currentWeth = await bridge.getEvmTokenBalance(chainNumericId, wethInfo, wallet.address);
+              const capWeth = wethIsPoolToken ? Math.max(0, currentWeth - wethBal / 2) : currentWeth;
+              const swapAmt = Math.min(capWeth, (halfTarget - held1Usd) / nativePrice);
+              if (swapAmt > 0.0001) {
+                const result = await swap.executeEvmSwap(chainNumericId, wethInfo, pool.token1.address, swapAmt, pool.feeTier);
+                if (result.success) logger.info(`[EvmLP] Swapped ${swapAmt.toFixed(4)} WETH → ${pool.token1.symbol}`);
+                else logger.warn(`[EvmLP] Swap WETH→${pool.token1.symbol} failed: ${result.error}`);
+              }
+            }
+          }
+
+          // If we still need funds, wrap native → WETH then swap into missing token
+          // (Phase 3 below handles wrapping when pool directly needs WETH/WMATIC,
+          //  but this handles a different case: pool doesn't have WETH but we need to
+          //  convert native → arbitrary token via WETH intermediate)
+        }
+      }
+    } catch (err) {
+      logger.warn('[EvmLP] Phase 2b native/WETH swap failed (non-fatal):', err);
+    }
+
+    // Phase 3: Wrap native token → WETH/WMATIC
+    // Case A: Pool directly needs WETH/WMATIC and we have native
+    // Case B: Pool doesn't need WETH but we're underfunded — wrap native then swap WETH → pool tokens
+    try {
+      const WRAPPED_NATIVE: Record<number, { symbol: string; address: string }> = {
+        1:     { symbol: 'WETH',   address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' },
+        10:    { symbol: 'WETH',   address: '0x4200000000000000000000000000000000000006' },
+        56:    { symbol: 'WBNB',   address: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c' },
+        137:   { symbol: 'WMATIC', address: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270' },
+        8453:  { symbol: 'WETH',   address: '0x4200000000000000000000000000000000000006' },
+        42161: { symbol: 'WETH',   address: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1' },
+        43114: { symbol: 'WAVAX',  address: '0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7' },
+      };
+
+      // Re-read balances first
+      [bal0, bal1] = await Promise.all([
+        token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+        token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      ]);
+      const p3Held0Usd = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+      const p3Held1Usd = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+      const p3HeldTotal = p3Held0Usd + p3Held1Usd;
+
+      const wrapped = WRAPPED_NATIVE[chainNumericId];
+      if (wrapped) {
+        const t0IsWrapped = pool.token0.address.toLowerCase() === wrapped.address.toLowerCase();
+        const t1IsWrapped = pool.token1.address.toLowerCase() === wrapped.address.toLowerCase();
+        const poolNeedsWrapped = t0IsWrapped || t1IsWrapped;
+
+        // Determine if we should wrap native
+        const shouldWrapForPool = poolNeedsWrapped &&
+          ((t0IsWrapped && p3Held0Usd < deployUsd * 0.2) ||
+           (t1IsWrapped && p3Held1Usd < deployUsd * 0.2));
+        const shouldWrapForSwap = !poolNeedsWrapped && p3HeldTotal < deployUsd * 0.4;
+
+        if (shouldWrapForPool || shouldWrapForSwap) {
+          const nativeBal = await provider.getBalance(wallet.address);
+          // Keep 0.05 native for gas — wrapping requires value + gas in a single tx
+          const gasReserve = ethers.parseEther('0.05');
+          if (nativeBal > gasReserve) {
+            const nativePrice = await getNativeTokenPrice(chainNumericId);
+
+            // How much to wrap: pool needs → half. Swap needs → full gap
+            const targetWrap = shouldWrapForPool
+              ? (deployUsd / 2) / nativePrice
+              : (deployUsd - p3HeldTotal) / nativePrice;
+
+            const halfDeployWei = ethers.parseEther(String(Math.min(
+              Number(ethers.formatEther(nativeBal - gasReserve)),
+              targetWrap,
+            )));
+
+            if (halfDeployWei > BigInt(0)) {
+              const WETH_ABI = ['function deposit() payable'];
+              const wethContract = new ethers.Contract(wrapped.address, WETH_ABI, wallet);
+              const wrapTx = await wethContract.deposit({ value: halfDeployWei });
+              await wrapTx.wait();
+              const wrappedAmt = Number(ethers.formatEther(halfDeployWei));
+              logger.info(`[EvmLP] Wrapped ${wrappedAmt.toFixed(4)} native → ${wrapped.symbol} ($${(wrappedAmt * nativePrice).toFixed(2)})`);
+
+              // If pool doesn't need WETH directly, swap WETH → pool tokens
+              if (shouldWrapForSwap && wrappedAmt > 0) {
+                const swap = await import('./evmSwapService.ts');
+                const halfSwap = wrappedAmt / 2;
+                const need0 = p3Held0Usd < deployUsd * 0.2;
+                const need1 = p3Held1Usd < deployUsd * 0.2;
+
+                if (need0) {
+                  const amt = need1 ? halfSwap : wrappedAmt;
+                  const result = await swap.executeEvmSwap(chainNumericId, wrapped.address, pool.token0.address, amt, pool.feeTier);
+                  if (result.success) logger.info(`[EvmLP] Swapped ${amt.toFixed(4)} ${wrapped.symbol} → ${pool.token0.symbol}`);
+                  else logger.warn(`[EvmLP] Swap ${wrapped.symbol}→${pool.token0.symbol} failed: ${result.error}`);
+                }
+                if (need1) {
+                  const bridge = await import('./wormholeService.ts');
+                  const currentWeth = await bridge.getEvmTokenBalance(chainNumericId, wrapped.address, wallet.address);
+                  if (currentWeth > 0.0001) {
+                    const result = await swap.executeEvmSwap(chainNumericId, wrapped.address, pool.token1.address, currentWeth, pool.feeTier);
+                    if (result.success) logger.info(`[EvmLP] Swapped ${currentWeth.toFixed(4)} ${wrapped.symbol} → ${pool.token1.symbol}`);
+                    else logger.warn(`[EvmLP] Swap ${wrapped.symbol}→${pool.token1.symbol} failed: ${result.error}`);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn('[EvmLP] Native token wrap failed (non-fatal):', err);
+    }
+
+    // Re-check balances after bridge + swap + wrap
+    [bal0, bal1] = await Promise.all([
+      token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+    ]);
+
+    // 4. Calculate desired amounts — cap at deployUsd equivalent
+    //    Price data already computed above (pre-funding) using sqrtPriceX96.
+
+    const halfUsd = deployUsd / 2;
+    const maxToken0 = BigInt(Math.floor((halfUsd / usdPerToken0) * (10 ** dec0)));
+    const maxToken1 = BigInt(Math.floor((halfUsd / usdPerToken1) * (10 ** dec1)));
+
+    let amount0Desired = bal0 < maxToken0 ? bal0 : maxToken0;
+    let amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
+
+    logger.info(`[EvmLP] Deploy cap: $${deployUsd} → token0 max=${ethers.formatUnits(maxToken0, dec0)} (have ${ethers.formatUnits(bal0, dec0)}), token1 max=${ethers.formatUnits(maxToken1, dec1)} (have ${ethers.formatUnits(bal1, dec1)})`);
+
+    // 5. Self-zap: if we only have one pool token (or negligible amount of the other),
+    //    swap half into the missing token.
+    //    Replicates Uniswap V3Utils `swapAndMint` logic without needing their
+    //    contract addresses or 0x API calldata. For our position sizes the
+    //    2-tx approach (swap → mint) is functionally identical to an atomic zap.
+    //    Treat < 5% of target as "negligible" (handles dust balances)
+    const amt0Ratio = maxToken0 > BigInt(0) ? Number(amount0Desired * BigInt(100) / maxToken0) : 0;
+    const amt1Ratio = maxToken1 > BigInt(0) ? Number(amount1Desired * BigInt(100) / maxToken1) : 0;
+    const NEGLIGIBLE_PCT = 5; // treat < 5% of target as "missing"
+
+    if (amt0Ratio > NEGLIGIBLE_PCT && amt1Ratio < NEGLIGIBLE_PCT) {
+      // Have token0 only → swap half into token1
+      // IMPORTANT: swap half of the WALLET balance (bal0), not half of the capped
+      // amount0Desired. The cap limits each side to deployUsd/2, but when all value
+      // is in one token the cap leaves excess tokens stranded in the wallet.
+      // Swapping half of bal0 distributes the full wallet value across both tokens.
+      logger.info(`[EvmLP] Zap: have ${pool.token0.symbol} (${amt0Ratio}% of target) but ${pool.token1.symbol} negligible (${amt1Ratio}%) — swapping half into ${pool.token1.symbol}`);
+      try {
+        const swap = await import('./evmSwapService.ts');
+        const halfAmt0 = bal0 / BigInt(2);
+        const halfHumanAmt = Number(ethers.formatUnits(halfAmt0, dec0)); // human token amount (NOT USD)
+        const halfUsdVal = halfHumanAmt * usdPerToken0; // for logging only
+        if (halfUsdVal > 0.5) {
+          const quote = await swap.quoteEvmSwap(chainNumericId, pool.token0.address, pool.token1.address, halfHumanAmt, pool.feeTier);
+          if (quote && quote.priceImpactPct > 3) {
+            logger.warn(`[EvmLP] Zap swap impact ${quote.priceImpactPct.toFixed(1)}% > 3% — skipping zap`);
+          } else {
+            const res = await swap.executeEvmSwap(chainNumericId, pool.token0.address, pool.token1.address, halfHumanAmt, pool.feeTier);
+            if (res.success) logger.info(`[EvmLP] Zap: ${halfHumanAmt.toFixed(6)} ${pool.token0.symbol} (~$${halfUsdVal.toFixed(2)}) → ${pool.token1.symbol}`);
+            else logger.warn(`[EvmLP] Zap swap failed: ${res.error}`);
+          }
+        }
+      } catch (err) { logger.warn('[EvmLP] Zap swap failed (non-fatal):', err); }
+
+      // Re-read balances + recalculate
+      [bal0, bal1] = await Promise.all([
+        token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+        token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      ]);
+      amount0Desired = bal0 < maxToken0 ? bal0 : maxToken0;
+      amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
+      logger.info(`[EvmLP] Post-zap: ${pool.token0.symbol}=${ethers.formatUnits(amount0Desired, dec0)}, ${pool.token1.symbol}=${ethers.formatUnits(amount1Desired, dec1)}`);
+
+    } else if (amt1Ratio > NEGLIGIBLE_PCT && amt0Ratio < NEGLIGIBLE_PCT) {
+      // Have token1 only → swap half into token0
+      // IMPORTANT: swap half of the WALLET balance (bal1), not half of the capped
+      // amount1Desired — same reasoning as the token0 branch above.
+      logger.info(`[EvmLP] Zap: have ${pool.token1.symbol} (${amt1Ratio}% of target) but ${pool.token0.symbol} negligible (${amt0Ratio}%) — swapping half into ${pool.token0.symbol}`);
+      try {
+        const swap = await import('./evmSwapService.ts');
+        const halfAmt1 = bal1 / BigInt(2);
+        const halfHumanAmt = Number(ethers.formatUnits(halfAmt1, dec1)); // human token amount (NOT USD)
+        const halfUsdVal = halfHumanAmt * usdPerToken1; // for logging only
+        if (halfUsdVal > 0.5) {
+          const quote = await swap.quoteEvmSwap(chainNumericId, pool.token1.address, pool.token0.address, halfHumanAmt, pool.feeTier);
+          if (quote && quote.priceImpactPct > 3) {
+            logger.warn(`[EvmLP] Zap swap impact ${quote.priceImpactPct.toFixed(1)}% > 3% — skipping zap`);
+          } else {
+            const res = await swap.executeEvmSwap(chainNumericId, pool.token1.address, pool.token0.address, halfHumanAmt, pool.feeTier);
+            if (res.success) logger.info(`[EvmLP] Zap: ${halfHumanAmt.toFixed(6)} ${pool.token1.symbol} (~$${halfUsdVal.toFixed(2)}) → ${pool.token0.symbol}`);
+            else logger.warn(`[EvmLP] Zap swap failed: ${res.error}`);
+          }
+        }
+      } catch (err) { logger.warn('[EvmLP] Zap swap failed (non-fatal):', err); }
+
+      // Re-read balances + recalculate
+      [bal0, bal1] = await Promise.all([
+        token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+        token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+      ]);
+      amount0Desired = bal0 < maxToken0 ? bal0 : maxToken0;
+      amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
+      logger.info(`[EvmLP] Post-zap: ${pool.token0.symbol}=${ethers.formatUnits(amount0Desired, dec0)}, ${pool.token1.symbol}=${ethers.formatUnits(amount1Desired, dec1)}`);
+    }
+
+    // 5b. Intermediate rebalance: if both tokens are present but heavily imbalanced
+    //     (one side has > 70% of value, other has < 30%), swap excess to get closer
+    //     to 50/50. This prevents leaving stranded tokens in the wallet after mint.
+    {
+      const held0Usd = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+      const held1Usd = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+      const totalHeld = held0Usd + held1Usd;
+      if (totalHeld > 1) {
+        const pct0 = held0Usd / totalHeld;
+        const pct1 = held1Usd / totalHeld;
+        const IMBALANCE_THRESH = 0.70; // one side > 70% → rebalance
+        if (pct0 > IMBALANCE_THRESH && pct1 < (1 - IMBALANCE_THRESH)) {
+          // Token0 heavy — swap excess into token1 to target ~50/50
+          const excessUsd = held0Usd - totalHeld / 2;
+          const excessTokens = excessUsd / usdPerToken0;
+          logger.info(`[EvmLP] Imbalanced: ${pool.token0.symbol}=${(pct0 * 100).toFixed(0)}% / ${pool.token1.symbol}=${(pct1 * 100).toFixed(0)}% — swapping ~$${excessUsd.toFixed(2)} ${pool.token0.symbol} → ${pool.token1.symbol}`);
+          try {
+            const swap = await import('./evmSwapService.ts');
+            if (excessTokens > 0.0001) {
+              const res = await swap.executeEvmSwap(chainNumericId, pool.token0.address, pool.token1.address, excessTokens, pool.feeTier);
+              if (res.success) logger.info(`[EvmLP] Rebalance swap OK: ${excessTokens.toFixed(6)} ${pool.token0.symbol} → ${pool.token1.symbol}`);
+              else logger.warn(`[EvmLP] Rebalance swap failed: ${res.error}`);
+            }
+          } catch (err) { logger.warn('[EvmLP] Rebalance swap failed (non-fatal):', err); }
+          // Re-read balances
+          [bal0, bal1] = await Promise.all([
+            token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+            token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+          ]);
+          amount0Desired = bal0 < maxToken0 ? bal0 : maxToken0;
+          amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
+        } else if (pct1 > IMBALANCE_THRESH && pct0 < (1 - IMBALANCE_THRESH)) {
+          // Token1 heavy — swap excess into token0
+          const excessUsd = held1Usd - totalHeld / 2;
+          const excessTokens = excessUsd / usdPerToken1;
+          logger.info(`[EvmLP] Imbalanced: ${pool.token1.symbol}=${(pct1 * 100).toFixed(0)}% / ${pool.token0.symbol}=${(pct0 * 100).toFixed(0)}% — swapping ~$${excessUsd.toFixed(2)} ${pool.token1.symbol} → ${pool.token0.symbol}`);
+          try {
+            const swap = await import('./evmSwapService.ts');
+            if (excessTokens > 0.0001) {
+              const res = await swap.executeEvmSwap(chainNumericId, pool.token1.address, pool.token0.address, excessTokens, pool.feeTier);
+              if (res.success) logger.info(`[EvmLP] Rebalance swap OK: ${excessTokens.toFixed(6)} ${pool.token1.symbol} → ${pool.token0.symbol}`);
+              else logger.warn(`[EvmLP] Rebalance swap failed: ${res.error}`);
+            }
+          } catch (err) { logger.warn('[EvmLP] Rebalance swap failed (non-fatal):', err); }
+          // Re-read balances
+          [bal0, bal1] = await Promise.all([
+            token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+            token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
+          ]);
+          amount0Desired = bal0 < maxToken0 ? bal0 : maxToken0;
+          amount1Desired = bal1 < maxToken1 ? bal1 : maxToken1;
+        }
+      }
+    }
+
+    // After zap attempt, if both are still zero, nothing we can do
+    if (amount0Desired === BigInt(0) && amount1Desired === BigInt(0)) {
+      return { success: false, error: 'No token0 or token1 balance on target chain (even after zap attempt)' };
+    }
+
+    // Re-check ratios after zap
+    const post0Ratio = maxToken0 > BigInt(0) ? Number(amount0Desired * BigInt(100) / maxToken0) : 0;
+    const post1Ratio = maxToken1 > BigInt(0) ? Number(amount1Desired * BigInt(100) / maxToken1) : 0;
+
+    // If only one side has tokens and the tick range spans the current price,
+    // the NFPM mint will revert (can't create in-range liquidity with one token).
+    // Abort early with a clear error rather than burning gas on a revert.
+    if (post0Ratio < NEGLIGIBLE_PCT || post1Ratio < NEGLIGIBLE_PCT) {
+      const oneSide = post0Ratio >= NEGLIGIBLE_PCT ? pool.token0.symbol : pool.token1.symbol;
+      const missing = post0Ratio < NEGLIGIBLE_PCT ? pool.token0.symbol : pool.token1.symbol;
+      logger.warn(`[EvmLP] One-sided: have ${oneSide} (${Math.max(post0Ratio, post1Ratio)}%) but ${missing} negligible (${Math.min(post0Ratio, post1Ratio)}%). Tick range is in-range — both tokens required. Aborting.`);
+      return { success: false, error: `Zap swap failed to acquire ${missing} — cannot mint in-range LP with only ${oneSide}` };
+    }
+
+    // Minimum deploy guard: if actual token value < 30% of target, abort (not worth gas)
+    const actualUsd0 = Number(ethers.formatUnits(amount0Desired, dec0)) * usdPerToken0;
+    const actualUsd1 = Number(ethers.formatUnits(amount1Desired, dec1)) * usdPerToken1;
+    const actualDeployUsd = actualUsd0 + actualUsd1;
+    if (actualDeployUsd < deployUsd * 0.3) {
+      logger.warn(
+        `[EvmLP] Underfunded: actual $${actualDeployUsd.toFixed(2)} < 30% of target $${deployUsd.toFixed(2)} ` +
+        `(${pool.token0.symbol}=$${actualUsd0.toFixed(2)}, ${pool.token1.symbol}=$${actualUsd1.toFixed(2)}). ` +
+        `Aborting — not worth gas for a tiny position.`,
+      );
+      return { success: false, error: `Insufficient funding: $${actualDeployUsd.toFixed(2)} < 30% of $${deployUsd.toFixed(2)} target` };
+    }
+
+    // 6a. Verify tokens are in correct order (NFPM requires token0 < token1 by address)
+    const sortedToken0 = pool.token0.address.toLowerCase() < pool.token1.address.toLowerCase()
+      ? pool.token0 : pool.token1;
+    const sortedToken1 = pool.token0.address.toLowerCase() < pool.token1.address.toLowerCase()
+      ? pool.token1 : pool.token0;
+    const sorted0Addr = sortedToken0.address;
+    const sorted1Addr = sortedToken1.address;
+    const sortedDec0 = sortedToken0.decimals ?? 18;
+    const sortedDec1 = sortedToken1.decimals ?? 18;
+
+    // If tokens were swapped, also swap the desired amounts
+    const tokensSwapped = sorted0Addr.toLowerCase() !== pool.token0.address.toLowerCase();
+    if (tokensSwapped) {
+      [amount0Desired, amount1Desired] = [amount1Desired, amount0Desired];
+      logger.info(`[EvmLP] Token order swapped: ${sortedToken0.symbol}/${sortedToken1.symbol} (NFPM requires sorted addresses)`);
+    }
+
+    // 6b. Gas estimate check — skip if gas > 5% of deployUsd
+    const nfpmAddr = nfpmAddrEarly;
+    const nfpmAbiToUse = protoResolved ? getNfpmAbiForProtocol(protoResolved.def.abi) : NFPM_ABI;
+    const nfpmContract = new ethers.Contract(nfpmAddr, nfpmAbiToUse, wallet);
+    const feeData = await provider.getFeeData();
+    const gasPrice = feeData.gasPrice ?? BigInt(0);
+    const estimatedGas = BigInt(500_000); // conservative estimate for mint
+    const gasCostWei = gasPrice * estimatedGas;
+    const nativePrice = await getNativeTokenPrice(chainNumericId);
+    const gasCostUsd = Number(ethers.formatEther(gasCostWei)) * nativePrice;
+
+    if (gasCostUsd > deployUsd * 0.05) {
+      logger.warn(`[EvmLP] Gas cost $${gasCostUsd.toFixed(2)} > 5% of deploy $${deployUsd} — skipping`);
+      return { success: false, error: `Gas too expensive: $${gasCostUsd.toFixed(2)}` };
+    }
+
+    // 7. Approve tokens for NFPM (using sorted addresses)
+    const token0Signer = new ethers.Contract(sorted0Addr, ERC20_ABI, wallet);
+    const token1Signer = new ethers.Contract(sorted1Addr, ERC20_ABI, wallet);
+
+    const [allowance0, allowance1] = await Promise.all([
+      token0Signer.allowance(wallet.address, nfpmAddr),
+      token1Signer.allowance(wallet.address, nfpmAddr),
+    ]);
+
+    if (allowance0 < amount0Desired) {
+      // Reset to 0 first for non-standard tokens (e.g. USDT on ETH mainnet)
+      if (allowance0 > BigInt(0)) {
+        try { await (await token0Signer.approve(nfpmAddr, 0)).wait(); } catch { /* non-fatal */ }
+      }
+      const approveTx = await token0Signer.approve(nfpmAddr, ethers.MaxUint256);
+      await approveTx.wait();
+      logger.info(`[EvmLP] Approved ${sortedToken0.symbol} for NFPM`);
+    }
+    if (allowance1 < amount1Desired) {
+      if (allowance1 > BigInt(0)) {
+        try { await (await token1Signer.approve(nfpmAddr, 0)).wait(); } catch { /* non-fatal */ }
+      }
+      const approveTx = await token1Signer.approve(nfpmAddr, ethers.MaxUint256);
+      await approveTx.wait();
+      logger.info(`[EvmLP] Approved ${sortedToken1.symbol} for NFPM`);
+    }
+
+    // 8. Slippage: For V3 concentrated LP mints, set mins to 0.
+    //    The NFPM deposits tokens in the ratio dictated by the tick range
+    //    and current price — not our requested ratio. Excess tokens stay
+    //    in the wallet. Setting min > 0 causes "Price slippage check" reverts
+    //    whenever the pool's required ratio differs from our even split.
+    //    Protection comes from: (a) capping desired amounts, (b) the deadline,
+    //    (c) choosing the tick range ourselves.
+    const amount0Min = BigInt(0);
+    const amount1Min = BigInt(0);
+
+    // 9. Mint LP position (using sorted token addresses)
+    const deadline = Math.floor(Date.now() / 1000) + 600; // 10 minutes
+
+    // Aerodrome CL uses tickSpacing instead of fee, and adds sqrtPriceX96 (0 = don't create pool)
+    const mintParams = isAerodromeCl
+      ? {
+          token0: sorted0Addr,
+          token1: sorted1Addr,
+          tickSpacing,  // on-chain resolved tickSpacing (not the API feeTier)
+          tickLower,
+          tickUpper,
+          amount0Desired,
+          amount1Desired,
+          amount0Min,
+          amount1Min,
+          recipient: wallet.address,
+          deadline,
+          sqrtPriceX96: BigInt(0),  // 0 = pool already exists, don't create
+        }
+      : {
+          token0: sorted0Addr,
+          token1: sorted1Addr,
+          fee: pool.feeTier,
+          tickLower,
+          tickUpper,
+          amount0Desired,
+          amount1Desired,
+          amount0Min,
+          amount1Min,
+          recipient: wallet.address,
+          deadline,
+        };
+
+    const protoLabel = protoResolved?.def.label ?? 'Uniswap V3';
+
+    // ── 9. Mint NEW position OR increase existing one ──────────────────
+    let tx: any;
+    let receipt: any;
+
+    if (existingTokenId) {
+      // Validate existing position ownership + metadata to avoid opaque reverts.
+      try {
+        const [posData, ownerOnChain] = await Promise.all([
+          nfpmContract.positions(existingTokenId),
+          nfpmContract.ownerOf(existingTokenId),
+        ]);
+
+        if (String(ownerOnChain).toLowerCase() !== wallet.address.toLowerCase()) {
+          return {
+            success: false,
+            error: `Cannot increase #${existingTokenId}: wallet ${wallet.address} is not owner (${ownerOnChain})`,
+          };
+        }
+
+        const posLiquidity = BigInt(posData.liquidity ?? posData[7] ?? 0);
+        if (posLiquidity === 0n) {
+          return {
+            success: false,
+            error: `Cannot increase #${existingTokenId}: position has zero liquidity (already closed)`,
+          };
+        }
+
+        const posToken0 = String(posData.token0 ?? posData[2] ?? '').toLowerCase();
+        const posToken1 = String(posData.token1 ?? posData[3] ?? '').toLowerCase();
+        if (
+          posToken0 && posToken1 &&
+          (posToken0 !== sorted0Addr.toLowerCase() || posToken1 !== sorted1Addr.toLowerCase())
+        ) {
+          return {
+            success: false,
+            error:
+              `Cannot increase #${existingTokenId}: position tokens (${posToken0}/${posToken1}) ` +
+              `do not match target pool (${sorted0Addr.toLowerCase()}/${sorted1Addr.toLowerCase()})`,
+          };
+        }
+      } catch (preErr) {
+        const reason = (preErr as any)?.reason ?? (preErr as Error).message;
+        return { success: false, error: `Cannot increase #${existingTokenId}: on-chain preflight failed: ${reason}` };
+      }
+
+      // ── increaseLiquidity: add funds to existing position NFT ──
+      const increaseParams = {
+        tokenId: BigInt(existingTokenId),
+        amount0Desired,
+        amount1Desired,
+        amount0Min: BigInt(0),
+        amount1Min: BigInt(0),
+        deadline: Math.floor(Date.now() / 1000) + 600,
+      };
+
+      logger.info(
+        `[EvmLP] Increasing liquidity on #${existingTokenId} via ${protoLabel}: ` +
+        `${sortedToken0.symbol}/${sortedToken1.symbol} on chain ${chainNumericId}, ` +
+        `amt0=${ethers.formatUnits(amount0Desired, sortedDec0)}, amt1=${ethers.formatUnits(amount1Desired, sortedDec1)}`,
+      );
+
+      // Pre-flight
+      try {
+        await nfpmContract.increaseLiquidity.estimateGas(increaseParams);
+      } catch (estErr) {
+        const reason = (estErr as any)?.reason ?? (estErr as Error).message;
+        logger.warn(`[EvmLP] increaseLiquidity estimateGas failed: ${reason}`);
+        return { success: false, error: `IncreaseLiquidity would revert: ${reason}` };
+      }
+
+      tx = await nfpmContract.increaseLiquidity(increaseParams);
+      receipt = await tx.wait();
+    } else {
+      // ── mint: create new position NFT ──
+      logger.info(
+        `[EvmLP] Minting LP via ${protoLabel}: ${sortedToken0.symbol}/${sortedToken1.symbol} on chain ${chainNumericId}, ` +
+        `ticks [${tickLower}, ${tickUpper}], ${isAerodromeCl ? 'tickSpacing' : 'fee'} ${isAerodromeCl ? tickSpacing : pool.feeTier}, ` +
+        `amt0=${ethers.formatUnits(amount0Desired, sortedDec0)}, amt1=${ethers.formatUnits(amount1Desired, sortedDec1)}`,
+      );
+
+      // Pre-flight: estimateGas to catch reverts before burning gas on-chain
+      try {
+        await nfpmContract.mint.estimateGas(mintParams);
+      } catch (estErr) {
+        const reason = (estErr as any)?.reason ?? (estErr as Error).message;
+        logger.warn(`[EvmLP] Mint estimateGas failed: ${reason}`);
+        // Record swap failure for token(s) that caused STF/revert so hasSwapFailure()
+        // blocks future pool selection involving this token (TTL 2h)
+        if (reason?.toLowerCase?.().includes('stf') || reason?.toLowerCase?.().includes('transfer')) {
+          try {
+            const swapSvc = await import('./evmSwapService.ts');
+            // Record both tokens — we don't know which one caused the STF
+            swapSvc.recordSwapFailure(chainNumericId, sortedToken0.address);
+            swapSvc.recordSwapFailure(chainNumericId, sortedToken1.address);
+            logger.info(`[EvmLP] Recorded swap failure for ${sortedToken0.symbol} & ${sortedToken1.symbol} on chain ${chainNumericId} (STF revert)`);
+          } catch { /* non-fatal */ }
+        }
+        return { success: false, error: `Mint would revert: ${reason}` };
+      }
+
+      tx = await nfpmContract.mint(mintParams);
+      receipt = await tx.wait();
+    }
+
+    // Parse tokenId AND actual amounts from IncreaseLiquidity event
+    let tokenId: string | undefined = existingTokenId; // already known for increase
+    let mintedAmount0 = BigInt(0);
+    let mintedAmount1 = BigInt(0);
+    for (const log of receipt.logs) {
+      try {
+        const parsed = nfpmContract.interface.parseLog({ topics: log.topics as string[], data: log.data });
+        if (parsed?.name === 'IncreaseLiquidity') {
+          if (!tokenId) tokenId = parsed.args?.tokenId?.toString();
+          mintedAmount0 = BigInt(parsed.args?.amount0?.toString() ?? '0');
+          mintedAmount1 = BigInt(parsed.args?.amount1?.toString() ?? '0');
+          if (tokenId) break;
+        } else if (parsed?.name === 'Transfer' && !tokenId) {
+          tokenId = parsed.args?.tokenId?.toString();
+        }
+      } catch { /* skip non-NFPM logs */ }
+    }
+
+    // Fallback: extract tokenId from raw ERC721 Transfer topics
+    // Transfer(address indexed from, address indexed to, uint256 indexed tokenId)
+    // topic[0] = keccak256("Transfer(address,address,uint256)")
+    // topic[3] = tokenId (4 topics = ERC721, 3 topics = ERC20)
+    if (!tokenId) {
+      const transferSig = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+      for (const log of receipt.logs) {
+        const topics = log.topics as string[];
+        if (topics.length === 4 && topics[0] === transferSig) {
+          // topic[3] is the tokenId as a 32-byte hex — parse to BigInt then string
+          tokenId = BigInt(topics[3]).toString();
+          if (tokenId && tokenId !== '0') break;
+        }
+      }
+    }
+
+    if (!tokenId) {
+      logger.warn(`[EvmLP] Could not parse tokenId from mint receipt — ${receipt.logs.length} logs. Hash: ${receipt.hash}`);
+      tokenId = `unknown-${receipt.hash.slice(0, 12)}`;
+    }
+
+    // Compute REAL deposited USD from IncreaseLiquidity event amounts (not pre-mint estimates)
+    // The NFPM only deposits tokens in the ratio dictated by tickRange × currentTick;
+    // excess tokens stay in the wallet. Pre-mint 'actualDeployUsd' can overstate badly.
+    let realDeployUsd = actualDeployUsd; // fallback to pre-mint estimate
+    if (mintedAmount0 > BigInt(0) || mintedAmount1 > BigInt(0)) {
+      // Use sorted decimals (amounts are in sorted token order)
+      const minted0Ui = Number(ethers.formatUnits(mintedAmount0, sortedDec0));
+      const minted1Ui = Number(ethers.formatUnits(mintedAmount1, sortedDec1));
+      // Compute USD per sorted token
+      const sorted0IsStable = stableSymbols.includes(sortedToken0.symbol.toUpperCase());
+      const sorted1IsStable = stableSymbols.includes(sortedToken1.symbol.toUpperCase());
+      const usdPerSorted0 = tokensSwapped ? usdPerToken1 : usdPerToken0;
+      const usdPerSorted1 = tokensSwapped ? usdPerToken0 : usdPerToken1;
+      realDeployUsd = minted0Ui * usdPerSorted0 + minted1Ui * usdPerSorted1;
+      logger.info(`[EvmLP] Mint actual amounts: ${sortedToken0.symbol}=${minted0Ui.toFixed(6)} ($${(minted0Ui * usdPerSorted0).toFixed(2)}), ${sortedToken1.symbol}=${minted1Ui.toFixed(6)} ($${(minted1Ui * usdPerSorted1).toFixed(2)}) → real=$${realDeployUsd.toFixed(2)} (pre-mint estimate was $${actualDeployUsd.toFixed(2)})`);
+    }
+
+    const verb = existingTokenId ? 'LP increased' : 'LP minted';
+    logger.info(`[EvmLP] ${verb}: tokenId=${tokenId} tx=${receipt.hash} actual=$${realDeployUsd.toFixed(2)}`);
+
+    // Post-mint guard: if the actual deposited value is negligible ($<1),
+    // the position is worthless and shouldn't be persisted upstream.
+    // This catches cases where the NFPM accepted the tx but deposited
+    // near-zero amounts (e.g. extreme tick misalignment, dust zaps).
+    if (realDeployUsd < 1 && !existingTokenId) {
+      logger.warn(
+        `[EvmLP] Post-mint value too low: $${realDeployUsd.toFixed(2)} — position ${tokenId} ` +
+        `is effectively empty. Returning failure to prevent phantom persist.`,
+      );
+      return { success: false, error: `Minted position value negligible ($${realDeployUsd.toFixed(2)})`, tokenId, txHash: receipt.hash };
+    }
+
+    return { success: true, tokenId, txHash: receipt.hash, actualDeployUsd: realDeployUsd };
+  } catch (err) {
+    logger.error('[EvmLP] openEvmLpPosition error:', err);
+    return { success: false, error: (err as Error).message };
+  }
+}
+
+// ============================================================================
+// Close Position — decreaseLiquidity + collect + burn
+// ============================================================================
+
+export async function closeEvmLpPosition(params: {
+  posId: string;
+  chainId: string;
+  chainNumericId: number;
+  /** Protocol name for NFPM routing (e.g. 'Uniswap V3', 'Aerodrome Concentrated', 'PancakeSwap V3') */
+  protocol?: string;
+  /** Token info for USD value estimation (optional — improves rebalance sizing) */
+  token0?: { address: string; symbol: string; decimals: number };
+  token1?: { address: string; symbol: string; decimals: number };
+}): Promise<EvmLpCloseResult> {
+  const env = getCFOEnv();
+  const { posId, chainNumericId } = params;
+  const { name: chainName } = parseEvmChainId(params.chainId);
+
+  const failResult: EvmLpCloseResult = {
+    success: false,
+    amount0Recovered: BigInt(0),
+    amount1Recovered: BigInt(0),
+    valueRecoveredUsd: 0,
+    feeTier: 0,
+    chainName,
+  };
+
+  if (env.dryRun) {
+    logger.info(`[EvmLP] DRY RUN — would close LP tokenId=${posId} on ${chainName}`);
+    return { ...failResult, success: true };
+  }
+
+  try {
+    const ethers = await loadEthers();
+    const wallet = await getEvmWallet(chainNumericId);
+    const protoResolved = params.protocol ? resolveProtocol(params.protocol.toLowerCase(), chainNumericId) : undefined;
+    const nfpmAddr = protoResolved?.nfpmAddress ?? getNfpmAddress(chainNumericId) ?? NFPM_ADDRESS;
+    const nfpmAbi = protoResolved ? getNfpmAbiForProtocol(protoResolved.def.abi) : NFPM_ABI;
+    const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, wallet);
+
+    // 1. Read position data
+    const posData = await nfpm.positions(posId);
+    const liquidity = posData.liquidity ?? posData[7];
+    const feeTier = Number(posData.fee ?? posData[4] ?? 0);
+
+    if (liquidity === BigInt(0)) {
+      logger.warn(`[EvmLP] Position ${posId} has zero liquidity — just collecting and burning`);
+    }
+
+    // 2. Decrease liquidity (withdraw all)
+    //    We manage nonces manually because ethers v6 caches nonces aggressively
+    //    and Arbitrum's sequencer confirms txs faster than the cache updates.
+    const provider = await getEvmProvider(chainNumericId);
+    let nextNonce = await provider.getTransactionCount(wallet.address, 'latest');
+
+    // 2a. Aerodrome gauge-staking check —————————————————————————————————
+    //     Aerodrome CL positions can be staked in a gauge for AERO rewards.
+    //     When staked, the gauge contract becomes the ERC-721 owner of the NFT.
+    //     Calling decreaseLiquidity/collect directly then reverts with "NG" (Not Gauge).
+    //     Fix: detect staking by checking ownerOf, derive the gauge via the pool,
+    //     call gauge.withdraw(tokenId) to return the NFT to our wallet, then proceed.
+    try {
+      const actualOwner: string = await nfpm.ownerOf(posId);
+      if (actualOwner.toLowerCase() !== wallet.address.toLowerCase()) {
+        logger.warn(`[EvmLP] Position ${posId} owned by ${actualOwner} (not our wallet) — attempting Aerodrome gauge unstake`);
+
+        // Aerodrome Slipstream CL factory addresses by chain
+        const AERODROME_CL_FACTORY: Record<number, string> = {
+          8453:   '0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A', // Base
+          34443:  '0x31832f2a97Fd20664D76Cc421207669b55CE4BC0', // Mode
+          10:     '0x31832f2a97Fd20664D76Cc421207669b55CE4BC0', // Optimism (Velodrome Slipstream)
+        };
+        const factoryAddr = AERODROME_CL_FACTORY[chainNumericId];
+        if (!factoryAddr) {
+          throw new Error(`No Aerodrome CL factory known for chain ${chainNumericId} — cannot unstake tokenId ${posId}`);
+        }
+
+        // Read pool identity from position data.
+        // Aerodrome CL NFPM stores tickSpacing at index 4 (same slot Uniswap V3 uses for fee).
+        const posToken0: string  = posData.token0 ?? posData[2];
+        const posToken1: string  = posData.token1 ?? posData[3];
+        const posTickSpacing      = posData.tickSpacing ?? posData.fee ?? posData[4];
+
+        const clFactoryAbi = ['function getPool(address,address,int24) view returns (address)'];
+        const clFactory = new ethers.Contract(factoryAddr, clFactoryAbi, wallet);
+        const poolAddr: string = await clFactory.getPool(posToken0, posToken1, posTickSpacing);
+        if (!poolAddr || poolAddr === ethers.ZeroAddress) {
+          throw new Error(`Aerodrome CL pool not found for ${posToken0}/${posToken1} tickSpacing=${posTickSpacing} on chain ${chainNumericId}`);
+        }
+
+        const clPoolAbi = ['function gauge() view returns (address)'];
+        const clPool = new ethers.Contract(poolAddr, clPoolAbi, wallet);
+        const gaugeAddr: string = await clPool.gauge();
+        if (!gaugeAddr || gaugeAddr === ethers.ZeroAddress) {
+          throw new Error(`Aerodrome pool ${poolAddr} has no gauge — cannot unstake tokenId ${posId}`);
+        }
+
+        if (gaugeAddr.toLowerCase() !== actualOwner.toLowerCase()) {
+          throw new Error(`Position ${posId} owned by ${actualOwner} but pool gauge is ${gaugeAddr} — unexpected owner, cannot unstake`);
+        }
+
+        const gaugeAbi = ['function withdraw(uint256 tokenId) external'];
+        const gaugeContract = new ethers.Contract(gaugeAddr, gaugeAbi, wallet);
+        const unstakeTx = await gaugeContract.withdraw(BigInt(posId), { nonce: nextNonce });
+        await unstakeTx.wait();
+        nextNonce++;
+        logger.info(`[EvmLP] Unstaked position ${posId} from gauge ${gaugeAddr} on chain ${chainNumericId}`);
+      }
+    } catch (gaugeErr) {
+      // If the revert reason is "NG" we know it's a gauge issue — re-throw to surface it.
+      // Other errors (ownerOf call failed for expired position, etc.) are also surfaced.
+      logger.error(`[EvmLP] Gauge ownership check/unstake failed for ${posId}:`, gaugeErr);
+      throw gaugeErr;
+    }
+
+    // 2a. Pre-collect accrued fees BEFORE decreasing liquidity.
+    //     This secures fee income even if decreaseLiquidity fails later.
+    //     V3 NFPM collect() returns whatever is owed — at this point only fees.
+    try {
+      const feeCollectTx = await nfpm.collect({
+        tokenId: posId,
+        recipient: wallet.address,
+        amount0Max: MaxUint128,
+        amount1Max: MaxUint128,
+      }, { nonce: nextNonce });
+      const feeReceipt = await feeCollectTx.wait();
+      nextNonce++;
+      // Log fee amounts if we can parse them
+      for (const log of feeReceipt.logs) {
+        try {
+          const parsed = nfpm.interface.parseLog({ topics: log.topics as string[], data: log.data });
+          if (parsed?.name === 'Collect') {
+            const f0 = parsed.args?.amount0 ?? BigInt(0);
+            const f1 = parsed.args?.amount1 ?? BigInt(0);
+            if (f0 > BigInt(0) || f1 > BigInt(0)) {
+              logger.info(`[EvmLP] Pre-collected fees for ${posId}: token0=${f0}, token1=${f1}`);
+            }
+            break;
+          }
+        } catch { /* skip */ }
+      }
+    } catch (feeErr) {
+      logger.warn(`[EvmLP] Pre-collect fees failed for ${posId} (non-fatal): ${(feeErr as Error).message}`);
+      // Re-sync nonce in case the tx was submitted but failed
+      nextNonce = await provider.getTransactionCount(wallet.address, 'latest');
+    }
+
+    // 2b. Decrease liquidity (withdraw all)
+    if (liquidity > BigInt(0)) {
+      const deadline = Math.floor(Date.now() / 1000) + 600;
+      const decreaseTx = await nfpm.decreaseLiquidity({
+        tokenId: posId,
+        liquidity,
+        amount0Min: BigInt(0),
+        amount1Min: BigInt(0),
+        deadline,
+      }, { nonce: nextNonce });
+      await decreaseTx.wait();
+      nextNonce++;
+      logger.info(`[EvmLP] decreaseLiquidity done for ${posId}`);
+    }
+
+    // 3. Collect withdrawn liquidity tokens (with retry — if this fails after
+    //    decreaseLiquidity the position is stuck with zero liquidity and tokens owed)
+    let collectReceipt: any;
+    for (let collectAttempt = 1; collectAttempt <= 3; collectAttempt++) {
+      try {
+        // Re-fetch nonce on retry since the previous attempt may have consumed it
+        if (collectAttempt > 1) {
+          nextNonce = await provider.getTransactionCount(wallet.address, 'latest');
+          await new Promise(r => setTimeout(r, 2000 * collectAttempt));
+        }
+        const collectTx = await nfpm.collect({
+          tokenId: posId,
+          recipient: wallet.address,
+          amount0Max: MaxUint128,
+          amount1Max: MaxUint128,
+        }, { nonce: nextNonce });
+        collectReceipt = await collectTx.wait();
+        nextNonce++;
+        break;
+      } catch (collectErr) {
+        logger.warn(`[EvmLP] collect attempt ${collectAttempt}/3 failed for ${posId}: ${(collectErr as Error).message}`);
+        if (collectAttempt === 3) throw collectErr;
+      }
+    }
+
+    // Parse collected amounts from Collect event
+    let amount0Recovered = BigInt(0);
+    let amount1Recovered = BigInt(0);
+    for (const log of collectReceipt.logs) {
+      try {
+        const parsed = nfpm.interface.parseLog({ topics: log.topics as string[], data: log.data });
+        if (parsed?.name === 'Collect') {
+          amount0Recovered = parsed.args?.amount0 ?? BigInt(0);
+          amount1Recovered = parsed.args?.amount1 ?? BigInt(0);
+          break;
+        }
+      } catch { /* skip */ }
+    }
+    logger.info(`[EvmLP] Collected: token0=${amount0Recovered}, token1=${amount1Recovered}`);
+
+    // 4. Burn the NFT
+    try {
+      const burnTx = await nfpm.burn(posId, { nonce: nextNonce });
+      await burnTx.wait();
+      logger.info(`[EvmLP] Burned NFT ${posId}`);
+    } catch (burnErr) {
+      // Burn can fail if tokens are still owed — non-fatal
+      logger.warn(`[EvmLP] Burn failed (non-fatal): ${(burnErr as Error).message}`);
+    }
+
+    // Estimate USD value from recovered token amounts
+    //   Previous heuristic (stableAmt * 2) broke when positions went out of range
+    //   and all value concentrated in one token — the stable side was $0 → total $0.
+    //   Now: derive per-token USD prices from the pool's sqrtPriceX96 and compute
+    //   value = human0 * usdPerToken0 + human1 * usdPerToken1.
+    let valueRecoveredUsd = 0;
+    try {
+      const stableSymbols = ['USDC', 'USDT', 'DAI', 'BUSD', 'USDCE', 'USDC.E', 'USDT0'];
+      const t0 = params.token0;
+      const t1 = params.token1;
+      if (t0 && t1) {
+        const dec0 = t0.decimals ?? 18;
+        const dec1 = t1.decimals ?? 18;
+        const human0 = Number(amount0Recovered) / (10 ** dec0);
+        const human1 = Number(amount1Recovered) / (10 ** dec1);
+        const is0Stable = stableSymbols.includes(t0.symbol.toUpperCase());
+        const is1Stable = stableSymbols.includes(t1.symbol.toUpperCase());
+
+        if (is0Stable && is1Stable) {
+          valueRecoveredUsd = human0 + human1;
+        } else {
+          // Read pool sqrtPriceX96 for accurate token pricing
+          let priced = false;
+          try {
+            const protoResolved = params.protocol ? resolveProtocol(params.protocol.toLowerCase(), chainNumericId) : undefined;
+            const isAerodromeCl = protoResolved?.def.abi === 'aerodrome-cl';
+            // Derive pool address from factory + position token pair
+            const factoryAddr = protoResolved?.factoryAddress;
+            if (factoryAddr) {
+              const posToken0 = t0.address;
+              const posToken1 = t1.address;
+              const feeOrSpacing = feeTier; // from posData
+              const factoryAbiStr = isAerodromeCl
+                ? 'function getPool(address,address,int24) view returns (address)'
+                : 'function getPool(address,address,uint24) view returns (address)';
+              const factory = new ethers.Contract(factoryAddr, [factoryAbiStr], provider);
+              const poolAddr: string = await factory.getPool(posToken0, posToken1, feeOrSpacing);
+              if (poolAddr && poolAddr !== ethers.ZeroAddress) {
+                const poolContract = new ethers.Contract(poolAddr, getPoolAbi(!!isAerodromeCl), provider);
+                const slot0 = await poolContract.slot0();
+                const sqrtPriceX96 = slot0.sqrtPriceX96 ?? slot0[0];
+                const sqrtP = Number(sqrtPriceX96) / (2 ** 96);
+                const rawPrice = sqrtP * sqrtP;
+                const price0In1 = rawPrice * (10 ** dec0) / (10 ** dec1);
+
+                let usdPer0: number;
+                let usdPer1: number;
+                // 6-case cascade: stable, native-aware pricing (same as position tracker)
+                const wrappedNative = WRAPPED_NATIVE_ADDR[chainNumericId]?.toLowerCase();
+                const t0Addr = (t0.address ?? '').toLowerCase();
+                const t1Addr = (t1.address ?? '').toLowerCase();
+                const is0Native = !!wrappedNative && t0Addr === wrappedNative;
+                const is1Native = !!wrappedNative && t1Addr === wrappedNative;
+                if (is0Stable && is1Stable) {
+                  usdPer0 = 1; usdPer1 = 1;
+                } else if (is1Stable) {
+                  usdPer1 = 1;
+                  usdPer0 = price0In1; // token0 priced in stable token1
+                } else if (is0Stable) {
+                  usdPer0 = 1;
+                  usdPer1 = price0In1 > 0 ? 1 / price0In1 : 0;
+                } else if (is0Native) {
+                  const nPrice = await getNativeTokenPrice(chainNumericId);
+                  usdPer0 = nPrice;
+                  usdPer1 = price0In1 > 0 ? nPrice / price0In1 : 0;
+                } else if (is1Native) {
+                  const nPrice = await getNativeTokenPrice(chainNumericId);
+                  usdPer1 = nPrice;
+                  usdPer0 = price0In1 > 0 ? price0In1 * nPrice : 0;
+                } else {
+                  // Neither stable nor native — best-effort: anchor token0 at native price
+                  const nPrice = await getNativeTokenPrice(chainNumericId);
+                  usdPer0 = nPrice;
+                  usdPer1 = price0In1 > 0 ? nPrice / price0In1 : 0;
+                  logger.debug(`[EvmLP] Close value: unknown pair ${t0.symbol}/${t1.symbol} — using pool-ratio × native fallback`);
+                }
+                valueRecoveredUsd = human0 * usdPer0 + human1 * usdPer1;
+                priced = true;
+              }
+            }
+          } catch (priceErr) {
+            logger.warn('[EvmLP] Pool-based pricing failed (falling back to heuristic):', priceErr);
+          }
+
+          // Fallback: simple heuristic (only used if pool lookup failed)
+          if (!priced) {
+            if (is0Stable) {
+              const nPrice = await getNativeTokenPrice(chainNumericId);
+              valueRecoveredUsd = human0 + human1 * nPrice;
+            } else if (is1Stable) {
+              const nPrice = await getNativeTokenPrice(chainNumericId);
+              valueRecoveredUsd = human1 + human0 * nPrice;
+            } else {
+              const nPrice = await getNativeTokenPrice(chainNumericId);
+              valueRecoveredUsd = (human0 + human1) * nPrice; // rough
+            }
+          }
+        }
+      }
+      if (valueRecoveredUsd > 0) {
+        logger.info(`[EvmLP] Estimated value recovered: $${valueRecoveredUsd.toFixed(2)}`);
+      }
+    } catch { /* non-fatal — fallback to 0 */ }
+
+    return {
+      success: true,
+      txHash: collectReceipt.hash,
+      amount0Recovered,
+      amount1Recovered,
+      valueRecoveredUsd,
+      feeTier,
+      chainName,
+    };
+  } catch (err) {
+    logger.error(`[EvmLP] closeEvmLpPosition error (${posId}):`, err);
+    return { ...failResult, error: (err as Error).message };
+  }
+}
+
+// ============================================================================
+// Claim Fees — collect without decreasing liquidity
+// ============================================================================
+
+export async function claimEvmLpFees(params: {
+  posId: string;
+  chainId: string;
+  chainNumericId: number;
+  /** Protocol name for NFPM routing */
+  protocol?: string;
+}): Promise<EvmLpClaimResult> {
+  const env = getCFOEnv();
+  const { posId, chainNumericId } = params;
+
+  if (env.dryRun) {
+    logger.info(`[EvmLP] DRY RUN — would claim fees for tokenId=${posId}`);
+    return { success: true };
+  }
+
+  try {
+    const ethers = await loadEthers();
+    const wallet = await getEvmWallet(chainNumericId);
+    const protoResolved = params.protocol ? resolveProtocol(params.protocol.toLowerCase(), chainNumericId) : undefined;
+    const nfpmAddr = protoResolved?.nfpmAddress ?? getNfpmAddress(chainNumericId) ?? NFPM_ADDRESS;
+    const nfpmAbi = protoResolved ? getNfpmAbiForProtocol(protoResolved.def.abi) : NFPM_ABI;
+    const nfpm = new ethers.Contract(nfpmAddr, nfpmAbi, wallet);
+
+    // Pre-check: verify the NFT still exists on-chain (may have been burned by rebalance)
+    try {
+      await nfpm.ownerOf(posId);
+    } catch {
+      logger.warn(`[EvmLP] claimEvmLpFees: tokenId ${posId} does not exist on-chain (burned?) — skipping`);
+      return { success: false, error: `Token ${posId} no longer exists on-chain` };
+    }
+
+    const tx = await nfpm.collect({
+      tokenId: posId,
+      recipient: wallet.address,
+      amount0Max: MaxUint128,
+      amount1Max: MaxUint128,
+    });
+    const receipt = await tx.wait();
+
+    let amount0Claimed = BigInt(0);
+    let amount1Claimed = BigInt(0);
+    for (const log of receipt.logs) {
+      try {
+        const parsed = nfpm.interface.parseLog({ topics: log.topics as string[], data: log.data });
+        if (parsed?.name === 'Collect') {
+          amount0Claimed = parsed.args?.amount0 ?? BigInt(0);
+          amount1Claimed = parsed.args?.amount1 ?? BigInt(0);
+          break;
+        }
+      } catch { /* skip */ }
+    }
+
+    logger.info(`[EvmLP] Fees claimed for ${posId}: token0=${amount0Claimed}, token1=${amount1Claimed}`);
+    return { success: true, txHash: receipt.hash, amount0Claimed, amount1Claimed };
+  } catch (err) {
+    logger.error(`[EvmLP] claimEvmLpFees error (${posId}):`, err);
+    return { success: false, error: (err as Error).message };
+  }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Module-level price cache — set by `setAnalystPrices()` from decision engine.
+ * Maps symbol → USD price. Populated each cycle from swarm intel.
+ */
+const _analystPrices: Record<string, number> = {};
+
+/** Update native token prices from analyst/oracle data. Call once per decision cycle. */
+export function setAnalystPrices(prices: Record<string, number>): void {
+  Object.assign(_analystPrices, prices);
+}
+
+/** Chain → native token symbol mapping for price lookups */
+const CHAIN_NATIVE_SYMBOL: Record<number, string> = {
+  1: 'ETH', 42161: 'ETH', 10: 'ETH', 8453: 'ETH', 324: 'ETH', 534352: 'ETH', 59144: 'ETH',
+  137: 'MATIC', 56: 'BNB', 43114: 'AVAX', 250: 'FTM',
+};
+
+/**
+ * Get native token price for gas cost estimation.
+ * Uses analyst prices when available, falls back to hardcoded estimates.
+ */
+async function getNativeTokenPrice(chainId: number): Promise<number> {
+  // 1. Try analyst prices (updated each decision cycle)
+  const symbol = CHAIN_NATIVE_SYMBOL[chainId];
+  if (symbol && _analystPrices[symbol] > 0) return _analystPrices[symbol];
+  // Also try common aliases
+  if (symbol === 'ETH' && _analystPrices['WETH'] > 0) return _analystPrices['WETH'];
+  if (symbol === 'MATIC' && _analystPrices['POL'] > 0) return _analystPrices['POL'];
+
+  // 2. Fallback to conservative hardcoded estimates
+  const estimates: Record<number, number> = {
+    1: 2500, 42161: 2500, 10: 2500, 8453: 2500, 324: 2500, 534352: 2500, 59144: 2500,
+    137: 0.5, 56: 300, 43114: 25, 250: 0.3,
+  };
+  return estimates[chainId] ?? 2500;
+}
+
+// ============================================================================
+// Standalone rebalance (close + reopen in one call)
+// ============================================================================
+
+/**
+ * Rebalance an out-of-range EVM LP position (close + reopen centred on current tick).
+ *
+ * @param posId           Position NFT token ID
+ * @param chainId         chain ID format (e.g. "arbitrum@42161")
+ * @param chainNumericId  Numeric chain ID
+ * @param rangeWidthTicks New range width in ticks
+ * @param closeOnly       If true, just close without reopening
+ *
+ * Returns the close result + optional open result.
+ */
+export async function rebalanceEvmLpPosition(params: {
+  posId: string;
+  chainId: string;
+  chainNumericId: number;
+  rangeWidthTicks: number;
+  closeOnly?: boolean;
+  /** Token info for USD value estimation (improves rebalance deploy sizing) */
+  token0?: { address: string; symbol: string; decimals: number };
+  token1?: { address: string; symbol: string; decimals: number };
+  /** Protocol key for multi-protocol NFPM routing */
+  protocol?: string;
+  /** Original pool address — rebalance will reopen on the SAME pool if available */
+  originalPoolAddress?: string;
+  /** Original entry USD value — used as preferred deploy target so the position
+   *  reopens at the same size it was originally opened at, not the (potentially
+   *  depreciated due to IL) close recovery value. */
+  entryUsd?: number;
+}): Promise<{
+  closeResult: EvmLpCloseResult;
+  openResult?: EvmLpOpenResult;
+}> {
+  const { posId, chainId, chainNumericId, rangeWidthTicks, closeOnly } = params;
+  const env = getCFOEnv();
+
+  // Step 1: Close existing position (pass token info for USD estimation)
+  const closeResult = await closeEvmLpPosition({
+    posId, chainId, chainNumericId,
+    token0: params.token0,
+    token1: params.token1,
+    protocol: params.protocol,
+  });
+  if (!closeResult.success) {
+    return { closeResult };
+  }
+  logger.info(`[EvmLP] Rebalance: closed posId=${posId} | tx=${closeResult.txHash}`);
+
+  if (closeOnly) {
+    return { closeResult };
+  }
+
+  // Brief settling delay — give the RPC node time to index the close tx so
+  // wallet balance reads below reflect the recovered tokens.
+  await new Promise(r => setTimeout(r, 3000));
+
+  // Step 2: Reopen on the SAME pool if originalPoolAddress + token info is available.
+  // Only fall back to discovery if the original pool info is missing.
+  let targetPool: {
+    chainId: string;
+    chainNumericId: number;
+    poolAddress: string;
+    token0: { address: string; symbol: string; decimals: number };
+    token1: { address: string; symbol: string; decimals: number };
+    protocol: string | { name: string };
+    feeTier: number;
+  };
+
+  if (params.originalPoolAddress && params.token0 && params.token1 && params.protocol) {
+    // Reopen on the same pool — use closeResult.feeTier which was read from on-chain
+    targetPool = {
+      chainId,
+      chainNumericId,
+      poolAddress: params.originalPoolAddress,
+      token0: params.token0,
+      token1: params.token1,
+      protocol: params.protocol,
+      feeTier: closeResult.feeTier,
+    };
+    logger.info(`[EvmLP] Rebalance: reopening on SAME pool ${params.token0.symbol}/${params.token1.symbol} @ ${params.originalPoolAddress.slice(0, 10)}…`);
+  } else {
+    // Fallback: discover pools (legacy path)
+    const { discoverEvmPools } = await import("./evmPoolDiscovery.ts");
+    const pools = await discoverEvmPools();
+    const eligible = pools.filter(p =>
+      p.chainId === chainNumericId &&
+      p.tvlUsd >= env.evmLpMinTvlUsd,
+    );
+
+    if (eligible.length === 0) {
+      logger.warn(`[EvmLP] Rebalance: no eligible pools on chain ${chainNumericId} — close only`);
+      return { closeResult };
+    }
+
+    const best = eligible[0]; // already sorted by score
+    targetPool = {
+      chainId: String(best.chainId),
+      chainNumericId: best.chainId,
+      poolAddress: best.poolAddress,
+      token0: best.token0,
+      token1: best.token1,
+      protocol: best.protocol.name,
+      feeTier: best.feeTier,
+    };
+    logger.info(`[EvmLP] Rebalance: no original pool info — using best discovered pool ${(targetPool.token0 as any).symbol}/${(targetPool.token1 as any).symbol}`);
+  }
+
+  // Compute deployUsd — prefer the original entry amount so the position reopens at
+  // the same size. Fall back to close recovery estimate, then wallet value scan.
+  // This prevents the slow leak where IL-depreciated positions reopen progressively
+  // smaller on each rebalance cycle.
+  const entryUsdTarget = params.entryUsd && params.entryUsd > 1 ? params.entryUsd : 0;
+  let deployUsd = entryUsdTarget > 0
+    ? entryUsdTarget
+    : closeResult.valueRecoveredUsd > 1
+      ? closeResult.valueRecoveredUsd
+      : env.evmLpMaxUsd * 0.5;
+  // Safety cap: never deploy more than evmLpMaxUsd regardless of value estimation
+  deployUsd = Math.min(deployUsd, env.evmLpMaxUsd);
+  if (entryUsdTarget > 0) {
+    logger.info(`[EvmLP] Rebalance: using original entryUsd=$${entryUsdTarget.toFixed(2)} (close recovered $${closeResult.valueRecoveredUsd.toFixed(2)})`);
+  }
+  try {
+    const ethers = await loadEthers();
+    const wallet = await getEvmWallet(chainNumericId);
+    const provider = await getEvmProvider(chainNumericId);
+    const t0Addr = typeof targetPool.token0 === 'string' ? targetPool.token0 : (targetPool.token0 as any).address;
+    const t1Addr = typeof targetPool.token1 === 'string' ? targetPool.token1 : (targetPool.token1 as any).address;
+    const t0Sym = typeof targetPool.token0 === 'string' ? '?' : (targetPool.token0 as any).symbol ?? '?';
+    const t1Sym = typeof targetPool.token1 === 'string' ? '?' : (targetPool.token1 as any).symbol ?? '?';
+    const [walBal0, walBal1] = await Promise.all([
+      new ethers.Contract(t0Addr, ERC20_ABI, provider).balanceOf(wallet.address).catch(() => BigInt(0)),
+      new ethers.Contract(t1Addr, ERC20_ABI, provider).balanceOf(wallet.address).catch(() => BigInt(0)),
+    ]);
+    const dec0 = (targetPool.token0 as any).decimals ?? 18;
+    const dec1 = (targetPool.token1 as any).decimals ?? 18;
+    const human0 = Number(ethers.formatUnits(walBal0, dec0));
+    const human1 = Number(ethers.formatUnits(walBal1, dec1));
+
+    const protoName = typeof targetPool.protocol === 'string' ? targetPool.protocol : (targetPool.protocol as any)?.name ?? '';
+    const protoResolved = resolveProtocol(protoName.toLowerCase(), chainNumericId);
+    const isAero = protoResolved?.def.abi === 'aerodrome-cl';
+    const poolContract = new ethers.Contract(targetPool.poolAddress, getPoolAbi(!!isAero), provider);
+    const slot0 = await poolContract.slot0();
+    const sqrtPriceX96 = slot0.sqrtPriceX96 ?? slot0[0];
+    const sqrtP = Number(sqrtPriceX96) / (2 ** 96);
+    const rawPrice = sqrtP * sqrtP;
+    const price0In1 = rawPrice * (10 ** dec0) / (10 ** dec1);
+
+    const stableSymbols = ['USDC', 'USDT', 'DAI', 'BUSD', 'USDCE', 'USDC.E', 'USDT0'];
+    const s0 = stableSymbols.includes(t0Sym.toUpperCase());
+    const s1 = stableSymbols.includes(t1Sym.toUpperCase());
+    const wrappedNative = WRAPPED_NATIVE_ADDR[chainNumericId]?.toLowerCase();
+    const is0Native = !!wrappedNative && t0Addr.toLowerCase() === wrappedNative;
+    const is1Native = !!wrappedNative && t1Addr.toLowerCase() === wrappedNative;
+    let usdPer0: number;
+    let usdPer1: number;
+    if (s0 && s1) { usdPer0 = 1; usdPer1 = 1; }
+    else if (s1) { usdPer1 = 1; usdPer0 = price0In1; }
+    else if (s0) { usdPer0 = 1; usdPer1 = price0In1 > 0 ? 1 / price0In1 : 0; }
+    else if (is0Native) { const np = await getNativeTokenPrice(chainNumericId); usdPer0 = np; usdPer1 = price0In1 > 0 ? np / price0In1 : 0; }
+    else if (is1Native) { const np = await getNativeTokenPrice(chainNumericId); usdPer1 = np; usdPer0 = price0In1 > 0 ? price0In1 * np : 0; }
+    else { const np = await getNativeTokenPrice(chainNumericId); usdPer0 = np; usdPer1 = price0In1 > 0 ? np / price0In1 : 0; }
+
+    const walletValueUsd = human0 * usdPer0 + human1 * usdPer1;
+    if (walletValueUsd > 1) {
+      // When we have an entryUsd target, use it if the wallet has enough tokens to
+      // cover it. Otherwise use what the wallet actually holds (capped at evmLpMaxUsd).
+      // This ensures rebalances deploy the original position size when possible,
+      // rather than shrinking every cycle due to IL and swap slippage.
+      const candidateDeploy = entryUsdTarget > 0 && walletValueUsd >= entryUsdTarget * 0.90
+        ? entryUsdTarget
+        : walletValueUsd;
+      deployUsd = Math.min(candidateDeploy, env.evmLpMaxUsd);
+      logger.info(`[EvmLP] Rebalance: wallet holds $${walletValueUsd.toFixed(2)} for ${t0Sym}/${t1Sym} → deployUsd=$${deployUsd.toFixed(2)} (entryUsd=$${entryUsdTarget.toFixed(2)})`);
+    }
+  } catch (err) {
+    logger.warn('[EvmLP] Rebalance: wallet value calc failed (using close estimate):', err);
+  }
+
+  const openResult = await openEvmLpPosition(
+    {
+      chainId: targetPool.chainId,
+      chainNumericId: targetPool.chainNumericId,
+      poolAddress: targetPool.poolAddress,
+      token0: { ...targetPool.token0, name: targetPool.token0.symbol },
+      token1: { ...targetPool.token1, name: targetPool.token1.symbol },
+      protocol: typeof targetPool.protocol === 'string' ? targetPool.protocol : { name: targetPool.protocol.name, factoryAddress: '' },
+      feeTier: targetPool.feeTier,
+    },
+    deployUsd,
+    rangeWidthTicks,
+  );
+
+  return { closeResult, openResult };
+}

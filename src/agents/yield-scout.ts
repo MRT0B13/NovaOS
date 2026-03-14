@@ -1,12 +1,12 @@
 /**
  * Yield Scout Agent
  *
- * Role: Multi-chain DeFi yield monitoring — scans Krystal (EVM),
+ * Role: Multi-chain DeFi yield monitoring — scans EVM LP pools,
  * Orca (Solana), Kamino (Solana), and Jito (Solana) for top-yielding
  * pools/vaults and alerts when APY exceeds user-defined thresholds.
  *
  * Data sources:
- *   - Krystal Cloud API  → EVM LP pools across Ethereum, Base, Arbitrum, Polygon, BSC, etc.
+ *   - DeFiLlama → EVM LP pools across Ethereum, Base, Arbitrum, Polygon, BSC, etc.
  *   - Orca Whirlpools    → Solana concentrated liquidity pools
  *   - Kamino             → Solana lending/borrowing vaults
  *   - Jito               → Solana liquid staking yield
@@ -54,7 +54,7 @@ const APY_SPIKE_THRESHOLD = 2.0; // 2x increase
 // ============================================================================
 
 interface YieldOpportunity {
-  source: 'krystal' | 'orca' | 'kamino' | 'jito';
+  source: 'evm_lp' | 'orca' | 'kamino' | 'jito';
   chain: string;
   protocol: string;
   pool: string;          // Pool name or pair (e.g. "ETH/USDC")
@@ -130,7 +130,7 @@ export class YieldScoutAgent extends BaseAgent {
     // Listen for supervisor commands
     this.addInterval(() => this.processCommands(), 30_000);
 
-    logger.info(`[yield-scout] 📈 Online — scanning Krystal + Orca + Kamino + Jito every ${this.pollIntervalMs / 60000}min (min APY: ${this.minApy}%)`);
+    logger.info(`[yield-scout] 📈 Online — scanning EVM LP + Orca + Kamino + Jito every ${this.pollIntervalMs / 60000}min (min APY: ${this.minApy}%)`);
   }
 
   protected async onStop(): Promise<void> {
@@ -153,22 +153,22 @@ export class YieldScoutAgent extends BaseAgent {
     let totalScanned = 0;
 
     // Scan all sources in parallel
-    const [krystalResult, orcaResult, kaminoResult, jitoResult] = await Promise.allSettled([
-      this.scanKrystal(),
+    const [evmLpResult, orcaResult, kaminoResult, jitoResult] = await Promise.allSettled([
+      this.scanEvmLpPools(),
       this.scanOrca(),
       this.scanKamino(),
       this.scanJito(),
     ]);
 
-    // Process Krystal (EVM multi-chain)
-    if (krystalResult.status === 'fulfilled' && krystalResult.value.length > 0) {
-      opportunities.push(...krystalResult.value);
-      totalScanned += krystalResult.value.length;
-      sourcesOnline.push('krystal');
+    // Process EVM LP (multi-chain)
+    if (evmLpResult.status === 'fulfilled' && evmLpResult.value.length > 0) {
+      opportunities.push(...evmLpResult.value);
+      totalScanned += evmLpResult.value.length;
+      sourcesOnline.push('evm_lp');
     } else {
-      sourcesOffline.push('krystal');
-      if (krystalResult.status === 'rejected') {
-        logger.warn(`[yield-scout] Krystal scan failed: ${krystalResult.reason}`);
+      sourcesOffline.push('evm_lp');
+      if (evmLpResult.status === 'rejected') {
+        logger.warn(`[yield-scout] EVM LP scan failed: ${evmLpResult.reason}`);
       }
     }
 
@@ -277,22 +277,22 @@ export class YieldScoutAgent extends BaseAgent {
     await this.persistState();
   }
 
-  // ── Krystal (EVM Multi-Chain) ──────────────────────────────────
+  // ── EVM LP (Multi-Chain) ──────────────────────────────────
 
-  private async scanKrystal(): Promise<YieldOpportunity[]> {
+  private async scanEvmLpPools(): Promise<YieldOpportunity[]> {
     try {
-      const { discoverKrystalPools } = await import('../launchkit/cfo/krystalService.ts');
-      const pools = await discoverKrystalPools();
+      const { discoverEvmPools } = await import('../launchkit/cfo/evmPoolDiscovery.ts');
+      const pools = await discoverEvmPools();
 
       return pools
         .filter((p: any) => p.tvlUsd >= this.minTvl)
         .map((p: any) => {
-          // Krystal pools have feeApy, rewardApy fields
+          // EVM pools have feeApy, rewardApy fields
           const totalApy = (p.feeApy || 0) + (p.rewardApy || 0);
           const chainName = p.chainName || p.chain || `chain-${p.chainId}`;
 
           return {
-            source: 'krystal' as const,
+            source: 'evm_lp' as const,
             chain: chainName,
             protocol: p.protocol || p.dex || 'unknown',
             pool: `${p.token0Symbol || '?'}/${p.token1Symbol || '?'}`,
@@ -301,7 +301,7 @@ export class YieldScoutAgent extends BaseAgent {
             token0: p.token0Symbol,
             token1: p.token1Symbol,
             feeRate: p.feeTier,
-            score: this.scoreYield(totalApy, p.tvlUsd || 0, 'krystal', p.score || 0),
+            score: this.scoreYield(totalApy, p.tvlUsd || 0, 'evm_lp', p.score || 0),
             metadata: {
               poolAddress: p.poolAddress,
               chainId: p.chainId,
@@ -309,13 +309,13 @@ export class YieldScoutAgent extends BaseAgent {
               feeApy: p.feeApy,
               rewardApy: p.rewardApy,
               volume24h: p.volume24h,
-              krystalScore: p.score,
+              evmPoolScore: p.score,
             },
           };
         })
         .filter((o: YieldOpportunity) => o.apy >= this.minApy);
     } catch (err: any) {
-      logger.warn(`[yield-scout] Krystal scan failed: ${err.message}`);
+      logger.warn(`[yield-scout] EVM LP scan failed: ${err.message}`);
       return [];
     }
   }
@@ -467,14 +467,14 @@ export class YieldScoutAgent extends BaseAgent {
 
     // Source quality (0-15 points)
     const sourceScores: Record<string, number> = {
-      krystal: 15,    // Multi-chain, well-validated
+      evm_lp: 15,    // Multi-chain DeFiLlama pools
       orca: 14,        // Solana blue-chip
       kamino: 13,      // Solana lending leader
       jito: 12,        // Liquid staking, safe
     };
     score += sourceScores[source] || 8;
 
-    // External score bonus (from Krystal's own scoring) (0-10 points)
+    // External score bonus (from DeFiLlama scoring) (0-10 points)
     if (externalScore) {
       score += Math.min(10, Math.round(externalScore / 10));
     }

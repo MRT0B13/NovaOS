@@ -125,8 +125,8 @@ export const CAPABILITY_TEMPLATES: Record<CapabilityType, CapabilityTemplate> = 
     optionalConfig: ['subreddits', 'minScore'],
   },
   yield_monitoring: {
-    description: 'Monitor DeFi yields across Krystal (EVM multi-chain), Orca, Kamino, and Jito (Solana)',
-    keywords: ['yield', 'apy', 'apr', 'farming', 'defi yields', 'staking', 'liquidity', 'lp rewards', 'krystal', 'orca', 'kamino', 'jito'],
+    description: 'Monitor DeFi yields across EVM LP (DeFiLlama multi-chain), Orca, Kamino, and Jito (Solana)',
+    keywords: ['yield', 'apy', 'apr', 'farming', 'defi yields', 'staking', 'liquidity', 'lp rewards', 'evm-lp', 'orca', 'kamino', 'jito'],
     defaultSchedule: 'every 15 minutes',
     requiresConfig: [],
     optionalConfig: ['minApy', 'minTvl', 'chains'],

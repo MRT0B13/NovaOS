@@ -15,7 +15,7 @@
  * Skills drive behaviour:
  *   - risk-framework   → position monitoring, exposure limit checks
  *   - hyperliquid-trader → hedge checks, stop-loss enforcement
- *   - orca-lp / krystal-lp → LP health monitoring, rebalance checks
+ *   - orca-lp / evm-lp → LP health monitoring, rebalance checks
  *   - kamino-yield      → LTV monitoring, yield tracking
  *   - scout-intel-scoring → intel digest consumption
  *
@@ -240,7 +240,7 @@ export class UserAgentRunner extends BaseAgent {
       }
 
       // ── Position Monitoring ──
-      if (capabilities.includes('lp') || skills.includes('orca-lp') || skills.includes('krystal-lp')) {
+      if (capabilities.includes('lp') || skills.includes('orca-lp') || skills.includes('evm-lp')) {
         await this.checkLpPositions();
       }
 
@@ -333,7 +333,7 @@ export class UserAgentRunner extends BaseAgent {
         `SELECT asset, quantity, entry_price, current_price, unrealized_pnl, metadata
          FROM cfo_positions
          WHERE agent_id = $1 AND status = 'OPEN'
-           AND (asset LIKE 'orca-lp-%' OR asset LIKE 'krystal-lp-%')
+           AND (asset LIKE 'orca-lp-%' OR asset LIKE 'evm-lp-%')
          ORDER BY created_at DESC`,
         [this.userConfig.agentId],
       );
@@ -368,7 +368,7 @@ export class UserAgentRunner extends BaseAgent {
         `SELECT asset, side, entry_price, current_price, quantity, unrealized_pnl, metadata
          FROM cfo_positions
          WHERE agent_id = $1 AND status = 'OPEN'
-           AND asset NOT LIKE 'orca-lp-%' AND asset NOT LIKE 'krystal-lp-%'
+           AND asset NOT LIKE 'orca-lp-%' AND asset NOT LIKE 'evm-lp-%'
          ORDER BY created_at DESC`,
         [this.userConfig.agentId],
       );

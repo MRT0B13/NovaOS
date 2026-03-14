@@ -227,7 +227,7 @@ async function quoteViaUniswap(
   feeTier: number,
 ): Promise<SwapQuote | null> {
   try {
-    const { getEvmProvider } = await import('./krystalService.ts');
+    const { getEvmProvider } = await import('./evmProviderService.ts');
     const ethers = await import('ethers' as string);
     const provider = await getEvmProvider(chainId);
 
@@ -308,7 +308,7 @@ async function quoteViaLifi(
 ): Promise<SwapQuote | null> {
   try {
     const ethers = await import('ethers' as string);
-    const { getEvmProvider } = await import('./krystalService.ts');
+    const { getEvmProvider } = await import('./evmProviderService.ts');
     const provider = await getEvmProvider(chainId);
 
     const inToken = new ethers.Contract(tokenInAddr, ERC20_ABI, provider);
@@ -378,7 +378,7 @@ async function quoteViaAerodrome(
   if (!routerAddr) return null;
 
   try {
-    const { getEvmProvider } = await import('./krystalService.ts');
+    const { getEvmProvider } = await import('./evmProviderService.ts');
     const ethers = await import('ethers' as string);
     const provider = await getEvmProvider(chainId);
 
@@ -481,7 +481,7 @@ async function executeViaUniswap(
   expectedOut: number,
 ): Promise<SwapResult> {
   try {
-    const { getEvmProvider } = await import('./krystalService.ts');
+    const { getEvmProvider } = await import('./evmProviderService.ts');
     const ethers = await import('ethers' as string);
     const env = getCFOEnv();
     if (!env.evmPrivateKey) throw new Error('CFO_EVM_PRIVATE_KEY not set');
@@ -556,7 +556,7 @@ async function executeViaLifiSwap(
 ): Promise<SwapResult> {
   try {
     const ethers = await import('ethers' as string);
-    const { getEvmProvider } = await import('./krystalService.ts');
+    const { getEvmProvider } = await import('./evmProviderService.ts');
     const env = getCFOEnv();
     if (!env.evmPrivateKey) throw new Error('CFO_EVM_PRIVATE_KEY not set');
 
@@ -666,7 +666,7 @@ async function executeViaAerodrome(
   const factory   = AERODROME_VOLATILE_FACTORY[chainId] ?? '0x0000000000000000000000000000000000000000';
 
   try {
-    const { getEvmProvider } = await import('./krystalService.ts');
+    const { getEvmProvider } = await import('./evmProviderService.ts');
     const ethers = await import('ethers' as string);
     const env = getCFOEnv();
     if (!env.evmPrivateKey) throw new Error('CFO_EVM_PRIVATE_KEY not set');

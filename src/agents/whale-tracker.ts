@@ -2,11 +2,11 @@
  * Whale Tracker Agent
  *
  * Role: Multi-chain whale movement detection — monitors large wallet
- * transfers on Solana (via Helius) and EVM chains (via Krystal/RPC).
+ * transfers on Solana (via Helius) and EVM chains (via EVM RPC).
  *
  * Data sources:
  *   - Helius Enhanced API → Solana transaction monitoring
- *   - Krystal getMultiChainEvmBalances() → EVM balance snapshots
+ *   - evmProviderService.getMultiChainEvmBalances() → EVM balance snapshots
  *   - Direct RPC recent block scanning → EVM large transfers
  *
  * Philosophy: This agent is the early warning system. When whales move,
@@ -411,8 +411,8 @@ export class WhaleTrackerAgent extends BaseAgent {
     const alerts: WhaleAlert[] = [];
 
     try {
-      // Use Krystal's multi-chain balance scanner
-      const { getMultiChainEvmBalances } = await import('../launchkit/cfo/krystalService.ts');
+      // Use evmProviderService multi-chain balance scanner
+      const { getMultiChainEvmBalances } = await import('../launchkit/cfo/evmProviderService.ts');
       const chainBalances = await getMultiChainEvmBalances();
 
       for (const cb of chainBalances) {
@@ -463,7 +463,7 @@ export class WhaleTrackerAgent extends BaseAgent {
 
   private async scanEvmAddress(address: string, alerts: WhaleAlert[]): Promise<void> {
     try {
-      const { getEvmProvider } = await import('../launchkit/cfo/krystalService.ts');
+      const { getEvmProvider } = await import('../launchkit/cfo/evmProviderService.ts');
       const { getCFOEnv } = await import('../launchkit/cfo/cfoEnv.ts');
       const env = getCFOEnv();
 

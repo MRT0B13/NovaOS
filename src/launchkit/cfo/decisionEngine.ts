@@ -341,13 +341,15 @@ export type DecisionType =
   | 'ORCA_LP_CLOSE'          // close Orca LP position without reopening (capital withdrawal)
   | 'ORCA_LP_CLAIM_FEES'     // collect accumulated fees from Orca LP positions (without closing)
   | 'KAMINO_BORROW_LP'       // borrow from Kamino → swap → open Orca LP, fees repay loan
+  | 'AAVE_BORROW_LP'         // borrow from AAVE V3 → open EVM LP, fees repay loan
   | 'EVM_FLASH_ARB'          // Arbitrum: atomic flash loan arb via Aave v3 + DEX spread
-  | 'KRYSTAL_LP_OPEN'        // open EVM concentrated LP via Krystal-discovered pool
-  | 'KRYSTAL_LP_INCREASE'    // add liquidity to an existing EVM LP position (avoid duplicate mints)
-  | 'KRYSTAL_LP_REBALANCE'   // close + reopen out-of-range EVM LP (closeOnly=true → just close)
-  | 'KRYSTAL_LP_CLAIM_FEES'  // collect accumulated fees from EVM LP positions
+  | 'EVM_LP_OPEN'        // open EVM concentrated LP via EVM concentrated LP pool
+  | 'EVM_LP_INCREASE'    // add liquidity to an existing EVM LP position (avoid duplicate mints)
+  | 'EVM_LP_REBALANCE'   // close + reopen out-of-range EVM LP (closeOnly=true → just close)
+  | 'EVM_LP_CLAIM_FEES'  // collect accumulated fees from EVM LP positions
   | 'EVM_BRIDGE'             // bridge tokens between EVM chains (via LI.FI)
   | 'EVM_SWAP'               // same-chain token swap on EVM (via Uniswap V3 / LI.FI)
+  | 'REINVEST_SWEEP'         // sweep accumulated idle profits into best yield destination
   | 'HL_PERP_OPEN'           // open a directional perp trade (LONG or SHORT) based on signals
   | 'HL_PERP_CLOSE'          // close an existing perp trade (TP/SL hit or signal reversed)
   | 'HL_PERP_NEWS'           // news-reactive perp trade (fast entry, tight stops)
@@ -421,8 +423,8 @@ export interface SwarmIntel {
   analystPricesAt?: number;
   analystArbitrumVolume24h?: number;  // Arbitrum DEX 24h volume USD (DeFiLlama via Analyst)
 
-  // From Analyst — Krystal EVM LP opportunities
-  analystEvmLpOpportunities?: any[];  // top Krystal pools from analyst
+  // From Analyst — EVM LP opportunities
+  analystEvmLpOpportunities?: any[];  // top EVM pools from analyst
   analystEvmLpAt?: number;
 
   // Composite score (computed)
@@ -524,7 +526,7 @@ export interface PortfolioState {
   evmArbPoolCount: number;        // number of candidate pools currently tracked
   evmArbUsdcBalance: number;      // native USDC on Arbitrum (in EVM wallet)
 
-  // Krystal EVM LP state
+  // EVM LP state
   evmLpPositions: Array<{
     posId: string;
     chainName: string;
@@ -903,7 +905,7 @@ export async function gatherSwarmIntel(pool: any): Promise<SwarmIntel> {
           intel.analystTrending = payload.trending ?? [];
           intel.analystPricesAt = ts;
           intel.analystArbitrumVolume24h = payload.arbitrumVolume24h;
-          // Krystal EVM LP opportunities (from analyst fetchKrystalLpIntel)
+          // EVM LP opportunities (from analyst fetchEvmLpIntel)
           if (payload.evmLpOpportunities) {
             intel.analystEvmLpOpportunities = payload.evmLpOpportunities;
             intel.analystEvmLpAt = ts;
@@ -1203,7 +1205,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
             const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
             if (dbUrl) {
               const { Pool } = await import('pg');
-              const pgPool = new Pool({ connectionString: dbUrl, max: 1 });
+              const pgPool = new Pool({ connectionString: dbUrl, max: 1, keepAlive: true, keepAliveInitialDelayMillis: 10_000 });
               try {
                 const orcaDbRes = await pgPool.query(
                   `SELECT asset, metadata, current_value_usd FROM cfo_positions WHERE strategy = 'orca_lp' AND status = 'OPEN'`,
@@ -1263,7 +1265,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
       })());
     }
 
-    // ── Job C: EVM (Arb + Krystal LP + Multi-chain balances) ───────────
+    // ── Job C: EVM (Arb + EVM LP + Multi-chain balances) ───────────
     stage2Jobs.push((async () => {
       const evmJobs: Promise<void>[] = [];
 
@@ -1278,22 +1280,22 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
         })());
       }
 
-      // Job 2: Krystal EVM LP positions
-      if (env.krystalLpEnabled) {
+      // Job 2: EVM LP positions
+      if (env.evmLpEnabled) {
         evmJobs.push((async () => {
           try {
-            const krystal = await import('./krystalService.ts');
+            const evmLp = await import('./evmLpService.ts');
             const walletAddr = env.evmPrivateKey
               ? (await import('ethers' as string)).computeAddress(env.evmPrivateKey)
               : undefined;
             if (walletAddr) {
-            const dbRecords = (globalThis as any).__cfo_evm_lp_records as import('./krystalService.ts').EvmLpRecord[] | undefined;
-            const positions = await krystal.fetchKrystalPositions(walletAddr, dbRecords);
+            const dbRecords = (globalThis as any).__cfo_evm_lp_records as import('./evmLpService.ts').EvmLpRecord[] | undefined;
+            const positions = await evmLp.fetchEvmLpPositions(walletAddr, dbRecords);
 
             // Clean up positions confirmed closed on-chain (0 liquidity)
             if (positions.closedOnChainPosIds?.length) {
               for (const closedPosId of positions.closedOnChainPosIds) {
-                const existing = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('./krystalService.ts').EvmLpRecord[];
+                const existing = ((globalThis as any).__cfo_evm_lp_records ?? []) as import('./evmLpService.ts').EvmLpRecord[];
                 (globalThis as any).__cfo_evm_lp_records = existing.filter(r => r.posId !== closedPosId);
               }
               // Clean kv_store so they don't rehydrate on restart
@@ -1311,7 +1313,7 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
                         `UPDATE cfo_positions SET status = 'CLOSED', realized_pnl_usd = 0,
                          unrealized_pnl_usd = 0, current_value_usd = 0,
                          exit_tx_hash = 'closed-on-chain', closed_at = NOW(), updated_at = NOW()
-                         WHERE strategy = 'krystal_lp' AND status = 'OPEN'
+                         WHERE strategy = 'evm_lp' AND status = 'OPEN'
                          AND metadata->>'nfpmTokenId' = $1`,
                         [closedPosId],
                       );
@@ -1349,11 +1351,11 @@ export async function gatherPortfolioState(): Promise<PortfolioState> {
     }
 
     // Job 3: Multi-chain EVM balance scan
-      if (env.krystalLpEnabled || env.lifiEnabled) {
+      if (env.evmLpEnabled || env.lifiEnabled) {
         evmJobs.push((async () => {
           try {
-            const krystal = await import('./krystalService.ts');
-            const balances = await krystal.getMultiChainEvmBalances();
+            const evmProvider = await import('./evmProviderService.ts');
+            const balances = await evmProvider.getMultiChainEvmBalances();
             evmChainBalances        = balances;
             evmTotalUsdcAllChains   = balances.reduce((s, b) => s + b.totalStableUsd, 0);
             evmTotalNativeAllChains = balances.reduce((s, b) => s + b.nativeValueUsd + b.wethValueUsd, 0);
@@ -2614,7 +2616,7 @@ export async function generateDecisions(
   // rebalancing in bearish markets to avoid drifting out of range.
   if (env.orcaLpEnabled && intel.marketCondition !== 'danger') {
 
-    // ── Tier-based range width multipliers (mirrored from Krystal) ──
+    // ── Tier-based range width multipliers (mirrored from EVM LP) ──
     const ORCA_TIER_RANGE_MULT: Record<string, number> = {
       low: 0.3,    // stables barely move → narrow range captures more fees
       medium: 0.8, // tighter than old 1.0 — earn more fees while near-price
@@ -2687,6 +2689,8 @@ export async function generateDecisions(
             tokenA: pos.tokenA,
             tokenB: pos.tokenB,
             feesUsd,
+            marketCondition: intel.marketCondition,
+            kaminoBorrowUsd: state.kaminoBorrowValueUsd,
           },
           urgency: 'low',
           estimatedImpactUsd: feesUsd,
@@ -2697,20 +2701,20 @@ export async function generateDecisions(
     }
   }
 
-  // ── I-bis) Krystal EVM Concentrated LP ────────────────────────────────────
+  // ── I-bis) EVM Concentrated LP ────────────────────────────────────
   //
-  // Mirrors Section I (Orca LP) but on EVM chains, powered by Krystal Cloud API
+  // Mirrors Section I (Orca LP) but on EVM chains via DeFiLlama pool discovery
   // for pool discovery and Uniswap V3 NonfungiblePositionManager for execution.
   //
-  if (env.krystalLpEnabled && intel.marketCondition !== 'danger') {
-    const krystalSkip = (reason: string) =>
+  if (env.evmLpEnabled && intel.marketCondition !== 'danger') {
+    const evmLpSkip = (reason: string) =>
       logger.debug(`[CFO:Decision] Section I-bis skip: ${reason}`);
 
     // I-bis.0: Claim accumulated fees from existing positions
     for (const pos of state.evmLpPositions) {
-      if (pos.feesOwedUsd >= 2 && checkCooldown(`KRYSTAL_LP_CLAIM_${pos.posId}`, 4 * 3600_000)) {
+      if (pos.feesOwedUsd >= 2 && checkCooldown(`EVM_LP_CLAIM_${pos.posId}`, 4 * 3600_000)) {
         decisions.push({
-          type: 'KRYSTAL_LP_CLAIM_FEES',
+          type: 'EVM_LP_CLAIM_FEES',
           reasoning:
             `Collecting $${pos.feesOwedUsd.toFixed(2)} unclaimed fees from ` +
             `${pos.token0Symbol}/${pos.token1Symbol} LP on ${pos.chainName}.`,
@@ -2722,6 +2726,7 @@ export async function generateDecisions(
             token0Symbol: pos.token0Symbol,
             token1Symbol: pos.token1Symbol,
             feesOwedUsd: pos.feesOwedUsd,
+            marketCondition: intel.marketCondition,
           },
           urgency: 'low',
           estimatedImpactUsd: pos.feesOwedUsd,
@@ -2745,11 +2750,11 @@ export async function generateDecisions(
       const tierMult = _tierRangeMults[posTier] ?? 1.0;
       const learnedTierMult = learned.lpTierRangeMultipliers?.[posTier] ?? 1.0;
       if (
-        (!pos.inRange || pos.rangeUtilisationPct < env.krystalLpRebalanceTriggerPct) &&
-        checkCooldown(`KRYSTAL_LP_REBALANCE_${pos.posId}`, 6 * 3600_000) // 6h per-position cooldown
+        (!pos.inRange || pos.rangeUtilisationPct < env.evmLpRebalanceTriggerPct) &&
+        checkCooldown(`EVM_LP_REBALANCE_${pos.posId}`, 6 * 3600_000) // 6h per-position cooldown
       ) {
         decisions.push({
-          type: 'KRYSTAL_LP_REBALANCE',
+          type: 'EVM_LP_REBALANCE',
           reasoning:
             `[${posTier.toUpperCase()} risk] EVM LP ${pos.posId.slice(0, 8)} (${pos.token0Symbol}/${pos.token1Symbol}, ${pos.chainName}) ` +
             `${pos.inRange ? 'near range edge' : 'OUT OF RANGE'} ` +
@@ -2772,7 +2777,7 @@ export async function generateDecisions(
             rangeWidthTicks: Math.round(adaptiveLpRangeWidthTicks(
               pos.token0Symbol,
               intel,
-              env.krystalLpRangeWidthTicks * tierMult * learnedTierMult,
+              env.evmLpRangeWidthTicks * tierMult * learnedTierMult,
               learned,
               pos.token1Symbol,
             )),
@@ -2786,7 +2791,7 @@ export async function generateDecisions(
     }
 
     // I-bis.2: Open new EVM LP position(s) — 3-tier risk system
-    // Enabled tiers: env.krystalLpRiskTiers (e.g. ['low','medium','high'])
+    // Enabled tiers: env.evmLpRiskTiers (e.g. ['low','medium','high'])
     // Each tier picks the best pool of its class so the portfolio gets diversified
     // exposure across risk levels.
     //
@@ -2794,7 +2799,7 @@ export async function generateDecisions(
     //   medium = volatile/stable (WETH/USDC) → normal range
     //   high   = volatile/volatile (WETH/ARB) → wide range, high APR, high IL
     //
-    const evmLpHeadroomUsd = Math.max(0, env.krystalLpMaxUsd - state.evmLpTotalValueUsd);
+    const evmLpHeadroomUsd = Math.max(0, env.evmLpMaxUsd - state.evmLpTotalValueUsd);
     // Cap deploy to 80% of total deployable EVM value (stables + WETH + native).
     // The execution code (Phase 2b/3) handles swapping WETH/native → pool tokens,
     // so we should not gate on stablecoins alone.
@@ -2803,16 +2808,16 @@ export async function generateDecisions(
     if (
       evmLpHeadroomUsd >= 20 &&
       evmTotalDeployableUsd >= 20 &&
-      state.evmLpPositions.length < env.krystalLpMaxPositions &&
+      state.evmLpPositions.length < env.evmLpMaxPositions &&
       intel.marketCondition !== 'bearish' &&
-      checkCooldown('KRYSTAL_LP_OPEN', env.krystalLpOpenCooldownMs)
+      checkCooldown('EVM_LP_OPEN', env.evmLpOpenCooldownMs)
     ) {
       try {
-        const krystal = await import('./krystalService.ts');
-        const pools = await krystal.discoverKrystalPools();
+        const { discoverEvmPools } = await import('./evmPoolDiscovery.ts');
+        const pools = await discoverEvmPools();
 
         // Apply learned APR floor adjustment (raised if past LP positions underperformed)
-        const learnedMinApr = env.krystalLpMinApr7d + (learned.lpMinAprAdjustment * learned.confidenceLevel);
+        const learnedMinApr = env.evmLpMinApr7d + (learned.lpMinAprAdjustment * learned.confidenceLevel);
 
         // Build set of chains where we actually have deployable value (stables + native + WETH >= $10)
         // OR chains we can bridge to from a funded chain (any configured RPC chain)
@@ -2838,12 +2843,12 @@ export async function generateDecisions(
         );
 
         const eligible = pools.filter(p =>
-          p.tvlUsd >= env.krystalLpMinTvlUsd &&
+          p.tvlUsd >= env.evmLpMinTvlUsd &&
           p.apr7d >= learnedMinApr &&
           (env.evmRpcUrls[p.chainNumericId] || p.chainNumericId === 42161) &&
           deployableChainIds.has(p.chainNumericId) && // deploy on funded chains OR bridge-reachable chains
           gasReadyChainIds.has(p.chainNumericId) &&   // must have enough native gas on target chain
-          env.krystalLpRiskTiers.has(p.riskTier) &&
+          env.evmLpRiskTiers.has(p.riskTier) &&
           // Skip pools with known-unswappable tokens (populated by pre-flight failures, TTL 2h)
           !swapSvc.hasSwapFailure(p.chainNumericId, p.token0.address) &&
           !swapSvc.hasSwapFailure(p.chainNumericId, p.token1.address),
@@ -2891,7 +2896,7 @@ export async function generateDecisions(
         };
 
         // Split headroom across enabled tiers (equal share)
-        const enabledTiers = env.krystalLpRiskTiers;
+        const enabledTiers = env.evmLpRiskTiers;
         const perTierMaxUsd = evmLpHeadroomUsd / Math.max(enabledTiers.size, 1);
 
         // Group eligible pools by tier and pick the best from each
@@ -2905,7 +2910,7 @@ export async function generateDecisions(
 
         for (const tier of enabledTiers) {
           // Respect max positions (could have filled up from another tier)
-          if (state.evmLpPositions.length + tiersOpened >= env.krystalLpMaxPositions) break;
+          if (state.evmLpPositions.length + tiersOpened >= env.evmLpMaxPositions) break;
 
           // Exclude pools whose pair was already selected in another tier this cycle
           const tierPools = newPools.filter(p =>
@@ -2914,7 +2919,7 @@ export async function generateDecisions(
             !pairsSelectedThisCycle.has(`${p.chainNumericId}_${p.token1.symbol.toUpperCase()}_${p.token0.symbol.toUpperCase()}`),
           );
           if (tierPools.length === 0) {
-            krystalSkip(`no ${tier}-risk NEW pools pass filters (${newPools.length} new, ${increasePools.length} increase-eligible)`);
+            evmLpSkip(`no ${tier}-risk NEW pools pass filters (${newPools.length} new, ${increasePools.length} increase-eligible)`);
             continue;
           }
 
@@ -2922,7 +2927,7 @@ export async function generateDecisions(
 
           // Check: EVM APR must beat best Solana LP APR by 5% (skip this check for high-risk — APR compensates)
           if (tier !== 'high' && best.apr7d <= bestSolanaApr + 5) {
-            krystalSkip(`${tier} tier: best EVM APR ${best.apr7d.toFixed(1)}% doesn't beat Solana ${bestSolanaApr.toFixed(1)}% + 5%`);
+            evmLpSkip(`${tier} tier: best EVM APR ${best.apr7d.toFixed(1)}% doesn't beat Solana ${bestSolanaApr.toFixed(1)}% + 5%`);
             continue;
           }
 
@@ -2936,10 +2941,10 @@ export async function generateDecisions(
                 .reduce((s, b) => s + b.totalValueUsd, 0) * 0.97
             : 0;
           const effectiveValue = targetChainLocalValue + otherChainsValue;
-          const deployUsd = Math.min(perTierMaxUsd, env.krystalLpMaxUsd, evmDeployCap, effectiveValue * 0.9);
+          const deployUsd = Math.min(perTierMaxUsd, env.evmLpMaxUsd, evmDeployCap, effectiveValue * 0.9);
 
           if (deployUsd < 15) {
-            krystalSkip(`${tier} tier: deploy amount too small ($${deployUsd.toFixed(0)}, local=$${targetChainLocalValue.toFixed(0)}, bridgeable=$${otherChainsValue.toFixed(0)})`);
+            evmLpSkip(`${tier} tier: deploy amount too small ($${deployUsd.toFixed(0)}, local=$${targetChainLocalValue.toFixed(0)}, bridgeable=$${otherChainsValue.toFixed(0)})`);
             continue;
           }
 
@@ -2949,13 +2954,13 @@ export async function generateDecisions(
           const rangeWidthTicks = Math.round(adaptiveLpRangeWidthTicks(
             best.token0.symbol,
             intel,
-            env.krystalLpRangeWidthTicks * tierRangeMult * learnedTierMult,
+            env.evmLpRangeWidthTicks * tierRangeMult * learnedTierMult,
             learned,
             best.token1.symbol,
           ));
 
           decisions.push({
-            type: 'KRYSTAL_LP_OPEN',
+            type: 'EVM_LP_OPEN',
             reasoning:
               `Opening [${tier.toUpperCase()} risk] EVM LP: ${best.token0.symbol}/${best.token1.symbol} on ${best.chainName} ` +
               `($${deployUsd.toFixed(0)}) [risk: ${best.riskTier}]. Pool score: ${best.score.toFixed(0)}/100 — ` +
@@ -2994,7 +2999,7 @@ export async function generateDecisions(
               intel.analystEvmLpAt ? 'analyst' : '',
               intel.guardianReceivedAt ? 'guardian' : '',
             ].filter(Boolean),
-            tier: classifyTier('KRYSTAL_LP_OPEN', 'low', deployUsd, config, intel.marketCondition),
+            tier: classifyTier('EVM_LP_OPEN', 'low', deployUsd, config, intel.marketCondition),
           });
           tiersOpened++;
 
@@ -3008,11 +3013,11 @@ export async function generateDecisions(
           existingPairMap.set(pairKey1, { posId: 'pending', inRange: true, valueUsd: deployUsd });
         }
 
-        // ── KRYSTAL_LP_INCREASE: add liquidity to existing in-range positions ──
+        // ── EVM_LP_INCREASE: add liquidity to existing in-range positions ──
         // Instead of opening duplicate positions, route funds to existing ones.
         // Gated by: cooldown, learning engine pair performance, and minimum APR.
         // Doesn't count toward tiersOpened or max positions.
-        if (checkCooldown('KRYSTAL_LP_INCREASE', 6 * 3600_000)) {
+        if (checkCooldown('EVM_LP_INCREASE', 6 * 3600_000)) {
           // Only increase positions whose pair is in the learning engine's "bestPairs"
           // or has too few data points to judge (benefit of the doubt).
           const learnedBestPairs = new Set(
@@ -3027,18 +3032,18 @@ export async function generateDecisions(
             // Learning gate: skip pairs that are performing badly (known, not in bestPairs)
             if (hasEnoughLearningData && learnedBestPairs.size > 0 &&
                 !learnedBestPairs.has(pairKey) && !learnedBestPairs.has(pairKeyRev)) {
-              krystalSkip(`increase: ${pairKey} not in learned bestPairs — waiting for more data`);
+              evmLpSkip(`increase: ${pairKey} not in learned bestPairs — waiting for more data`);
               continue;
             }
 
             // Cap deploy per increase to per-tier budget
             const targetChainBal = state.evmChainBalances.find(b => b.chainId === incPool.chainNumericId);
             const localValue = targetChainBal?.totalValueUsd ?? 0;
-            const deployUsd = Math.min(perTierMaxUsd, env.krystalLpMaxUsd, evmDeployCap, localValue * 0.9);
+            const deployUsd = Math.min(perTierMaxUsd, env.evmLpMaxUsd, evmDeployCap, localValue * 0.9);
             if (deployUsd < 10) continue; // too small to bother
 
             decisions.push({
-              type: 'KRYSTAL_LP_INCREASE',
+              type: 'EVM_LP_INCREASE',
               reasoning:
                 `Adding $${deployUsd.toFixed(0)} to existing ${incPool.token0.symbol}/${incPool.token1.symbol} LP #${existing.posId} on ${incPool.chainName} ` +
                 `(current $${existing.valueUsd.toFixed(0)}, in-range). APR7d ${incPool.apr7d.toFixed(1)}%.`,
@@ -3065,17 +3070,17 @@ export async function generateDecisions(
                 intel.analystEvmLpAt ? 'analyst' : '',
                 intel.guardianReceivedAt ? 'guardian' : '',
               ].filter(Boolean),
-              tier: classifyTier('KRYSTAL_LP_INCREASE', 'low', deployUsd, config, intel.marketCondition),
+              tier: classifyTier('EVM_LP_INCREASE', 'low', deployUsd, config, intel.marketCondition),
             });
           }
         }
 
         if (tiersOpened === 0 && newPools.length === 0 && increasePools.length === 0) {
-          krystalSkip('no eligible pools (' + pools.length + ' total, 0 pass filters' +
-            ' — allowed tiers: ' + [...env.krystalLpRiskTiers].join(',') + ')');
+          evmLpSkip('no eligible pools (' + pools.length + ' total, 0 pass filters' +
+            ' — allowed tiers: ' + [...env.evmLpRiskTiers].join(',') + ')');
         }
       } catch (err) {
-        logger.debug('[CFO:Decision] Krystal pool discovery failed:', err);
+        logger.debug('[CFO:Decision] EVM pool discovery failed:', err);
       }
     }
   }
@@ -3498,6 +3503,238 @@ export async function generateDecisions(
         tier: 'APPROVAL',
       });
       logger.info(`[CFO:Decision] Section K-bis: standalone ORCA_LP_OPEN $${deployUsd.toFixed(0)} into ${pair} (no Kamino borrow)`);
+    }
+  }
+
+  // ── Section L) AAVE V3 Borrow → EVM LP (multi-chain) ─────────────────────
+  // Mirror of Section K but for EVM: borrow stablecoins from AAVE V3 →
+  // deploy into EVM concentrated LP position → fees repay the loan.
+  if (
+    env.aaveBorrowLpEnabled &&
+    env.evmLpEnabled &&
+    intel.marketCondition !== 'danger'
+  ) {
+    const aaveLpSkip = (reason: string) => {
+      logger.debug(`[CFO:Decision] Section L skip: ${reason}`);
+    };
+
+    // Determine which chains to scan for AAVE borrow capacity
+    const aaveChains = env.aaveBorrowLpChains
+      .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    const chainIdMap: Record<string, number> = {
+      arbitrum: 42161, base: 8453, polygon: 137, optimism: 10,
+    };
+
+    let aaveLpGenerated = false;
+
+    for (const chainName of aaveChains) {
+      const chainId = chainIdMap[chainName];
+      if (!chainId) { aaveLpSkip(`unknown chain: ${chainName}`); continue; }
+
+      try {
+        const aaveMod = await import('./aaveLendingService.ts');
+        const accountData = await aaveMod.getAaveAccountData(chainId);
+
+        if (accountData.totalCollateralUsd < 10) {
+          aaveLpSkip(`no AAVE collateral on ${chainName} ($${accountData.totalCollateralUsd.toFixed(0)})`);
+          continue;
+        }
+        if (accountData.healthFactor < 2.0) {
+          aaveLpSkip(`AAVE health factor ${accountData.healthFactor.toFixed(2)} < 2.0 on ${chainName}`);
+          continue;
+        }
+        if (accountData.ltv >= (env.aaveBorrowLpMaxLtvPct / 100) * 0.90) {
+          aaveLpSkip(`AAVE LTV ${(accountData.ltv * 100).toFixed(1)}% too close to cap ${env.aaveBorrowLpMaxLtvPct}% on ${chainName}`);
+          continue;
+        }
+        if ((learned.aaveBorrowLpCycleCount ?? 0) >= 3 && (learned.aaveBorrowLpNetYield ?? 0) < -5) {
+          aaveLpSkip(`learning: aaveBorrowLpNetYield=${(learned.aaveBorrowLpNetYield ?? 0).toFixed(1)}% after ${learned.aaveBorrowLpCycleCount} cycles — pausing`);
+          continue;
+        }
+        if (state.evmLpPositions.length >= env.evmLpMaxPositions) {
+          aaveLpSkip(`already at max EVM LP positions (${state.evmLpPositions.length}/${env.evmLpMaxPositions})`);
+          continue;
+        }
+        if (!checkCooldown('AAVE_BORROW_LP', 4 * 3600_000)) {
+          aaveLpSkip('cooldown (4h)');
+          continue;
+        }
+
+        // Calculate safe borrow amount
+        const maxBorrowLtv = env.aaveBorrowLpMaxLtvPct / 100;
+        const headroomUsd = Math.max(0,
+          accountData.totalCollateralUsd * maxBorrowLtv - accountData.totalDebtUsd,
+        );
+        const fractionToUse = (env.aaveBorrowLpCapacityPct ?? 20) / 100;
+        const totalBorrowBudget = Math.min(
+          headroomUsd * fractionToUse,
+          env.aaveBorrowLpMaxUsd,
+          accountData.availableBorrowsUsd * 0.90,
+          env.evmLpMaxUsd - state.evmLpTotalValueUsd,
+        );
+
+        // Get AAVE borrow cost for USDC on this chain
+        const apys = await aaveMod.fetchAaveApys(chainId);
+        const borrowCost = apys['USDC']?.borrowApy ?? apys['USDC.e']?.borrowApy ?? 0.06;
+
+        // Estimated LP fee APY from discovered pools (or conservative fallback)
+        const estimatedLpFeeApy = 0.15;
+        const spreadPct = (estimatedLpFeeApy - borrowCost) * 100;
+
+        if (totalBorrowBudget < 10) {
+          aaveLpSkip(`borrow budget $${totalBorrowBudget.toFixed(0)} too small on ${chainName}`);
+          continue;
+        }
+        if (spreadPct < (env.aaveBorrowLpMinSpreadPct ?? 5)) {
+          aaveLpSkip(`spread ${spreadPct.toFixed(1)}% < min ${env.aaveBorrowLpMinSpreadPct ?? 5}% on ${chainName}`);
+          continue;
+        }
+
+        // Discover best EVM pool on this chain for the LP deployment
+        let bestPool: any = null;
+        try {
+          const poolDisc = await import('./evmPoolDiscovery.ts');
+          const selection = await poolDisc.selectBestEvmPool({
+            chainFilter: chainName,
+            minTvlUsd: env.evmLpMinTvlUsd,
+            minApr7d: env.evmLpMinApr7d,
+          });
+          bestPool = selection;
+        } catch (poolErr) {
+          logger.debug(`[CFO:Decision] Section L: pool discovery failed on ${chainName}: ${(poolErr as Error).message}`);
+        }
+
+        const enabledTiers = env.evmLpRiskTiers;
+        const slotsAvailable = env.evmLpMaxPositions - state.evmLpPositions.length;
+        const perTierBudget = totalBorrowBudget / Math.max(enabledTiers.size, 1);
+        let tiersOpened = 0;
+        let budgetUsed = 0;
+
+        for (const tier of enabledTiers) {
+          if (tiersOpened >= slotsAvailable) break;
+
+          const remainingBudget = totalBorrowBudget - budgetUsed;
+          const borrowUsd = Math.min(perTierBudget, remainingBudget);
+
+          if (borrowUsd < 10) {
+            aaveLpSkip(`${tier} tier: borrow $${borrowUsd.toFixed(0)} too small on ${chainName}`);
+            continue;
+          }
+
+          const learnedTierMult = learned.lpTierRangeMultipliers?.[tier] ?? 1.0;
+          const tierRangeMult: Record<string, number> = { low: 0.3, medium: 0.8, high: 1.5 };
+          const rangeWidthPct = (env.evmLpRebalanceTriggerPct ?? 10) * (tierRangeMult[tier] ?? 1.0) * learnedTierMult;
+
+          const postBorrowLtv = (accountData.totalDebtUsd + borrowUsd) /
+            Math.max(accountData.totalCollateralUsd, 1);
+
+          decisions.push({
+            type: 'AAVE_BORROW_LP',
+            reasoning:
+              `[${tier.toUpperCase()} risk] Borrow $${borrowUsd.toFixed(0)} USDC from AAVE V3 on ${chainName} ` +
+              `(${(fractionToUse * 100).toFixed(0)}% of headroom) → deploy into EVM concentrated LP. ` +
+              `Est. LP fee yield ~${(estimatedLpFeeApy * 100).toFixed(0)}% vs borrow cost ~${(borrowCost * 100).toFixed(0)}% ` +
+              `= ${spreadPct.toFixed(1)}% spread. Post-borrow LTV: ~${(postBorrowLtv * 100).toFixed(0)}%. ` +
+              `LP fees accrue → close LP → repay AAVE → keep profit.`,
+            params: {
+              chainId,
+              chainName,
+              borrowUsd,
+              borrowAsset: 'USDC',
+              rangeWidthPct,
+              estimatedLpApy: estimatedLpFeeApy,
+              borrowApy: borrowCost,
+              spreadPct,
+              riskTier: tier,
+              postBorrowLtv,
+              poolAddress: bestPool?.poolAddress,
+              poolChain: bestPool?.chainName ?? chainName,
+              token0Symbol: bestPool?.token0?.symbol,
+              token1Symbol: bestPool?.token1?.symbol,
+              token0Address: bestPool?.token0?.address,
+              token1Address: bestPool?.token1?.address,
+              token0Decimals: bestPool?.token0?.decimals,
+              token1Decimals: bestPool?.token1?.decimals,
+              protocol: bestPool?.protocol,
+            },
+            urgency: 'low',
+            estimatedImpactUsd: borrowUsd * (estimatedLpFeeApy - borrowCost),
+            intelUsed: [],
+            tier: 'APPROVAL',   // ALWAYS require admin approval for borrowed money
+          });
+
+          tiersOpened++;
+          budgetUsed += borrowUsd;
+
+          logger.info(
+            `[CFO:Decision] Section L: AAVE_BORROW_LP [${tier}] on ${chainName} — ` +
+            `borrow $${borrowUsd.toFixed(0)} → EVM LP (spread ${spreadPct.toFixed(1)}%, ` +
+            `post-LTV ${(postBorrowLtv * 100).toFixed(0)}%)`,
+          );
+        }
+
+        if (tiersOpened > 0) {
+          markDecision('AAVE_BORROW_LP');
+          aaveLpGenerated = true;
+        }
+      } catch (err) {
+        aaveLpSkip(`error on ${chainName}: ${(err as Error).message}`);
+      }
+    }
+
+    if (aaveLpGenerated) {
+      diag.push('AaveBorrowLP:✓');
+    }
+  }
+
+  // ── Section M-sweep) Periodic Profit Reinvestment Sweep ───────────────────
+  //
+  // Check if accumulated idle profits from fee claims exceed the reinvestment
+  // threshold. If so, generate a REINVEST_SWEEP decision to route them to the
+  // best yield destination.
+  //
+  if (
+    env.reinvestEnabled &&
+    intel.marketCondition !== 'danger' &&
+    checkCooldown('REINVEST_SWEEP', (env.reinvestSweepIntervalH ?? 0.5) * 3600_000)
+  ) {
+    try {
+      const reinvest = await import('./reinvestmentEngine.ts');
+      const accumulated = reinvest.getAccumulatedFees();
+      let solPriceForSweep = 85;
+      try { const pyth = await import('./pythOracleService.ts'); solPriceForSweep = await pyth.getSolPrice(); } catch { /* fallback */ }
+      const solanaUsd = (accumulated.solana.solAmount * solPriceForSweep) + accumulated.solana.usdcAmount;
+      let evmTotalUsd = 0;
+      for (const acc of Object.values(accumulated.evm)) {
+        evmTotalUsd += acc.stableAmount;
+      }
+      const totalAccumulatedUsd = solanaUsd + evmTotalUsd;
+      const minSweepUsd = env.reinvestMinUsd ?? 10;
+
+      if (totalAccumulatedUsd >= minSweepUsd) {
+        decisions.push({
+          type: 'REINVEST_SWEEP',
+          reasoning:
+            `$${totalAccumulatedUsd.toFixed(2)} in accumulated idle profits ` +
+            `(Solana: $${solanaUsd.toFixed(2)}, EVM: $${evmTotalUsd.toFixed(2)}) — ` +
+            `routing to optimal yield destinations.`,
+          params: {
+            totalAccumulatedUsd,
+            solanaUsd,
+            evmTotalUsd,
+            solPriceUsd: solPriceForSweep,
+            marketCondition: intel.marketCondition,
+            kaminoBorrowUsd: state.kaminoBorrowValueUsd,
+          },
+          urgency: 'low',
+          estimatedImpactUsd: totalAccumulatedUsd * 0.05, // ~5% yield benefit estimate
+          intelUsed: [],
+          tier: 'AUTO',
+        });
+        diag.push(`ReinvestSweep:$${totalAccumulatedUsd.toFixed(0)}`);
+      }
+    } catch (err) {
+      logger.debug(`[CFO:Decision] Section M-sweep skip: ${(err as Error).message}`);
     }
   }
 
@@ -4997,16 +5234,16 @@ export async function generateDecisions(
       else diag.push('OrcaLP:needs-borrow-enable');
     }
 
-    // I-bis: Krystal EVM LP (3-tier risk system)
-    if (env.krystalLpEnabled) {
-      const tierTag = [...env.krystalLpRiskTiers].join('/');
-      if (state.evmLpPositions.length > 0) diag.push(`KrystalLP:active(${state.evmLpPositions.length})[${tierTag}]`);
-      else if (intel.marketCondition === 'danger') diag.push('KrystalLP:danger');
-      else if (state.evmTotalUsdcAllChains + state.evmTotalNativeAllChains < 20) diag.push(`KrystalLP:low-funds($${(state.evmTotalUsdcAllChains + state.evmTotalNativeAllChains).toFixed(0)})`);
-      else if (state.evmLpPositions.length >= env.krystalLpMaxPositions) diag.push(`KrystalLP:max-pos(${state.evmLpPositions.length})`);
-      else if (intel.marketCondition === 'bearish') diag.push('KrystalLP:bearish');
-      else if (!checkCooldown('KRYSTAL_LP_OPEN', env.krystalLpOpenCooldownMs)) diag.push('KrystalLP:cooldown');
-      else diag.push(`KrystalLP:seeking[${tierTag}]`);
+    // I-bis: EVM LP (3-tier risk system)
+    if (env.evmLpEnabled) {
+      const tierTag = [...env.evmLpRiskTiers].join('/');
+      if (state.evmLpPositions.length > 0) diag.push(`EvmLP:active(${state.evmLpPositions.length})[${tierTag}]`);
+      else if (intel.marketCondition === 'danger') diag.push('EvmLP:danger');
+      else if (state.evmTotalUsdcAllChains + state.evmTotalNativeAllChains < 20) diag.push(`EvmLP:low-funds($${(state.evmTotalUsdcAllChains + state.evmTotalNativeAllChains).toFixed(0)})`);
+      else if (state.evmLpPositions.length >= env.evmLpMaxPositions) diag.push(`EvmLP:max-pos(${state.evmLpPositions.length})`);
+      else if (intel.marketCondition === 'bearish') diag.push('EvmLP:bearish');
+      else if (!checkCooldown('EVM_LP_OPEN', env.evmLpOpenCooldownMs)) diag.push('EvmLP:cooldown');
+      else diag.push(`EvmLP:seeking[${tierTag}]`);
     }
 
     // J: Arb
@@ -5023,6 +5260,14 @@ export async function generateDecisions(
       else if (intel.marketCondition === 'bearish' || intel.marketCondition === 'danger') diag.push(`BorrowLP:market-${intel.marketCondition}`);
       else if (_borrowLpLastSkip) diag.push(`BorrowLP:${_borrowLpLastSkip}`);
       else diag.push('BorrowLP:skip(unknown)');
+    }
+
+    // L: AAVE-funded EVM LP
+    if (env.aaveBorrowLpEnabled) {
+      if (decisions.some(d => d.type === 'AAVE_BORROW_LP')) diag.push('AaveBorrowLP:✓');
+      else if (!env.evmLpEnabled) diag.push('AaveBorrowLP:evm-lp-off');
+      else if (intel.marketCondition === 'danger') diag.push('AaveBorrowLP:danger');
+      else diag.push('AaveBorrowLP:skip');
     }
 
     // M: HL Perp Trading (signal-driven)
@@ -5079,14 +5324,14 @@ export async function generateDecisions(
   // on the same (about-to-be-burned) position just causes "nonexistent token" errors.
   const rebalancePosIds = new Set(
     decisions
-      .filter(d => d.type === 'KRYSTAL_LP_REBALANCE')
+      .filter(d => d.type === 'EVM_LP_REBALANCE')
       .map(d => d.params.posId)
       .filter(Boolean),
   );
   if (rebalancePosIds.size > 0) {
     const before = decisions.length;
     decisions = decisions.filter(d => {
-      if (d.type === 'KRYSTAL_LP_CLAIM_FEES' && rebalancePosIds.has(d.params.posId)) {
+      if (d.type === 'EVM_LP_CLAIM_FEES' && rebalancePosIds.has(d.params.posId)) {
         logger.info(`[CFO:Decision] Dropping CLAIM_FEES for posId=${d.params.posId} — REBALANCE already collects fees during close`);
         return false;
       }
@@ -5102,7 +5347,7 @@ export async function generateDecisions(
   // Split decisions into trading vs non-trading, then merge with reserved slots.
   const TRADING_TYPES = new Set([
     'HL_PERP_OPEN', 'HL_SPOT_BUY', 'HL_SPOT_SELL',
-    'KAMINO_BORROW_LP', 'ORCA_LP_OPEN', 'EVM_FLASH_ARB', 'EVM_LP_OPEN',
+    'KAMINO_BORROW_LP', 'AAVE_BORROW_LP', 'ORCA_LP_OPEN', 'EVM_FLASH_ARB', 'EVM_LP_OPEN',
   ]);
   const tradingDecisions = decisions.filter(d => TRADING_TYPES.has(d.type));
   const infraDecisions = decisions.filter(d => !TRADING_TYPES.has(d.type));
@@ -5646,6 +5891,29 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         let solPriceForClaim = 85;
         try { const pyth = await import('./pythOracleService.ts'); solPriceForClaim = await pyth.getSolPrice(); } catch { /* fallback */ }
         const claimedUsd = (claimResult.solClaimed * solPriceForClaim) + claimResult.usdcClaimed;
+
+        // ── Post-claim reinvestment hook ──
+        if (claimResult.success && env.reinvestEnabled && claimedUsd > 0) {
+          try {
+            const reinvest = await import('./reinvestmentEngine.ts');
+            const reinvestResult = await reinvest.handleOrcaClaimProceeds({
+              solClaimed: claimResult.solClaimed,
+              usdcClaimed: claimResult.usdcClaimed,
+              solPriceUsd: solPriceForClaim,
+              marketCondition: decision.params.marketCondition ?? 'neutral',
+              kaminoBorrowUsd: decision.params.kaminoBorrowUsd,
+            });
+            if (reinvestResult.reinvested && reinvestResult.result) {
+              logger.info(
+                `[CFO:Reinvest] Orca claim $${claimedUsd.toFixed(2)} → ${reinvestResult.result.target}: ` +
+                `${reinvestResult.result.success ? 'OK' : reinvestResult.result.error}`,
+              );
+            }
+          } catch (reinvestErr) {
+            logger.warn(`[CFO:Reinvest] Post-claim hook failed (non-fatal):`, reinvestErr);
+          }
+        }
+
         return {
           ...base,
           executed: true,
@@ -5916,6 +6184,81 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         } as DecisionResult & { txHash?: string; positionMint?: string };
       }
 
+      case 'AAVE_BORROW_LP': {
+        // AAVE V3 Borrow → EVM LP loop (EVM equivalent of KAMINO_BORROW_LP)
+        // Step 1: Borrow USDC from AAVE V3
+        // Step 2: Open EVM concentrated LP with borrowed funds
+        // Step 3: LP fees accrue → close LP → repay AAVE → keep profit
+        const aaveMod = await import('./aaveLendingService.ts');
+        const evmLpMod = await import('./evmLpService.ts');
+        const {
+          chainId, chainName, borrowUsd, borrowAsset,
+          rangeWidthPct, poolAddress, poolChain,
+          token0Symbol, token1Symbol, token0Address, token1Address,
+          token0Decimals, token1Decimals, protocol, riskTier,
+        } = decision.params;
+
+        // Step 1: Borrow stablecoins from AAVE
+        const borrowResult = await aaveMod.borrowFromAave(chainId, borrowAsset ?? 'USDC', borrowUsd);
+        if (!borrowResult.success) {
+          return { ...base, executed: true, success: false, error: `AAVE borrow failed: ${borrowResult.error}` };
+        }
+        logger.info(`[CFO] AAVE_BORROW_LP step 1: borrowed $${borrowUsd.toFixed(0)} ${borrowAsset} on ${chainName} | tx: ${borrowResult.txHash}`);
+
+        // Step 2: Open EVM LP position with borrowed funds
+        // The borrowed USDC stays in the wallet on the same chain — deploy into LP
+        const lpResult = await evmLpMod.openEvmLpPosition({
+          chainName: poolChain ?? chainName,
+          poolAddress,
+          depositUsd: borrowUsd,
+          rangeWidthPct: rangeWidthPct ?? 10,
+          riskTier: riskTier ?? 'medium',
+        });
+
+        if (!lpResult.success) {
+          // LP open failed — repay the borrowed amount
+          markDecision('AAVE_BORROW_LP');
+          logger.error(`[CFO] AAVE_BORROW_LP LP open failed — repaying borrowed ${borrowAsset}`);
+          let unwindNote = 'Repay not attempted';
+          try {
+            const repayResult = await aaveMod.repayAave(chainId, borrowAsset ?? 'USDC', borrowUsd * 0.995);
+            unwindNote = repayResult.success
+              ? `Auto-repay OK: $${borrowUsd.toFixed(0)}`
+              : `Repay failed: ${repayResult.error}`;
+          } catch (repayErr) {
+            unwindNote = `Repay error: ${(repayErr as Error).message}`;
+          }
+          // Alert admin if rollback failed
+          if (!unwindNote.startsWith('Auto-repay OK')) {
+            try {
+              const { notifyAdminForce } = await import('../services/adminNotify.ts');
+              await notifyAdminForce(
+                `⚠️ AAVE_BORROW_LP rollback incomplete\n` +
+                `Borrowed $${borrowUsd.toFixed(0)} ${borrowAsset} on ${chainName} but LP open failed.\n` +
+                `${unwindNote}\n` +
+                `Action needed: manually repay AAVE on ${chainName}.`,
+              );
+            } catch { /* best-effort */ }
+          }
+          return { ...base, executed: true, success: false, error: `LP open failed: ${lpResult.error}. ${unwindNote}` };
+        }
+
+        markDecision('AAVE_BORROW_LP');
+        logger.info(
+          `[CFO] AAVE_BORROW_LP step 2: opened EVM LP on ${chainName} ` +
+          `(${token0Symbol ?? '?'}/${token1Symbol ?? '?'}) | tx: ${lpResult.txHash}`,
+        );
+
+        return {
+          ...base,
+          executed: true,
+          success: true,
+          txId: lpResult.positionId ?? lpResult.txHash,
+          txHash: lpResult.txHash,
+          valueLocked: borrowUsd,
+        } as DecisionResult & { txHash?: string; valueLocked?: number };
+      }
+
       case 'EVM_FLASH_ARB': {
         const arb = await import('./evmArbService.ts');
         const { opportunity, ethPriceUsd } = decision.params;
@@ -6062,8 +6405,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         };
       }
 
-      case 'KRYSTAL_LP_OPEN': {
-        const krystal = await import('./krystalService.ts');
+      case 'EVM_LP_OPEN': {
+        const evmLp = await import('./evmLpService.ts');
         const { pool, deployUsd, rangeWidthTicks, bridgeFunding } = decision.params;
 
         // Compute wallet address for bridge funding if needed
@@ -6076,9 +6419,9 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           };
         }
 
-        const result = await krystal.openEvmLpPosition(pool, deployUsd, rangeWidthTicks, resolvedBridgeFunding);
+        const result = await evmLp.openEvmLpPosition(pool, deployUsd, rangeWidthTicks, resolvedBridgeFunding);
         if (result.success) {
-          markDecision('KRYSTAL_LP_OPEN');
+          markDecision('EVM_LP_OPEN');
         } else {
           // Mark cooldown on deterministic/repeatable failures to prevent
           // hammering the same doomed open every cycle (insufficient funds,
@@ -6096,8 +6439,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
             err.includes('would revert') || // pre-flight simulation failure (STF, etc.)
             err.includes('stf')              // SafeTransferFrom — token contract blocking transfers
           ) {
-            markDecision('KRYSTAL_LP_OPEN');
-            logger.info(`[CFO:Decision] KRYSTAL_LP_OPEN failed (deterministic) — marking cooldown to avoid retry: ${err.slice(0, 80)}`);
+            markDecision('EVM_LP_OPEN');
+            logger.info(`[CFO:Decision] EVM_LP_OPEN failed (deterministic) — marking cooldown to avoid retry: ${err.slice(0, 80)}`);
           }
         }
         return {
@@ -6111,18 +6454,18 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         } as DecisionResult & { txHash?: string; actualDeployUsd?: number };
       }
 
-      case 'KRYSTAL_LP_INCREASE': {
-        const krystal = await import('./krystalService.ts');
+      case 'EVM_LP_INCREASE': {
+        const evmLp = await import('./evmLpService.ts');
         const { pool, deployUsd, existingPosId } = decision.params;
 
         if (!existingPosId) {
-          return { ...base, executed: false, error: 'KRYSTAL_LP_INCREASE missing existingPosId' };
+          return { ...base, executed: false, error: 'EVM_LP_INCREASE missing existingPosId' };
         }
 
         // Reuse openEvmLpPosition with existingTokenId → calls increaseLiquidity instead of mint
-        const result = await krystal.openEvmLpPosition(pool, deployUsd, 0, undefined, existingPosId);
+        const result = await evmLp.openEvmLpPosition(pool, deployUsd, 0, undefined, existingPosId);
         if (result.success) {
-          markDecision('KRYSTAL_LP_INCREASE');
+          markDecision('EVM_LP_INCREASE');
         } else {
           const err = String(result.error ?? '').toLowerCase();
           // Deterministic failures (ownership/metadata/revert preflight) should not be retried every cycle.
@@ -6132,7 +6475,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
             err.includes('position has zero liquidity') ||
             err.includes('owner')
           ) {
-            markDecision('KRYSTAL_LP_INCREASE');
+            markDecision('EVM_LP_INCREASE');
           }
         }
         return {
@@ -6146,8 +6489,8 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         } as DecisionResult & { txHash?: string; actualDeployUsd?: number };
       }
 
-      case 'KRYSTAL_LP_REBALANCE': {
-        const krystal = await import('./krystalService.ts');
+      case 'EVM_LP_REBALANCE': {
+        const evmLp = await import('./evmLpService.ts');
         const { posId, chainNumericId, closeOnly, rangeWidthTicks, protocol: rebalProto } = decision.params;
         const chainId = decision.params.chainName
           ? `${decision.params.chainName}@${chainNumericId}`
@@ -6162,7 +6505,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           : undefined;
 
         // Use standalone rebalance function
-        const { closeResult, openResult } = await krystal.rebalanceEvmLpPosition({
+        const { closeResult, openResult } = await evmLp.rebalanceEvmLpPosition({
           posId,
           chainId,
           chainNumericId,
@@ -6178,10 +6521,10 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         if (!closeResult.success) {
           return { ...base, executed: true, success: false, error: `Close failed: ${closeResult.error}` };
         }
-        logger.info(`[CFO] KRYSTAL_LP_REBALANCE: closed posId=${posId} | tx=${closeResult.txHash}`);
+        logger.info(`[CFO] EVM_LP_REBALANCE: closed posId=${posId} | tx=${closeResult.txHash}`);
 
         if (openResult?.success) {
-          markDecision('KRYSTAL_LP_OPEN');
+          markDecision('EVM_LP_OPEN');
           return {
             ...base,
             executed: true,
@@ -6197,7 +6540,7 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
         // The next LP-open cycle will automatically pick them up and redeploy.
         const reopenErr = openResult?.error ?? 'unknown';
         logger.warn(
-          `[CFO] KRYSTAL_LP_REBALANCE: close OK but reopen FAILED for posId=${posId} — ` +
+          `[CFO] EVM_LP_REBALANCE: close OK but reopen FAILED for posId=${posId} — ` +
           `error: ${reopenErr}. Recovered funds are idle in EVM wallet and will be ` +
           `redeployed on next LP-open cycle.`,
         );
@@ -6210,16 +6553,37 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           );
         } catch { /* non-fatal */ }
 
-        markDecision('KRYSTAL_LP_REBALANCE');
+        markDecision('EVM_LP_REBALANCE');
         return { ...base, executed: true, success: true, txId: closeResult.txHash, error: `Reopen failed: ${reopenErr}` };
       }
 
-      case 'KRYSTAL_LP_CLAIM_FEES': {
-        const krystal = await import('./krystalService.ts');
+      case 'EVM_LP_CLAIM_FEES': {
+        const evmLp = await import('./evmLpService.ts');
         const { posId, chainNumericId, chainName, protocol: claimProto } = decision.params;
         const chainId = `${chainName}@${chainNumericId}`;
-        const result = await krystal.claimEvmLpFees({ posId, chainId, chainNumericId, protocol: claimProto });
-        if (result.success) markDecision(`KRYSTAL_LP_CLAIM_${posId}`);
+        const result = await evmLp.claimEvmLpFees({ posId, chainId, chainNumericId, protocol: claimProto });
+        if (result.success) markDecision(`EVM_LP_CLAIM_${posId}`);
+
+        // ── Post-claim reinvestment hook ──
+        if (result.success && env.reinvestEnabled && (decision.params.feesOwedUsd ?? 0) > 0) {
+          try {
+            const reinvest = await import('./reinvestmentEngine.ts');
+            const reinvestResult = await reinvest.handleEvmClaimProceeds({
+              chainNumericId,
+              estimatedUsd: decision.params.feesOwedUsd ?? 0,
+              marketCondition: decision.params.marketCondition ?? 'neutral',
+            });
+            if (reinvestResult.reinvested && reinvestResult.result) {
+              logger.info(
+                `[CFO:Reinvest] EVM claim $${(decision.params.feesOwedUsd ?? 0).toFixed(2)} on ${chainName} → ` +
+                `${reinvestResult.result.target}: ${reinvestResult.result.success ? 'OK' : reinvestResult.result.error}`,
+              );
+            }
+          } catch (reinvestErr) {
+            logger.warn(`[CFO:Reinvest] EVM post-claim hook failed (non-fatal):`, reinvestErr);
+          }
+        }
+
         return {
           ...base,
           executed: true,
@@ -6227,6 +6591,31 @@ export async function executeDecision(decision: Decision, env: CFOEnv): Promise<
           txId: result.txHash,
           error: result.error,
         };
+      }
+
+      // ── Profit Reinvestment Sweep ───────────────────────────────────
+      case 'REINVEST_SWEEP': {
+        const reinvest = await import('./reinvestmentEngine.ts');
+        const { solPriceUsd, marketCondition: mc, kaminoBorrowUsd } = decision.params;
+        const sweepResults = await reinvest.sweepAccumulatedProfits({
+          marketCondition: mc ?? 'neutral',
+          solPriceUsd: solPriceUsd ?? 85,
+          kaminoBorrowUsd,
+        });
+        const successCount = sweepResults.filter(r => r.result.success).length;
+        if (successCount > 0) markDecision('REINVEST_SWEEP');
+        const totalReinvested = sweepResults.reduce((s, r) => s + (r.result.success ? r.result.amountUsd : 0), 0);
+        logger.info(
+          `[CFO:Reinvest] Sweep complete: ${successCount}/${sweepResults.length} chains, ` +
+          `$${totalReinvested.toFixed(2)} reinvested`,
+        );
+        return {
+          ...base,
+          executed: true,
+          success: successCount > 0 || sweepResults.length === 0,
+          reinvestedUsd: totalReinvested,
+          sweepResults: sweepResults.map(r => ({ chain: r.chain, target: r.result.target, success: r.result.success })),
+        } as DecisionResult & { reinvestedUsd?: number; sweepResults?: any[] };
       }
 
       // ── Signal-driven perp trading ──────────────────────────────────
@@ -6426,11 +6815,11 @@ export function formatDecisionReport(
   if (state.kaminoDepositValueUsd > 1) L.push(`   Kamino: $${state.kaminoDepositValueUsd.toFixed(0)}`);
   if (state.orcaLpValueUsd > 1) L.push(`   Orca LP: $${state.orcaLpValueUsd.toFixed(0)}`);
 
-  // EVM LP (summary only — per-position detail shown in Krystal LP section of system report)
+  // EVM LP (summary only — per-position detail shown in EVM LP section of system report)
   if (state.evmLpTotalValueUsd > 1) {
     const inRange = state.evmLpPositions.filter(p => p.inRange).length;
     const feeStr = state.evmLpTotalFeesUsd > 0.01 ? ` (+$${state.evmLpTotalFeesUsd.toFixed(2)} fees)` : '';
-    L.push(`   Krystal LP: $${state.evmLpTotalValueUsd.toFixed(0)} (${inRange}/${state.evmLpPositions.length} in-range)${feeStr}`);
+    L.push(`   EVM LP: $${state.evmLpTotalValueUsd.toFixed(0)} (${inRange}/${state.evmLpPositions.length} in-range)${feeStr}`);
   }
 
   // EVM chain balances (all assets per chain)
@@ -6588,16 +6977,18 @@ function _humanAction(d: Decision, state: PortfolioState): string {
         (flash > 0 ? ` · flash $${flash.toLocaleString()}` : '') +
         (net > 0 ? ` · net $${net.toFixed(2)}` : '');
     }
-    case 'KRYSTAL_LP_OPEN':
+    case 'EVM_LP_OPEN':
       return `<b>Open EVM LP</b> — $${p.deployUsd?.toFixed(0) ?? '?'} in ${p.pair ?? '?/?'} on ${p.chainName ?? 'EVM'} (${p.rangeWidthTicks ?? 400} tick range)`;
-    case 'KRYSTAL_LP_INCREASE':
+    case 'EVM_LP_INCREASE':
       return `<b>Add to EVM LP</b> — $${p.deployUsd?.toFixed(0) ?? '?'} → ${p.pair ?? '?/?'} #${p.existingPosId ?? '?'} on ${p.chainName ?? 'EVM'}`;
-    case 'KRYSTAL_LP_REBALANCE':
+    case 'EVM_LP_REBALANCE':
       return p.closeOnly
         ? `<b>Close EVM LP</b> — ${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'} on ${p.chainName ?? 'EVM'}`
         : `<b>Rebalance EVM LP</b> — ${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'} on ${p.chainName ?? 'EVM'}, re-centering`;
-    case 'KRYSTAL_LP_CLAIM_FEES':
+    case 'EVM_LP_CLAIM_FEES':
       return `<b>Claim EVM LP fees</b> — $${p.feesOwedUsd?.toFixed(2) ?? '?'} from ${p.token0Symbol ?? '?'}/${p.token1Symbol ?? '?'} on ${p.chainName ?? 'EVM'}`;
+    case 'REINVEST_SWEEP':
+      return `<b>Sweep idle profits</b> — $${p.totalAccumulatedUsd?.toFixed(2) ?? '?'} → optimal yield destinations`;
     case 'HL_PERP_OPEN': {
       const styleTag = p.tradeStyle ? `[${p.tradeStyle}] ` : '';
       return `<b>${styleTag}${p.side ?? 'LONG'} ${p.coin ?? '?'}-PERP</b> — $${p.sizeUsd?.toFixed(0) ?? '?'} at ${p.leverage ?? 2}x (conviction: ${((p.conviction ?? 0) * 100).toFixed(0)}%, SL: ${p.stopLossPct ?? 5}%, TP: ${p.takeProfitPct ?? 10}%)`;
@@ -6797,10 +7188,10 @@ async function _runDecisionCycleInner(pool?: any): Promise<{
       }
     }
 
-    // Push analyst prices to krystalService for native token pricing (gas estimates, LP value)
+    // Push analyst prices to evmLpService for native token pricing (gas estimates, LP value)
     try {
-      const krystal = await import('./krystalService.ts');
-      krystal.setAnalystPrices(priceMap);
+      const evmLp = await import('./evmLpService.ts');
+      evmLp.setAnalystPrices(priceMap);
     } catch { /* non-fatal */ }
 
     // Build enriched treasury exposures

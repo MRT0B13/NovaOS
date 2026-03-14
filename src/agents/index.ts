@@ -9,7 +9,7 @@
  *     ├── Launcher  — pump.fun token creation, deploy, graduation tracking
  *     ├── Community — TG management, X engagement, community health
  *     ├── SocialSentinel — Reddit + Google Trends social trending → launch pipeline
- *     ├── YieldScout — Multi-chain DeFi yield monitoring (Krystal EVM + Solana)
+ *     ├── YieldScout — Multi-chain DeFi yield monitoring (EVM LP + Solana)
  *     ├── WhaleTracker — Solana + EVM whale movement detection
  *     ├── ArbScanner — Cross-DEX arbitrage opportunity scanning (EVM)
  *     ├── PortfolioWatchdog — Multi-chain portfolio health + PnL alerts

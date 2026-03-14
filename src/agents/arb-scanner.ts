@@ -8,7 +8,7 @@
  *
  * Data sources:
  *   - evmArbService → DeFiLlama pool discovery + on-chain quoter calls
- *   - Krystal → Additional cross-chain pool data
+ *   - DeFiLlama → Cross-chain pool data
  *
  * Key invariant: This agent NEVER executes trades. It only scans and
  * reports opportunities. The CFO decides whether to execute.

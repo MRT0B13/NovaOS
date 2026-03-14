@@ -171,17 +171,17 @@ const SEED_SKILLS: SeedSkill[] = [
     version: '1.0.0',
   },
   {
-    skillId: 'krystal-lp',
-    name: 'Krystal EVM LP Strategy (Multi-chain)',
+    skillId: 'evm-lp',
+    name: 'EVM LP Strategy (Multi-chain)',
     category: 'finance',
-    description: 'Concentrated liquidity LP on EVM chains via Krystal — Uniswap V3, PancakeSwap, Aerodrome',
-    content: `# Krystal EVM LP — Decision Framework
+    description: 'Concentrated liquidity LP on EVM chains via DeFiLlama — Uniswap V3, PancakeSwap, Aerodrome',
+    content: `# EVM LP — Decision Framework
 
 ## Chain and Protocol Selection
 - Chains: Ethereum, Optimism, Polygon, Base, Arbitrum, BSC
 - Protocols: Uniswap V3, PancakeSwap V3, Aerodrome CL (different ABI — tick-based not fee-based)
 - Score pools: APR 7d (40%), TVL (25%), volume consistency (20%), protocol reputation (10%), range safety (5%)
-- Minimum: CFO_KRYSTAL_LP_MIN_APR_7D and CFO_KRYSTAL_LP_MIN_TVL_USD must be met
+- Minimum: CFO_EVM_LP_MIN_APR_7D and CFO_EVM_LP_MIN_TVL_USD must be met
 
 ## Risk Tiers
 - Assign riskTier to every opened position (write to metadata.riskTier)
@@ -191,10 +191,10 @@ const SEED_SKILLS: SeedSkill[] = [
 - Record tier in cfo_positions metadata — feeds learning engine lpRangeWidthMultiplier
 
 ## Range Management
-- Use CFO_KRYSTAL_LP_RANGE_WIDTH_TICKS for initial range
+- Use CFO_EVM_LP_RANGE_WIDTH_TICKS for initial range
 - Apply learning engine lpRangeWidthMultiplier adjustments
-- Monitor via Krystal API — if API down, use on-chain fallback (NFPM.positions())
-- Rebalance when: position OOR AND CFO_KRYSTAL_LP_REBALANCE_TRIGGER_PCT exceeded
+- Monitor via on-chain NFPM fallback (NFPM.positions())
+- Rebalance when: position OOR AND CFO_EVM_LP_REBALANCE_TRIGGER_PCT exceeded
 
 ## EVM Wallet Considerations
 - Gas costs on Ethereum can be significant — check before rebalancing small positions
@@ -219,7 +219,7 @@ const SEED_SKILLS: SeedSkill[] = [
 - Polymarket: max CFO_MAX_POLYMARKET_USD total exposure
 - Kamino: max CFO_MAX_KAMINO_USD deposited/borrowed
 - Orca LP: max CFO_ORCA_LP_MAX_USD
-- Krystal LP: max CFO_KRYSTAL_LP_MAX_USD
+- EVM LP: max CFO_EVM_LP_MAX_USD
 - Jito: max CFO_MAX_JITO_SOL staked
 - Always maintain CFO_STAKE_RESERVE_SOL liquid (never deploy below this)
 
@@ -332,7 +332,7 @@ const SEED_ASSIGNMENTS: SeedAssignment[] = [
   { agentRole: 'nova-cfo', skillId: 'polymarket-edge', priority: 20 },
   { agentRole: 'nova-cfo', skillId: 'kamino-yield', priority: 30 },
   { agentRole: 'nova-cfo', skillId: 'orca-lp', priority: 40 },
-  { agentRole: 'nova-cfo', skillId: 'krystal-lp', priority: 50 },
+  { agentRole: 'nova-cfo', skillId: 'evm-lp', priority: 50 },
 
   // Scout gets intel scoring
   { agentRole: 'nova-scout', skillId: 'scout-intel-scoring', priority: 10 },

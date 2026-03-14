@@ -29,6 +29,8 @@ async function main() {
     connectionString: process.env.DATABASE_URL || process.env.POSTGRES_URL,
     max: 5,
     idleTimeoutMillis: 30_000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
   });
 
   // Verify DB connection

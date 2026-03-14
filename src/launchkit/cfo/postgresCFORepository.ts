@@ -20,7 +20,7 @@ import { logger } from '@elizaos/core';
 // ============================================================================
 
 export type PositionStatus = 'OPEN' | 'PARTIAL_EXIT' | 'CLOSED' | 'STOP_HIT' | 'EXPIRED';
-export type PositionStrategy = 'polymarket' | 'hyperliquid' | 'hl_perp' | 'hl_perp_scalp' | 'hl_perp_day' | 'hl_perp_swing' | 'hl_spot' | 'hl_spot_swing' | 'hl_spot_accumulation' | 'kamino' | 'kamino_loop' | `kamino_${string}_loop` | 'kamino_multiply_vault' | 'orca_lp' | 'jito' | 'jupiter_swap' | 'evm_flash_arb' | 'krystal_lp';
+export type PositionStrategy = 'polymarket' | 'hyperliquid' | 'hl_perp' | 'hl_perp_scalp' | 'hl_perp_day' | 'hl_perp_swing' | 'hl_spot' | 'hl_spot_swing' | 'hl_spot_accumulation' | 'kamino' | 'kamino_loop' | `kamino_${string}_loop` | 'kamino_multiply_vault' | 'orca_lp' | 'jito' | 'jupiter_swap' | 'evm_flash_arb' | 'evm_lp' | 'aave_borrow_lp';
 
 export interface CFOPosition {
   id: string;
@@ -193,7 +193,7 @@ async function ensureCFOSchema(pool: Pool): Promise<void> {
         current_price = CASE WHEN current_price <= 1 THEN cost_basis_usd ELSE current_price END
     WHERE entry_price = 1
       AND cost_basis_usd > 1
-      AND strategy IN ('orca_lp', 'krystal_lp')
+      AND strategy IN ('orca_lp', 'evm_lp', 'aave_borrow_lp')
   `).catch(() => { /* non-fatal */ });
 
   // Fix HL positions that have entry_price=0 (stale strategy subtypes that were never tracked)
@@ -310,6 +310,8 @@ export class PostgresCFORepository {
       max: 3,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 10_000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10_000,
     };
     if (sslNeeded) config.ssl = { rejectUnauthorized: false } as any;
 

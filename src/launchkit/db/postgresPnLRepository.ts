@@ -17,6 +17,8 @@ function buildPool(databaseUrl: string): Pool {
     max: 3,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
   };
   if (sslNeeded) {
     config.ssl = { rejectUnauthorized: false } as any;
