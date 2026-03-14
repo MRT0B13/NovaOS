@@ -2895,20 +2895,29 @@ export async function generateDecisions(
           high: 1.3,   // volatile pairs tolerate more drift before rebalance
         };
 
-        // Split headroom across enabled tiers (equal share)
+        // Split headroom across enabled tiers. When max positions is small and
+        // volatile preference is on, concentrate the budget into fewer tiers.
         const enabledTiers = env.evmLpRiskTiers;
-        const perTierMaxUsd = evmLpHeadroomUsd / Math.max(enabledTiers.size, 1);
+        const tierDivisor = Math.min(enabledTiers.size, env.evmLpMaxPositions);
+        const perTierMaxUsd = evmLpHeadroomUsd / Math.max(tierDivisor, 1);
 
         // Group eligible pools by tier and pick the best from each
         const bestSolanaApr = state.orcaLpFeeApy ?? 0;
         let tiersOpened = 0;
+
+        // When volatile preference is on, iterate high → medium → low instead
+        // of the default insertion order. This ensures the single position slot
+        // (maxPositions=1) goes to a high-APR volatile pair, not a stable one.
+        const tierOrder = env.reinvestPreferVolatile
+          ? [...enabledTiers].reverse()
+          : [...enabledTiers];
 
         // Track pairs already selected for OPEN this cycle to prevent duplicate
         // positions for the same pair across tiers (e.g. WETH/USDC appearing in
         // both 'medium' and 'high' tiers from different DEXes).
         const pairsSelectedThisCycle = new Set<string>();
 
-        for (const tier of enabledTiers) {
+        for (const tier of tierOrder) {
           // Respect max positions (could have filled up from another tier)
           if (state.evmLpPositions.length + tiersOpened >= env.evmLpMaxPositions) break;
 
