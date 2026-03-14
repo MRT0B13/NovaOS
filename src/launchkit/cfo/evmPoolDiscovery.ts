@@ -207,6 +207,8 @@ export async function discoverEvmPools(forceRefresh = false): Promise<EvmPoolCan
       // DeFiLlama 'pool' field is a UUID, but for EVM pools it often contains
       // the on-chain address embedded or in underlyingTokens
       const poolAddress = extractPoolAddress(llama);
+      // Skip pools where we couldn't extract a valid on-chain address
+      if (!/^0x[a-fA-F0-9]{40}$/i.test(poolAddress)) continue;
 
       // Parse fee tier from symbol or pool metadata
       const feeTier = parseFeeTier(llama);
@@ -653,14 +655,28 @@ function extractPoolAddress(llama: any): string {
     return poolField.slice(0, 42);
   }
 
-  // Some DeFiLlama records include the address in the pool UUID pattern
+  // Some DeFiLlama records embed the address without 0x prefix: "{40hex}-{chain}"
   const hexMatch = poolField.match(/^([a-fA-F0-9]{40})/);
   if (hexMatch) {
     return '0x' + hexMatch[1];
   }
 
-  // Fallback: use the pool UUID as-is (will need factory lookup during execution)
-  return poolField;
+  // DeFiLlama sometimes stores the address in the 'poolMeta' or 'address' field
+  const metaAddr = String(llama.poolMeta ?? llama.address ?? '');
+  if (/^0x[a-fA-F0-9]{40}$/i.test(metaAddr)) {
+    return metaAddr;
+  }
+
+  // Strip hyphens from UUID-like strings and check if the hex portion is ≥40 chars
+  // (DeFiLlama UUIDs are 32 hex chars → too short; real addresses are 40)
+  const stripped = poolField.replace(/-/g, '');
+  const strippedMatch = stripped.match(/^([a-fA-F0-9]{40})/);
+  if (strippedMatch) {
+    return '0x' + strippedMatch[1];
+  }
+
+  // No valid address found — return empty string (caller must filter these out)
+  return '';
 }
 
 /** Parse fee tier from DeFiLlama pool symbol or metadata */
