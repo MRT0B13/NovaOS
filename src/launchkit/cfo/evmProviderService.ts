@@ -29,6 +29,12 @@ export async function loadEthers(): Promise<typeof import('ethers')> {
 // Provider pooling
 // ============================================================================
 
+const CHAIN_NAMES: Record<number, string> = {
+  1: 'mainnet', 10: 'optimism', 56: 'bnb', 137: 'matic',
+  8453: 'base', 42161: 'arbitrum', 43114: 'avalanche',
+  324: 'zksync', 534352: 'scroll', 59144: 'linea',
+};
+
 const _providerCache = new Map<number, any>();
 
 export async function getEvmProvider(numericChainId: number): Promise<any> {
@@ -40,12 +46,13 @@ export async function getEvmProvider(numericChainId: number): Promise<any> {
   if (!url) throw new Error(`[EvmProvider] No RPC URL configured for chainId ${numericChainId}`);
 
   const ethers = await loadEthers();
-  const staticNetwork = ethers.Network.from(numericChainId);
-  // Disable ENS on non-mainnet chains — ethers v6 still attempts resolver()
-  // calls even with staticNetwork, which fails on L2s without ENS registries.
-  if (numericChainId !== 1) {
-    staticNetwork.attachPlugin(new ethers.EnsPlugin(null));
-  }
+  // Use bare Network constructor for non-mainnet chains to avoid ENS plugin.
+  // Network.from() pre-populates an EnsPlugin for known chains, which causes
+  // resolver() calls on L2s without ENS registries (Base, Arb, etc.) to fail
+  // with BAD_DATA. The bare constructor creates a clean network with no plugins.
+  const staticNetwork = numericChainId === 1
+    ? ethers.Network.from(numericChainId)
+    : new ethers.Network(CHAIN_NAMES[numericChainId] ?? `chain-${numericChainId}`, numericChainId);
   const provider = new ethers.JsonRpcProvider(url, staticNetwork, { staticNetwork: true });
   _providerCache.set(numericChainId, provider);
   return provider;
