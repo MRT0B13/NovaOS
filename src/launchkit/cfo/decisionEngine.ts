@@ -2897,6 +2897,12 @@ export async function generateDecisions(
           }
         }
 
+        // ── Tier-based deploy sizing ──
+        // low  = stable/stable: large capital required, uncapped on the upper end
+        // medium/high = volatile: small positions only ($30–$100 per position)
+        const TIER_MIN_DEPLOY: Record<string, number> = { low: 200, medium: 30, high: 30 };
+        const TIER_MAX_DEPLOY: Record<string, number> = { low: Infinity, medium: 100, high: 100 };
+
         // ── Tier-based range width multipliers ──
         // Tighter ranges = more concentrated liquidity = higher fee capture.
         // Only widen for genuinely volatile pairs, and even then keep it moderate.
@@ -2952,6 +2958,18 @@ export async function generateDecisions(
 
           const best = tierPools[0]; // already sorted by score
 
+          // Stablecoin gate for stable/stable (low) tier: require ≥$200 USDC+USDT on the
+          // target chain. Volatile asset value does not count — swapping volatile → stable
+          // incurs fees and slippage that destroy the thin margin of a stable/stable pool.
+          if (tier === 'low') {
+            const lowTierChainBal = state.evmChainBalances.find(b => b.chainId === best.chainId);
+            const stableOnTargetChain = (lowTierChainBal?.usdcBalance ?? 0) + (lowTierChainBal?.usdcBridgedBalance ?? 0) + (lowTierChainBal?.usdtBalance ?? 0);
+            if (stableOnTargetChain < TIER_MIN_DEPLOY.low) {
+              evmLpSkip(`low tier (stable/stable): need ≥$${TIER_MIN_DEPLOY.low} USDC/USDT on ${best.chainName}, have $${stableOnTargetChain.toFixed(0)}`);
+              continue;
+            }
+          }
+
           // Check: EVM APR must beat best Solana LP APR by 5% (skip this check for high-risk — APR compensates)
           if (tier !== 'high' && best.apr7d <= bestSolanaApr + 5) {
             evmLpSkip(`${tier} tier: best EVM APR ${best.apr7d.toFixed(1)}% doesn't beat Solana ${bestSolanaApr.toFixed(1)}% + 5%`);
@@ -2961,17 +2979,25 @@ export async function generateDecisions(
           // Cap deploy to available value: target chain local value + bridgeable value from other chains
           const targetChainBal = state.evmChainBalances.find(b => b.chainId === best.chainId);
           const targetChainLocalValue = targetChainBal?.totalValueUsd ?? 0;
+          // Strongly prefer chains with actual stablecoins: only count stable balance for chains
+          // that lack adequate stablecoins for the tier. This prevents picking Polygon ($18 volatile)
+          // over Arbitrum (where the USDC actually sits), since swapping volatile → stable loses value.
+          const targetChainStableUsd = (targetChainBal?.usdcBalance ?? 0) + (targetChainBal?.usdcBridgedBalance ?? 0) + (targetChainBal?.usdtBalance ?? 0);
+          const chainHasAdequateStables = targetChainStableUsd >= TIER_MIN_DEPLOY[tier];
+          const effectiveLocalValue = chainHasAdequateStables ? targetChainLocalValue : targetChainStableUsd;
           // If target chain is underfunded, consider bridgeable funds from other chains (minus ~3% for bridge fees)
           const otherChainsValue = bridgeReachable
             ? state.evmChainBalances
                 .filter(b => b.chainId !== best.chainId && b.totalValueUsd >= 5)
                 .reduce((s, b) => s + b.totalValueUsd, 0) * 0.97
             : 0;
-          const effectiveValue = targetChainLocalValue + otherChainsValue;
-          const deployUsd = Math.min(perTierMaxUsd, env.evmLpMaxUsd, evmDeployCap, effectiveValue * 0.9);
+          const effectiveValue = effectiveLocalValue + otherChainsValue;
+          let deployUsd = Math.min(perTierMaxUsd, env.evmLpMaxUsd, evmDeployCap, effectiveValue * 0.9);
+          // Clamp to tier-specific max: volatile positions ($30–$100), stable uncapped (bounded by evmLpMaxUsd)
+          deployUsd = Math.min(deployUsd, TIER_MAX_DEPLOY[tier] ?? Infinity);
 
-          if (deployUsd < env.evmLpMinUsd) {
-            evmLpSkip(`${tier} tier: deploy amount too small ($${deployUsd.toFixed(0)} < min $${env.evmLpMinUsd.toFixed(0)}, local=$${targetChainLocalValue.toFixed(0)}, bridgeable=$${otherChainsValue.toFixed(0)})`);
+          if (deployUsd < (TIER_MIN_DEPLOY[tier] ?? 30)) {
+            evmLpSkip(`${tier} tier: deploy amount too small ($${deployUsd.toFixed(0)} < min $${TIER_MIN_DEPLOY[tier] ?? 30}, local=$${targetChainLocalValue.toFixed(0)}, stables=$${targetChainStableUsd.toFixed(0)}, bridgeable=$${otherChainsValue.toFixed(0)})`);
             continue;
           }
 
@@ -3063,11 +3089,13 @@ export async function generateDecisions(
               continue;
             }
 
-            // Cap deploy per increase to per-tier budget
+            // Cap deploy per increase to per-tier budget with tier-specific min/max
+            const incTier = incPool.riskTier ?? 'medium';
             const targetChainBal = state.evmChainBalances.find(b => b.chainId === incPool.chainId);
             const localValue = targetChainBal?.totalValueUsd ?? 0;
-            const deployUsd = Math.min(perTierMaxUsd, env.evmLpMaxUsd, evmDeployCap, localValue * 0.9);
-            if (deployUsd < 10) continue; // too small to bother
+            let deployUsd = Math.min(perTierMaxUsd, env.evmLpMaxUsd, evmDeployCap, localValue * 0.9);
+            deployUsd = Math.min(deployUsd, TIER_MAX_DEPLOY[incTier] ?? Infinity);
+            if (deployUsd < (TIER_MIN_DEPLOY[incTier] ?? 30)) continue; // too small for this tier
 
             decisions.push({
               type: 'EVM_LP_INCREASE',
