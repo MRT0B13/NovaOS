@@ -234,7 +234,7 @@ async function quoteViaUniswap(
     // Get input token decimals
     const inToken = new ethers.Contract(tokenInAddr, ERC20_ABI, provider);
     const inDecimals = Number(await inToken.decimals().catch(() => 18));
-    const amountInRaw = ethers.parseUnits(amountInHuman.toString(), inDecimals);
+    const amountInRaw = ethers.parseUnits(parseFloat(amountInHuman.toFixed(inDecimals)).toString(), inDecimals);
 
     // Call QuoterV2 (staticCall — doesn't consume gas)
     const quoter = new ethers.Contract(getQuoterV2(chainId), QUOTER_ABI, provider);
@@ -313,7 +313,7 @@ async function quoteViaLifi(
 
     const inToken = new ethers.Contract(tokenInAddr, ERC20_ABI, provider);
     const inDecimals = Number(await inToken.decimals().catch(() => 18));
-    const amountInRaw = ethers.parseUnits(amountInHuman.toString(), inDecimals).toString();
+    const amountInRaw = ethers.parseUnits(parseFloat(amountInHuman.toFixed(inDecimals)).toString(), inDecimals).toString();
 
     // LI.FI supports same-chain swaps via /quote with fromChain === toChain
     const env = getCFOEnv();
@@ -497,7 +497,7 @@ async function executeViaUniswap(
       outToken.decimals().then(Number).catch(() => 18),
     ]);
 
-    const amountInRaw = ethers.parseUnits(amountInHuman.toString(), inDecimals);
+    const amountInRaw = ethers.parseUnits(parseFloat(amountInHuman.toFixed(inDecimals)).toString(), inDecimals);
     const amountOutMinRaw = ethers.parseUnits(
       (expectedOut * (1 - slippagePct / 100)).toFixed(outDecimals),
       outDecimals,
@@ -565,7 +565,7 @@ async function executeViaLifiSwap(
 
     const inToken = new ethers.Contract(tokenInAddr, ERC20_ABI, provider);
     const inDecimals = Number(await inToken.decimals().catch(() => 18));
-    const amountInRaw = ethers.parseUnits(amountInHuman.toString(), inDecimals).toString();
+    const amountInRaw = ethers.parseUnits(parseFloat(amountInHuman.toFixed(inDecimals)).toString(), inDecimals).toString();
 
     // Get LI.FI quote (same-chain swap)
     const params = new URLSearchParams({
