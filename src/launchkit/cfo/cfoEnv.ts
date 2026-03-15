@@ -120,6 +120,7 @@ export interface CFOEnv {
 
   // ── EVM Concentrated LP ──────────────────────────────────────────
   evmLpEnabled: boolean;                          // enable EVM LP (default false) — accepts CFO_KRYSTAL_LP_ENABLE as fallback
+  evmLpMinUsd: number;                            // min USD to deploy (default 20) — skip if wallet balance below this
   evmLpMaxUsd: number;                            // max USD per position (default 200)
   evmLpMinTvlUsd: number;                         // min pool TVL filter (default 500000)
   evmLpMinApr7d: number;                          // min 7d APR filter (default 15)
@@ -389,6 +390,7 @@ export function getCFOEnv(bust = false): CFOEnv {
     ),
 
     evmLpEnabled: (process.env.CFO_EVM_LP_ENABLE ?? process.env.CFO_KRYSTAL_LP_ENABLE) === 'true',
+    evmLpMinUsd: Number(process.env.CFO_EVM_LP_MIN_USD ?? 20),
     evmLpMaxUsd: Number(process.env.CFO_EVM_LP_MAX_USD ?? process.env.CFO_KRYSTAL_LP_MAX_USD ?? 200),
     evmLpMinTvlUsd: Number(process.env.CFO_EVM_LP_MIN_TVL_USD ?? process.env.CFO_KRYSTAL_LP_MIN_TVL_USD ?? 500_000),
     evmLpMinApr7d: Number(process.env.CFO_EVM_LP_MIN_APR_7D ?? process.env.CFO_KRYSTAL_LP_MIN_APR_7D ?? 15),
