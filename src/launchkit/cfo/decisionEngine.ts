@@ -2970,8 +2970,8 @@ export async function generateDecisions(
           const effectiveValue = targetChainLocalValue + otherChainsValue;
           const deployUsd = Math.min(perTierMaxUsd, env.evmLpMaxUsd, evmDeployCap, effectiveValue * 0.9);
 
-          if (deployUsd < 15) {
-            evmLpSkip(`${tier} tier: deploy amount too small ($${deployUsd.toFixed(0)}, local=$${targetChainLocalValue.toFixed(0)}, bridgeable=$${otherChainsValue.toFixed(0)})`);
+          if (deployUsd < env.evmLpMinUsd) {
+            evmLpSkip(`${tier} tier: deploy amount too small ($${deployUsd.toFixed(0)} < min $${env.evmLpMinUsd.toFixed(0)}, local=$${targetChainLocalValue.toFixed(0)}, bridgeable=$${otherChainsValue.toFixed(0)})`);
             continue;
           }
 

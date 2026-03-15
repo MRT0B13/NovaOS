@@ -273,7 +273,7 @@ export async function rankYieldOptions(
               chain,
               estimatedApyPct: poolApr,
               riskAdjustedApyPct: poolApr * riskFactors.risky,
-              minAmountUsd: 25,
+              minAmountUsd: getCFOEnv().evmLpMinUsd,
               description: `Re-LP into EVM ${bestPool.pool.pair} on ${bestPool.pool.chainName} (${poolApr.toFixed(1)}% APR, ${bestPool.pool.riskTier} risk)`,
             });
             _lastEvmLpTarget = bestPool.pool;

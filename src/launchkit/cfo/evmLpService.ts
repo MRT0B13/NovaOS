@@ -573,7 +573,7 @@ export async function fetchEvmLpPositions(
           feeTier = Number(posData.fee ?? posData[4] ?? 0);
 
           // Get current tick from pool slot0 (cached)
-          if (poolAddress) {
+          if (poolAddress && isValidEvmAddress(poolAddress)) {
             const poolKey = `${numericId}_${poolAddress}`;
             const cached = _slot0Cache.get(poolKey);
             if (cached && Date.now() - cached.ts < SLOT0_CACHE_TTL) {
@@ -763,7 +763,7 @@ export async function fetchEvmLpPositions(
             const ethersLib = ethers; // use the already-imported ethers
             // We already have currentTick + slot0 from pool lookup above.
             // If we have a poolAddress, read slot0 to get sqrtPriceX96
-            if (poolAddress && currentTick !== 0) {
+            if (poolAddress && isValidEvmAddress(poolAddress) && currentTick !== 0) {
               const poolContract = new ethersLib.Contract(poolAddress, getPoolAbi(isAerodrome), provider);
               const slot0 = await poolContract.slot0();
               const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96 ?? slot0[0] ?? 0);
@@ -874,7 +874,7 @@ export async function fetchEvmLpPositions(
           // Falls back to raw tokensOwed if pool read fails or no pool address available.
           let tokensOwed0 = 0;
           let tokensOwed1 = 0;
-          if (poolAddress && currentTick !== 0) {
+          if (poolAddress && isValidEvmAddress(poolAddress) && currentTick !== 0) {
             try {
               const poolContract = new ethers.Contract(poolAddress, getPoolAbi(isAerodrome), provider);
               const { fees0, fees1 } = await computePendingFeesV3(poolContract, posData, currentTick);
@@ -1281,14 +1281,16 @@ export async function openEvmLpPosition(
               logger.warn(`[EvmLP] Bridge failed: ${bridgeResult.error}`);
             }
           } else {
-            // No single source covers the full amount — log total available
+            // No single source covers the full bridge amount — check if target chain has enough on its own
             const totalAvailable = allCandidates.reduce((s, c) => s + c.balance, 0);
-            logger.warn(`[EvmLP] Insufficient funds on source chain ${srcChain}: $${totalAvailable.toFixed(2)} available < $${bridgeAmountUsd.toFixed(2)} needed`);
-
-            // If the target chain also has zero balance, abort early — no point
-            // proceeding to zap/mint with nothing.
-            if (totalHeldUsd < 1) {
-              return { success: false, error: `Insufficient funds: $${totalAvailable.toFixed(2)} on source chain + $${totalHeldUsd.toFixed(2)} on target chain` };
+            if (totalHeldUsd >= env.evmLpMinUsd) {
+              // Target chain already has enough to meet minimum — skip bridge, deploy what's there
+              logger.info(`[EvmLP] No bridge source covers $${bridgeAmountUsd.toFixed(2)}; target chain has $${totalHeldUsd.toFixed(2)} ≥ min $${env.evmLpMinUsd.toFixed(2)} — proceeding without bridge`);
+            } else {
+              // Insufficient funds on both source and target chains
+              const totalAcrossChains = totalAvailable + totalHeldUsd;
+              logger.warn(`[EvmLP] Insufficient funds on source chain ${srcChain}: $${totalAvailable.toFixed(2)} available < $${bridgeAmountUsd.toFixed(2)} needed (target: $${totalHeldUsd.toFixed(2)})`);
+              return { success: false, error: `Insufficient funds: $${totalAcrossChains.toFixed(2)} total across chains < $${env.evmLpMinUsd.toFixed(2)} minimum required` };
             }
           }
         }
@@ -1619,6 +1621,20 @@ export async function openEvmLpPosition(
       token0Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
       token1Contract.balanceOf(wallet.address).catch(() => BigInt(0)),
     ]);
+
+    // 3b. Enforce min/max deploy range based on what's actually available
+    //     Deploy whatever is in the wallet (up to evmLpMaxUsd); abort if below evmLpMinUsd.
+    const postFundUsd0 = Number(ethers.formatUnits(bal0, dec0)) * usdPerToken0;
+    const postFundUsd1 = Number(ethers.formatUnits(bal1, dec1)) * usdPerToken1;
+    const postFundTotalUsd = postFundUsd0 + postFundUsd1;
+    if (postFundTotalUsd < env.evmLpMinUsd) {
+      const insufficientMsg = `Insufficient funds: $${postFundTotalUsd.toFixed(2)} available < $${env.evmLpMinUsd.toFixed(2)} minimum`;
+      logger.warn(`[EvmLP] ${insufficientMsg} (after all funding phases)`);
+      return { success: false, error: insufficientMsg };
+    }
+    // Cap deploy at max but deploy all available if below the originally requested amount
+    deployUsd = Math.min(postFundTotalUsd, env.evmLpMaxUsd);
+    logger.info(`[EvmLP] Effective deploy: $${deployUsd.toFixed(2)} (available $${postFundTotalUsd.toFixed(2)}, max $${env.evmLpMaxUsd.toFixed(2)})`);
 
     // 4. Calculate desired amounts — cap at deployUsd equivalent
     //    Price data already computed above (pre-funding) using sqrtPriceX96.
@@ -2662,7 +2678,30 @@ export async function rebalanceEvmLpPosition(params: {
     const protoName = typeof targetPool.protocol === 'string' ? targetPool.protocol : (targetPool.protocol as any)?.name ?? '';
     const protoResolved = resolveProtocol(protoName.toLowerCase(), chainNumericId);
     const isAero = protoResolved?.def.abi === 'aerodrome-cl';
-    const poolContract = new ethers.Contract(targetPool.poolAddress, getPoolAbi(!!isAero), provider);
+
+    // Resolve pool address — guard against UUID or empty-string addresses that would
+    // cause ethers v6 to throw UNCONFIGURED_NAME trying to resolve as ENS.
+    let rebalPoolAddress = targetPool.poolAddress;
+    if (!isValidEvmAddress(rebalPoolAddress)) {
+      const factoryAddr = protoResolved?.factoryAddress;
+      if (factoryAddr) {
+        try {
+          const factoryAbiStr = isAero
+            ? 'function getPool(address,address,int24) view returns (address)'
+            : 'function getPool(address,address,uint24) view returns (address)';
+          const rebalFactory = new ethers.Contract(factoryAddr, [factoryAbiStr], provider);
+          const resolvedAddr: string = await rebalFactory.getPool(t0Addr, t1Addr, targetPool.feeTier);
+          if (resolvedAddr && resolvedAddr !== ethers.ZeroAddress) {
+            rebalPoolAddress = resolvedAddr;
+            logger.info(`[EvmLP] Rebalance: resolved pool address from factory: ${rebalPoolAddress}`);
+          }
+        } catch (err) {
+          logger.debug('[EvmLP] Rebalance: factory pool resolution failed (non-fatal):', err);
+        }
+      }
+    }
+
+    const poolContract = new ethers.Contract(rebalPoolAddress, getPoolAbi(!!isAero), provider);
     const slot0 = await poolContract.slot0();
     const sqrtPriceX96 = slot0.sqrtPriceX96 ?? slot0[0];
     const sqrtP = Number(sqrtPriceX96) / (2 ** 96);
