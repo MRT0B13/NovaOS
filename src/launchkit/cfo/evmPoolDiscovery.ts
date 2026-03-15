@@ -207,15 +207,14 @@ export async function discoverEvmPools(forceRefresh = false): Promise<EvmPoolCan
 
       // Parse pool address from DeFiLlama.
       // DeFiLlama EVM pool IDs follow "{40-hex-address}-{chain}" for most CL pools,
-      // but some use pure UUIDs.  When no valid 0x address can be extracted we fall
-      // back to the raw DeFiLlama pool UUID so the pool can still be scored and
-      // selected; the actual on-chain address is resolved at execution time via
-      // factory contract calls.
+      // but some use pure UUIDs.  When no valid 0x address can be extracted we store
+      // an empty string so the pool is still scored/selected while preventing any
+      // UUID from reaching ethers.Contract constructors.  The actual on-chain address
+      // is resolved at execution time via factory contract calls in evmLpService.ts.
       const extracted = extractPoolAddress(llama);
       const poolAddress = (extracted.startsWith('0x') && isEvmAddress(extracted.slice(2)))
         ? extracted
-        : String(llama.pool ?? '');
-      if (!poolAddress) { droppedNoAddress++; continue; }
+        : '';
 
       // Parse fee tier from symbol or pool metadata
       const feeTier = parseFeeTier(llama);
