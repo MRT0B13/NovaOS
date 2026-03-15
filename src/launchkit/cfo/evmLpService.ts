@@ -1160,6 +1160,39 @@ export async function openEvmLpPosition(
 
     logger.info(`[EvmLP] Pre-funding: held $${totalHeldUsd.toFixed(2)} (${pool.token0.symbol}=$${heldUsd0.toFixed(2)}, ${pool.token1.symbol}=$${heldUsd1.toFixed(2)}), target $${deployUsd.toFixed(2)}, gap $${fundingGapUsd.toFixed(2)}`);
 
+    // ── Early abort guard ────────────────────────────────────────────────────
+    // If the deploy target is more than 3× the total local value on this chain
+    // and no bridge is configured, abort immediately to avoid a wasteful swap
+    // cascade that burns gas and still can't fund the position.
+    // Local total = pool tokens + WETH/wrapped-native + native gas token.
+    // The 3× multiplier gives headroom for partially-held positions while still
+    // blocking obviously doomed cases (e.g. $200 target vs $18 local assets).
+    const EARLY_ABORT_BALANCE_MULTIPLIER = 3;
+    if (!bridgeFunding && fundingGapUsd > 0) {
+      try {
+        const nativePriceEst = await getNativeTokenPrice(chainNumericId).catch(() => 0);
+        if (nativePriceEst > 0) {
+          const wethAddrEst = WRAPPED_NATIVE_ADDR[chainNumericId];
+          const [nativeBalBig, wethBalBig] = await Promise.all([
+            provider.getBalance(wallet.address).catch(() => BigInt(0)),
+            wethAddrEst
+              ? new ethers.Contract(wethAddrEst, ERC20_ABI, provider).balanceOf(wallet.address).catch(() => BigInt(0))
+              : Promise.resolve(BigInt(0)),
+          ]);
+          const nativeValEst = Number(ethers.formatEther(nativeBalBig)) * nativePriceEst;
+          const wethValEst = Number(ethers.formatEther(wethBalBig)) * nativePriceEst;
+          const totalLocalEst = totalHeldUsd + nativeValEst + wethValEst;
+          if (deployUsd > totalLocalEst * EARLY_ABORT_BALANCE_MULTIPLIER) {
+            const abortMsg = `Deploy amount ($${deployUsd.toFixed(2)}) exceeds ${EARLY_ABORT_BALANCE_MULTIPLIER}× local balance ($${totalLocalEst.toFixed(2)}) with no bridge configured`;
+            logger.warn(`[EvmLP] Early abort: ${abortMsg} — skipping to prevent wasteful swaps`);
+            return { success: false, error: abortMsg };
+          }
+        }
+      } catch (err) {
+        logger.warn('[EvmLP] Early abort balance check failed (non-fatal, continuing):', err);
+      }
+    }
+
     // ── Pre-flight: verify both tokens are swappable from USDC before bridging ──
     // Prevents wasting bridge fees on pools where a token has no DEX liquidity
     // (e.g. VIRTUAL only trades on Aerodrome, not Uniswap V3; exotic BSC tokens etc.)
